@@ -312,3 +312,7 @@ tests/ext_conformance/artifacts/doom-overlay/doom-debug.log
 .DS_Store
 README.md:*
 root@*
+
+# [epiq]: local hydrated state is never committed
+.epiq/events/
+.epiq/log/
