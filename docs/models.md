@@ -2,12 +2,66 @@
 
 Pi loads available models from a built-in registry and an optional user-defined `models.json`.
 
+## Planning model in the default terminal
+
+The default terminal can use a dedicated planning model while keeping the model
+you selected for execution. Set `modelRoles.plan` in your settings, or override it
+for one launch with `--plan provider/model[:thinking]`:
+
+```json
+{
+  "modelRoles": {
+    "plan": "anthropic/claude-opus-4-7:high"
+  }
+}
+```
+
+`/plan enter` first enables the read-only planning gate and checkpoints it, then
+selects the configured planning model. `--plan-mode` starts the terminal in this
+mode. The model must exist in the live registry, including your custom models.
+Automatic planning selection respects `disabledProviders` and the most specific
+`modelScopeOverrides` for the current session's working directory. `enabledModels`
+continues to limit the picker and model cycling, without excluding an explicitly
+assigned planning model.
+Its credentials, headers, context limit, output limit, and image support come
+from its own registered provider. With no planning model configured, planning
+uses your current model. An omitted thinking suffix retains your current level,
+clamped to the planning model's supported levels.
+
+After the agent submits a proposal, use `/plan review` and approve the displayed
+review ID. Approval pins that proposal and restores your previous model and
+thinking level; `/plan off` also restores them. These controls do not start an
+execution turn or change tool permissions. A successful explicit model or
+thinking selection while planning takes precedence over restoration, including
+reselecting the current value. Automatic planning transitions preserve an armed
+`/prewalk`; explicit selections keep their existing disarm behavior. A provider
+failover during planning remains part of that planning role, so approving or
+leaving the plan still restores the execution model.
+
+If a checkpoint or model restoration fails, the terminal reports the failure
+and does not advertise execution readiness. Resolve a checkpoint or credential
+error and use `/plan save` to retry; an accepted approval does not need to be
+repeated. If entering plan mode could not save its checkpoint, a later
+successful `/plan save` finishes the deferred planning-model selection unless
+you explicitly selected a model or thinking level in the meantime. An
+indeterminate native model save blocks provider access separately:
+resolve the storage error, reopen the saved session, and select the intended
+model explicitly. `/plan save` cannot clear that block. If the configured
+planning model cannot be selected, the read-only gate remains active and the
+terminal reports the current model. An explicit API key stays with the provider
+selected when the key was supplied, including when that provider is restored.
+
+Automatic restoration belongs to the current running session and branch. A
+session replacement, navigation to a different branch, or a newer model
+selection retires that restoration. After restarting during planning, explicitly
+select your intended execution model when leaving plan mode.
+
 ## Location
 
 | Path | Description |
 |------|-------------|
 | `~/.pi/agent/models.json` | User-defined model overrides and custom providers |
-| `~/.pi/agent/models.fetched.json` | Generated v2 live-catalog membership; managed only by `--persist-models` |
+| `~/.pi/agent/models.fetched.json` | Generated v2 live-catalog membership and advertised reasoning tiers; managed only by `--persist-models` |
 
 Do not hand-edit `models.fetched.json`. Its provider/model IDs are bound to the
 fetching endpoint and transport shape by a non-secret fingerprint and timestamp. The
@@ -25,6 +79,25 @@ invalidate saved membership automatically; rerun
 Inference requests still resolve the current account's credential, while only
 the opt-in saved model list can remain stale. Hand-authored `models.json` remains
 authoritative.
+
+Each generated model row contains its `id` and may contain `reasoningLevels`, a
+non-empty list of at most seven distinct canonical thinking tiers. Discovery
+reads `supported_reasoning_levels` from the model row or its `metadata` object
+(metadata takes precedence), accepting tier strings or objects with an `effort`
+string. `none` becomes `off`; unknown values are ignored. Empty, malformed,
+unknown-only, or oversized advertisements leave existing capabilities unchanged.
+Conflicting advertisements for the same normalized model ID are also ignored.
+
+Usable tiers update thinking choices and request encoding while preserving
+bundled context limits, pricing, input types, and other model metadata. Unsupported
+tiers are explicitly disabled so sparse ladders such as only `xhigh` clamp
+correctly. The selected effort still comes from your configuration; a provider's
+`default_reasoning_level` does not change it. Manual provider and model overrides
+load last, including explicit `reasoning: false`, `supportsReasoningEffort: false`,
+and null `thinkingLevelMap` entries. A provider's `compat` merges field by field
+with the discovered settings, and each `thinkingLevelMap` entry refines the
+discovered map for its level only. Generated rows cannot supply endpoints,
+credentials, headers, or arbitrary compatibility settings.
 
 Legacy `pi.models.fetched.v1` files lack the endpoint and transport provenance
 required by v2 and are preserved rather than overwritten automatically. Move
@@ -91,8 +164,50 @@ Every key of `compat.openRouterRouting` is copied verbatim onto the top level of
 | `contextWindow` | number | Context window size in tokens |
 | `maxTokens` | number | Max output tokens |
 | `reasoning` | boolean | True if model supports extended thinking |
-| `input` | string[] | Any of `"text"`, `"image"`, `"video"`, `"audio"`. Unknown labels are dropped with a warning. `video`/`audio` are honored only by the Gemini-family transports (`google-generative-ai`, `google-gemini-cli`, `google-vertex`), which get them added automatically for bundled Gemini models; other transports degrade media blocks to a text placeholder |
-| `cost` | object | Cost per million tokens |
+| `input` | string[] | Any of `"text"`, `"image"`, `"video"`, `"audio"`. Unknown labels are dropped with a warning. Gemini-family transports accept native audio/video. OpenAI Chat Completions accepts native WAV/MP3 when the model declares `"audio"` and supplies audio pricing; unsupported media becomes a visible text placeholder. Custom models and `modelOverrides` both preserve these capabilities |
+| `cost` | object | Text/cache cost per million tokens, with optional separate `audio` rates |
+
+### Native audio with OpenAI Chat Completions
+
+The bundled `openai/gpt-audio-1.5` model accepts native WAV and MP3 input and
+returns text, including tool calls. Select it with `pi --model openai/gpt-audio-1.5`.
+Audio can come from an attached file, `read_media`, or an SDK/RPC/ACP native media
+block. Audio returned by a tool is sent after the complete group of tool replies.
+Saved session media is replayed through the same transport.
+
+For a custom audio-capable Chat Completions model, declare `"audio"` in `input`
+and provide separate rates in `cost.audio`. For example, the bundled model uses:
+
+```json
+{
+  "id": "gpt-audio-1.5",
+  "api": "openai-completions",
+  "input": ["text", "audio"],
+  "cost": {
+    "input": 2.5,
+    "output": 10,
+    "audio": { "input": 32, "output": 64 }
+  }
+}
+```
+
+All rates are per million tokens. Omitted audio rates are unknown; an explicit
+`0` means free. Audio requests require a known input rate and streamed usage.
+Pi prices text and audio separately and keeps context-token totals separate from
+billable token counts. If the provider omits required audio billing or reports
+cached tokens without enough detail to price the modalities, the spending
+account refuses further requests unless an authoritative provider bill resolves
+the amount. Accounting failures remain recorded when the session is resumed.
+
+The Chat transport validates native payloads before dispatch, including provider
+request hooks: at most 10 MiB decoded per audio block, 32 audio blocks, and 64 MiB
+decoded audio per request. The configured ingress limit (5 MiB per media item by
+default) still applies. Video and unsupported audio formats retain omission
+placeholders; OpenAI Responses and Codex do not use this Chat audio path.
+
+Provider contract and published rates:
+[audio in Chat Completions](https://developers.openai.com/api/docs/guides/audio-chat-completions)
+and [GPT-Audio-1.5](https://developers.openai.com/api/docs/models/gpt-audio-1.5).
 
 ### Compatibility Flags (`compat`)
 
@@ -129,6 +244,50 @@ Reasoning models on the `openrouter` provider forward pi's thinking level as Ope
 ```
 
 A custom OpenAI-compatible proxy that speaks the same shape can opt in with `"compat": {"thinkingFormat": "openrouter"}`.
+
+### DeepSeek tool calls emitted as text
+
+Some DeepSeek endpoints return tool markup in the assistant's text channel
+instead of the structured `tool_calls` field. The OpenAI-compatible transport
+recovers those calls automatically for the `deepseek` provider and for models
+whose path components explicitly identify DeepSeek, such as
+`deepseek/deepseek-chat`. Unrelated models keep their ordinary text behavior.
+
+Recovery recognizes DeepSeek's DSML invocation/parameter format and V3
+template markers, including the documented fullwidth-bar and separator
+variants. String parameters remain strings; DSML parameters marked
+`string="false"` must contain complete JSON. Template arguments must be a
+complete JSON object. Duplicate JSON keys, repeated DSML parameters, invalid
+function names, incomplete envelopes, and oversized captures are rejected.
+The parser never repairs missing arguments or invents values.
+
+Ordinary prose streams as it arrives. Once a possible tool envelope begins,
+its tail is withheld until the terminal response so incomplete markup does
+not enter conversation replay. Code fences and closed inline-code examples
+are protected by a conservative quotation guard: a fence opens only at the
+start of a line, and an inline-code span closes on its own line, so a stray
+backtick in earlier prose does not hide a later call. `<think>` envelopes remain
+text, and their contents are excluded from tool recovery even when a closing
+tag never arrives. Captured markup is limited to 1 MiB and 128 recovered calls
+per response.
+
+Structured native calls remain authoritative if the endpoint supplies them:
+the text copy is not executed again, and a malformed text copy does not
+invalidate otherwise valid native calls. Native arguments still undergo
+their existing strict validation. Without native calls, malformed recovered
+markup fails the response before any completed tool call is emitted.
+Token-limited, failed, and aborted responses cannot gain recovered calls.
+
+Successful recovery creates the same tool events and assistant content as a
+structured call. Normal tool registration, argument validation, approvals,
+execution, and session persistence still apply. No tools are enabled or
+executed by the parser itself.
+
+Implementation: `src/providers/openai_deepseek.rs`, integrated by
+`src/providers/openai.rs`. Streaming regressions live in
+`src/providers/openai_deepseek_tests.rs`. These regression tests were authored
+and source-reviewed; DSR execution was unavailable in the implementation
+environment, so a passing quality gate is not claimed.
 
 ## Bundled Provider Registry
 

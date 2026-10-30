@@ -10,9 +10,9 @@
 
 use super::deadline::Deadline;
 use super::{
-    AgentDefinition, RevivalSpec, SchemaMode, SubagentResult, SubagentStatus, SubagentTask,
-    UpdateCallback, append_bounded_line, child_args, child_depth, compile_output_schema,
-    corrective_retry_task, emit_progress, protocol, validate_child_output,
+    AgentDefinition, LaunchAdmission, RevivalSpec, SchemaMode, SubagentResult, SubagentStatus,
+    SubagentTask, UpdateCallback, append_bounded_line, child_args, child_depth,
+    compile_output_schema, corrective_retry_task, emit_progress, protocol, validate_child_output,
 };
 use crate::agent_cx::AgentCx;
 use crate::agent_hub::ChildKind;
@@ -36,6 +36,7 @@ use std::time::Instant;
 mod ownership;
 #[cfg(unix)]
 mod pipes;
+pub(super) mod worker;
 use ownership::{HubLease, ProcessLease};
 
 const DRAIN_BATCH: usize = 32;
@@ -56,9 +57,15 @@ pub(super) struct ChildRunner {
     child_binary: PathBuf,
     role_model_spec: Option<String>,
     parent_model: Option<crate::tools::ToolModelSelection>,
+    cost_budget: Option<crate::cost::CostBudget>,
+    worker_model_selection: Option<super::model_selection::Selection>,
+    worker_fallback_policy: Option<String>,
     hub_kind: ChildKind,
     deadline: Deadline,
     revival: Option<(String, RevivalSpec)>,
+    public_task: Option<String>,
+    launch_admission: Option<LaunchAdmission>,
+    foreground: bool,
 }
 
 impl ChildRunner {
@@ -76,10 +83,44 @@ impl ChildRunner {
             child_binary,
             role_model_spec,
             parent_model: None,
+            cost_budget: None,
+            worker_model_selection: None,
+            worker_fallback_policy: None,
             hub_kind,
             deadline,
             revival: None,
+            public_task: None,
+            launch_admission: None,
+            foreground: true,
         }
+    }
+
+    pub(super) const fn into_background(mut self) -> Self {
+        self.foreground = false;
+        self
+    }
+
+    pub(super) fn with_public_task(mut self, task: Option<String>) -> Self {
+        self.public_task = task;
+        self
+    }
+
+    pub(super) fn with_launch_admission(mut self, admission: Option<LaunchAdmission>) -> Self {
+        self.launch_admission = admission;
+        self
+    }
+
+    fn public_result(&self, mut result: SubagentResult) -> SubagentResult {
+        let task = self
+            .revival
+            .as_ref()
+            .map_or(self.public_task.as_deref(), |(_, launch)| {
+                launch.public_task()
+            });
+        if let Some(task) = task {
+            result.task = task.to_string();
+        }
+        result
     }
 
     pub(super) fn with_revival(mut self, source: String, launch: RevivalSpec) -> Self {
@@ -92,6 +133,24 @@ impl ChildRunner {
         model: Option<crate::tools::ToolModelSelection>,
     ) -> Self {
         self.parent_model = model;
+        self
+    }
+
+    pub(super) fn with_cost_budget(mut self, budget: Option<crate::cost::CostBudget>) -> Self {
+        self.cost_budget = budget;
+        self
+    }
+
+    pub(super) fn with_worker_model_selection(
+        mut self,
+        model: Option<super::model_selection::Selection>,
+    ) -> Self {
+        self.worker_model_selection = model;
+        self
+    }
+
+    pub(super) fn with_worker_fallback_policy(mut self, policy: String) -> Self {
+        self.worker_fallback_policy = Some(policy);
         self
     }
 
@@ -123,7 +182,7 @@ impl ChildRunner {
         completed.sort_by_key(|(index, _)| *index);
         completed
             .into_iter()
-            .map(|(_, pending)| pending.finish(update))
+            .map(|(_, pending)| self.public_result(pending.finish(update)))
             .collect()
     }
 
@@ -214,9 +273,11 @@ impl ChildRunner {
         on_update: Option<UpdateCallback>,
     ) -> SubagentResult {
         let update = on_update.as_ref();
-        self.run_pending(agents, task, step, update, None)
+        let result = self
+            .run_pending(agents, task, step, update, None)
             .await
-            .finish(update)
+            .finish(update);
+        self.public_result(result)
     }
 
     /// At most one fresh corrective run. The first attempt's isolated edits
@@ -273,6 +334,9 @@ impl ChildRunner {
                 parent_model: self.parent_model.clone(),
                 timeout: self.deadline.remaining(),
                 depth: child_depth(),
+                public_task: self.public_task.clone(),
+                launch_admission: self.launch_admission.clone(),
+                cost_budget: self.cost_budget.clone(),
             },
             |(_, launch)| launch.clone(),
         );
@@ -357,7 +421,7 @@ impl ChildRunner {
         retry.result.schema_retries = Some(1);
         // Keep the public assignment stable; corrective prompt text is a
         // transport detail, not a replacement for the user's original task.
-        retry.result.task.clone_from(&launch.task.task);
+        retry.result.task = launch.display_task().to_string();
         if let Some(iso) = previous.iso {
             retry.result.preserved_worktrees.push(iso);
         }
@@ -399,20 +463,30 @@ impl ChildRunner {
         baseline: Option<&BaselineCapture>,
     ) -> Attempt {
         let cwd = self.task_cwd(&task);
-        let args = child_args(
-            agent,
-            &task.task,
-            self.role_model_spec.as_deref(),
-            launch.parent_model.as_ref(),
-            schema,
+        let args = super::with_fallback_policy_args(
+            child_args(
+                agent,
+                &task.task,
+                self.role_model_spec.as_deref(),
+                launch.parent_model.as_ref(),
+                task.model_selection.as_ref(),
+                schema,
+            ),
+            task.fallback_policy.as_deref(),
         );
         let policy = isolation_policy(&task);
         let mut attempt = Attempt::new(
             SubagentResult::starting(agent, task, step, &self.child_binary, &cwd, &args),
             self.deadline,
         );
-        attempt.result.task.clone_from(&launch.task.task);
+        attempt.result.task = launch.display_task().to_string();
         if !check_budget(owner, self.deadline, &mut attempt.result) {
+            return attempt;
+        }
+        if let Some(budget) = &launch.cost_budget
+            && let Err(error) = budget.admit()
+        {
+            attempt.result.fail(error.to_string());
             return attempt;
         }
         let capabilities = owner.capabilities();
@@ -455,6 +529,23 @@ impl ChildRunner {
             }
         };
         attempt.result.hub_id = Some(hub_entry.id.clone());
+        if self.foreground {
+            let hold = crate::agent_hub::registry()
+                .lock()
+                .map_err(|_| {
+                    crate::error::Error::tool("subagent", "PI_SUBAGENT_HUB: registry is poisoned")
+                })
+                .and_then(|mut hub| {
+                    hub.hold_child_result(&hub_entry.id, self.deadline.remaining())
+                });
+            match hold {
+                Ok(hold) => attempt.parent_wait = Some(hold),
+                Err(error) => {
+                    attempt.result.fail(error.to_string());
+                    return attempt;
+                }
+            }
+        }
         emit_progress(update, &attempt.result);
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
@@ -496,13 +587,16 @@ impl ChildRunner {
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
-        let hub_channel = if attempt.result.tools.iter().any(|tool| tool == "hub") {
+        let messaging = attempt.result.tools.iter().any(|tool| tool == "hub");
+        let hub_channel = if messaging || launch.cost_budget.is_some() {
             match crate::agent_hub::ipc::ChildChannel::bind(
                 &hub_entry.id,
                 owner,
                 self.deadline.remaining(),
             ) {
-                Ok(channel) => Some(channel),
+                Ok(channel) => {
+                    Some(channel.with_cost_budget(launch.cost_budget.clone(), messaging))
+                }
                 Err(error) => {
                     attempt.result.fail(error.to_string());
                     return attempt;
@@ -539,6 +633,17 @@ impl ChildRunner {
         // Check after callbacks and setup, immediately before dispatch.
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
+        }
+        // Scope can change during host progress callbacks. Retain this policy
+        // on the private launch so schema retries and revival check it too.
+        if launch.launch_admission.is_some() {
+            if let Err(error) = launch.check_launch_admission() {
+                attempt.result.fail(error.to_string());
+                return attempt;
+            }
+            if !check_budget(owner, self.deadline, &mut attempt.result) {
+                return attempt;
+            }
         }
         let mut child = match ChildProcessGuard::spawn(owner, &mut command) {
             // Bind process authority before activation. The same guard then
@@ -743,6 +848,7 @@ struct Attempt {
     isolation: Option<(IsoHandle, IsoApplyMode)>,
     hub: HubLease,
     deadline: Deadline,
+    parent_wait: Option<Arc<crate::agent_hub::DependencyHold>>,
 }
 
 impl Attempt {
@@ -752,6 +858,7 @@ impl Attempt {
             isolation: None,
             hub: HubLease::empty(),
             deadline,
+            parent_wait: None,
         }
     }
 
@@ -846,6 +953,7 @@ impl Attempt {
             self.result.iso = Some(outcome);
         }
         self.hub.settle(&self.result);
+        drop(self.parent_wait.take());
         emit_progress(update, &self.result);
         self.result
     }

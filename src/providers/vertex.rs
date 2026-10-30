@@ -332,7 +332,11 @@ impl Provider for VertexProvider {
             self.api().to_string(),
             self.name().to_string(),
         );
-        Ok(Box::pin(state.into_stream(false)))
+        Ok(Box::pin(
+            state
+                .with_usage_observer(options.usage_observer.clone())
+                .into_stream(false),
+        ))
     }
 }
 
@@ -620,7 +624,7 @@ mod tests {
             stop_reason: crate::model::StopReason::ToolUse,
             ..crate::model::AssistantMessage::default()
         })];
-        for (index, id) in calls.iter().enumerate() {
+        for (index, id) in calls.iter().enumerate().rev() {
             let content = if index == 0 {
                 vec![crate::model::ContentBlock::Image(
                     crate::model::ImageContent {
@@ -720,6 +724,7 @@ mod tests {
                     output: 0.0,
                     cache_read: 0.0,
                     cache_write: 0.0,
+                    audio: None,
                 },
                 context_window: 128_000,
                 max_tokens: 8192,

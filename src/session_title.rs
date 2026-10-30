@@ -28,17 +28,25 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REPLY_BYTES: usize = 4096;
 const MAX_INPUT_FIELDS: usize = 256;
 
-/// An optional tiny/smol client bound to its launch-time destination and key.
+/// An optional tiny/smol client bound to its launch-time destination.
 pub struct TitleClient {
     provider: Arc<dyn Provider>,
     options: StreamOptions,
+    credential_binding: Option<ModelCredentialBinding>,
     privacy: Arc<AuxiliaryPrivacy>,
+}
+
+struct ModelCredentialBinding {
+    entry: crate::models::ModelEntry,
+    auth: crate::auth::AuthStorage,
+    override_key: Option<String>,
 }
 
 pub(crate) struct PreparedTitle {
     system_prompt: String,
     prompt: String,
     privacy: Arc<AuxiliaryPrivacy>,
+    cost_budget: Option<crate::cost::CostBudget>,
 }
 
 impl TitleClient {
@@ -58,8 +66,8 @@ impl TitleClient {
             &entry.model.provider,
             &primary_entry.model.provider,
         ) && entry.model.base_url == primary_entry.model.base_url;
-        let api_key =
-            crate::models::resolve_model_key(cli_api_key.filter(|_| same_destination), auth, entry);
+        let override_key = cli_api_key.filter(|_| same_destination);
+        let api_key = crate::models::resolve_model_key(override_key, auth, entry).ok()?;
         if crate::models::model_requires_configured_credential(entry) && api_key.is_none() {
             return None;
         }
@@ -72,6 +80,11 @@ impl TitleClient {
                 thinking_level: Some(entry.clamp_thinking_level(ThinkingLevel::Minimal)),
                 ..Default::default()
             },
+            credential_binding: Some(ModelCredentialBinding {
+                entry: entry.clone(),
+                auth: auth.clone(),
+                override_key: override_key.map(str::to_string),
+            }),
             privacy: Arc::new(AuxiliaryPrivacy::from_settings(secrets)),
         }))
     }
@@ -80,9 +93,13 @@ impl TitleClient {
         &self,
         agent: &crate::agent::Agent,
     ) -> Result<Option<PreparedTitle>> {
-        self.prepare_projected(agent.messages(), |parts| {
+        let mut request = self.prepare_projected(agent.messages(), |parts| {
             agent.project_auxiliary_inputs(parts, &self.privacy)
-        })
+        })?;
+        if let Some(request) = &mut request {
+            request.cost_budget = agent.cost_budget().cloned();
+        }
+        Ok(request)
     }
 
     fn prepare_projected(
@@ -143,6 +160,7 @@ impl TitleClient {
                 excerpt(&assistant, 800)
             ),
             privacy: Arc::clone(&self.privacy),
+            cost_budget: self.provider.cost_budget().cloned(),
         }))
     }
 
@@ -158,6 +176,14 @@ impl TitleClient {
         if !Arc::ptr_eq(&request.privacy, &self.privacy) {
             return None;
         }
+        let provider = request.cost_budget.map_or_else(
+            || {
+                self.provider
+                    .unguarded_provider()
+                    .unwrap_or_else(|| Arc::clone(&self.provider))
+            },
+            |budget| crate::provider::guard_with_cost_budget(Arc::clone(&self.provider), budget),
+        );
         let context = Context {
             system_prompt: Some(request.system_prompt.into()),
             messages: vec![Message::User(UserMessage {
@@ -168,7 +194,17 @@ impl TitleClient {
             tools: Vec::new().into(),
         };
         let raw = with_timeout(timeout, async {
-            let stream = self.provider.stream(&context, &self.options).await?;
+            let mut options = self.options.clone();
+            if let Some(binding) = &self.credential_binding {
+                // The foreground turn may have cooled this pool since the
+                // optional client was created. Re-admit its current key here.
+                options.api_key = crate::models::resolve_model_key(
+                    binding.override_key.as_deref(),
+                    &binding.auth,
+                    &binding.entry,
+                )?;
+            }
+            let stream = provider.stream(&context, &options).await?;
             collect_text(stream, MAX_REPLY_BYTES).await
         })
         .await
@@ -305,6 +341,9 @@ pub(crate) async fn save_if_unnamed(
     }
     let mut candidate = session.clone();
     candidate.set_name(title);
+    if let Some(budget) = agent_session.agent.cost_budget() {
+        budget.checkpoint(&mut candidate)?;
+    }
     // Mark uncertainty immediately before persistence. If the owner is
     // dropped during the save, the shared gate remains closed. The identical
     // candidate reconciles an append that reached disk before a failed ack.

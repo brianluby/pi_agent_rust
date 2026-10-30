@@ -164,6 +164,9 @@ pub struct PromptTemplate {
     pub name: String,
     pub description: String,
     pub content: String,
+    /// Interactive invocations use the ephemeral `/btw` lane. Other
+    /// surfaces still expand this template into an ordinary prompt.
+    pub side: bool,
     pub source: String,
     pub file_path: PathBuf,
 }
@@ -668,6 +671,7 @@ impl ResourceLoader {
                 "name": template.name,
                 "description": template.description,
                 "source": "template",
+                "side": template.side,
                 "location": template.source,
                 "path": template.file_path.display().to_string(),
             }));
@@ -692,6 +696,20 @@ impl ResourceLoader {
             expanded = expand_skill_command(&expanded, &self.skills);
         }
         expand_prompt_template(&expanded, &self.prompts)
+    }
+
+    /// Expand an explicitly invoked side template without reinterpreting its
+    /// body as another command. Command owners must resolve built-in and
+    /// extension precedence before choosing this interactive-only route.
+    pub fn expand_side_prompt(&self, text: &str) -> Option<String> {
+        if !text.starts_with('/') || text.starts_with("/skill:") {
+            return None;
+        }
+        let (name, _) = split_command_name_and_args(text, 1);
+        let template = self.prompts.iter().find(|template| template.name == name)?;
+        template
+            .side
+            .then(|| expand_prompt_template(text, &self.prompts))
     }
 }
 
@@ -1599,6 +1617,7 @@ fn load_template_from_file(path: &Path, source: &str, label: &str) -> Result<Pro
     Ok(PromptTemplate {
         name,
         description,
+        side: parsed.booleans.get("side") == Some(&true),
         content: parsed.body,
         source: source.to_string(),
         file_path: path.to_path_buf(),
@@ -1902,54 +1921,59 @@ fn split_command_name_and_args(text: &str, prefix_len: usize) -> (&str, &str) {
     (name, args)
 }
 
-/// Cached regex for positional `$1`, `$2`, … substitution.
-fn positional_arg_regex() -> &'static regex::Regex {
+/// Cached regex for every template argument placeholder: `${@:start}` /
+/// `${@:start:length}` (pi), `$@[start]` / `$@[start:]` / `$@[start:length]`
+/// (OMP), `$ARGUMENTS`, `$@` and positional `$1`, `$2`, ….
+fn template_arg_regex() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\$(\d+)").expect("positional arg regex"))
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r"\$\{@:(\d+)(?::(\d+))?\}|\$@\[(\d+)(?::(\d*))?\]|\$ARGUMENTS|\$@|\$(\d+)",
+        )
+        .expect("template arg regex")
+    })
 }
 
-/// Cached regex for `${@:start}` or `${@:start:length}` substitution.
-fn slice_arg_regex() -> &'static regex::Regex {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\$\{@:(\d+)(?::(\d+))?\}").expect("slice arg regex"))
-}
-
-#[allow(clippy::option_if_let_else)] // Clearer with if-let than map_or_else in the closure
+/// Fill a template's placeholders in one pass, so an argument that itself
+/// contains `$1` or `$@` is inserted as written, not substituted again.
 pub fn substitute_args(content: &str, args: &[String]) -> String {
-    let mut result = content.to_string();
-
-    // Positional $1, $2, ...
-    result = replace_regex(&result, positional_arg_regex(), |caps| {
-        let idx = caps[1].parse::<usize>().unwrap_or(0);
-        if idx == 0 {
-            String::new()
-        } else {
-            args.get(idx.saturating_sub(1)).cloned().unwrap_or_default()
-        }
-    });
-
-    // ${@:start} or ${@:start:length}
-    result = replace_regex(&result, slice_arg_regex(), |caps| {
-        let mut start = caps[1].parse::<usize>().unwrap_or(1);
-        if start == 0 {
-            start = 1;
-        }
-        let start_idx = start.saturating_sub(1);
-        let maybe_len = caps.get(2).and_then(|m| m.as_str().parse::<usize>().ok());
-        let slice = maybe_len.map_or_else(
-            || args.get(start_idx..).unwrap_or(&[]).to_vec(),
-            |len| {
-                let end = start_idx.saturating_add(len).min(args.len());
-                args.get(start_idx..end).unwrap_or(&[]).to_vec()
-            },
-        );
-        slice.join(" ")
-    });
-
     let all_args = args.join(" ");
-    result = result.replace("$ARGUMENTS", &all_args);
-    result = result.replace("$@", &all_args);
-    result
+    let number = |m: Option<regex::Match<'_>>| m.and_then(|m| m.as_str().parse::<usize>().ok());
+    replace_regex(content, template_arg_regex(), |caps| {
+        if let Some(idx) = caps.get(5) {
+            // `$0` names no argument.
+            let idx = idx.as_str().parse::<usize>().unwrap_or(0);
+            return idx
+                .checked_sub(1)
+                .and_then(|idx| args.get(idx))
+                .cloned()
+                .unwrap_or_default();
+        }
+        // `${@:0}` starts at the first argument, as bash's `$@` does.
+        let (start, length) = if caps.get(1).is_some() {
+            (number(caps.get(1)).unwrap_or(1).max(1), number(caps.get(2)))
+        } else if caps.get(3).is_some() {
+            // OMP: `$@[0]` and `$@[n:0]` select nothing.
+            let start = number(caps.get(3)).unwrap_or(0);
+            let length = caps
+                .get(4)
+                .filter(|m| !m.as_str().is_empty())
+                .map(|m| m.as_str().parse::<usize>().unwrap_or(usize::MAX));
+            if start == 0 || length == Some(0) {
+                return String::new();
+            }
+            (start, length)
+        } else {
+            return all_args.clone();
+        };
+        args.get(start.saturating_sub(1)..)
+            .unwrap_or(&[])
+            .iter()
+            .take(length.unwrap_or(usize::MAX))
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
 }
 
 pub fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> String {
@@ -1960,7 +1984,17 @@ pub fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> Strin
 
     if let Some(template) = templates.iter().find(|t| t.name == name) {
         let args = parse_command_args(args);
-        return substitute_args(&template.content, &args);
+        let expanded = substitute_args(&template.content, &args);
+        // A template with no placeholder would drop what was typed after
+        // its name; OMP appends it instead (appendInlineArgsFallback).
+        let args_text = args.join(" ");
+        if args_text.is_empty() || template_arg_regex().is_match(&template.content) {
+            return expanded;
+        }
+        if expanded.is_empty() {
+            return args_text;
+        }
+        return format!("{expanded}\n\n{args_text}");
     }
 
     text.to_string()
@@ -2009,6 +2043,9 @@ fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
 
 struct ParsedFrontmatter {
     frontmatter: HashMap<String, String>,
+    /// Preserve scalar types for opt-in behavior such as `side: true`;
+    /// quoted or block-scalar text must not enable a boolean capability.
+    booleans: HashMap<String, bool>,
     body: String,
 }
 
@@ -2017,6 +2054,7 @@ fn parse_frontmatter(raw: &str) -> ParsedFrontmatter {
     let Some(first) = lines.next() else {
         return ParsedFrontmatter {
             frontmatter: HashMap::new(),
+            booleans: HashMap::new(),
             body: String::new(),
         };
     };
@@ -2024,6 +2062,7 @@ fn parse_frontmatter(raw: &str) -> ParsedFrontmatter {
     if first.trim() != "---" {
         return ParsedFrontmatter {
             frontmatter: HashMap::new(),
+            booleans: HashMap::new(),
             body: raw.to_string(),
         };
     }
@@ -2046,18 +2085,22 @@ fn parse_frontmatter(raw: &str) -> ParsedFrontmatter {
     if in_frontmatter {
         return ParsedFrontmatter {
             frontmatter: HashMap::new(),
+            booleans: HashMap::new(),
             body: raw.to_string(),
         };
     }
 
+    let (frontmatter, booleans) = parse_frontmatter_lines(&front_lines);
     ParsedFrontmatter {
-        frontmatter: parse_frontmatter_lines(&front_lines),
+        frontmatter,
+        booleans,
         body: body_lines.join("\n"),
     }
 }
 
-fn parse_frontmatter_lines(lines: &[&str]) -> HashMap<String, String> {
+fn parse_frontmatter_lines(lines: &[&str]) -> (HashMap<String, String>, HashMap<String, bool>) {
     let mut map = HashMap::new();
+    let mut booleans = HashMap::new();
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
@@ -2074,6 +2117,22 @@ fn parse_frontmatter_lines(lines: &[&str]) -> HashMap<String, String> {
             continue;
         }
         let value = value.trim();
+        if indent_of(line) == 0 {
+            booleans.remove(key);
+            let scalar = value.split_whitespace().next().unwrap_or("");
+            let suffix = value[scalar.len()..].trim_start();
+            if suffix.is_empty() || suffix.starts_with('#') {
+                match scalar {
+                    "true" | "True" | "TRUE" => {
+                        booleans.insert(key.to_string(), true);
+                    }
+                    "false" | "False" | "FALSE" => {
+                        booleans.insert(key.to_string(), false);
+                    }
+                    _ => {}
+                }
+            }
+        }
         // gh #240: `key: >` / `key: |` is a YAML block scalar whose value is
         // the following, more-indented lines. Parsed line by line, each of
         // those became its own entry, and any containing a colon surfaced as
@@ -2087,7 +2146,7 @@ fn parse_frontmatter_lines(lines: &[&str]) -> HashMap<String, String> {
         let value = value.trim_matches('"').trim_matches('\'');
         map.insert(key.to_string(), value.to_string());
     }
-    map
+    (map, booleans)
 }
 
 /// `Some(true)` for a folded (`>`) block scalar header, `Some(false)` for a
@@ -2962,12 +3021,71 @@ mod tests {
         assert_eq!(substitute_args("${@:2:1}", &args), "two");
     }
 
+    /// OMP's `$@[start:length]` slices work next to pi's `${@:start:length}`,
+    /// and an argument is inserted as written: the old pass-per-placeholder
+    /// loop substituted a `$@` or `$2` inside an argument a second time.
+    #[test]
+    fn substitute_args_reads_omp_slices_and_never_substitutes_twice() {
+        let args = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        assert_eq!(substitute_args("$@[2]", &args), "two three");
+        assert_eq!(substitute_args("$@[2:]", &args), "two three");
+        assert_eq!(substitute_args("$@[2:1]", &args), "two");
+        assert_eq!(
+            substitute_args("[$@[0]] [$@[2:0]] [$@[9]]", &args),
+            "[] [] []"
+        );
+        assert_eq!(substitute_args("${@:0}", &args), "one two three");
+
+        let tricky = vec!["$2".to_string(), "$@".to_string()];
+        assert_eq!(substitute_args("[$1] [$2]", &tricky), "[$2] [$@]");
+        assert_eq!(substitute_args("$ARGUMENTS", &tricky), "$2 $@");
+    }
+
+    /// A template with no placeholder used to drop everything typed after
+    /// its name. OMP appends it (appendInlineArgsFallback).
+    #[test]
+    fn expand_prompt_template_appends_arguments_the_template_does_not_place() {
+        let template = |content: &str| PromptTemplate {
+            name: "review".to_string(),
+            description: "Review code".to_string(),
+            content: content.to_string(),
+            side: false,
+            source: "user".to_string(),
+            file_path: PathBuf::from("/tmp/review.md"),
+        };
+        let plain = [template("Review the staged changes.")];
+        assert_eq!(
+            expand_prompt_template("/review focus on \"error paths\"", &plain),
+            "Review the staged changes.\n\nfocus on error paths"
+        );
+        assert_eq!(
+            expand_prompt_template("/review", &plain),
+            "Review the staged changes."
+        );
+        assert_eq!(
+            expand_prompt_template("/review only this", &[template("")]),
+            "only this"
+        );
+        for placed in [
+            "Review $1",
+            "Review $@[2]",
+            "Review ${@:2}",
+            "Review $ARGUMENTS",
+        ] {
+            assert!(
+                !expand_prompt_template("/review a b", &[template(placed)]).contains("\n\n"),
+                "{placed}: placed arguments are not appended again"
+            );
+        }
+    }
+
     #[test]
     fn test_expand_prompt_template() {
         let template = PromptTemplate {
             name: "review".to_string(),
             description: "Review code".to_string(),
             content: "Review $1".to_string(),
+            side: false,
             source: "user".to_string(),
             file_path: PathBuf::from("/tmp/review.md"),
         };
@@ -2977,6 +3095,72 @@ mod tests {
         assert_eq!(tab_out, "Review foo");
         let newline_out = expand_prompt_template("/review\nfoo", std::slice::from_ref(&template));
         assert_eq!(newline_out, "Review foo");
+    }
+
+    #[test]
+    fn side_templates_require_boolean_frontmatter_and_keep_ordinary_expansion() {
+        let dir = tempfile::tempdir().expect("templates");
+        let path = dir.path().join("sitrep.md");
+        for (header, side) in [
+            ("side: true", true),
+            ("side: true # ephemeral", true),
+            ("side: false", false),
+            ("description: Brief status", false),
+            ("side: \"true\"", false),
+            ("side: 'true'", false),
+            ("side: yes", false),
+            ("side: trueish", false),
+            ("side: |\n  true", false),
+            ("metadata:\n  side: true", false),
+            ("description: |\n  side: true", false),
+            ("side: true\nside: false", false),
+        ] {
+            fs::write(&path, format!("---\n{header}\n---\nSummarize $ARGUMENTS"))
+                .expect("write template");
+            let template =
+                load_template_from_file(&path, "project", "(project)").expect("load template");
+            assert_eq!(template.side, side, "{header}");
+            let mut resources = ResourceLoader::empty(true);
+            resources.prompts.push(template);
+            for (input, expanded) in [
+                ("/sitrep", "Summarize "),
+                ("/sitrep \"the retry path\"", "Summarize the retry path"),
+                ("/sitrep '$1'", "Summarize $1"),
+            ] {
+                assert_eq!(resources.expand_input(input), expanded);
+                assert_eq!(
+                    resources.expand_side_prompt(input).as_deref(),
+                    side.then_some(expanded),
+                );
+            }
+            assert_eq!(resources.list_commands()[0]["side"], json!(side));
+            assert!(resources.expand_side_prompt("/sitrep-extra").is_none());
+            assert!(resources.expand_side_prompt("ordinary /sitrep").is_none());
+        }
+    }
+
+    #[test]
+    fn side_template_routing_follows_the_winning_template_and_never_recurses() {
+        let mut resources = ResourceLoader::empty(true);
+        let mut template = PromptTemplate {
+            name: "summary".into(),
+            description: String::new(),
+            content: "/other generated".into(),
+            side: false,
+            source: "project".into(),
+            file_path: PathBuf::from("summary.md"),
+        };
+        resources.prompts.push(template.clone());
+        template.side = true;
+        template.source = "user".into();
+        resources.prompts.push(template);
+        assert!(resources.expand_side_prompt("/summary").is_none());
+        resources.prompts[0].side = true;
+        assert_eq!(
+            resources.expand_side_prompt("/summary detail").as_deref(),
+            Some("/other generated\n\ndetail")
+        );
+        assert!(resources.expand_side_prompt("/skill:summary").is_none());
     }
 
     #[test]
@@ -4002,6 +4186,7 @@ still frontmatter",
                 name: "review".to_string(),
                 description: "first".to_string(),
                 content: "content1".to_string(),
+                side: false,
                 source: "a".to_string(),
                 file_path: PathBuf::from("/a/review.md"),
             },
@@ -4009,6 +4194,7 @@ still frontmatter",
                 name: "review".to_string(),
                 description: "second".to_string(),
                 content: "content2".to_string(),
+                side: false,
                 source: "b".to_string(),
                 file_path: PathBuf::from("/b/review.md"),
             },
@@ -4016,6 +4202,7 @@ still frontmatter",
                 name: "unique".to_string(),
                 description: "only one".to_string(),
                 content: "content3".to_string(),
+                side: false,
                 source: "c".to_string(),
                 file_path: PathBuf::from("/c/unique.md"),
             },
@@ -4034,6 +4221,7 @@ still frontmatter",
                 name: "z-prompt".to_string(),
                 description: "z".to_string(),
                 content: String::new(),
+                side: false,
                 source: "s".to_string(),
                 file_path: PathBuf::from("/z.md"),
             },
@@ -4041,6 +4229,7 @@ still frontmatter",
                 name: "a-prompt".to_string(),
                 description: "a".to_string(),
                 content: String::new(),
+                side: false,
                 source: "s".to_string(),
                 file_path: PathBuf::from("/a.md"),
             },
@@ -4222,6 +4411,7 @@ still frontmatter",
             name: "review".to_string(),
             description: "review prompt".to_string(),
             content: "first=[$1] second=[$2] rest=[${@:2}]".to_string(),
+            side: false,
             source: "test".to_string(),
             file_path: PathBuf::from("/review.md"),
         };
@@ -4236,6 +4426,7 @@ still frontmatter",
             name: "review".to_string(),
             description: "review prompt".to_string(),
             content: "first=[$1] second=[$2] third=[$3]".to_string(),
+            side: false,
             source: "test".to_string(),
             file_path: PathBuf::from("/review.md"),
         };
@@ -4250,6 +4441,7 @@ still frontmatter",
             name: "review".to_string(),
             description: "review prompt".to_string(),
             content: "first=[$1] second=[$2] third=[$3] fourth=[$4]".to_string(),
+            side: false,
             source: "test".to_string(),
             file_path: PathBuf::from("/review.md"),
         };
@@ -4264,6 +4456,7 @@ still frontmatter",
             name: "review".to_string(),
             description: "review prompt".to_string(),
             content: "first=[$1] second=[$2]".to_string(),
+            side: false,
             source: "test".to_string(),
             file_path: PathBuf::from("/review.md"),
         };

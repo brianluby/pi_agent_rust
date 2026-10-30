@@ -2,8 +2,8 @@
 //! cancellation drops it instead of reusing a possibly partially written frame.
 
 use super::{
-    BrowserLaunchOptions, BrowserTabInfo, dialog, download, exports, frames, interaction, launch,
-    output, policy, required,
+    BrowserLaunchOptions, BrowserTabInfo, dialog, download, exports, frames, history, interaction,
+    launch, output, policy, required, storage,
 };
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
@@ -16,14 +16,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
+mod contexts;
+mod diagnostics;
+
 const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EVENTS: usize = 8192;
 const MAX_DOWNLOAD_RECORDS: usize = 128;
 const MAX_REFERENCE_DOCUMENTS: usize = 256;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct DownloadRecord {
     pub(super) guid: String,
+    pub(super) frame_id: String,
     pub(super) url: String,
     pub(super) suggested_filename: String,
     pub(super) state: String,
@@ -43,13 +47,10 @@ fn downloads_since_in(
         .collect()
 }
 
-/// Apply one `Browser.download*` CDP event to a download table.
-///
-/// Free function rather than a `Cdp` method because it touches nothing else:
-/// no socket, no session, no page state. `Cdp::record_download_event` is a
-/// one-line delegation to it, and the test below drives a bare `BTreeMap`,
-/// which is what it was already trying to do — it just needed a
-/// `WebSocket<TcpStream>` for the struct field it never reads.
+/// Validate each event completely before changing retained state. A repeated
+/// start may acknowledge the same transfer, never replace its source or reset
+/// terminal progress. The connection also latches errors so best-effort cleanup
+/// cannot hide a malformed event from the eventual publication gate.
 fn record_download_event_into(
     downloads: &mut BTreeMap<String, DownloadRecord>,
     value: &Value,
@@ -58,17 +59,36 @@ fn record_download_event_into(
     if method == "Browser.downloadWillBegin" {
         let params = &value["params"];
         let guid = required(params, "guid")?;
+        let frame_id = required(params, "frameId")?;
         let url = required(params, "url")?;
         let suggested = required(params, "suggestedFilename")?;
-        if guid.len() > 128
+        if guid.is_empty()
+            || guid.len() > 128
             || guid.chars().any(char::is_control)
+            || frame_id.is_empty()
+            || frame_id.len() > 256
+            || frame_id.chars().any(char::is_control)
+            || url.is_empty()
             || url.len() > 64 * 1024
+            || url.chars().any(char::is_control)
             || suggested.len() > 4096
             || suggested.chars().any(char::is_control)
         {
             return Err(Error::tool("browser", "invalid bounded download metadata"));
         }
-        if !downloads.contains_key(guid) && downloads.len() >= MAX_DOWNLOAD_RECORDS {
+        if let Some(existing) = downloads.get(guid) {
+            if existing.frame_id == frame_id
+                && existing.url == url
+                && existing.suggested_filename == suggested
+            {
+                return Ok(());
+            }
+            return Err(Error::tool(
+                "browser",
+                "download identity changed after its initial event",
+            ));
+        }
+        if downloads.len() >= MAX_DOWNLOAD_RECORDS {
             return Err(Error::tool(
                 "browser",
                 "too many browser downloads are being tracked",
@@ -78,6 +98,7 @@ fn record_download_event_into(
             guid.to_owned(),
             DownloadRecord {
                 guid: guid.to_owned(),
+                frame_id: frame_id.to_owned(),
                 url: url.to_owned(),
                 suggested_filename: suggested.to_owned(),
                 state: "inProgress".into(),
@@ -99,10 +120,27 @@ fn record_download_event_into(
                     .filter(|value| value.is_finite() && *value >= 0.0)
                     .ok_or_else(|| Error::tool("browser", format!("invalid download {name}")))
             };
+            let received = number("receivedBytes")?;
+            let total = number("totalBytes")?;
+            // totalBytes is an estimate and may change (including from zero).
+            // Received bytes must not retreat, and terminal events are final.
+            if received < record.received_bytes
+                || (record.state != "inProgress"
+                    && (record.state != state
+                        || (record.received_bytes - received).abs() > 0.0
+                        || (record.total_bytes - total).abs() > 0.0))
+            {
+                return Err(Error::tool(
+                    "browser",
+                    "download progress regressed or changed after termination",
+                ));
+            }
             state.clone_into(&mut record.state);
-            record.received_bytes = number("receivedBytes")?;
-            record.total_bytes = number("totalBytes")?;
+            record.received_bytes = received;
+            record.total_bytes = total;
         }
+        // A progress event without a start on this connection is not a new
+        // downloadable artifact. It may belong to a pre-existing browser job.
     }
     Ok(())
 }
@@ -118,6 +156,7 @@ pub(super) struct Session {
     browser: Option<launch::ManagedBrowser>,
     uploads: interaction::upload::Store,
     downloads_denied: bool,
+    pending_download_context: Option<contexts::Context>,
 }
 
 fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
@@ -125,6 +164,7 @@ fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
     frames::validate(args)?;
     dialog::validate_action(args)?;
     dialog::Expected::from_args(args, allowlist)?;
+    diagnostics::validate(args)?;
     match action {
         "start" | "status" | "stop" => {
             if args.as_object().is_some_and(|object| {
@@ -138,6 +178,7 @@ fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
                 ));
             }
         }
+        action if storage::is_action(action) => storage::validate(args)?,
         action if interaction::forms::is_action(action) => interaction::forms::validate(args)?,
         "upload" => {
             interaction::upload::validate(args)?;
@@ -145,12 +186,17 @@ fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
         "download" => download::validate(args)?,
         "screenshot" | "print_pdf" => exports::validate(args)?,
         "open" | "goto" => policy::check_navigation(required(args, "url")?, allowlist)?,
+        "back" | "forward" | "reload" => history::validate(args)?,
         "evaluate" => {
             required(args, "script")?;
         }
-        "handle_dialog" | "close" | "list_tabs" | "list_frames" | "snapshot" | "ax_tree" => {}
+        "handle_dialog" | "close" | "list_tabs" | "list_frames" | "snapshot" | "ax_tree"
+        | "diagnostics" => {}
         "click" | "wait_for" => {
             required(args, "selector")?;
+        }
+        "hover" | "drag" => {
+            interaction::pointer::validate_input(args)?;
         }
         "type" | "fill" => {
             required(args, "selector")?;
@@ -213,6 +259,7 @@ pub(super) async fn execute(
 ) -> Result<ToolOutput> {
     let timeout_ms = validate(args, allowlist)?;
     let connection = launch::Connection::resolve(endpoint_override, launch_options)?;
+    storage::validate_connection(args, &connection)?;
     let owner = AgentCx::for_current_or_request();
     let caps = owner.capabilities();
     if !caps.io || !caps.time || !caps.entropy {
@@ -252,7 +299,8 @@ pub(super) async fn execute(
         }
         let mut cdp = connected.ok_or_else(|| Error::tool("browser", "browser is not running"))?;
         cdp.timeout_ms = timeout_ms;
-        state.execute(&owner, &mut cdp, cwd, allowlist, args).await
+        let result = state.execute(&owner, &mut cdp, cwd, allowlist, args).await;
+        diagnostics::finish(&owner, &mut cdp, result).await
     };
     let cancelled = async {
         let (sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
@@ -286,11 +334,14 @@ pub(super) struct Cdp {
     next_id: u64,
     session_id: Option<String>,
     frame_scope: Option<frames::Scope>,
+    context_binding: Option<contexts::Binding>,
     pub(super) frame_targets: frames::Targets,
     loaded: BTreeSet<(String, String)>,
     downloads: BTreeMap<String, DownloadRecord>,
+    download_failure: bool,
     timeout_ms: u64,
     dialog: dialog::State,
+    diagnostics: Option<diagnostics::Capture>,
 }
 
 impl Cdp {
@@ -340,11 +391,14 @@ impl Cdp {
             next_id: 0,
             session_id: None,
             frame_scope: None,
+            context_binding: None,
             frame_targets: frames::Targets::default(),
             loaded: BTreeSet::new(),
             downloads: BTreeMap::new(),
+            download_failure: false,
             timeout_ms: 30_000,
             dialog: dialog::State::default(),
+            diagnostics: None,
         })
     }
 
@@ -361,6 +415,9 @@ impl Cdp {
                         .map_err(|e| Error::tool("browser", format!("invalid CDP JSON: {e}")))?;
                     if !value.is_object() {
                         return Err(Error::tool("browser", "CDP message must be an object"));
+                    }
+                    if let Some(capture) = self.diagnostics.as_mut() {
+                        capture.observe(&value);
                     }
                     if value["method"] == "Page.lifecycleEvent"
                         && matches!(
@@ -563,6 +620,38 @@ impl Cdp {
         self.call(owner, method, params, false).await
     }
 
+    fn current_download_context(&self) -> contexts::Context {
+        self.context_binding
+            .as_ref()
+            .map_or(contexts::Context::Default, |binding| {
+                binding.context.clone()
+            })
+    }
+
+    pub(super) fn download_context_metadata(&self) -> Value {
+        self.current_download_context().metadata()
+    }
+
+    pub(super) async fn check_download_context(&mut self, owner: &AgentCx) -> Result<()> {
+        if let Some(binding) = self.context_binding.clone() {
+            binding.check(owner, self).await?;
+        }
+        Ok(())
+    }
+
+    /// Policy and cancellation use the original page's browser context, not
+    /// its DOM renderer session. Cleanup never falls back to another profile.
+    pub(super) async fn download_command(
+        &mut self,
+        owner: &AgentCx,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        self.current_download_context()
+            .command(owner, self, method, params)
+            .await
+    }
+
     pub(super) fn page_session_id(&self) -> Result<&str> {
         self.session_id
             .as_deref()
@@ -647,8 +736,20 @@ impl Cdp {
         self.downloads.get(guid).cloned()
     }
 
+    pub(super) fn check_download_events(&self) -> Result<()> {
+        if self.download_failure {
+            return Err(Error::tool(
+                "browser",
+                "download event validation failed; no artifact may be published",
+            ));
+        }
+        Ok(())
+    }
+
     fn record_download_event(&mut self, value: &Value) -> Result<()> {
-        record_download_event_into(&mut self.downloads, value)
+        let result = record_download_event_into(&mut self.downloads, value);
+        self.download_failure |= result.is_err();
+        result
     }
 
     pub(super) const fn frame_selected(&self) -> bool {
@@ -792,10 +893,12 @@ impl Session {
         self.active = None;
         self.endpoint = None;
         self.downloads_denied = false;
+        self.pending_download_context = None;
         // Never reuse element IDs across process lifetimes. Upload copies are
         // retained separately: pending File objects can outlive a tab/navigation.
     }
 
+    #[allow(clippy::too_many_lines)] // one ordered stop/attach/launch/handshake transition
     async fn connect(
         &mut self,
         owner: &AgentCx,
@@ -854,6 +957,12 @@ impl Session {
                             "no owned browser is running; handling a dialog never launches a browser",
                         ));
                     }
+                    if storage::is_action(action) {
+                        return Err(Error::tool(
+                            "browser",
+                            "BROWSER_STATE_NOT_RUNNING: open the intended origin in a Pi-owned browser before saving or restoring state",
+                        ));
+                    }
                     startup = Some(launch::ManagedBrowser::launch(owner, cwd, options).await?);
                 }
                 let browser = self
@@ -867,11 +976,26 @@ impl Session {
                 )
             }
         };
+        if self.pending_download_context.is_some()
+            && self.endpoint.as_deref() != Some(endpoint.as_str())
+        {
+            return Err(Error::tool(
+                "browser",
+                "BROWSER_CONTEXT_RECOVERY_ENDPOINT: recover the pending download policy on its original endpoint before switching browsers",
+            ));
+        }
         // Adopt startup only after discovery AND WebSocket identity/handshake
         // succeed. Failure or cancellation before then drops the local process.
         let mut cdp = Cdp::connect(owner, &endpoint, expected_path.as_deref()).await?;
         if self.endpoint.as_deref() != Some(endpoint.as_str()) {
             self.clear_pages();
+        }
+        if let Some(context) = self.pending_download_context.clone() {
+            context.restore(owner, &mut cdp).await?;
+            self.pending_download_context = None;
+            if context == contexts::Context::Default {
+                self.downloads_denied = true;
+            }
         }
         if !self.downloads_denied {
             cdp.browser_command(
@@ -1009,6 +1133,9 @@ impl Session {
                 .ok_or_else(|| Error::tool("browser", "target has no current URL"))?;
             policy::check_navigation(current, allowlist)?;
         }
+        if let Some(info) = pages.get(&target) {
+            cdp.context_binding = contexts::select(owner, cdp, info).await?;
+        }
         let attached = cdp
             .call(
                 owner,
@@ -1030,13 +1157,24 @@ impl Session {
             cdp.frame_scope = Some(scope);
         }
         let reference_key = (target.clone(), frame.unwrap_or_default().to_owned());
+        diagnostics::start(owner, cdp, args, allowlist).await?;
         if let Some(expected) = dialog::Expected::from_args(args, allowlist)? {
             // An already-open dialog surfaced by Page.enable is not consent
             // for a future action. Arm only after enabling has completed.
             cdp.command(owner, "Page.enable", json!({})).await?;
             cdp.dialog.arm(expected);
         }
+        if let Some(capture) = cdp.diagnostics.as_mut() {
+            capture.begin_action();
+        }
         let result = match action {
+            action if storage::is_action(action) => {
+                storage::execute(owner, cdp, cwd, &tab, allowlist, args).await
+            }
+            "diagnostics" => Ok(output(
+                format!("Observing diagnostics for tab {tab}"),
+                json!({"tab": tab, "backend": "cdp"}),
+            )),
             // No Runtime.evaluate or DOM query: a modal dialog can suspend
             // page JavaScript. Target metadata already passed the URL guard.
             "handle_dialog" => dialog::execute(owner, cdp, &tab, args).await,
@@ -1053,6 +1191,9 @@ impl Session {
                     format!("Navigated tab {tab} to {final_url} (Title: \"{title}\")"),
                     json!({"tab": tab, "url": final_url, "title": title, "loaded": true, "backend": "cdp"}),
                 ))
+            }
+            "back" | "forward" | "reload" => {
+                history::execute(owner, cdp, &tab, args, allowlist).await
             }
             "snapshot" | "ax_tree" => {
                 let (result, references) = interaction::snapshot(
@@ -1072,7 +1213,7 @@ impl Session {
                 self.references.insert(reference_key.clone(), references);
                 Ok(result)
             }
-            "click" | "type" | "fill" | "press" | "scroll" | "wait_for" => {
+            "click" | "hover" | "drag" | "type" | "fill" | "press" | "scroll" | "wait_for" => {
                 interaction::execute(owner, cdp, &tab, self.references.get(&reference_key), args)
                     .await
             }
@@ -1099,10 +1240,11 @@ impl Session {
                     .await
             }
             "download" => {
-                // Mark false before allowing a transfer. If cancellation drops
-                // the future before deny is restored, the next call re-applies
-                // deny in connect() before any new browser action.
+                // Persist the original context before allowing a transfer. If
+                // cancellation drops cleanup, connect restores that context
+                // before any subsequent action, even on a different tab.
                 self.downloads_denied = false;
+                self.pending_download_context = Some(cdp.current_download_context());
                 let result = download::execute(
                     owner,
                     cdp,
@@ -1115,6 +1257,7 @@ impl Session {
                 .await;
                 if result.is_ok() {
                     self.downloads_denied = true;
+                    self.pending_download_context = None;
                 }
                 result
             }
@@ -1282,6 +1425,7 @@ mod tests {
             "old".to_string(),
             DownloadRecord {
                 guid: "old".into(),
+                frame_id: "old-frame".into(),
                 url: "https://example.com/old".into(),
                 suggested_filename: "old.bin".into(),
                 state: "completed".into(),
@@ -1295,7 +1439,7 @@ mod tests {
         record_download_event_into(
             &mut downloads,
             &json!({"method":"Browser.downloadWillBegin","params":{
-                "guid":"new","url":"https://example.com/file","suggestedFilename":"file.bin"
+                "guid":"new","frameId":"frame-1","url":"https://example.com/file","suggestedFilename":"file.bin"
             }}),
         )
         .unwrap();
@@ -1310,5 +1454,125 @@ mod tests {
         assert_eq!(fresh.len(), 1);
         assert_eq!(fresh[0].state, "completed");
         assert_eq!(fresh[0].received_bytes, 7.0);
+        assert_eq!(fresh[0].frame_id, "frame-1");
+    }
+
+    fn download_start(guid: &str) -> Value {
+        json!({"method":"Browser.downloadWillBegin","params":{
+            "guid":guid,"frameId":"frame-1","url":"https://example.com/file","suggestedFilename":"file.bin"
+        }})
+    }
+
+    fn download_progress(state: &str, received: f64, total: f64) -> Value {
+        json!({"method":"Browser.downloadProgress","params":{
+            "guid":"job","state":state,"receivedBytes":received,"totalBytes":total
+        }})
+    }
+
+    #[test]
+    fn repeated_download_starts_preserve_source_and_terminal_progress() {
+        let mut downloads = BTreeMap::new();
+        let start = download_start("job");
+        record_download_event_into(&mut downloads, &start).unwrap();
+        record_download_event_into(&mut downloads, &download_progress("completed", 7.0, 7.0))
+            .unwrap();
+        let saved = downloads.clone();
+        record_download_event_into(&mut downloads, &start).unwrap();
+        assert_eq!(downloads, saved);
+        for field in ["frameId", "url", "suggestedFilename"] {
+            let mut changed = start.clone();
+            changed["params"][field] = json!("PRIVATE-CANARY");
+            let error = record_download_event_into(&mut downloads, &changed).unwrap_err();
+            assert!(!error.to_string().contains("PRIVATE-CANARY"));
+            assert_eq!(downloads, saved);
+        }
+    }
+
+    #[test]
+    fn invalid_download_progress_cannot_partially_complete_a_record() {
+        let mut downloads = BTreeMap::new();
+        record_download_event_into(&mut downloads, &download_start("job")).unwrap();
+        record_download_event_into(&mut downloads, &download_progress("inProgress", 4.0, 0.0))
+            .unwrap();
+        let saved = downloads.clone();
+        for invalid in [
+            download_progress("completed", 7.0, f64::NAN),
+            download_progress("completed", -1.0, 7.0),
+            download_progress("completed", 3.0, 7.0),
+            download_progress("unknown", 7.0, 7.0),
+        ] {
+            assert!(record_download_event_into(&mut downloads, &invalid).is_err());
+            assert_eq!(downloads, saved);
+        }
+        // An unknown total becoming known is ordinary progress, not a reset.
+        record_download_event_into(&mut downloads, &download_progress("inProgress", 5.0, 10.0))
+            .unwrap();
+        record_download_event_into(&mut downloads, &download_progress("completed", 7.0, 7.0))
+            .unwrap();
+        assert_eq!(downloads["job"].state, "completed");
+    }
+
+    #[test]
+    fn terminal_downloads_cannot_resurrect_or_change_byte_counts() {
+        for terminal in ["completed", "canceled"] {
+            let mut downloads = BTreeMap::new();
+            record_download_event_into(&mut downloads, &download_start("job")).unwrap();
+            let event = download_progress(terminal, 7.0, 9.0);
+            record_download_event_into(&mut downloads, &event).unwrap();
+            let saved = downloads.clone();
+            record_download_event_into(&mut downloads, &event).unwrap();
+            for invalid in [
+                download_progress("inProgress", 7.0, 9.0),
+                download_progress(terminal, 8.0, 9.0),
+                download_progress(terminal, 7.0, 10.0),
+                download_progress(
+                    if terminal == "completed" {
+                        "canceled"
+                    } else {
+                        "completed"
+                    },
+                    7.0,
+                    9.0,
+                ),
+            ] {
+                assert!(record_download_event_into(&mut downloads, &invalid).is_err());
+                assert_eq!(downloads, saved);
+            }
+        }
+    }
+
+    #[test]
+    fn download_metadata_requires_bounded_source_identity_without_leaking_it() {
+        for (field, value) in [
+            ("frameId", Value::Null),
+            ("frameId", json!("")),
+            ("frameId", json!("f".repeat(257))),
+            ("frameId", json!("PRIVATE-CANARY\n")),
+            ("guid", json!("")),
+            ("url", json!("")),
+            ("url", json!("https://example.com/PRIVATE-CANARY\n")),
+        ] {
+            let mut event = download_start("job");
+            event["params"][field] = value;
+            let mut downloads = BTreeMap::new();
+            let error = record_download_event_into(&mut downloads, &event).unwrap_err();
+            assert!(!error.to_string().contains("PRIVATE-CANARY"));
+            assert!(downloads.is_empty());
+        }
+    }
+
+    #[test]
+    fn download_record_budget_allows_duplicates_not_extra_transfer_identities() {
+        let mut downloads = BTreeMap::new();
+        for i in 0..MAX_DOWNLOAD_RECORDS {
+            record_download_event_into(&mut downloads, &download_start(&format!("job-{i}")))
+                .unwrap();
+        }
+        record_download_event_into(&mut downloads, &download_start("job-0")).unwrap();
+        assert!(record_download_event_into(&mut downloads, &download_start("overflow")).is_err());
+        assert_eq!(downloads.len(), MAX_DOWNLOAD_RECORDS);
+        record_download_event_into(&mut downloads, &download_progress("completed", 7.0, 7.0))
+            .unwrap();
+        assert!(!downloads.contains_key("job"));
     }
 }

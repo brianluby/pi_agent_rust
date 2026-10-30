@@ -57,6 +57,7 @@ const ROOT_SUBCOMMANDS: &[&str] = &[
     "stats",
     "profile",
     "import",
+    "recover",
     "grievances",
     "self-update",
     "web",
@@ -76,9 +77,12 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "acp"
         | "verbose"
         | "no-tools"
+        | "no-mcp"
         | "no-extensions"
         | "plan-mode"
         | "plan-yolo"
+        | "prewalk"
+        | "no-prewalk"
         | "yolo"
         | "auto-approve"
         | "explain-extension-policy"
@@ -114,6 +118,10 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "slow"
         | "plan"
         | "advisor"
+        | "warn-cost"
+        | "max-cost"
+        | "prewalk-into"
+        | "subagent-fallback-policy"
         | "approval-mode"
         | "thinking"
         | "system-prompt"
@@ -174,6 +182,16 @@ fn is_negative_numeric_token(token: &str) -> bool {
         return false;
     }
     token.parse::<i64>().is_ok() || token.parse::<f64>().is_ok_and(f64::is_finite)
+}
+
+fn recovery_entry_id(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() || value.len() > 1024 {
+        return Err(
+            "branch ID must be nonempty and at most 1024 UTF-8 bytes; use --root for a new path"
+                .to_string(),
+        );
+    }
+    Ok(value.to_string())
 }
 
 #[allow(clippy::too_many_lines)] // Argument normalization needs single-pass stateful parsing.
@@ -371,6 +389,22 @@ pub struct Cli {
     #[arg(long, value_name = "PROVIDER/MODEL")]
     pub advisor: Option<String>,
 
+    /// Frozen host routing policy for an admitted native child process.
+    #[arg(long, hide = true)]
+    pub subagent_fallback_policy: Option<crate::failover::ChildFallbackPolicy>,
+
+    /// Plan with the initial model, then hand off to @smol after the first edit.
+    #[arg(long, conflicts_with = "no_prewalk")]
+    pub prewalk: bool,
+
+    /// Prewalk destination: provider/model[:thinking] or an explicit @role.
+    #[arg(long, value_name = "MODEL_OR_ROLE", conflicts_with = "no_prewalk")]
+    pub prewalk_into: Option<String>,
+
+    /// Disable prewalk for this launch, overriding prewalk.enabled in settings.
+    #[arg(long, conflicts_with_all = ["prewalk", "prewalk_into"])]
+    pub no_prewalk: bool,
+
     /// Start in plan mode: read-only planning until a plan is approved
     /// (bd-cv653.3.5).
     #[arg(long)]
@@ -509,6 +543,11 @@ pub struct Cli {
     #[arg(short = 'p', long)]
     pub print: bool,
 
+    /// In print mode, wait for background jobs and let the agent handle their results.
+    /// --max-time also bounds idle waiting and subsequent completion turns.
+    #[arg(long, conflicts_with_all = ["rpc", "acp"])]
+    pub wait_async: bool,
+
     /// Start in RPC mode (alias for --mode rpc)
     #[arg(long, conflicts_with_all = ["mode", "print"])]
     pub rpc: bool,
@@ -547,6 +586,11 @@ pub struct Cli {
     /// discovered foreign configs)
     #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
     pub mcp_config: Vec<PathBuf>,
+
+    /// Disable MCP discovery, server startup and tool mounting for this run.
+    /// ACP clients cannot attach MCP servers while this flag is set.
+    #[arg(long)]
+    pub no_mcp: bool,
 
     /// Disable extension discovery
     #[arg(long)]
@@ -643,6 +687,15 @@ pub struct Cli {
     /// --max-tool-iterations (per-turn count).
     #[arg(long, value_name = "SECONDS")]
     pub max_time: Option<u64>,
+
+    /// Warn once when recorded session-tree model spend reaches this USD amount.
+    #[arg(long, value_name = "USD", value_parser = crate::cost::parse_threshold)]
+    pub warn_cost: Option<f64>,
+
+    /// Refuse further model requests after recorded session-tree spend reaches
+    /// this USD amount. In-flight requests may exceed the cap.
+    #[arg(long, value_name = "USD", value_parser = crate::cost::parse_threshold)]
+    pub max_cost: Option<f64>,
 
     /// Additional workspace roots (bd-cv653.3.12): grant the agent access to
     /// extra directories beyond the primary cwd. Repeatable. Tools and the
@@ -1292,6 +1345,94 @@ mod tests {
     }
 
     #[test]
+    fn parse_recover_inspection_and_session_copy_modes() -> Result<(), String> {
+        let cli = Cli::parse_from(["pi", "recover", "saved.jsonl", "--active"]);
+        let Some(Commands::Recover {
+            source,
+            output,
+            session_output,
+            json,
+            active,
+            branch,
+            root,
+        }) = cli.command
+        else {
+            return Err(format!("unexpected command: {:?}", cli.command));
+        };
+        assert_eq!(source, PathBuf::from("saved.jsonl"));
+        assert!(output.is_none() && session_output.is_none() && !json && active);
+        assert!(branch.is_none() && !root);
+
+        let cli = Cli::parse_from([
+            "pi",
+            "recover",
+            "saved.jsonl",
+            "--session-output",
+            "copy.jsonl",
+            "--branch",
+            "answer",
+        ]);
+        let Some(Commands::Recover {
+            session_output,
+            branch,
+            ..
+        }) = cli.command
+        else {
+            return Err(format!("unexpected command: {:?}", cli.command));
+        };
+        assert_eq!(session_output, Some(PathBuf::from("copy.jsonl")));
+        assert_eq!(branch.as_deref(), Some("answer"));
+        Ok(())
+    }
+
+    #[test]
+    fn recover_rejects_ambiguous_or_destructive_mode_combinations() {
+        for argv in [
+            vec!["pi", "recover", "saved.jsonl", "--root"],
+            vec!["pi", "recover", "saved.jsonl", "--branch", ""],
+            vec!["pi", "recover", "saved.jsonl", "--active", "--branch", "id"],
+            vec!["pi", "recover", "saved.jsonl", "--json", "--branch", "id"],
+            vec![
+                "pi",
+                "recover",
+                "saved.jsonl",
+                "--session-output",
+                "copy.jsonl",
+                "--output",
+                "report.txt",
+            ],
+            vec![
+                "pi",
+                "recover",
+                "saved.jsonl",
+                "--session-output",
+                "copy.jsonl",
+                "--root",
+                "--branch",
+                "id",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+    }
+
+    #[test]
+    fn recover_is_not_misclassified_as_an_extension_flag() {
+        let parsed = parse_with_extension_flags(
+            ["pi", "recover", "saved.jsonl", "--json"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+        .expect("recover subcommand");
+        assert!(matches!(
+            parsed.cli.command,
+            Some(Commands::Recover { json: true, .. })
+        ));
+        assert!(parsed.extension_flags.is_empty());
+    }
+
+    #[test]
     fn no_subcommand_when_only_message() {
         let cli = Cli::parse_from(["pi", "hello"]);
         assert!(cli.command.is_none());
@@ -1320,6 +1461,25 @@ mod tests {
         };
         assert_eq!(pat, "claude*");
         Ok(())
+    }
+
+    #[test]
+    fn wait_async_survives_extension_flag_preprocessing() {
+        let parsed = parse_with_extension_flags(
+            ["pi", "-p", "--wait-async", "--max-time", "37", "run tests"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+        .expect("parse background completion mode");
+        assert!(parsed.cli.print);
+        assert!(parsed.cli.wait_async);
+        assert_eq!(parsed.cli.max_time, Some(37));
+        assert_eq!(parsed.cli.message_args(), vec!["run tests"]);
+        assert!(parsed.extension_flags.is_empty());
+        assert!(!Cli::parse_from(["pi", "-p", "hello"]).wait_async);
+        assert!(Cli::try_parse_from(["pi", "--rpc", "--wait-async"]).is_err());
+        assert!(Cli::try_parse_from(["pi", "--acp", "--wait-async"]).is_err());
     }
 
     #[test]
@@ -1631,6 +1791,28 @@ mod tests {
     }
 
     #[test]
+    fn cost_limits_are_validated_builtin_flags_and_preserve_the_prompt() {
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--warn-cost".to_string(),
+            "0.25".to_string(),
+            "--max-cost=2.50".to_string(),
+            "--print".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("cost flags");
+        assert_eq!(parsed.cli.warn_cost, Some(0.25));
+        assert_eq!(parsed.cli.max_cost, Some(2.5));
+        assert_eq!(parsed.cli.message_args(), vec!["hello"]);
+        assert!(parsed.extension_flags.is_empty());
+        for flag in ["--warn-cost", "--max-cost"] {
+            for amount in ["0", "-1", "NaN", "inf", "1e999", "money"] {
+                assert!(Cli::try_parse_from(["pi", &format!("{flag}={amount}")]).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn parse_with_extension_flags_recognizes_no_mouse_capture_as_builtin() {
         let parsed = parse_with_extension_flags(vec![
             "pi".to_string(),
@@ -1790,6 +1972,48 @@ mod tests {
     fn no_extensions_flag() {
         let cli = Cli::parse_from(["pi", "--no-extensions"]);
         assert!(cli.no_extensions);
+    }
+
+    #[test]
+    fn no_mcp_survives_preprocessing_and_keeps_other_tools_enabled() {
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--no-mcp".to_string(),
+            "--mcp-config".to_string(),
+            "ignored.json".to_string(),
+            "-p".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("parse --no-mcp");
+        assert!(parsed.cli.no_mcp);
+        assert!(!parsed.cli.no_tools);
+        assert!(!parsed.cli.no_extensions);
+        assert!(parsed.extension_flags.is_empty());
+        assert!(!Cli::parse_from(["pi"]).no_mcp);
+    }
+
+    #[test]
+    fn native_child_fallback_policy_survives_extension_flag_preprocessing() {
+        let policy = crate::failover::ChildFallbackPolicy::capture(
+            &crate::config::Config::default(),
+            crate::models::ModelRole::Task,
+            &[],
+        )
+        .to_cli_arg()
+        .unwrap();
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--subagent-fallback-policy".to_string(),
+            policy,
+            "--mode".to_string(),
+            "json".to_string(),
+            "--print".to_string(),
+            "Task: finish delegated work".to_string(),
+        ])
+        .unwrap();
+        assert!(parsed.extension_flags.is_empty());
+        assert!(parsed.cli.subagent_fallback_policy.is_some());
+        assert!(Cli::try_parse_from(["pi", "--subagent-fallback-policy", "{}"]).is_err());
     }
 
     #[test]
@@ -2441,6 +2665,39 @@ pub enum Commands {
         from_codex: Option<String>,
     },
 
+    /// Recover readable text from a v3 JSONL session without opening media sidecars.
+    ///
+    /// Inspection is read-only by default. --session-output explicitly creates a
+    /// separate text-only native session with a new identity; it never repairs or
+    /// overwrites the source.
+    #[command(name = "recover")]
+    Recover {
+        /// Authoritative version-3 JSONL source.
+        source: PathBuf,
+        /// Create a new report file. Existing destinations are never replaced.
+        #[arg(long, conflicts_with = "session_output")]
+        output: Option<PathBuf>,
+        /// Create a NEW resumable text-only .jsonl session. Existing files and sidecars are refused.
+        #[arg(long, conflicts_with_all = ["output", "json"])]
+        session_output: Option<PathBuf>,
+        /// Emit the complete machine-readable recovery report.
+        #[arg(long, conflicts_with_all = ["active", "branch", "root", "session_output"])]
+        json: bool,
+        /// Inspect only the source's saved active path. Default inspection shows all records.
+        #[arg(long, conflicts_with_all = ["branch", "root", "session_output"])]
+        active: bool,
+        /// Inspect this exact root-to-entry path, or select it in a new session copy.
+        #[arg(long, conflicts_with = "root", value_parser = recovery_entry_id)]
+        branch: Option<String>,
+        /// Start a new session copy at the root while preserving source history off-path.
+        #[arg(
+            long,
+            requires = "session_output",
+            conflicts_with_all = ["active", "branch", "json"]
+        )]
+        root: bool,
+    },
+
     /// Generate structured cross-session/cross-agent handoff brief (bd-cv653.3.17)
     #[command(name = "handoff")]
     Handoff {
@@ -2503,12 +2760,15 @@ pub enum Commands {
         check: bool,
     },
 
-    /// Prioritized parallel code review with ship verdict (bd-cv653.3.11)
+    /// Parallel model code review with prioritized findings and a ship verdict
     #[command(name = "review")]
     Review {
-        /// Target to review: uncommitted (default), commit range (e.g. main..HEAD), or branch
+        /// Target: uncommitted (default), staged, commit:REF, branch:REF, a commit range, or an HTTPS GitHub PR / GitLab MR URL
         #[arg(value_name = "TARGET")]
         target: Option<String>,
+        /// Run only local heuristics; do not send code to a model
+        #[arg(long)]
+        offline: bool,
         /// Fail with non-zero exit code if findings meet or exceed severity (P0, P1, P2)
         #[arg(long, value_name = "SEVERITY")]
         fail_on: Option<String>,
@@ -2670,7 +2930,7 @@ pub enum Commands {
 
     /// Diagnose environment health and extension compatibility
     Doctor {
-        /// Extension path to check (omit to run all environment checks)
+        /// Extension path to check (omit to check ordinary installation health)
         path: Option<String>,
         /// Output format: text (default), json, markdown
         #[arg(long, default_value = "text")]
@@ -2681,7 +2941,7 @@ pub enum Commands {
         /// Automatically fix safe issues (missing dirs, permissions)
         #[arg(long)]
         fix: bool,
-        /// Run specific categories: config,dirs,auth,shell,sessions,swarm,extensions
+        /// Run specific categories: config,dirs,auth,shell,sessions,swarm,extensions (swarm is opt-in)
         #[arg(long)]
         only: Option<String>,
     },

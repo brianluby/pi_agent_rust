@@ -61,6 +61,7 @@ fn test_model_entry() -> ModelEntry {
             reasoning: true,
             input: vec![crate::provider::InputType::Text],
             cost: crate::provider::ModelCost {
+                audio: None,
                 input: 0.0,
                 output: 0.0,
                 cache_read: 0.0,
@@ -203,6 +204,21 @@ fn extract_file_references_removes_indented_ref_line_without_leaving_blank_white
     let (cleaned, refs) = app.extract_file_references("Summary:\n  @notes.txt\nNext line");
 
     assert_eq!(cleaned, "Summary:\nNext line");
+    assert_eq!(refs, vec!["notes.txt".to_string()]);
+}
+
+/// An `@` reference to an empty file keeps its token: nothing is attached
+/// for an empty file, so stripping the token too erased the mention.
+#[test]
+fn extract_file_references_keeps_a_reference_to_an_empty_file() {
+    let dir = tempdir();
+    std::fs::write(dir.path().join("notes.txt"), "hi").expect("write file");
+    std::fs::write(dir.path().join("todo.md"), "").expect("write file");
+    let mut app = build_test_app(dir.path().to_path_buf());
+
+    let (cleaned, refs) = app.extract_file_references("use @notes.txt to fill in @todo.md");
+
+    assert_eq!(cleaned, "use to fill in @todo.md");
     assert_eq!(refs, vec!["notes.txt".to_string()]);
 }
 
@@ -810,7 +826,66 @@ fn new_session_thinking_level_resolves_configured_default() {
     );
 }
 
-/// route to AskTool::respond_ui (an expired request surfaces a status).
+#[test]
+fn cancelled_ask_cards_release_the_editor_for_a_successor() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    let tool = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
+    app.ask_tool = Some(tool.clone());
+    app.input.set_value("original draft");
+    let request: crate::ask::AskRequest = serde_json::from_value(serde_json::json!({
+        "questions": [{"question":"Choose?", "options":[{"label":"A"},{"label":"B"}]}]
+    }))
+    .unwrap();
+    for id in ["cancelled-active", "cancelled-buffered", "successor"] {
+        tool.register_channel_ui_request_for_tests(id);
+    }
+    for id in ["cancelled-active", "cancelled-buffered"] {
+        let _ = app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+            id: id.to_string(),
+            request: request.clone(),
+        }));
+    }
+    app.input.set_value("unfinished answer");
+    for id in ["cancelled-active", "cancelled-buffered"] {
+        tool.respond_ui(
+            id,
+            crate::ask::AskResponse {
+                answers: Vec::new(),
+                dismissed: true,
+            },
+        );
+    }
+    let _ = app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "successor".to_string(),
+        request: request.clone(),
+    }));
+    assert_eq!(app.active_ask_ui.as_ref().unwrap().request.id, "successor");
+    assert!(app.ask_ui_queue.is_empty());
+    assert_eq!(app.input_card_order.len(), 1);
+    assert!(app.input.value().is_empty());
+    assert_eq!(app.card_draft_snapshot.as_deref(), Some("original draft"));
+    let _ = app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "cancelled-active".to_string(),
+        request,
+    }));
+    assert!(app.ask_ui_queue.is_empty());
+    assert!(tool.channel_ui_request_is_pending("successor"));
+    app.agent_state = AgentState::ToolRunning;
+    tool.respond_ui(
+        "successor",
+        crate::ask::AskResponse {
+            answers: Vec::new(),
+            dismissed: true,
+        },
+    );
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert!(app.active_ask_ui.is_none());
+    assert_eq!(app.input.value(), "original draft");
+    assert!(app.message_queue.lock().unwrap().pop_steering().is_empty());
+}
+
+/// Route to AskTool::respond_ui (an expired request surfaces a status).
 #[test]
 fn ask_card_consumes_input_and_advances_questions() {
     let dir = tempdir();

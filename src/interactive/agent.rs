@@ -329,6 +329,23 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
         AgentEvent::AutoCompactionStart { reason } => {
             batcher.send_immediate(PiMsg::SystemNote(format!("Compacting context: {reason}")));
         }
+        AgentEvent::PrewalkSwitched {
+            provider,
+            model,
+            thinking,
+        } => {
+            batcher.send_immediate(PiMsg::ProviderRecovery {
+                message: format!("Prewalk switched → {provider}/{model}:{thinking}"),
+                model: Some((provider.clone(), model.clone())),
+                discard_incomplete: false,
+            });
+        }
+        AgentEvent::AdvisorNote { level, rationale } => {
+            batcher.send_immediate(PiMsg::SystemNote(format!("[ADVISOR:{level}] {rationale}")));
+        }
+        AgentEvent::CostWarning { message, .. } => {
+            batcher.send_immediate(PiMsg::SystemNote(message.clone()));
+        }
         AgentEvent::MessageUpdate {
             assistant_message_event,
             ..
@@ -798,7 +815,18 @@ impl PiApp {
 
     /// Handle custom Pi messages from the agent.
     pub(super) fn handle_pi_message(&mut self, msg: PiMsg) -> Option<Cmd> {
+        self.prune_expired_ask_cards();
         self.handle_pi_message_with_session_retry(msg, SESSION_EVENT_LOCK_RETRY_ATTEMPTS)
+    }
+
+    fn finish_handoff_ui(&mut self) {
+        self.handoff_request_id = None;
+        self.abort_handle = None;
+        self.agent_state = AgentState::Idle;
+        self.current_tool = None;
+        self.current_tool_id = None;
+        self.current_tool_summary.clear();
+        self.extension_compacting.store(false, Ordering::SeqCst);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -807,7 +835,41 @@ impl PiApp {
         msg: PiMsg,
         attempts_remaining: u8,
     ) -> Option<Cmd> {
+        if let PiMsg::McpAuthFinished {
+            request_id,
+            message,
+        } = msg
+        {
+            if self.mcp_auth_request_id.as_deref() != Some(request_id.as_str()) {
+                return None;
+            }
+            self.mcp_auth_request_id = None;
+            return self
+                .handle_pi_message_with_session_retry(PiMsg::System(message), attempts_remaining);
+        }
+        let (msg, handoff_completion) = match msg {
+            PiMsg::HandoffFinished { request_id, event } => {
+                if self.handoff_request_id.as_deref() != Some(request_id.as_str()) {
+                    return None;
+                }
+                (*event, Some(request_id))
+            }
+            msg => (msg, None),
+        };
+        if handoff_completion.is_some() && !matches!(&msg, PiMsg::ConversationReset { .. }) {
+            self.finish_handoff_ui();
+        }
         match msg {
+            PiMsg::HandoffFinished { .. } | PiMsg::McpAuthFinished { .. } => return None,
+            PiMsg::System(message) | PiMsg::AgentError(message)
+                if self.handoff_request_id.is_some() || self.mcp_auth_request_id.is_some() =>
+            {
+                // Background notices cannot release an operator request's
+                // abort handle or admit another foreground operation.
+                self.messages
+                    .push(ConversationMessage::new(MessageRole::System, message, None));
+                self.scroll_to_bottom();
+            }
             PiMsg::AgentStart => {
                 self.agent_state = AgentState::Processing;
                 self.current_response.clear();
@@ -891,6 +953,7 @@ impl PiApp {
             PiMsg::UiShutdown
             | PiMsg::TerminalTitle(_)
             | PiMsg::AutocompleteCatalog(_)
+            | PiMsg::ResourcesReloaded { .. }
             | PiMsg::LoginPending { .. }
             | PiMsg::StatusSnapshot(_)
             | PiMsg::UserInputSubmitted { .. }
@@ -1044,6 +1107,28 @@ impl PiApp {
                 // Update usage
                 if let Some(ref u) = usage {
                     add_usage(&mut self.total_usage, u);
+                }
+
+                if self.handoff_request_id.is_some() || self.mcp_auth_request_id.is_some() {
+                    // A delayed terminal from an earlier turn may finalize its
+                    // display, but it does not own this handoff's cancellation
+                    // handle, hook dialogs, or foreground admission state.
+                    if let Some(message) = time_cap_message {
+                        self.pending_inputs_paused_by_time_cap = true;
+                        self.messages.push(ConversationMessage::new(
+                            MessageRole::System,
+                            message,
+                            None,
+                        ));
+                    } else if let Some(message) = error_message {
+                        self.messages.push(ConversationMessage::new(
+                            MessageRole::System,
+                            message,
+                            None,
+                        ));
+                    }
+                    self.refresh_conversation_viewport(follow_tail);
+                    return None;
                 }
 
                 self.agent_state = AgentState::Idle;
@@ -1219,6 +1304,37 @@ impl PiApp {
                 });
                 self.scroll_to_bottom();
             }
+            PiMsg::ReviewFinished {
+                owner_session_id,
+                request_id,
+                message,
+            } => {
+                if self.review_request_id.as_deref() != Some(request_id.as_str()) {
+                    return None;
+                }
+                match self.session_event_ownership(&owner_session_id) {
+                    SessionEventOwnership::Current => {}
+                    SessionEventOwnership::Stale => {
+                        self.review_request_id = None;
+                        return None;
+                    }
+                    SessionEventOwnership::Busy => {
+                        return self.retry_busy_session_event(
+                            PiMsg::ReviewFinished {
+                                owner_session_id,
+                                request_id,
+                                message,
+                            },
+                            attempts_remaining,
+                        );
+                    }
+                }
+                self.review_request_id = None;
+                return self.handle_pi_message_with_session_retry(
+                    PiMsg::System(message),
+                    attempts_remaining,
+                );
+            }
             PiMsg::SessionSystemNote {
                 owner_session_id,
                 message,
@@ -1244,18 +1360,10 @@ impl PiApp {
                 });
                 self.scroll_to_bottom();
             }
-            PiMsg::BashResult {
-                display,
-                content_for_agent,
-            } => {
+            PiMsg::BashResult { display } => {
                 self.bash_running = false;
                 self.current_tool = None;
                 self.agent_state = AgentState::Idle;
-
-                if let Some(content) = content_for_agent {
-                    self.scroll_to_bottom();
-                    return self.submit_content(content);
-                }
 
                 // `!cmd` output is raw terminal bytes; strip escapes/controls
                 // before it enters the transcript (bd-p45xh).
@@ -1367,18 +1475,39 @@ After approving access in the browser, press Enter in Pi to complete login."
             } => {
                 match self.session_event_ownership(&session_id) {
                     SessionEventOwnership::Current => {}
-                    SessionEventOwnership::Stale => return None,
-                    SessionEventOwnership::Busy => {
-                        return self.retry_busy_session_event(
-                            PiMsg::ConversationReset {
-                                session_id,
-                                messages,
-                                usage,
-                                status,
-                            },
-                            attempts_remaining,
-                        );
+                    SessionEventOwnership::Stale => {
+                        if handoff_completion.is_some() {
+                            self.finish_handoff_ui();
+                            self.status_message = Some("Handoff finished for an earlier session; the current display was kept".to_string());
+                        }
+                        return None;
                     }
+                    SessionEventOwnership::Busy => {
+                        let event = PiMsg::ConversationReset {
+                            session_id,
+                            messages,
+                            usage,
+                            status,
+                        };
+                        if let Some(request_id) = handoff_completion {
+                            if attempts_remaining == 0 {
+                                self.finish_handoff_ui();
+                                self.status_message = Some("Handoff saved; the busy session prevented a conversation display refresh".to_string());
+                                return None;
+                            }
+                            return self.retry_busy_session_event(
+                                PiMsg::HandoffFinished {
+                                    request_id,
+                                    event: Box::new(event),
+                                },
+                                attempts_remaining,
+                            );
+                        }
+                        return self.retry_busy_session_event(event, attempts_remaining);
+                    }
+                }
+                if handoff_completion.is_some() {
+                    self.finish_handoff_ui();
                 }
                 let is_replacement =
                     self.displayed_session_id.as_deref() != Some(session_id.as_str());
@@ -1402,6 +1531,8 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.current_tool_summary.clear();
                 self.abort_handle = None;
                 if is_replacement {
+                    self.handoff_request_id = None;
+                    self.mcp_auth_request_id = None;
                     self.title_cancellation = None;
                     self.pending_inputs_paused_by_time_cap = false;
                     self.title_requested = !self.messages.is_empty();
@@ -2312,6 +2443,41 @@ After approving access in the browser, press Enter in Pi to complete login."
         }
     }
 
+    /// A cancelled provider/server wait releases only its own cards. Keep the
+    /// mixed Ask/extension order aligned when removing buffered requests.
+    pub(super) fn prune_expired_ask_cards(&mut self) -> bool {
+        let Some(tool) = self.ask_tool.clone() else {
+            return false;
+        };
+        let mut queued = VecDeque::new();
+        self.ask_ui_queue.retain(|request| {
+            let pending = tool.channel_ui_request_is_pending(&request.id);
+            queued.push_back(pending);
+            pending
+        });
+        let mut active = self.active_ask_ui.is_some();
+        self.input_card_order.retain(|kind| {
+            if *kind != InputCardKind::Ask {
+                true
+            } else if active {
+                active = false;
+                true
+            } else {
+                queued.pop_front().unwrap_or(false)
+            }
+        });
+        let released = self
+            .active_ask_ui
+            .as_ref()
+            .is_some_and(|card| !tool.channel_ui_request_is_pending(&card.request.id));
+        if released {
+            self.active_ask_ui = None;
+            self.complete_input_card_transition(InputCardKind::Ask);
+        }
+        self.restore_card_draft_after_cards_settle();
+        released
+    }
+
     /// Ask cards (bd-cv653.3.8): show the next queued request's current
     /// question as a conversation card and focus the input for the reply.
     fn advance_ask_ui_queue(&mut self) {
@@ -2894,6 +3060,24 @@ After approving access in the browser, press Enter in Pi to complete login."
             return;
         }
 
+        if self.mcp_auth_request_id.is_some() {
+            self.status_message =
+                Some("MCP authentication is still running; Escape cancels it".to_string());
+            return;
+        }
+        if self.handoff_request_id.is_some()
+            || matches!(
+                SlashCommand::parse(trimmed),
+                Some((SlashCommand::Handoff, _))
+            )
+        {
+            self.status_message = Some(
+                "Handoff must finish before submitting another request; Escape cancels it"
+                    .to_string(),
+            );
+            return;
+        }
+
         if let Some((command, _args)) = parse_extension_command(trimmed)
             && let Some(manager) = &self.extensions
             && manager.has_command(&command)
@@ -2901,6 +3085,14 @@ After approving access in the browser, press Enter in Pi to complete login."
             self.status_message = Some(format!(
                 "Extension command '/{command}' cannot be queued while busy"
             ));
+            return;
+        }
+
+        if self.submit_side_template(trimmed) {
+            return;
+        }
+        if let Some((SlashCommand::Btw, args)) = SlashCommand::parse(trimmed) {
+            let _ = self.handle_slash_btw(args);
             return;
         }
 
@@ -3013,6 +3205,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         self.pending_inputs_paused_by_time_cap = false;
         let extension_compacting = Arc::clone(&self.extension_compacting);
         let (abort_handle, abort_signal) = AbortHandle::new();
+        self.review_request_id = None;
         self.abort_handle = Some(abort_handle);
         self.agent_state = AgentState::Processing;
         // Extensions may send steering while the first request is in backoff
@@ -3219,12 +3412,26 @@ After approving access in the browser, press Enter in Pi to complete login."
             return None;
         }
 
+        if self.mcp_auth_request_id.is_some() {
+            self.status_message =
+                Some("MCP authentication is still running; Escape cancels it".to_string());
+            return None;
+        }
+        if self.handoff_request_id.is_some() {
+            self.status_message = Some("Handoff is still running; Escape cancels it".to_string());
+            return None;
+        }
+
         if let Some(pending) = self.pending_oauth.take() {
             return self.submit_oauth_code(message, pending);
         }
 
         if let Some((command, exclude_from_context)) = parse_bash_command(message) {
             return self.submit_bash_command(message, command, exclude_from_context);
+        }
+
+        if self.submit_side_template(message) {
+            return None;
         }
 
         // Check for slash commands
@@ -3672,6 +3879,7 @@ mod stream_delta_batcher_tests {
                 reasoning: true,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3935,7 +4143,10 @@ mod stream_delta_batcher_tests {
                 Ok(event) => {
                     let done = matches!(
                         event,
-                        PiMsg::AgentDone { .. } | PiMsg::AgentTimeCap { .. } | PiMsg::AgentError(_)
+                        PiMsg::AgentDone { .. }
+                            | PiMsg::AgentTimeCap { .. }
+                            | PiMsg::AgentError(_)
+                            | PiMsg::HandoffFinished { .. }
                     );
                     let _ = app.handle_pi_message(event.clone());
                     events.push(event);
@@ -4781,6 +4992,7 @@ mod stream_delta_batcher_tests {
                 name: "tc-plan".to_string(),
                 description: "Planning template".to_string(),
                 content: "Plan the following: $ARGUMENTS".to_string(),
+                side: false,
                 source: "test".to_string(),
                 file_path: std::path::PathBuf::from("tc-plan.md"),
             });
@@ -4810,6 +5022,7 @@ mod stream_delta_batcher_tests {
                 name: "queued".to_string(),
                 description: "Queued provenance fixture".to_string(),
                 content: "generated ultrathink workflowz payload; argument=$ARGUMENTS".to_string(),
+                side: false,
                 source: "test".to_string(),
                 file_path: std::path::PathBuf::from("queued.md"),
             });
@@ -4831,6 +5044,130 @@ mod stream_delta_batcher_tests {
                 ..
             }) if text == "generated ultrathink workflowz payload; argument=orchestrate"
         ));
+    }
+
+    #[test]
+    fn side_templates_never_enter_classic_steering_or_session_history() {
+        for (busy, follow_up, input) in [
+            (false, false, "/sitrep"),
+            (true, false, "/sitrep the retry path"),
+            (true, true, "/sitrep another concern"),
+            (false, false, "/template sitrep"),
+            (true, true, "/template /sitrep another concern"),
+        ] {
+            let main_state = Arc::new(ContinueProbeState::default());
+            let side_state = Arc::new(ContinueProbeState::default());
+            let (mut app, mut receiver) =
+                build_test_app_with_provider(Arc::new(ContinueProbeProvider {
+                    state: Arc::clone(&main_state),
+                }));
+            app.resources
+                .push_prompt_for_tests(crate::resources::PromptTemplate {
+                    name: "sitrep".into(),
+                    description: String::new(),
+                    content: "Summarize $ARGUMENTS".into(),
+                    side: true,
+                    source: "project".into(),
+                    file_path: std::path::PathBuf::from("sitrep.md"),
+                });
+            app.set_btw_client(Arc::new(crate::btw::BtwClient::new(
+                Arc::new(ContinueProbeProvider {
+                    state: Arc::clone(&side_state),
+                }),
+                None,
+            )));
+            let agent = Arc::clone(&app.agent);
+            let held = busy.then(|| agent.try_lock().expect("active main turn"));
+            if busy {
+                app.agent_state = AgentState::Processing;
+            }
+            app.input.set_value(input);
+            if busy {
+                app.queue_input(if follow_up {
+                    QueuedMessageKind::FollowUp
+                } else {
+                    QueuedMessageKind::Steering
+                });
+            } else {
+                let _ = app.submit_message(input);
+            }
+            assert_eq!(app.message_queue.lock().unwrap().pending_count(), 0);
+            assert!(app.input.value().is_empty());
+            assert_eq!(app.history.entries().last().unwrap().value, input);
+            assert_eq!(main_state.calls.load(Ordering::SeqCst), 0);
+            drop(held);
+            let note = runtime().block_on(async {
+                let cx = Cx::for_request();
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    std::time::Duration::from_secs(10),
+                    receiver.recv(&cx),
+                )
+                .await
+                .expect("side request settles")
+                .expect("side event")
+            });
+            assert!(matches!(
+                &note,
+                PiMsg::SessionSystemNote { message, .. }
+                    if message == &format!("({input}) continued")
+            ));
+            let _ = app.handle_pi_message(note);
+            assert_eq!(main_state.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(side_state.calls.load(Ordering::SeqCst), 1);
+            assert!(app.session.try_lock().unwrap().entries.is_empty());
+            assert!(app.agent.try_lock().unwrap().messages().is_empty());
+            assert!(
+                app.messages
+                    .iter()
+                    .all(|message| message.role != MessageRole::User)
+            );
+            assert_eq!(
+                app.agent_state,
+                if busy {
+                    AgentState::Processing
+                } else {
+                    AgentState::Idle
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_classic_side_template_keeps_input_without_starting_a_turn() {
+        for busy in [false, true] {
+            let state = Arc::new(ContinueProbeState::default());
+            let (mut app, _receiver) =
+                build_test_app_with_provider(Arc::new(ContinueProbeProvider {
+                    state: Arc::clone(&state),
+                }));
+            app.resources
+                .push_prompt_for_tests(crate::resources::PromptTemplate {
+                    name: "sitrep".into(),
+                    description: String::new(),
+                    content: "Summarize current progress".into(),
+                    side: true,
+                    source: "project".into(),
+                    file_path: std::path::PathBuf::from("sitrep.md"),
+                });
+            app.input.set_value("/sitrep");
+            if busy {
+                app.agent_state = AgentState::Processing;
+                app.queue_input(QueuedMessageKind::FollowUp);
+            } else {
+                let _ = app.submit_message("/sitrep");
+            }
+            assert!(
+                app.status_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("/sitrep unavailable")
+            );
+            assert_eq!(app.input.value(), "/sitrep");
+            assert_eq!(app.message_queue.lock().unwrap().pending_count(), 0);
+            assert!(app.session.try_lock().unwrap().entries.is_empty());
+            assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]
@@ -5319,6 +5656,68 @@ mod stream_delta_batcher_tests {
     }
 
     #[test]
+    fn advisor_note_dispatch_flushes_text_and_reaches_the_transcript() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut batcher = UiStreamDeltaBatcher::new(tx);
+        batcher.flush_interval = std::time::Duration::from_secs(60);
+        batcher.last_flush = std::time::Instant::now();
+        batcher.push_delta(StreamDeltaKind::Text, "Completed review.");
+        dispatch_agent_event_to_ui(
+            &AgentEvent::AdvisorNote {
+                level: "CONCERN".to_string(),
+                rationale: "The fixture omits Unicode input.".to_string(),
+            },
+            &mut batcher,
+        );
+
+        let text = rx.try_recv().expect("pending answer precedes the note");
+        assert!(matches!(&text, PiMsg::TextDelta(text) if text == "Completed review."));
+        let mut app = build_test_app();
+        let _ = app.handle_pi_message(text);
+        let _ = app.handle_pi_message(rx.try_recv().expect("immediate advisor note"));
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationMessage { role: MessageRole::System, content, .. })
+                if content == "[ADVISOR:CONCERN] The fixture omits Unicode input."
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "one emitted note has one display event"
+        );
+    }
+
+    #[test]
+    fn cost_warning_preserves_live_turn_state_and_flushes_earlier_text() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut batcher = UiStreamDeltaBatcher::new(tx);
+        batcher.flush_interval = std::time::Duration::from_secs(60);
+        batcher.last_flush = std::time::Instant::now();
+        batcher.push_delta(StreamDeltaKind::Text, "Still working.");
+        dispatch_agent_event_to_ui(
+            &AgentEvent::CostWarning {
+                spent: 2.5,
+                threshold: 2.0,
+                message: "Model spend reached $2.50 (warning at $2.00).".into(),
+            },
+            &mut batcher,
+        );
+        let text = rx.try_recv().expect("text before warning");
+        assert!(matches!(&text, PiMsg::TextDelta(text) if text == "Still working."));
+        let mut app = build_test_app();
+        app.agent_state = AgentState::Processing;
+        let _ = app.handle_pi_message(text);
+        let _ = app.handle_pi_message(rx.try_recv().expect("visible cost warning"));
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationMessage { role: MessageRole::System, content, .. })
+                if content == "Model spend reached $2.50 (warning at $2.00)."
+        ));
+        assert!(app.session.try_lock().unwrap().entries.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn normal_tool_updates_flush_immediately() {
         let (tx, mut rx) = mpsc::channel(8);
         let mut batcher = UiStreamDeltaBatcher::new(tx);
@@ -5470,6 +5869,268 @@ mod stream_delta_batcher_tests {
         batcher.flush(true);
         let second = rx.try_recv().expect("expected retained agent_done event");
         assert!(matches!(second, PiMsg::AgentDone { .. }));
+    }
+
+    #[test]
+    fn review_completion_is_bound_to_its_session_and_active_request() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        let owner = app.session.try_lock().expect("session").header.id.clone(); // ubs:ignore[rust.panic.expect,rust.ownership.unwrap-expect] -- The idle fixture session must be available to capture its owner ID.
+        let original_messages = app.messages.len();
+        app.agent_state = AgentState::Processing;
+        app.review_request_id = Some("current-review".to_string());
+        let _ = app.handle_pi_message(PiMsg::ReviewFinished {
+            owner_session_id: owner.clone(),
+            request_id: "replaced-review".to_string(),
+            message: "stale request".to_string(),
+        });
+        assert_eq!(app.agent_state, AgentState::Processing); // ubs:ignore[rust.panic.assert-macros] -- A stale request completion must not settle the active review.
+        assert_eq!(app.messages.len(), original_messages); // ubs:ignore[rust.panic.assert-macros] -- A stale request must not append a report card.
+        assert_eq!(app.review_request_id.as_deref(), Some("current-review")); // ubs:ignore[rust.panic.assert-macros] -- Request ownership must remain with the current review.
+
+        let _ = app.handle_pi_message(PiMsg::ReviewFinished {
+            owner_session_id: "replaced-session".to_string(),
+            request_id: "current-review".to_string(),
+            message: "stale session".to_string(),
+        });
+        assert_eq!(app.agent_state, AgentState::Processing); // ubs:ignore[rust.panic.assert-macros] -- An old session's completion cannot idle its replacement.
+        assert_eq!(app.messages.len(), original_messages); // ubs:ignore[rust.panic.assert-macros] -- Session ownership must prevent stale transcript publication.
+        assert!(app.review_request_id.is_none()); // ubs:ignore[rust.panic.assert-macros] -- A confirmed stale owner retires that review request ID.
+
+        app.review_request_id = Some("accepted-review".to_string());
+        let _ = app.handle_pi_message(PiMsg::ReviewFinished {
+            owner_session_id: owner,
+            request_id: "accepted-review".to_string(),
+            message: "current review report".to_string(),
+        });
+        assert_eq!(app.agent_state, AgentState::Idle); // ubs:ignore[rust.panic.assert-macros] -- A current owned completion must settle the review.
+        assert!(app.review_request_id.is_none()); // ubs:ignore[rust.panic.assert-macros] -- Successful completion retires request ownership.
+        assert!(
+            matches!(app.messages.last(), Some(ConversationMessage { content, .. }) if content == "current review report")
+        ); // ubs:ignore[rust.panic.assert-macros] -- Only the current review report may reach the transcript.
+        eprintln!(
+            "{}",
+            serde_json::json!({"schema":"pi.review.test.v1","case":"classic_review_ownership","outcome":"stale completions ignored; current completion settles review"})
+        );
+    }
+
+    #[test]
+    fn classic_handoff_runs_the_native_transaction_and_refreshes_both_views() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("classic-handoff.jsonl");
+        let state = Arc::new(ContinueProbeState::default());
+        let (mut app, mut receiver) = build_test_app_with_session_configuration(
+            Arc::new(ContinueProbeProvider {
+                state: Arc::clone(&state),
+            }),
+            Config::default(),
+            None,
+            |session| {
+                let mut stored = session.session.try_lock().unwrap();
+                stored.path = Some(path.clone());
+                stored.session_dir = Some(directory.path().to_path_buf());
+                stored.append_message(SessionMessage::User {
+                    content: UserContent::Text("Earlier authored migration decision".into()),
+                    timestamp: None,
+                });
+                // Larger than the normal recent budget, so the native safe
+                // boundary retains this entire current turn without cutting it.
+                stored.append_message(SessionMessage::User {
+                    content: UserContent::Text("retained native tail ".repeat(8192)),
+                    timestamp: None,
+                });
+                session
+                    .agent
+                    .replace_messages(stored.to_messages_for_current_path());
+            },
+        );
+        let owner = app.session.try_lock().unwrap().header.id.clone();
+        runtime().block_on(async {
+            let cx = Cx::for_request();
+            app.session.lock(&cx).await.unwrap().save().await.unwrap();
+        });
+        let _ = app.submit_message("/handoff preserve migration decisions");
+        assert!(app.handoff_request_id.is_some());
+        assert_eq!(app.agent_state, AgentState::Processing);
+        let events = drive_turn(&mut app, &mut receiver);
+        assert!(
+            matches!(events.last(), Some(PiMsg::HandoffFinished { event, .. })
+            if matches!(event.as_ref(), PiMsg::ConversationReset { .. }))
+        );
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(app.abort_handle.is_none());
+        assert!(app.handoff_request_id.is_none());
+        assert!(!app.extension_compacting.load(Ordering::SeqCst));
+        assert_eq!(app.messages.len(), 2);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .starts_with("Handoff saved")
+        );
+        let reopened = runtime()
+            .block_on(Session::open(path.to_str().unwrap()))
+            .unwrap();
+        assert_eq!(reopened.header.id, owner);
+        assert_eq!(reopened.entries.len(), 3);
+        assert!(reopened.entries.iter().any(|entry| matches!(entry,
+            SessionEntry::Compaction(compaction) if compaction.details.as_ref().unwrap()["mode"] == "handoff")));
+        // The summary and these timestamp-less rows are re-stamped on every
+        // projection, so only their timestamps may differ from the reopened file.
+        let (live, durable) =
+            reopened.current_path_comparison_values(app.agent.try_lock().unwrap().messages());
+        assert_eq!(live, durable);
+        eprintln!(
+            "{}",
+            json!({"schema":"pi.handoff.ui.test.v1","case":"classic_native_transaction"})
+        );
+    }
+
+    #[test]
+    fn classic_handoff_refusal_releases_busy_and_report_stays_explicit() {
+        let state = Arc::new(ContinueProbeState::default());
+        let (mut app, mut receiver) =
+            build_test_app_with_provider(Arc::new(ContinueProbeProvider {
+                state: Arc::clone(&state),
+            }));
+        let _ = app.submit_message("/handoff --report");
+        assert!(app.handoff_request_id.is_none());
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        let _ = app.submit_message("/handoff --unknown target");
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("Usage: /handoff")
+        );
+        assert!(app.handoff_request_id.is_none());
+        let _ = app.submit_message("/handoff human is a focus, not a recipient");
+        assert!(app.handoff_request_id.is_some());
+        let events = drive_turn(&mut app, &mut receiver);
+        assert!(
+            matches!(events.last(), Some(PiMsg::HandoffFinished { event, .. })
+            if matches!(event.as_ref(), PiMsg::AgentError(message) if message.contains("Nothing safe to hand off")))
+        );
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(app.abort_handle.is_none());
+        assert!(app.handoff_request_id.is_none());
+        assert!(!app.extension_compacting.load(Ordering::SeqCst));
+        assert!(app.session.try_lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn classic_handoff_keeps_request_ownership_through_busy_snapshot_retries() {
+        let (mut app, _receiver) = build_test_app_with_provider(Arc::new(DummyProvider));
+        let store = Arc::clone(&app.session);
+        let held = store.try_lock().unwrap();
+        let owner = held.header.id.clone();
+        let (abort, signal) = AbortHandle::new();
+        app.handoff_request_id = Some("current-handoff".into());
+        app.abort_handle = Some(abort);
+        app.agent_state = AgentState::Processing;
+        app.extension_compacting.store(true, Ordering::SeqCst);
+        let terminal = PiMsg::HandoffFinished {
+            request_id: "current-handoff".into(),
+            event: Box::new(PiMsg::ConversationReset {
+                session_id: owner,
+                messages: Vec::new(),
+                usage: Usage::default(),
+                status: Some("Handoff saved".into()),
+            }),
+        };
+        assert!(
+            app.handle_pi_message_with_session_retry(terminal.clone(), 1)
+                .is_some()
+        );
+        let _ = app.handle_pi_message(PiMsg::AgentError("unrelated background error".into()));
+        let _ = app.handle_pi_message(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        });
+        let _ = app.handle_pi_message(PiMsg::HandoffFinished {
+            request_id: "older-handoff".into(),
+            event: Box::new(PiMsg::System("stale".into())),
+        });
+        assert_eq!(app.handoff_request_id.as_deref(), Some("current-handoff"));
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert!(app.abort_handle.is_some());
+        app.input.set_value("Keep this draft");
+        app.queue_input(QueuedMessageKind::FollowUp);
+        assert_eq!(app.input.value(), "Keep this draft");
+        assert_eq!(app.message_queue.lock().unwrap().pending_count(), 0);
+        app.abort_agent();
+        assert!(signal.is_aborted());
+        assert!(
+            app.handle_pi_message_with_session_retry(terminal, 0)
+                .is_none()
+        );
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(app.handoff_request_id.is_none());
+        assert!(app.abort_handle.is_none());
+        assert!(!app.extension_compacting.load(Ordering::SeqCst));
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("Handoff saved")
+        );
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("display refresh")
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn classic_mcp_auth_keeps_ownership_until_its_matching_completion() {
+        let state = Arc::new(ContinueProbeState::default());
+        let (mut app, _receiver) = build_test_app_with_provider(Arc::new(ContinueProbeProvider {
+            state: Arc::clone(&state),
+        }));
+        let (abort, signal) = AbortHandle::new();
+        app.mcp_auth_request_id = Some("current-auth".into());
+        app.abort_handle = Some(abort);
+        app.agent_state = AgentState::Processing;
+        for notice in [
+            PiMsg::SystemNote("Open the sign-in URL".into()),
+            PiMsg::System("An older MCP test completed".into()),
+            PiMsg::AgentError("Unrelated background task failed".into()),
+            PiMsg::AgentDone {
+                usage: None,
+                stop_reason: StopReason::Stop,
+                error_message: None,
+            },
+            PiMsg::McpAuthFinished {
+                request_id: "older-auth".into(),
+                message: "stale".into(),
+            },
+        ] {
+            let _ = app.handle_pi_message(notice);
+            assert_eq!(app.mcp_auth_request_id.as_deref(), Some("current-auth"));
+            assert_eq!(app.agent_state, AgentState::Processing);
+            assert!(app.abort_handle.is_some());
+        }
+        app.input.set_value("Keep this draft");
+        app.queue_input(QueuedMessageKind::FollowUp);
+        assert_eq!(app.input.value(), "Keep this draft");
+        assert_eq!(app.message_queue.lock().unwrap().pending_count(), 0);
+        let _ = app.submit_message("must wait for authentication");
+        assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+        app.abort_agent();
+        assert!(signal.is_aborted());
+        let _ = app.handle_pi_message(PiMsg::McpAuthFinished {
+            request_id: "current-auth".into(),
+            message: "Authentication cancelled".into(),
+        });
+        assert_eq!(app.agent_state, AgentState::Idle);
+        assert!(app.mcp_auth_request_id.is_none());
+        assert!(app.abort_handle.is_none());
+        assert!(app.session.try_lock().unwrap().entries.is_empty());
     }
 
     #[test]
@@ -6394,6 +7055,16 @@ mod stream_delta_batcher_tests {
         let mut next = model_entry("openai", "gpt-4o");
         next.model.reasoning = false;
         app.available_models.push(next.clone());
+        // Session-header sync resolves against the session registry that PiApp
+        // seeds at construction, not the later-extended picker list.
+        app.agent
+            .try_lock()
+            .expect("lock agent")
+            .handle
+            .session_mut()
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(
+                app.available_models.clone(),
+            ));
 
         let session_id = runtime().block_on(async {
             let cx = Cx::for_request();
@@ -6442,6 +7113,16 @@ mod stream_delta_batcher_tests {
         let mut next = model_entry("openai", "gpt-4o");
         next.model.reasoning = false;
         app.available_models.push(next.clone());
+        // Branch sync resolves against the session registry that PiApp seeds
+        // at construction, not the later-extended picker list.
+        app.agent
+            .try_lock()
+            .expect("lock agent")
+            .handle
+            .session_mut()
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(
+                app.available_models.clone(),
+            ));
 
         let (session_id, current_leaf_id, target_leaf_id) = runtime().block_on(async {
             let cx = Cx::for_request();

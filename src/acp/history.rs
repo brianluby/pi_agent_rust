@@ -195,8 +195,8 @@ pub(super) async fn load(
 ) -> HistoryResult<Value> {
     let id = requested_session_id(params)?;
     let cwd = requested_cwd(params)?;
-    let supplied =
-        crate::mcp::config::parse_acp_servers(params, &cwd).map_err(HistoryError::invalid)?;
+    let supplied = super::mcp::parse_servers(params, &cwd, options.launch.no_mcp)
+        .map_err(HistoryError::invalid)?;
     let live = {
         let guard = sessions
             .lock(cx)
@@ -230,6 +230,9 @@ pub(super) async fn load(
         if loaded_id != id {
             return Err(HistoryError::internal("Restored session identity changed"));
         }
+        super::arm_acp_prewalk(&mut state, options)
+            .await
+            .map_err(|error| HistoryError::invalid(format!("Cannot arm prewalk: {error}")))?;
         let mcp_state = super::mcp::prepare(
             &cwd,
             &crate::config::Config::global_dir(),
@@ -1031,7 +1034,7 @@ mod tests {
             ] {
                 in_tx.try_send(request.to_string()).unwrap();
             }
-            super::super::run(options, in_rx, out_tx).await.unwrap();
+            Box::pin(super::super::run(options, in_rx, out_tx)).await.unwrap();
             let messages = out_rx.try_iter().map(|line| serde_json::from_str::<Value>(&line).unwrap()).collect::<Vec<_>>();
             assert_eq!(messages.len(), 6);
             assert_eq!(messages[0]["result"]["agentCapabilities"]["loadSession"], true);

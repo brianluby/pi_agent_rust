@@ -172,6 +172,67 @@ fn warn_mode_executes_with_annotation() {
     finish_case(&harness, case);
 }
 
+#[test]
+fn warn_mode_preserves_failed_execution_and_legacy_audit_details() {
+    let case = "warn_mode_preserves_failed_execution_and_legacy_audit_details";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    std::fs::write(root.join("warn-target"), "fixture").expect("write chmod fixture");
+
+    for background in [None, Some(false), Some(true)] {
+        let owner = format!("mediation-warn-{}", uuid::Uuid::new_v4().simple());
+        let mut tool = bash_tool(
+            &root,
+            Some(BashSettings {
+                pty: Some("off".to_string()),
+                auto_background: Some(pi::config::BashAutoBackgroundSettings {
+                    enabled: Some(true),
+                    threshold_ms: Some(60_000),
+                }),
+                ..settings("warn")
+            }),
+        );
+        tool.bind_job_session_scope(pi::jobs::JobSessionScope::fixed(&owner));
+        let mut input = json!({
+            "command": "chmod 777 warn-target; printf warned-failure; exit 7"
+        });
+        if let Some(background) = background {
+            input["background"] = json!(background);
+        }
+        let output =
+            block_on_local(tool.execute("warn-failure", input, None)).expect("warn execution");
+        assert!(first_text(&output).contains("MEDIATION WARN"));
+        let details = output.details.as_ref().expect("warning details");
+        assert_eq!(details["mediation"]["schema"], "pi.bash.mediation.v1");
+        assert_eq!(details["mediation"]["verdict"], "warn");
+        if background == Some(true) {
+            assert_eq!(details["schema"], pi::jobs::JOB_SCHEMA);
+            let id = details["id"].as_str().expect("background ID");
+            let settled = block_on_local(pi::jobs::wait_async(
+                &owner,
+                id,
+                std::time::Duration::from_secs(10),
+            ))
+            .expect("warn background completion");
+            assert_eq!(settled.exit_code, Some(7));
+            let _ = pi::jobs::take_completion_notices(&owner);
+        } else {
+            assert!(output.is_error, "warning must not hide exit code 7");
+            assert!(first_text(&output).contains("Command exited with code 7"));
+            assert_eq!(details["schema"], "pi.bash.mediation.v1");
+            assert_eq!(details["verdict"], "warn");
+            assert!(
+                !details["hits"]
+                    .as_array()
+                    .expect("legacy audit hits")
+                    .is_empty()
+            );
+            assert!(pi::jobs::take_completion_notices(&owner).is_empty());
+        }
+    }
+    finish_case(&harness, case);
+}
+
 // ---------------------------------------------------------------------------
 // DCG policy bridge
 // ---------------------------------------------------------------------------
@@ -322,6 +383,37 @@ fn pty_auto_leaves_plain_commands_on_pipes() {
         "auto mode must leave plain commands on the pipe path: {text}"
     );
     assert!(!out.is_error);
+    finish_case(&harness, case);
+}
+
+#[test]
+fn every_runner_sets_the_non_interactive_environment() {
+    let case = "every_runner_sets_the_non_interactive_environment";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let probe = r#"printf '[%s,%s,%s,%s]' "$PAGER" "$GIT_TERMINAL_PROMPT" "$EDITOR" "$SSH_ASKPASS_REQUIRE""#;
+    // Direct foreground pipes, the managed (auto-background) pipes, and a PTY.
+    for (label, settings, background) in [
+        ("direct", Some(pty_settings("off")), Some(false)),
+        ("managed", None, None),
+        ("pty", Some(pty_settings("always")), None),
+    ] {
+        let tool = bash_tool(&root, settings);
+        let mut input = json!({ "command": probe });
+        if let Some(background) = background {
+            input["background"] = json!(background);
+        }
+        let out = block_on_local(tool.execute("call-1", input, None)).expect("execute");
+        let text = first_text(&out);
+        harness.log().info("verify", format!("{label}: {text}"));
+        assert!(text.contains("[cat,0,true,force]"), "{label}: {text}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+    }
+    // A pager on auto stays on pipes, and the command's own assignment wins.
+    let tool = bash_tool(&root, None);
+    let text = first_text(&execute(&tool, "less /dev/null; test -t 1 || echo PIPE")).to_owned();
+    assert!(text.contains("PIPE"), "less must not get a PTY: {text}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+    let out = execute(&tool, r#"EDITOR=vim sh -c 'printf "[%s]" "$EDITOR"'"#);
+    assert!(first_text(&out).contains("[vim]"), "{}", first_text(&out)); // ubs:ignore[rust.panic.assert-macros] -- test assertion
     finish_case(&harness, case);
 }
 

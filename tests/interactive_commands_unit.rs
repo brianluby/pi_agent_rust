@@ -31,6 +31,7 @@ fn make_entry(provider: &str, id: &str) -> ModelEntry {
             reasoning: false,
             input: vec![InputType::Text],
             cost: ModelCost {
+                audio: None,
                 input: 0.0,
                 output: 0.0,
                 cache_read: 0.0,
@@ -126,8 +127,10 @@ fn slash_command_parse_all_aliases() {
         ("/?", SlashCommand::Help),
         ("/cls", SlashCommand::Clear),
         ("/m", SlashCommand::Model),
+        ("/models", SlashCommand::Model),
         ("/think", SlashCommand::Thinking),
         ("/t", SlashCommand::Thinking),
+        ("/effort", SlashCommand::Thinking),
         ("/scoped", SlashCommand::ScopedModels),
         ("/quit", SlashCommand::Exit),
         ("/q", SlashCommand::Exit),

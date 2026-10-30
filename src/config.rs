@@ -76,6 +76,8 @@ pub struct Config {
     pub model_roles: Option<ModelRoleSettings>,
     /// Automatic session titling (see [`TitlingSettings`], bd-cv653.3.1).
     pub titling: Option<TitlingSettings>,
+    /// Opt in to a one-shot strong-to-small model handoff on fresh sessions.
+    pub prewalk: Option<PrewalkSettings>,
     /// Providers whose models are hidden from selection and cycling
     /// (bd-cv653.3.2). Canonical ids or aliases, case-insensitive.
     #[serde(alias = "disabledProviders")]
@@ -95,6 +97,8 @@ pub struct Config {
     pub bash: Option<BashSettings>,
     /// Memory-bank settings (bd-cv653.4.1).
     pub memory: Option<MemorySettings>,
+    /// MCP discovery controls. Explicit files and client definitions remain eligible.
+    pub mcp: Option<McpSettings>,
     /// Opt-in media trio settings (bd-cv653.2.7).
     pub media: Option<crate::media_tools::MediaSettings>,
     /// Opt-in computer tool settings (bd-cv653.2.5).
@@ -137,6 +141,11 @@ pub struct Config {
     pub steering_mode: Option<String>,
     #[serde(alias = "followUpMode")]
     pub follow_up_mode: Option<String>,
+    /// Background completion behavior for unattended print runs.
+    #[serde(rename = "async", alias = "async_settings")]
+    pub async_settings: Option<AsyncSettings>,
+    /// Shared model-spend warning/cap for a session and its native children.
+    pub session: Option<SessionSettings>,
 
     // Version check
     #[serde(alias = "checkForUpdates")]
@@ -399,10 +408,48 @@ pub struct BranchSummarySettings {
     pub reserve_tokens: Option<u32>,
 }
 
+/// Opt-in background completion handling. Ordinary print runs still exit
+/// when their authored prompts finish.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AsyncSettings {
+    #[serde(alias = "printWake")]
+    pub print_wake: Option<bool>,
+}
+
+/// Model costs are denominated in USD. CLI thresholds override these values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SessionSettings {
+    #[serde(alias = "warn_cost", deserialize_with = "deserialize_cost_threshold")]
+    pub warn_cost: Option<f64>,
+    #[serde(alias = "max_cost", deserialize_with = "deserialize_cost_threshold")]
+    pub max_cost: Option<f64>,
+}
+
+fn deserialize_cost_threshold<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(deserializer)?;
+    if value.is_some_and(|amount| !amount.is_finite() || amount <= 0.0) {
+        return Err(serde::de::Error::custom(
+            "expected a positive finite USD amount",
+        ));
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetrySettings {
     pub enabled: Option<bool>,
+    /// Allow recovery to switch models after an eligible provider failure.
+    #[serde(alias = "modelFallback")]
+    pub model_fallback: Option<bool>,
+    /// Restrict the provider failures that may advance the fallback chain.
+    #[serde(alias = "fallbackOn")]
+    pub fallback_on: Option<crate::failover::FallbackOn>,
     #[serde(alias = "maxRetries")]
     pub max_retries: Option<u32>,
     #[serde(alias = "baseDelayMs")]
@@ -411,7 +458,8 @@ pub struct RetrySettings {
     pub max_delay_ms: Option<u32>,
     /// Cross-model failover chains (bd-cv653.3.2): maps a role name
     /// (`default`/`smol`/…) or an exact `provider/model` spec to an ordered
-    /// list of fallback `provider/model` specs. On a classified transient
+    /// list of fallback `provider/model[:thinking]` specs. An explicit empty
+    /// role chain disables fallback for that role. On a classified transient
     /// failure (429/quota/overload after the retry budget) the NEXT entry
     /// continues the turn; the primary is restored after the cooldown.
     #[serde(alias = "fallbackChains")]
@@ -461,6 +509,14 @@ pub struct TitlingSettings {
     pub auto_title: Option<bool>,
 }
 
+/// Prewalk is off unless explicitly enabled. The destination is the `smol`
+/// model role; CLI `--prewalk-into` can choose a destination for one launch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrewalkSettings {
+    pub enabled: Option<bool>,
+}
+
 /// A path-scoped model-set override (bd-cv653.3.2).
 ///
 /// Applies when the current working directory is inside `path` (or `path`
@@ -508,6 +564,9 @@ pub struct AdvisorSettings {
     /// Hard timeout per advisor call in seconds (default 15).
     #[serde(alias = "timeoutSecs")]
     pub timeout_secs: Option<u64>,
+    /// Lowest severity that resumes a completed turn. Default: concern.
+    #[serde(alias = "continueSeverity")]
+    pub continue_severity: Option<crate::advisor::ContinueSeverity>,
 }
 
 /// LSP tool configuration (bd-cv653.1.1).
@@ -547,6 +606,9 @@ pub struct LspServerSettings {
     /// `initializationOptions` payload for the handshake.
     #[serde(alias = "initializationOptions")]
     pub initialization_options: Option<serde_json::Value>,
+    /// Workspace settings exposed during initialization and notified after it.
+    /// Must be an object; each higher-precedence value replaces the whole object.
+    pub settings: Option<serde_json::Value>,
 }
 
 /// Approval mode configuration (bd-cv653.3.19).
@@ -602,6 +664,24 @@ pub struct BashSettings {
     /// PTY allocation for isatty-requiring commands: `off`, `auto`
     /// (default), or `always` (bd-cv653.1.7).
     pub pty: Option<String>,
+    /// Keep native Bash variables, functions, aliases, options, and cwd across
+    /// foreground calls on Unix (default true). Explicit jobs stay isolated.
+    pub persistent: Option<bool>,
+    /// Promote long-running non-PTY calls without restarting the command.
+    #[serde(alias = "autoBackground")]
+    pub auto_background: Option<BashAutoBackgroundSettings>,
+}
+
+/// Foreground waiting policy for managed bash commands.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BashAutoBackgroundSettings {
+    /// Enabled by default; explicit background:false disables it for one call.
+    pub enabled: Option<bool>,
+    /// Foreground wait in milliseconds (default 60,000; clamped to 600,000).
+    /// Zero promotes immediately. The command's execution timeout is unchanged.
+    #[serde(alias = "thresholdMs")]
+    pub threshold_ms: Option<u64>,
 }
 
 /// `memory.backend` (bd-cv653.4.1).
@@ -616,6 +696,36 @@ pub struct BashSettings {
 pub struct MemorySettings {
     /// Memory backend: off | local | cass.
     pub backend: Option<String>,
+    /// Learn durable facts from completed saved turns. Explicitly opt-in.
+    #[serde(alias = "autoExtract")]
+    pub auto_extract: Option<bool>,
+    /// Authored turns between automatic extractions (default 3; range 1..=100).
+    #[serde(alias = "extractEveryTurns")]
+    pub extract_every_turns: Option<u32>,
+}
+
+impl MemorySettings {
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        matches!(
+            self.backend.as_deref().map(str::trim),
+            Some("local" | "cass")
+        )
+    }
+
+    #[must_use]
+    pub fn extraction_cadence(&self) -> usize {
+        self.extract_every_turns.unwrap_or(3).clamp(1, 100) as usize
+    }
+}
+
+/// Controls automatic discovery of project MCP configuration files.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpSettings {
+    /// Default true; false skips every discovered project-native and foreign file.
+    #[serde(alias = "enableProjectConfig")]
+    pub enable_project_config: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -901,6 +1011,12 @@ impl Config {
             enabled_models: other.enabled_models.or(base.enabled_models),
             model_roles: merge_model_roles(base.model_roles, other.model_roles),
             titling: merge_titling(base.titling, other.titling),
+            prewalk: match (base.prewalk, other.prewalk) {
+                (Some(base), Some(other)) => Some(PrewalkSettings {
+                    enabled: other.enabled.or(base.enabled),
+                }),
+                (base, other) => other.or(base),
+            },
             disabled_providers: other.disabled_providers.or(base.disabled_providers),
             model_scope_overrides: other.model_scope_overrides.or(base.model_scope_overrides),
             tools: merge_tools(base.tools, other.tools),
@@ -908,6 +1024,14 @@ impl Config {
             read: merge_read(base.read, other.read),
             bash: merge_bash(base.bash, other.bash),
             memory: merge_memory(base.memory, other.memory),
+            mcp: match (base.mcp, other.mcp) {
+                (Some(base), Some(other)) => Some(McpSettings {
+                    enable_project_config: other
+                        .enable_project_config
+                        .or(base.enable_project_config),
+                }),
+                (base, other) => other.or(base),
+            },
             media: merge_media(base.media, other.media),
             computer: merge_computer(base.computer, other.computer),
             browser: merge_browser(base.browser, other.browser),
@@ -922,6 +1046,19 @@ impl Config {
             // Message Handling
             steering_mode: other.steering_mode.or(base.steering_mode),
             follow_up_mode: other.follow_up_mode.or(base.follow_up_mode),
+            async_settings: match (base.async_settings, other.async_settings) {
+                (Some(base), Some(other)) => Some(AsyncSettings {
+                    print_wake: other.print_wake.or(base.print_wake),
+                }),
+                (base, other) => other.or(base),
+            },
+            session: match (base.session, other.session) {
+                (Some(base), Some(other)) => Some(SessionSettings {
+                    warn_cost: other.warn_cost.or(base.warn_cost),
+                    max_cost: other.max_cost.or(base.max_cost),
+                }),
+                (base, other) => other.or(base),
+            },
 
             // Version check
             check_for_updates: other.check_for_updates.or(base.check_for_updates),
@@ -999,6 +1136,26 @@ impl Config {
     }
 
     // === Accessor methods with defaults ===
+
+    /// Keep print mode alive for owned background work only when opted in.
+    #[must_use]
+    pub fn async_print_wake(&self) -> bool {
+        self.async_settings
+            .as_ref()
+            .and_then(|settings| settings.print_wake)
+            .unwrap_or(false)
+    }
+
+    /// Discover project-local MCP definitions when the workspace is also trusted.
+    /// Explicit CLI files, global definitions, and ACP client declarations are
+    /// independent of this setting.
+    #[must_use]
+    pub fn mcp_project_config_enabled(&self) -> bool {
+        self.mcp
+            .as_ref()
+            .and_then(|settings| settings.enable_project_config)
+            .unwrap_or(true)
+    }
 
     pub fn compaction_enabled(&self) -> bool {
         self.compaction
@@ -1106,6 +1263,15 @@ impl Config {
             .unwrap_or(15)
     }
 
+    /// Lowest advisor severity that resumes a completed turn. Default: concern.
+    #[must_use]
+    pub fn advisor_continue_severity(&self) -> crate::advisor::ContinueSeverity {
+        self.advisor
+            .as_ref()
+            .and_then(|advisor| advisor.continue_severity)
+            .unwrap_or_default()
+    }
+
     pub fn steering_queue_mode(&self) -> QueueMode {
         parse_queue_mode_or_default(self.steering_mode.as_deref())
     }
@@ -1143,6 +1309,22 @@ impl Config {
 
     pub fn retry_enabled(&self) -> bool {
         self.retry.as_ref().and_then(|r| r.enabled).unwrap_or(true)
+    }
+
+    /// Whether automatic recovery may change models (default: true).
+    pub fn model_fallback_enabled(&self) -> bool {
+        self.retry
+            .as_ref()
+            .and_then(|retry| retry.model_fallback)
+            .unwrap_or(true)
+    }
+
+    /// Provider failure filter for model fallback (default: any).
+    pub fn retry_fallback_on(&self) -> crate::failover::FallbackOn {
+        self.retry
+            .as_ref()
+            .and_then(|retry| retry.fallback_on)
+            .unwrap_or_default()
     }
 
     pub fn retry_max_retries(&self) -> u32 {
@@ -1874,6 +2056,8 @@ fn merge_retry(base: Option<RetrySettings>, other: Option<RetrySettings>) -> Opt
     match (base, other) {
         (Some(base), Some(other)) => Some(RetrySettings {
             enabled: other.enabled.or(base.enabled),
+            model_fallback: other.model_fallback.or(base.model_fallback),
+            fallback_on: other.fallback_on.or(base.fallback_on),
             max_retries: other.max_retries.or(base.max_retries),
             base_delay_ms: other.base_delay_ms.or(base.base_delay_ms),
             max_delay_ms: other.max_delay_ms.or(base.max_delay_ms),
@@ -1950,6 +2134,7 @@ fn merge_advisor(
         (Some(base), Some(other)) => Some(AdvisorSettings {
             enabled: other.enabled.or(base.enabled),
             timeout_secs: other.timeout_secs.or(base.timeout_secs),
+            continue_severity: other.continue_severity.or(base.continue_severity),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -1985,6 +2170,26 @@ fn merge_bash(base: Option<BashSettings>, other: Option<BashSettings>) -> Option
             mediation_forced: other.mediation_forced.or(base.mediation_forced),
             mediation_dcg: other.mediation_dcg.or(base.mediation_dcg),
             pty: other.pty.or(base.pty),
+            persistent: other.persistent.or(base.persistent),
+            auto_background: merge_bash_auto_background(
+                base.auto_background,
+                other.auto_background,
+            ),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+fn merge_bash_auto_background(
+    base: Option<BashAutoBackgroundSettings>,
+    other: Option<BashAutoBackgroundSettings>,
+) -> Option<BashAutoBackgroundSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(BashAutoBackgroundSettings {
+            enabled: other.enabled.or(base.enabled),
+            threshold_ms: other.threshold_ms.or(base.threshold_ms),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -2000,6 +2205,8 @@ fn merge_memory(
     match (base, other) {
         (Some(base), Some(other)) => Some(MemorySettings {
             backend: other.backend.or(base.backend),
+            auto_extract: other.auto_extract.or(base.auto_extract),
+            extract_every_turns: other.extract_every_turns.or(base.extract_every_turns),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -2069,14 +2276,31 @@ fn merge_browser(
     }
 }
 
-/// Merge LSP settings: server maps union (other wins per server name),
-/// scalars prefer `other` (bd-cv653.1.1).
+/// Merge LSP settings: server maps union, set fields prefer `other` within
+/// each server, and object-valued fields replace as a whole (bd-cv653.1.1).
 fn merge_lsp(base: Option<LspSettings>, other: Option<LspSettings>) -> Option<LspSettings> {
     match (base, other) {
         (Some(base), Some(other)) => {
             let mut servers = base.servers.unwrap_or_default();
             if let Some(other_servers) = other.servers {
-                servers.extend(other_servers);
+                for (name, other) in other_servers {
+                    let server = match servers.remove(&name) {
+                        Some(base) => LspServerSettings {
+                            command: other.command.or(base.command),
+                            args: other.args.or(base.args),
+                            env: other.env.or(base.env),
+                            languages: other.languages.or(base.languages),
+                            extensions: other.extensions.or(base.extensions),
+                            root_markers: other.root_markers.or(base.root_markers),
+                            initialization_options: other
+                                .initialization_options
+                                .or(base.initialization_options),
+                            settings: other.settings.or(base.settings),
+                        },
+                        None => other,
+                    };
+                    servers.insert(name, server);
+                }
             }
             Some(LspSettings {
                 servers: if servers.is_empty() {
@@ -2436,6 +2660,171 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn session_cost_thresholds_validate_and_merge_individually() {
+        for content in [
+            r#"{"session":{"warnCost":1.5,"maxCost":5}}"#,
+            r#"{"session":{"warn_cost":1.5,"max_cost":5}}"#,
+        ] {
+            let base: Config = serde_json::from_str(content).expect("cost settings");
+            assert!(unrecognised_setting_keys(content).is_empty());
+            let other = serde_json::from_str(r#"{"session":{"maxCost":8}}"#).expect("override");
+            let merged = Config::merge(base, other)
+                .session
+                .expect("session settings");
+            assert_eq!(merged.warn_cost, Some(1.5));
+            assert_eq!(merged.max_cost, Some(8.0));
+        }
+        for value in ["0", "-1", "1e999", "\"NaN\"", "true"] {
+            for key in ["warnCost", "maxCost"] {
+                let content = format!(r#"{{"session":{{"{key}":{value}}}}}"#);
+                assert!(
+                    serde_json::from_str::<Config>(&content).is_err(),
+                    "accepted {content}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn async_print_wake_is_opt_in_and_preserves_partial_settings_merges() {
+        assert!(!Config::default().async_print_wake());
+        for content in [
+            r#"{"async":{"printWake":true}}"#,
+            r#"{"async":{"print_wake":true}}"#,
+            r#"{"async_settings":{"print_wake":true}}"#,
+        ] {
+            let enabled: Config = serde_json::from_str(content).expect("async settings");
+            assert!(enabled.async_print_wake());
+            assert!(unrecognised_setting_keys(content).is_empty());
+            let partial = serde_json::from_str(r#"{"async":{}}"#).expect("empty override");
+            let inherited = Config::merge(enabled, partial);
+            assert!(inherited.async_print_wake());
+            let disabled = serde_json::from_str(r#"{"async":{"printWake":false}}"#)
+                .expect("explicit project override");
+            assert!(!Config::merge(inherited, disabled).async_print_wake());
+        }
+        assert!(serde_json::from_str::<Config>(r#"{"async":{"printWake":"true"}}"#).is_err());
+    }
+
+    #[test]
+    fn mcp_project_discovery_setting_aliases_defaults_and_layering() {
+        assert!(Config::default().mcp_project_config_enabled());
+        for content in [
+            r#"{"mcp":{"enableProjectConfig":false}}"#,
+            r#"{"mcp":{"enable_project_config":false}}"#,
+        ] {
+            let disabled: Config = serde_json::from_str(content).expect("MCP settings");
+            assert!(!disabled.mcp_project_config_enabled());
+            assert!(unrecognised_setting_keys(content).is_empty());
+            let empty: Config = serde_json::from_str(r#"{"mcp":{}}"#).expect("empty override");
+            let inherited = Config::merge(disabled, empty);
+            assert!(!inherited.mcp_project_config_enabled());
+            let enabled: Config = serde_json::from_str(r#"{"mcp":{"enableProjectConfig":true}}"#)
+                .expect("explicit override");
+            assert!(Config::merge(inherited, enabled).mcp_project_config_enabled());
+        }
+        assert!(
+            serde_json::from_str::<Config>(r#"{"mcp":{"enableProjectConfig":"false"}}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn advisor_continuation_threshold_aliases_defaults_and_layering() {
+        use crate::advisor::ContinueSeverity;
+
+        assert_eq!(
+            Config::default().advisor_continue_severity(),
+            ContinueSeverity::Concern
+        );
+        for (key, value, expected) in [
+            ("continueSeverity", "nit", ContinueSeverity::Nit),
+            ("continue_severity", "note", ContinueSeverity::Nit),
+            ("continueSeverity", "concern", ContinueSeverity::Concern),
+            ("continue_severity", "blocker", ContinueSeverity::Blocker),
+        ] {
+            let content = format!(r#"{{"advisor":{{"{key}":"{value}"}}}}"#);
+            let config: Config = serde_json::from_str(&content).expect("advisor settings");
+            assert_eq!(config.advisor_continue_severity(), expected);
+            assert!(unrecognised_setting_keys(&content).is_empty());
+        }
+        assert!(
+            serde_json::from_str::<Config>(r#"{"advisor":{"continueSeverity":"critical"}}"#)
+                .is_err(),
+            "unknown thresholds must not silently enable automatic continuation"
+        );
+        let global: Config = serde_json::from_value(json!({
+            "advisor": {"enabled": false, "timeoutSecs": 25, "continueSeverity": "blocker"}
+        }))
+        .expect("global settings");
+        let project: Config = serde_json::from_value(json!({
+            "advisor": {"timeoutSecs": 8}
+        }))
+        .expect("project settings");
+        let inherited = Config::merge(global, project);
+        assert!(!inherited.advisor_enabled());
+        assert_eq!(inherited.advisor_timeout_secs(), 8);
+        assert_eq!(
+            inherited.advisor_continue_severity(),
+            ContinueSeverity::Blocker
+        );
+
+        let override_config: Config = serde_json::from_value(json!({
+            "advisor": {"enabled": true, "continue_severity": "nit"}
+        }))
+        .expect("project override");
+        let overridden = Config::merge(inherited, override_config);
+        assert!(overridden.advisor_enabled());
+        assert_eq!(overridden.advisor_timeout_secs(), 8);
+        assert_eq!(
+            overridden.advisor_continue_severity(),
+            ContinueSeverity::Nit
+        );
+    }
+
+    #[test]
+    fn bash_auto_background_settings_merge_without_losing_parent_fields() {
+        for content in [
+            r#"{"bash":{"autoBackground":{"enabled":false,"thresholdMs":250}}}"#,
+            r#"{"bash":{"auto_background":{"enabled":false,"threshold_ms":250}}}"#,
+        ] {
+            let config: Config = serde_json::from_str(content).expect("bash settings");
+            let settings = config
+                .bash
+                .expect("bash")
+                .auto_background
+                .expect("auto background");
+            assert_eq!(settings.enabled, Some(false));
+            assert_eq!(settings.threshold_ms, Some(250));
+            assert!(unrecognised_setting_keys(content).is_empty());
+        }
+        let global: Config = serde_json::from_value(json!({
+            "bash": {
+                "mediation": "block-high",
+                "persistent": false,
+                "autoBackground": {"enabled": false, "thresholdMs": 400}
+            }
+        }))
+        .expect("global settings");
+        let project: Config = serde_json::from_value(json!({
+            "bash": {"autoBackground": {"enabled": true}}
+        }))
+        .expect("project settings");
+        let merged = Config::merge(global, project);
+        let bash = merged.bash.expect("merged bash");
+        assert_eq!(bash.mediation.as_deref(), Some("block-high"));
+        assert_eq!(bash.persistent, Some(false));
+        let auto = bash.auto_background.expect("merged auto background");
+        assert_eq!(auto.enabled, Some(true));
+        assert_eq!(auto.threshold_ms, Some(400));
+        assert!(
+            serde_json::from_value::<Config>(json!({
+                "bash": {"autoBackground": {"thresholdMs": -1}}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn http_loopback_proxy_setting_accepts_camel_and_snake_case() {
         for (content, expected) in [
             (r#"{"http":{"proxyLoopback":true}}"#, true),
@@ -2526,6 +2915,8 @@ mod tests {
             "retry": {
                 "enabled": true,
                 "maxRetries": 2,
+                "modelFallback": false,
+                "fallbackOn": "usage-limit",
                 "fallbackChains": {
                     "default": ["openai/gpt-5-mini", "google/gemini-3-pro"],
                     "anthropic/claude-opus-4-7": ["openai/gpt-5.5"]
@@ -2552,6 +2943,11 @@ mod tests {
         assert_eq!(retry.max_failovers_per_turn, Some(3));
         assert_eq!(config.failover_cooldown_secs(), 120);
         assert_eq!(config.max_failovers_per_turn(), 3);
+        assert!(!config.model_fallback_enabled());
+        assert_eq!(
+            config.retry_fallback_on(),
+            crate::failover::FallbackOn::UsageLimit
+        );
     }
 
     #[test]
@@ -2559,6 +2955,8 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.failover_cooldown_secs(), 300);
         assert_eq!(config.max_failovers_per_turn(), 8);
+        assert!(config.model_fallback_enabled());
+        assert_eq!(config.retry_fallback_on(), crate::failover::FallbackOn::Any);
         assert!(config.disabled_providers.is_none());
         assert!(config.model_scope_overrides.is_none());
     }
@@ -2597,6 +2995,8 @@ mod tests {
     #[test]
     fn failover_chains_merge_field_wise() {
         let base = RetrySettings {
+            model_fallback: Some(false),
+            fallback_on: Some(crate::failover::FallbackOn::UsageLimit),
             fallback_chains: Some(HashMap::from([(
                 "default".to_string(),
                 vec!["openai/gpt-5-mini".to_string()],
@@ -2606,12 +3006,39 @@ mod tests {
         };
         let other = RetrySettings {
             max_retries: Some(5),
+            fallback_on: Some(crate::failover::FallbackOn::ExceptUsageLimit),
             ..Default::default()
         };
         let merged = merge_retry(Some(base), Some(other)).expect("merged");
         assert!(merged.fallback_chains.is_some(), "base chains preserved");
         assert_eq!(merged.failover_cooldown_secs, Some(60));
         assert_eq!(merged.max_retries, Some(5));
+        assert_eq!(merged.model_fallback, Some(false));
+        assert_eq!(
+            merged.fallback_on,
+            Some(crate::failover::FallbackOn::ExceptUsageLimit)
+        );
+    }
+
+    #[test]
+    fn fallback_filters_round_trip_and_reject_unknown_modes() {
+        for mode in ["any", "usage-limit", "except-usage-limit"] {
+            let config: Config = serde_json::from_value(json!({
+                "retry": {"model_fallback": false, "fallback_on": mode}
+            }))
+            .expect("valid fallback policy");
+            assert!(!config.model_fallback_enabled());
+            assert_eq!(config.retry_fallback_on().as_str(), mode);
+            let encoded = serde_json::to_value(config).expect("serialize");
+            assert_eq!(encoded["retry"]["model_fallback"], false);
+            assert_eq!(encoded["retry"]["fallback_on"], mode);
+        }
+        assert!(
+            serde_json::from_value::<Config>(json!({
+                "retry": {"fallbackOn": "sometimes"}
+            }))
+            .is_err()
+        );
     }
 
     #[test]

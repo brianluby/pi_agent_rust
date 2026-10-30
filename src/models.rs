@@ -110,6 +110,9 @@ impl ModelEntry {
 
     /// Whether this model supports xhigh thinking level.
     pub fn supports_xhigh(&self) -> bool {
+        if let Some(supported) = self.thinking_level_map_supports("xhigh") {
+            return self.model.reasoning && supported;
+        }
         matches!(
             self.model.id.as_str(),
             "gpt-5.1-codex-max"
@@ -126,7 +129,6 @@ impl ModelEntry {
         ) || self.is_deepseek_reasoning_model()
             || self.is_openrouter_reasoning_model()
             || self.is_anthropic_xhigh_effort_model()
-            || self.thinking_level_map_declares("xhigh")
     }
 
     /// Whether this model's thinking level is forwarded as OpenRouter's
@@ -164,17 +166,14 @@ impl ModelEntry {
         })
     }
 
-    /// Whether the catalog's per-model `thinkingLevelMap` declares a mapping
-    /// for the given lowercase thinking-level name. A declared entry is the
-    /// catalog author asserting the model accepts that tier (possibly under a
-    /// different provider vocabulary), so the registry must not clamp it away
-    /// for custom models that hard-coded model-id detection cannot know about
-    /// (gh #165).
-    fn thinking_level_map_declares(&self, level: &str) -> bool {
+    /// A string declares a supported tier; explicit null disables it even if
+    /// a provider heuristic would enable it. An absent key keeps the defaults.
+    fn thinking_level_map_supports(&self, level: &str) -> Option<bool> {
         self.compat
             .as_ref()
             .and_then(|compat| compat.thinking_level_map.as_ref())
-            .is_some_and(|map| map.contains_key(level))
+            .and_then(|map| map.get(level))
+            .map(Option::is_some)
     }
 
     /// Whether this is an Anthropic adaptive-thinking model whose modern
@@ -226,13 +225,15 @@ impl ModelEntry {
     /// family; older OpenAI models continue to clamp `Max` down to `XHigh`.
     /// A catalog `thinkingLevelMap` override can still re-map levels per model.
     pub fn supports_max(&self) -> bool {
+        if let Some(supported) = self.thinking_level_map_supports("max") {
+            return self.model.reasoning && supported;
+        }
         matches!(
             self.model.id.as_str(),
             "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
         ) || self.is_deepseek_reasoning_model()
             || self.is_openrouter_reasoning_model()
             || self.is_anthropic_max_effort_model()
-            || self.thinking_level_map_declares("max")
     }
 
     /// Whether this is an Anthropic adaptive-thinking model whose
@@ -327,6 +328,10 @@ impl ModelEntry {
         if self.supports_max() {
             levels.push(ThinkingLevel::Max);
         }
+        levels.retain(|level| self.thinking_level_map_supports(&level.to_string()) != Some(false));
+        if levels.is_empty() {
+            levels.push(ThinkingLevel::Off);
+        }
         levels
     }
 
@@ -334,27 +339,39 @@ impl ModelEntry {
     ///
     /// Non-reasoning models always return `Off`. Models without max support
     /// downgrade `Max` to `XHigh` (or `High` if xhigh is also unsupported);
-    /// models without xhigh support downgrade `XHigh` to `High`. All other
-    /// levels pass through unchanged.
+    /// models without xhigh support downgrade `XHigh` to `High`. Explicit
+    /// null mappings remove unsupported tiers. Choose the closest supported
+    /// lower tier, or the first supported tier if none is lower.
     pub fn clamp_thinking_level(
         &self,
         thinking: crate::model::ThinkingLevel,
     ) -> crate::model::ThinkingLevel {
+        use crate::model::ThinkingLevel;
+
         if !self.model.reasoning {
             return crate::model::ThinkingLevel::Off;
         }
-        let mut thinking = thinking;
-        if thinking == crate::model::ThinkingLevel::Max && !self.supports_max() {
-            thinking = if self.supports_xhigh() {
-                crate::model::ThinkingLevel::XHigh
-            } else {
-                crate::model::ThinkingLevel::High
-            };
+        let levels = self.available_thinking_levels();
+        let mut lower = None;
+        for candidate in [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::XHigh,
+            ThinkingLevel::Max,
+        ] {
+            if levels.contains(&candidate) {
+                lower = Some(candidate);
+            }
+            if candidate == thinking {
+                break;
+            }
         }
-        if thinking == crate::model::ThinkingLevel::XHigh && !self.supports_xhigh() {
-            return crate::model::ThinkingLevel::High;
-        }
-        thinking
+        lower
+            .or_else(|| levels.first().copied())
+            .unwrap_or(ThinkingLevel::Off)
     }
 }
 
@@ -602,6 +619,12 @@ pub(crate) struct PersistedFetchedProvider {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PersistedFetchedModel {
     pub(crate) id: String,
+    #[serde(
+        default,
+        rename = "reasoningLevels",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) reasoning_levels: Option<Vec<crate::model::ThinkingLevel>>,
 }
 
 fn deserialize_fetched_providers<'de, D>(
@@ -957,7 +980,7 @@ pub struct ModelOverrideConfig {
     pub headers: Option<HashMap<String, String>>,
     pub compat: Option<CompatConfig>,
     pub dialect: Option<crate::dialects::Dialect>,
-    pub thinking_level_map: Option<HashMap<String, String>>,
+    pub thinking_level_map: Option<HashMap<String, Option<String>>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -980,7 +1003,7 @@ pub struct ModelConfig {
     /// folded into the entry's merged [`CompatConfig`] at registry build time.
     /// Declaring a mapping for `xhigh`/`max` also marks the level as supported,
     /// so the registry does not clamp it away for custom models.
-    pub thinking_level_map: Option<HashMap<String, String>>,
+    pub thinking_level_map: Option<HashMap<String, Option<String>>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1023,8 +1046,9 @@ pub struct CompatConfig {
     /// `ThinkingLevel` name
     /// (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`).
     /// Lets the catalog steer a transport's effort serialization without code
-    /// changes (gh #117). When absent, transports apply their built-in mapping.
-    pub thinking_level_map: Option<HashMap<String, String>>,
+    /// changes (gh #117). An explicit null disables that tier; an absent key
+    /// leaves the built-in mapping intact (pi-freeflow, gh #270).
+    pub thinking_level_map: Option<HashMap<String, Option<String>>>,
     /// Force the modern adaptive-thinking API (`thinking: {type: "adaptive"}`
     /// plus `output_config.effort`) instead of the deprecated `budget_tokens`
     /// extended-thinking path. Authoritative over a transport's built-in
@@ -1038,7 +1062,7 @@ pub struct CompatConfig {
     pub thinking_format: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ModelRegistry {
     models: Vec<ModelEntry>,
     error: Option<String>,
@@ -1541,14 +1565,30 @@ pub fn resolve_model_key(
     cli_api_key: Option<&str>,
     auth: &crate::auth::AuthStorage,
     entry: &ModelEntry,
-) -> Option<String> {
-    cli_api_key
-        .and_then(|key| {
-            let trimmed = key.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        })
-        .or_else(|| normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None)))
-        .or_else(|| normalize_api_key_opt(entry.api_key.clone()))
+) -> crate::error::Result<Option<String>> {
+    let resolved = auth
+        .resolve_api_key_status(&entry.model.provider, cli_api_key)
+        .into_result(&entry.model.provider)?;
+    Ok(normalize_api_key_opt(resolved).or_else(|| normalize_api_key_opt(entry.api_key.clone())))
+}
+
+/// Resolve a prospective fallback without reusing the failed request's key.
+/// The projection applies only to its provider's managed pool; explicit pins
+/// and unrelated providers retain the ordinary precedence.
+pub(crate) fn resolve_model_key_after_rate_limit(
+    cli_api_key: Option<&str>,
+    auth: &crate::auth::AuthStorage,
+    entry: &ModelEntry,
+    failed_provider: &str,
+    failed_key: &str,
+) -> crate::error::Result<Option<String>> {
+    if !crate::provider_metadata::provider_ids_match(&entry.model.provider, failed_provider) {
+        return resolve_model_key(cli_api_key, auth, entry);
+    }
+    let resolved = auth
+        .resolve_api_key_after_rate_limit(&entry.model.provider, cli_api_key, failed_key)
+        .into_result(&entry.model.provider)?;
+    Ok(normalize_api_key_opt(resolved).or_else(|| normalize_api_key_opt(entry.api_key.clone())))
 }
 
 pub fn model_requires_configured_credential(entry: &ModelEntry) -> bool {
@@ -1788,58 +1828,7 @@ impl ModelRegistry {
     }
 
     pub fn find(&self, provider: &str, id: &str) -> Option<ModelEntry> {
-        let provider = provider.trim();
-        let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
-        let trimmed_id = id.trim();
-        let is_openrouter = canonical_provider.eq_ignore_ascii_case("openrouter");
-        // Avoid Vec + String allocation for the common (non-OpenRouter) path.
-        let openrouter_ids = if is_openrouter {
-            openrouter_model_lookup_ids(id)
-        } else {
-            Vec::new()
-        };
-        let builtin_model_id_matches = |candidate: &str| {
-            if is_openrouter {
-                let canonical_candidate = canonicalize_openrouter_model_id(candidate);
-                openrouter_ids.iter().any(|lookup_id| {
-                    candidate.eq_ignore_ascii_case(lookup_id)
-                        || canonical_candidate.eq_ignore_ascii_case(lookup_id)
-                })
-            } else {
-                candidate.eq_ignore_ascii_case(trimmed_id)
-            }
-        };
-        // Declared provider IDs are authoritative when they match directly.
-        // Only fall back to built-in alias equivalence when no exact provider
-        // row exists, otherwise two distinct extension IDs such as `azure`
-        // and `azure-openai` become insertion-order dependent.
-        if let Some(entry) = self.models.iter().find(|entry| {
-            entry.model.provider.trim().eq_ignore_ascii_case(provider)
-                && builtin_model_id_matches(&entry.model.id)
-        }) {
-            return Some(entry.clone());
-        }
-        if self
-            .models
-            .iter()
-            .any(|entry| entry.model.provider.trim().eq_ignore_ascii_case(provider))
-        {
-            return None;
-        }
-
-        self.models
-            .iter()
-            .find(|m| {
-                let model_provider = m.model.provider.as_str();
-                let model_provider_canonical =
-                    canonical_provider_id(model_provider).unwrap_or(model_provider);
-                let provider_matches = model_provider.eq_ignore_ascii_case(provider)
-                    || model_provider.eq_ignore_ascii_case(canonical_provider)
-                    || model_provider_canonical.eq_ignore_ascii_case(provider)
-                    || model_provider_canonical.eq_ignore_ascii_case(canonical_provider);
-                provider_matches && builtin_model_id_matches(&m.model.id)
-            })
-            .cloned()
+        find_model_entry(&self.models, provider, id).cloned()
     }
 
     /// Find a model by ID alone (ignoring provider), useful for extension models
@@ -1885,6 +1874,23 @@ impl ModelRegistry {
                 .iter()
                 .any(|m| normalized_registry_key(&m.model.provider, &m.model.id) == entry_key);
             if !exists {
+                self.models.push(entry);
+            }
+        }
+    }
+
+    /// Admit a supplied catalog without replacing existing routes or metadata.
+    /// Declared provider IDs stay distinct even when they are built-in aliases.
+    pub(crate) fn merge_missing_entries(&mut self, entries: Vec<ModelEntry>) {
+        let key = |entry: &ModelEntry| {
+            (
+                entry.model.provider.trim().to_ascii_lowercase(),
+                entry.model.id.trim().to_ascii_lowercase(),
+            )
+        };
+        let mut present: HashSet<_> = self.models.iter().map(key).collect();
+        for entry in entries {
+            if present.insert(key(&entry)) {
                 self.models.push(entry);
             }
         }
@@ -2042,6 +2048,134 @@ impl ModelRegistry {
         }
         Ok(())
     }
+}
+
+/// Find a catalog entry, preferring its exact declared provider over built-in
+/// alias equivalence.
+///
+/// Pass the full catalog before filtering by credentials so an unavailable
+/// declared provider cannot be replaced by an alias's route.
+pub fn find_model_entry<'a>(
+    models: &'a [ModelEntry],
+    provider: &str,
+    id: &str,
+) -> Option<&'a ModelEntry> {
+    let provider = provider.trim();
+    let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
+    let trimmed_id = id.trim();
+    let is_openrouter = canonical_provider.eq_ignore_ascii_case("openrouter");
+    // Avoid Vec + String allocation for the common (non-OpenRouter) path.
+    let openrouter_ids = if is_openrouter {
+        openrouter_model_lookup_ids(id)
+    } else {
+        Vec::new()
+    };
+    let builtin_model_id_matches = |candidate: &str| {
+        if is_openrouter {
+            let canonical_candidate = canonicalize_openrouter_model_id(candidate);
+            openrouter_ids.iter().any(|lookup_id| {
+                candidate.eq_ignore_ascii_case(lookup_id)
+                    || canonical_candidate.eq_ignore_ascii_case(lookup_id)
+            })
+        } else {
+            candidate.eq_ignore_ascii_case(trimmed_id)
+        }
+    };
+    // Declared provider IDs are authoritative when they match directly.
+    // Only fall back to built-in alias equivalence when no exact provider row
+    // exists, otherwise distinct extension IDs become insertion-order dependent.
+    if let Some(entry) = models.iter().find(|entry| {
+        entry.model.provider.trim().eq_ignore_ascii_case(provider)
+            && builtin_model_id_matches(&entry.model.id)
+    }) {
+        return Some(entry);
+    }
+    if models
+        .iter()
+        .any(|entry| entry.model.provider.trim().eq_ignore_ascii_case(provider))
+    {
+        return None;
+    }
+
+    models.iter().find(|entry| {
+        let model_provider = entry.model.provider.as_str();
+        let model_provider_canonical =
+            canonical_provider_id(model_provider).unwrap_or(model_provider);
+        let provider_matches = model_provider.eq_ignore_ascii_case(provider)
+            || model_provider.eq_ignore_ascii_case(canonical_provider)
+            || model_provider_canonical.eq_ignore_ascii_case(provider)
+            || model_provider_canonical.eq_ignore_ascii_case(canonical_provider);
+        provider_matches && builtin_model_id_matches(&entry.model.id)
+    })
+}
+
+/// Resolve a registered destination, allowing unlisted native model IDs.
+///
+/// A separately declared provider can own a name that is also a built-in alias,
+/// such as `open-router` or `gemini`. If that provider does not declare the
+/// requested model, synthesizing the built-in alias's route would discard its
+/// configured endpoint and credentials. Keep the same declared-provider boundary
+/// as [`find_model_entry`] in that case. Native provider IDs and undeclared
+/// aliases retain their ad-hoc behavior. Pass the full catalog before filtering
+/// by credentials.
+pub fn resolve_model_entry(models: &[ModelEntry], provider: &str, id: &str) -> Option<ModelEntry> {
+    let provider = provider.trim();
+    if let Some(entry) = find_model_entry(models, provider, id) {
+        return Some(entry.clone());
+    }
+    if canonical_provider_id(provider)
+        .is_some_and(|canonical| !canonical.eq_ignore_ascii_case(provider))
+        && models
+            .iter()
+            .any(|entry| entry.model.provider.trim().eq_ignore_ascii_case(provider))
+    {
+        return None;
+    }
+    ad_hoc_model_entry(provider, id)
+}
+
+/// Compare resolved destinations without merging separately declared providers.
+///
+/// Native aliases remain equivalent when the catalog does not declare both
+/// spellings independently, including unlisted native model IDs.
+pub fn model_identities_match(
+    models: &[ModelEntry],
+    left_provider: &str,
+    left_model: &str,
+    right_provider: &str,
+    right_model: &str,
+) -> bool {
+    let same_model_id = left_model.trim().eq_ignore_ascii_case(right_model.trim());
+    if same_model_id
+        && left_provider
+            .trim()
+            .eq_ignore_ascii_case(right_provider.trim())
+    {
+        return true;
+    }
+    if let (Some(left), Some(right)) = (
+        find_model_entry(models, left_provider, left_model),
+        find_model_entry(models, right_provider, right_model),
+    ) {
+        return left
+            .model
+            .provider
+            .trim()
+            .eq_ignore_ascii_case(right.model.provider.trim())
+            && left.model.id.eq_ignore_ascii_case(&right.model.id);
+    }
+    let provider_is_declared = |provider: &str| {
+        models.iter().any(|entry| {
+            entry
+                .model
+                .provider
+                .trim()
+                .eq_ignore_ascii_case(provider.trim())
+        })
+    };
+    same_model_id
+        && crate::provider_metadata::provider_ids_match(left_provider, right_provider)
+        && !(provider_is_declared(left_provider) && provider_is_declared(right_provider))
 }
 
 /// Returns `true` when `provider` is the canonical/primary source for a model
@@ -2438,6 +2572,7 @@ fn append_upstream_nonlegacy_models(
                     reasoning,
                     input: defaults.input.to_vec(),
                     cost: ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,
@@ -2540,6 +2675,7 @@ fn built_in_models(
         );
 
         let default_cost = ModelCost {
+            audio: None,
             input: 0.0,
             output: 0.0,
             cache_read: 0.0,
@@ -2635,6 +2771,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -2725,6 +2862,7 @@ fn built_in_models(
                     reasoning: true,
                     input: vec![InputType::Text, InputType::Image],
                     cost: ModelCost {
+                        audio: None,
                         input,
                         output,
                         cache_read,
@@ -2747,6 +2885,56 @@ fn built_in_models(
                 oauth_config: None,
             });
         }
+    }
+
+    // Native Chat Completions audio is a separate model capability, not a
+    // property of every OpenAI-compatible endpoint. Pricing and limits:
+    // https://developers.openai.com/api/docs/models/gpt-audio-1.5
+    if !models
+        .iter()
+        .any(|entry| entry.model.provider == "openai" && entry.model.id == "gpt-audio-1.5")
+    {
+        models.push(ModelEntry {
+            model: Model {
+                id: "gpt-audio-1.5".to_string(),
+                name: "GPT Audio 1.5".to_string(),
+                api: "openai-completions".to_string(),
+                provider: "openai".to_string(),
+                base_url: if mode == ModelRegistryLoadMode::Full {
+                    "https://api.openai.com/v1".to_string()
+                } else {
+                    String::new()
+                },
+                reasoning: false,
+                input: vec![InputType::Text, InputType::Audio],
+                cost: ModelCost {
+                    input: 2.5,
+                    output: 10.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    audio: Some(crate::provider::AudioModelCost {
+                        input: Some(32.0),
+                        output: Some(64.0),
+                        cache_read: None,
+                        cache_write: None,
+                    }),
+                },
+                context_window: 128_000,
+                max_tokens: 16_384,
+                headers: HashMap::new(),
+            },
+            api_key: resolve_provider_api_key_cached(
+                auth,
+                "openai",
+                "openai",
+                &mut canonical_api_key_cache,
+                &mut provider_api_key_cache,
+            ),
+            headers: HashMap::new(),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        });
     }
 
     // Ensure the latest GPT-5 default exists for OpenAI routing.
@@ -2775,6 +2963,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -2820,6 +3009,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -2869,6 +3059,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -2914,6 +3105,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -2959,6 +3151,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3005,6 +3198,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3050,6 +3244,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3090,6 +3285,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3130,6 +3326,7 @@ fn built_in_models(
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3273,6 +3470,17 @@ fn apply_fetched_models(
             )
         })
         .collect::<HashMap<_, _>>();
+    let advertised = config
+        .providers
+        .iter()
+        .flat_map(|(provider, config)| {
+            config
+                .models
+                .iter()
+                .flatten()
+                .map(move |model| (fetched_model_key(provider, &model.id), model))
+        })
+        .collect::<HashMap<_, _>>();
 
     apply_custom_models(auth, models, &config, base_dir);
 
@@ -3280,10 +3488,19 @@ fn apply_fetched_models(
         .iter_mut()
         .filter(|entry| fetched_providers.contains(&canonical_provider_key(&entry.model.provider)))
     {
-        if let Some(existing) =
-            preserved.get(&fetched_model_key(&entry.model.provider, &entry.model.id))
-        {
+        let key = fetched_model_key(&entry.model.provider, &entry.model.id);
+        if let Some(existing) = preserved.get(&key) {
             entry.clone_from(existing);
+        }
+        if let Some(discovered) = advertised.get(&key) {
+            if let Some(reasoning) = discovered.reasoning {
+                entry.model.reasoning = reasoning;
+            }
+            if let Some(levels) = &discovered.thinking_level_map {
+                let compat = entry.compat.get_or_insert_with(CompatConfig::default);
+                compat.thinking_level_map = Some(levels.clone());
+                compat.supports_reasoning_effort = Some(true);
+            }
         }
     }
 }
@@ -3375,7 +3592,10 @@ fn apply_custom_models_with_provider_headers(
                     entry.api_key.clone_from(&provider_key);
                 }
                 if provider_cfg.compat.is_some() {
-                    entry.compat.clone_from(&provider_cfg.compat);
+                    // Field by field, as `modelOverrides` does: an unrelated
+                    // provider setting must not erase discovered reasoning tiers.
+                    entry.compat =
+                        merge_compat(entry.compat.as_ref(), provider_cfg.compat.as_ref());
                 }
                 if provider_cfg.auth_header.is_some() {
                     entry.auth_header = auth_header;
@@ -3433,16 +3653,7 @@ fn apply_custom_models_with_provider_headers(
                 .map_or_else(|| vec![InputType::Text], |defaults| defaults.input.to_vec());
             let input_types = model_cfg.input.as_ref().map_or_else(
                 || default_input_types.clone(),
-                |input| {
-                    input
-                        .iter()
-                        .filter_map(|i| match i.as_str() {
-                            "text" => Some(InputType::Text),
-                            "image" => Some(InputType::Image),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                },
+                |input| parse_input_types(input),
             );
             let input_types = if input_types.is_empty() {
                 default_input_types
@@ -3469,6 +3680,7 @@ fn apply_custom_models_with_provider_headers(
                 }),
                 input: input_types,
                 cost: model_cfg.cost.clone().unwrap_or(ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3626,14 +3838,7 @@ fn apply_model_override(
         entry.model.reasoning = reasoning;
     }
     if let Some(input) = &override_cfg.input {
-        let parsed: Vec<InputType> = input
-            .iter()
-            .filter_map(|value| match value.as_str() {
-                "text" => Some(InputType::Text),
-                "image" => Some(InputType::Image),
-                _ => None,
-            })
-            .collect();
+        let parsed = parse_input_types(input);
         if !parsed.is_empty() {
             entry.model.input = parsed;
         }
@@ -3657,10 +3862,14 @@ fn apply_model_override(
         entry.compat = merge_compat(entry.compat.as_ref(), override_cfg.compat.as_ref());
     }
     if let Some(map) = override_cfg.thinking_level_map.clone() {
+        // Per-level: each entry (`null` withdraws a level) refines the map in
+        // place, a discovered ladder included, rather than replacing it.
         entry
             .compat
             .get_or_insert_with(CompatConfig::default)
-            .thinking_level_map = Some(map);
+            .thinking_level_map
+            .get_or_insert_with(HashMap::new)
+            .extend(map);
     }
     if let Some(dialect) = override_cfg.dialect {
         entry
@@ -3670,7 +3879,7 @@ fn apply_model_override(
     }
 }
 
-fn merge_compat(
+pub(crate) fn merge_compat(
     provider_compat: Option<&CompatConfig>,
     model_compat: Option<&CompatConfig>,
 ) -> Option<CompatConfig> {
@@ -4670,6 +4879,15 @@ fn load_fetched_models_config(
             .models
             .into_iter()
             .map(|model| ModelConfig {
+                reasoning: model.reasoning_levels.as_ref().map(|levels| {
+                    levels
+                        .iter()
+                        .any(|level| *level != crate::model::ThinkingLevel::Off)
+                }),
+                thinking_level_map: model
+                    .reasoning_levels
+                    .as_deref()
+                    .map(fetched_thinking_level_map),
                 id: model.id,
                 ..ModelConfig::default()
             })
@@ -4684,6 +4902,34 @@ fn load_fetched_models_config(
     })
     .collect();
     Ok((ModelsConfig { providers }, binding_errors))
+}
+
+fn fetched_thinking_level_map(
+    levels: &[crate::model::ThinkingLevel],
+) -> HashMap<String, Option<String>> {
+    use crate::model::ThinkingLevel;
+    [
+        ThinkingLevel::Off,
+        ThinkingLevel::Minimal,
+        ThinkingLevel::Low,
+        ThinkingLevel::Medium,
+        ThinkingLevel::High,
+        ThinkingLevel::XHigh,
+        ThinkingLevel::Max,
+    ]
+    .into_iter()
+    .map(|level| {
+        let key = level.to_string();
+        let value = levels.contains(&level).then(|| {
+            if level == ThinkingLevel::Off {
+                "none".to_string()
+            } else {
+                key.clone()
+            }
+        });
+        (key, value)
+    })
+    .collect()
 }
 
 pub(crate) fn parse_persisted_fetched_catalog(
@@ -4759,6 +5005,22 @@ pub(crate) fn validate_persisted_fetched_catalog(
             )));
         }
         for model in &fetched.models {
+            if let Some(levels) = &model.reasoning_levels {
+                if levels.is_empty() || levels.len() > 7 {
+                    return Err(Error::config(
+                        "Generated model reasoning levels must contain one to seven tiers",
+                    ));
+                }
+                if levels
+                    .iter()
+                    .enumerate()
+                    .any(|(index, level)| levels[..index].contains(level))
+                {
+                    return Err(Error::config(
+                        "Generated model reasoning levels contain duplicate tiers",
+                    ));
+                }
+            }
             if !is_safe_model_catalog_identifier(&model.id, MAX_FETCHED_MODEL_ID_BYTES) {
                 return Err(Error::config(format!(
                     "Generated model catalog contains an invalid model ID for provider {provider:?}"
@@ -4847,6 +5109,7 @@ where
                 reasoning: effective_reasoning(model_id, true),
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -4880,6 +5143,7 @@ where
             reasoning,
             input: defaults.input.to_vec(),
             cost: ModelCost {
+                audio: None,
                 input: 0.0,
                 output: 0.0,
                 cache_read: 0.0,
@@ -5265,6 +5529,59 @@ mod tests {
             ]
         );
         assert_eq!(parse_input_types(&["hologram".to_string()]), Vec::new());
+    }
+
+    #[test]
+    fn model_overrides_preserve_audio_and_video_inputs() {
+        let (_directory, auth) = test_auth_storage();
+        let custom: ModelsConfig = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "audio-fixture": {
+                    "api": "openai-completions",
+                    "baseUrl": "http://127.0.0.1:1/v1",
+                    "models": [{
+                        "id": "listen",
+                        "input": ["text", "AUDIO", "video", "audio"],
+                        "cost": {
+                            "input": 2.5, "output": 10, "cacheRead": 0, "cacheWrite": 0,
+                            "audio": {"input": 0}
+                        }
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+        let mut entries = Vec::new();
+        apply_custom_models(&auth, &mut entries, &custom, None);
+        let entry = entries.first().expect("custom audio model");
+        assert_eq!(
+            entry.model.input,
+            [InputType::Text, InputType::Audio, InputType::Video]
+        );
+        assert_eq!(entry.model.cost.audio.as_ref().unwrap().input, Some(0.0));
+        assert!(entry.model.cost.is_priced());
+
+        let patch: ModelOverrideConfig = serde_json::from_value(serde_json::json!({
+            "input": ["audio", "text", "AUDIO"],
+            "cost": {"input": 2.5, "output": 10, "cacheRead": 0, "cacheWrite": 0, "audio": {"input": 32}}
+        })).unwrap();
+        apply_model_override(&mut entries[0], &patch, None);
+        assert_eq!(entries[0].model.input, [InputType::Audio, InputType::Text]);
+        assert_eq!(
+            entries[0].model.cost.audio.as_ref().unwrap().input,
+            Some(32.0)
+        );
+
+        let builtins = built_in_models(&auth, ModelRegistryLoadMode::Full);
+        let native = builtins
+            .iter()
+            .find(|entry| entry.model.provider == "openai" && entry.model.id == "gpt-audio-1.5")
+            .expect("native audio model");
+        assert_eq!(native.model.api, "openai-completions");
+        assert_eq!(native.model.input, [InputType::Text, InputType::Audio]);
+        assert_eq!(native.model.cost.audio.as_ref().unwrap().input, Some(32.0));
+        assert_eq!(native.model.cost.audio.as_ref().unwrap().output, Some(64.0));
+        assert_eq!(native.model.context_window, 128_000);
     }
 
     #[test]
@@ -5660,6 +5977,7 @@ mod tests {
                 reasoning: false,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -5714,6 +6032,7 @@ mod tests {
                 reasoning: false,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -6379,6 +6698,136 @@ mod tests {
     }
 
     #[test]
+    fn model_registry_ad_hoc_resolution_keeps_declared_alias_destinations() {
+        for (declared_provider, native_provider) in
+            [("open-router", "openrouter"), ("gemini", "google")]
+        {
+            let native = ad_hoc_model_entry_with_sap_resolver(native_provider, "shared", || None)
+                .expect("native model template");
+            let mut native_only = native.clone();
+            native_only.model.id = "native-only".to_string();
+            let mut declared = native.clone();
+            declared.model.provider = declared_provider.to_string();
+            declared.model.base_url = "https://declared.example.test/v1".to_string();
+            declared
+                .headers
+                .insert("x-route".to_string(), "declared".to_string());
+
+            for api_key in [None, Some(String::new()), Some("declared-key".to_string())] {
+                declared.api_key.clone_from(&api_key);
+                for reverse in [false, true] {
+                    let mut entries = vec![native.clone(), native_only.clone(), declared.clone()];
+                    if reverse {
+                        entries.reverse();
+                    }
+                    let registry = ModelRegistry::from_entries_for_tests(entries);
+                    let request = format!(" {} ", declared_provider.to_ascii_uppercase());
+                    let selected = resolve_model_entry(registry.models(), &request, "shared")
+                        .expect("registered declared destination");
+                    assert_eq!(selected.model.provider, declared_provider);
+                    assert_eq!(selected.model.base_url, declared.model.base_url);
+                    assert_eq!(selected.api_key, api_key);
+                    assert_eq!(selected.headers, declared.headers);
+                    assert!(
+                        resolve_model_entry(registry.models(), &request, "native-only").is_none()
+                    );
+                    assert!(resolve_model_entry(registry.models(), &request, "unlisted").is_none());
+                    let native_selected =
+                        resolve_model_entry(registry.models(), native_provider, "native-only")
+                            .expect("explicit native destination");
+                    assert_eq!(native_selected.model.provider, native_provider);
+                    assert_eq!(native_selected.model.base_url, native.model.base_url);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn model_registry_ad_hoc_resolution_preserves_native_models_and_undeclared_aliases() {
+        let entries = ["openai", "openrouter", "google", "ollama"]
+            .into_iter()
+            .map(|provider| {
+                ad_hoc_model_entry_with_sap_resolver(provider, "registered", || None)
+                    .expect("native model template")
+            })
+            .collect();
+        let registry = ModelRegistry::from_entries_for_tests(entries);
+        for (provider, canonical) in [
+            ("openai", "openai"),
+            ("openrouter", "openrouter"),
+            ("open-router", "openrouter"),
+            ("gemini", "google"),
+            ("ollama", "ollama"),
+        ] {
+            let registered = resolve_model_entry(registry.models(), provider, "registered")
+                .expect("registered native model");
+            assert_eq!(registered.model.provider, canonical);
+            let unlisted = resolve_model_entry(registry.models(), provider, "vendor/new-model")
+                .expect("unlisted native model");
+            assert_eq!(unlisted.model.provider, provider);
+            assert_eq!(unlisted.model.id, "vendor/new-model");
+            assert_eq!(unlisted.model.base_url, registered.model.base_url);
+            if provider == "ollama" {
+                assert!(!unlisted.auth_header);
+                assert!(model_entry_is_ready(&unlisted));
+            }
+        }
+        assert!(resolve_model_entry(registry.models(), "unregistered-provider", "model").is_none());
+    }
+
+    #[test]
+    fn model_identity_comparison_keeps_declared_aliases_distinct() {
+        let native = ad_hoc_model_entry_with_sap_resolver("openrouter", "shared", || None)
+            .expect("native model template");
+        let mut declared = native.clone();
+        declared.model.provider = "open-router".to_string();
+        for entries in [
+            vec![native.clone(), declared.clone()],
+            vec![declared, native.clone()],
+        ] {
+            assert!(model_identities_match(
+                &entries,
+                " OPEN-ROUTER ",
+                " SHARED ",
+                "open-router",
+                "shared",
+            ));
+            for model in ["shared", "unlisted"] {
+                assert!(!model_identities_match(
+                    &entries,
+                    "open-router",
+                    model,
+                    "openrouter",
+                    model,
+                ));
+                assert!(!model_identities_match(
+                    &entries,
+                    "openrouter",
+                    model,
+                    "open-router",
+                    model,
+                ));
+            }
+        }
+        for model in ["shared", "unlisted"] {
+            assert!(model_identities_match(
+                std::slice::from_ref(&native),
+                "open-router",
+                model,
+                "openrouter",
+                model,
+            ));
+        }
+        assert!(!model_identities_match(
+            std::slice::from_ref(&native),
+            "open-router",
+            "shared",
+            "openrouter",
+            "different",
+        ));
+    }
+
+    #[test]
     fn ad_hoc_model_entry_normalizes_openrouter_aliases() {
         let auto = ad_hoc_model_entry("openrouter", "auto").expect("openrouter auto ad-hoc");
         assert_eq!(auto.model.id, "openrouter/auto");
@@ -6407,6 +6856,7 @@ mod tests {
                 reasoning: true,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -6445,6 +6895,54 @@ mod tests {
 
         registry.merge_entries(vec![alias_case_variant]);
         assert_eq!(registry.models().len(), before);
+    }
+
+    #[test]
+    fn model_registry_admission_preserves_declared_aliases_and_existing_metadata() {
+        let mut original = ad_hoc_model_entry("openai", "shared").expect("model template");
+        original.model.provider = "azure-openai".to_string();
+        original.model.base_url = "https://original.example.test/v1".to_string();
+        original.api_key = Some("original-key".to_string());
+        original
+            .headers
+            .insert("x-route".to_string(), "original".to_string());
+        original.oauth_config = Some(OAuthConfig {
+            auth_url: "https://original.example.test/authorize".to_string(),
+            token_url: "https://original.example.test/token".to_string(),
+            client_id: "original-client".to_string(),
+            scopes: vec!["models:use".to_string()],
+            redirect_uri: None,
+        });
+        let mut duplicate = original.clone();
+        duplicate.model.provider = " AZURE-OPENAI ".to_string();
+        duplicate.model.id = " SHARED ".to_string();
+        duplicate.model.base_url = "https://replacement.example.test/v1".to_string();
+        duplicate.api_key = None;
+        duplicate.headers.clear();
+        duplicate.oauth_config = None;
+        let mut declared = duplicate.clone();
+        declared.model.provider = "azure".to_string();
+        declared.model.id = "shared".to_string();
+
+        let mut registry = ModelRegistry::from_entries_for_tests(vec![original.clone()]);
+        registry.merge_missing_entries(vec![duplicate, declared.clone(), declared]);
+
+        assert_eq!(registry.models().len(), 2);
+        let retained = registry
+            .find("azure-openai", "shared")
+            .expect("original route");
+        assert_eq!(retained.model.base_url, original.model.base_url);
+        assert_eq!(retained.api_key, original.api_key);
+        assert_eq!(retained.headers, original.headers);
+        assert_eq!(retained.oauth_config, original.oauth_config);
+        let admitted = registry
+            .find("azure", "shared")
+            .expect("distinct admitted route");
+        assert_eq!(admitted.model.provider, "azure");
+        assert_eq!(
+            admitted.model.base_url,
+            "https://replacement.example.test/v1"
+        );
     }
 
     #[test]
@@ -7499,6 +7997,66 @@ mod tests {
     }
 
     #[test]
+    fn generated_reasoning_capabilities_are_bounded_and_cannot_supply_config() {
+        let catalog = |row: serde_json::Value| {
+            serde_json::json!({
+                "schema": FETCHED_MODELS_SCHEMA,
+                "providers": {"openai": {
+                    "routeFingerprint": format!("sha256:{}", "0".repeat(64)),
+                    "fetchedAtUnixMs": 1,
+                    "models": [row]
+                }}
+            })
+            .to_string()
+        };
+        for levels in [
+            serde_json::json!([]),
+            serde_json::json!(["high", "high"]),
+            serde_json::json!([
+                "off", "minimal", "low", "medium", "high", "xhigh", "max", "low"
+            ]),
+            serde_json::json!(["unknown"]),
+            serde_json::json!([{"effort": "high"}]),
+            serde_json::json!("high"),
+        ] {
+            assert!(
+                parse_persisted_fetched_catalog(&catalog(serde_json::json!({
+                    "id": "new-model", "reasoningLevels": levels
+                })))
+                .is_err(),
+                "invalid persisted tiers: {levels}"
+            );
+        }
+        for (field, value) in [
+            ("baseUrl", serde_json::json!("https://untrusted.example/v1")),
+            ("headers", serde_json::json!({"Authorization": "secret"})),
+            (
+                "compat",
+                serde_json::json!({"supportsReasoningEffort": true}),
+            ),
+            ("thinkingLevelMap", serde_json::json!({"high": "arbitrary"})),
+            ("reasoning", serde_json::json!(true)),
+        ] {
+            let mut row = serde_json::json!({"id": "new-model", "reasoningLevels": ["high"]});
+            row[field] = value;
+            assert!(
+                parse_persisted_fetched_catalog(&catalog(row)).is_err(),
+                "unauthorized field: {field}"
+            );
+        }
+        let valid = parse_persisted_fetched_catalog(&catalog(serde_json::json!({
+            "id": "new-model", "reasoningLevels": ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        }))).expect("all seven canonical tiers are allowed");
+        assert_eq!(
+            valid.providers["openai"].models[0]
+                .reasoning_levels
+                .as_ref()
+                .map(Vec::len),
+            Some(7)
+        );
+    }
+
+    #[test]
     fn model_catalog_discovery_rejects_custom_provider_without_explicit_endpoint() {
         let dir = tempdir().expect("tempdir");
         let models_path = dir.path().join("models.json");
@@ -7891,6 +8449,109 @@ mod tests {
     }
 
     #[test]
+    fn fetched_reasoning_overlays_preserved_metadata_and_can_disable_reasoning() {
+        use crate::model::ThinkingLevel;
+
+        let (dir, auth) = test_auth_storage();
+        let baseline = ModelRegistry::load(&auth, None);
+        let models_path = dir.path().join("models.json");
+        let route = resolve_model_catalog_provider_config("openai", &models_path)
+            .expect("resolve OpenAI route")
+            .expect("built-in OpenAI route");
+        let mut provider = fetched_provider_json("openai", &route, &["gpt-4o", "gpt-5.6"]);
+        provider["models"][0]["reasoningLevels"] = serde_json::json!(["xhigh"]);
+        provider["models"][1]["reasoningLevels"] = serde_json::json!(["off"]);
+        std::fs::write(
+            fetched_models_path(&models_path),
+            serde_json::json!({
+                "schema": FETCHED_MODELS_SCHEMA, "providers": {"openai": provider}
+            })
+            .to_string(),
+        )
+        .expect("write advertised reasoning");
+        let registry = ModelRegistry::load(&auth, Some(models_path));
+        assert!(registry.error().is_none(), "{:?}", registry.error());
+        for (id, reasoning, levels) in [
+            ("gpt-4o", true, vec![ThinkingLevel::XHigh]),
+            ("gpt-5.6", false, vec![ThinkingLevel::Off]),
+        ] {
+            let mut expected = baseline.find("openai", id).expect("baseline model").model;
+            expected.reasoning = reasoning;
+            let discovered = registry.find("openai", id).expect("discovered known model");
+            assert_eq!(
+                serde_json::to_value(&discovered.model).expect("discovered metadata"),
+                serde_json::to_value(expected).expect("baseline metadata"),
+                "all other model metadata must survive the capability overlay"
+            );
+            assert_eq!(discovered.available_thinking_levels(), levels);
+            let compat = discovered
+                .compat
+                .as_ref()
+                .expect("advertised compatibility");
+            assert_eq!(compat.supports_reasoning_effort, Some(true));
+            assert_eq!(
+                compat.thinking_level_map.as_ref().map(HashMap::len),
+                Some(7)
+            );
+        }
+    }
+
+    #[test]
+    fn models_json_overrides_refine_discovered_reasoning_tiers() {
+        use crate::model::ThinkingLevel;
+
+        let (dir, auth) = test_auth_storage();
+        let models_path = dir.path().join("models.json");
+        std::fs::write(
+            &models_path,
+            serde_json::json!({"providers": {"openai": {
+                "compat": {"maxTokensField": "max_completion_tokens"},
+                "modelOverrides": {"gpt-4o": {"thinkingLevelMap": {"xhigh": null}}}
+            }}})
+            .to_string(),
+        )
+        .expect("write models.json");
+        let route = resolve_model_catalog_provider_config("openai", &models_path)
+            .expect("resolve OpenAI route")
+            .expect("built-in OpenAI route");
+        let mut provider = fetched_provider_json("openai", &route, &["gpt-4o"]);
+        provider["models"][0]["reasoningLevels"] =
+            serde_json::json!(["low", "medium", "high", "xhigh"]);
+        std::fs::write(
+            fetched_models_path(&models_path),
+            serde_json::json!({
+                "schema": FETCHED_MODELS_SCHEMA, "providers": {"openai": provider}
+            })
+            .to_string(),
+        )
+        .expect("write advertised reasoning");
+        let registry = ModelRegistry::load(&auth, Some(models_path));
+        assert_eq!(registry.error(), None);
+        let entry = registry.find("openai", "gpt-4o").expect("discovered model");
+        let compat = entry.compat.as_ref().expect("merged compatibility");
+        // The provider's unrelated setting merges with the discovered tiers.
+        assert_eq!(
+            compat.max_tokens_field.as_deref(),
+            Some("max_completion_tokens")
+        );
+        assert_eq!(compat.supports_reasoning_effort, Some(true));
+        // The null entry withdraws xhigh and nothing else: off and minimal,
+        // which the model never advertised, stay withdrawn.
+        assert_eq!(
+            compat.thinking_level_map.as_ref().map(HashMap::len),
+            Some(7)
+        );
+        assert_eq!(
+            entry.available_thinking_levels(),
+            vec![
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High
+            ]
+        );
+    }
+
+    #[test]
     fn fetched_catalog_rejects_wrong_schema_and_user_only_fields() {
         let (dir, auth) = test_auth_storage();
         let models_path = dir.path().join("models.json");
@@ -8186,6 +8847,7 @@ mod tests {
                 reasoning,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -8697,8 +9359,8 @@ mod tests {
         let mut entry = make_model_entry("my-custom-reasoner", true);
         entry.compat = Some(CompatConfig {
             thinking_level_map: Some(HashMap::from([
-                ("xhigh".to_string(), "high".to_string()),
-                ("max".to_string(), "ultra".to_string()),
+                ("xhigh".to_string(), Some("high".to_string())),
+                ("max".to_string(), Some("ultra".to_string())),
             ])),
             ..CompatConfig::default()
         });
@@ -8734,7 +9396,10 @@ mod tests {
         use crate::model::ThinkingLevel;
         let mut entry = make_model_entry("my-custom-reasoner", true);
         entry.compat = Some(CompatConfig {
-            thinking_level_map: Some(HashMap::from([("xhigh".to_string(), "max".to_string())])),
+            thinking_level_map: Some(HashMap::from([(
+                "xhigh".to_string(),
+                Some("max".to_string()),
+            )])),
             ..CompatConfig::default()
         });
         assert!(entry.supports_xhigh());
@@ -8749,6 +9414,77 @@ mod tests {
         assert_eq!(
             bare.clamp_thinking_level(ThinkingLevel::XHigh),
             ThinkingLevel::High
+        );
+    }
+
+    #[test]
+    fn nullable_thinking_map_filters_and_clamps_freeflow_efforts() {
+        use crate::model::ThinkingLevel;
+        let mut entry = make_model_entry("ovh-free/gpt-oss-120b", true);
+        entry.model.api = "openai-completions".to_string();
+        entry.compat = Some(
+            serde_json::from_value(serde_json::json!({
+                "supportsReasoningEffort": true,
+                "thinkingLevelMap": {
+                    "off": null, "minimal": null, "low": "low", "medium": null,
+                    "high": "high", "xhigh": null, "max": null
+                }
+            }))
+            .expect("nullable map"),
+        );
+        assert_eq!(
+            entry.available_thinking_levels(),
+            vec![ThinkingLevel::Low, ThinkingLevel::High]
+        );
+        for level in [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Medium,
+        ] {
+            assert_eq!(entry.clamp_thinking_level(level), ThinkingLevel::Low);
+        }
+        for level in [
+            ThinkingLevel::High,
+            ThinkingLevel::XHigh,
+            ThinkingLevel::Max,
+        ] {
+            assert_eq!(entry.clamp_thinking_level(level), ThinkingLevel::High);
+        }
+
+        // Explicit null wins over the OpenRouter heuristic; a missing key
+        // still inherits it, so existing partial maps retain their meaning.
+        entry.compat = Some(
+            serde_json::from_value(serde_json::json!({
+                "thinkingFormat": "openrouter",
+                "thinkingLevelMap": { "max": null }
+            }))
+            .expect("partial nullable map"),
+        );
+        assert!(entry.supports_xhigh());
+        assert!(!entry.supports_max());
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Max),
+            ThinkingLevel::XHigh
+        );
+    }
+
+    #[test]
+    fn all_disabled_thinking_tiers_have_a_non_panicking_fallback() {
+        use crate::model::ThinkingLevel;
+        let mut entry = make_model_entry("disabled-reasoner", true);
+        entry.compat = Some(
+            serde_json::from_value(serde_json::json!({
+                "thinkingLevelMap": {
+                    "off": null, "minimal": null, "low": null, "medium": null,
+                    "high": null, "xhigh": null, "max": null
+                }
+            }))
+            .expect("nullable map"),
+        );
+        assert_eq!(entry.available_thinking_levels(), vec![ThinkingLevel::Off]);
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Max),
+            ThinkingLevel::Off
         );
     }
 
@@ -8841,13 +9577,13 @@ mod tests {
                         compat: Some(CompatConfig {
                             thinking_level_map: Some(HashMap::from([(
                                 "xhigh".to_string(),
-                                "compat-loses".to_string(),
+                                Some("compat-loses".to_string()),
                             )])),
                             ..CompatConfig::default()
                         }),
                         thinking_level_map: Some(HashMap::from([(
                             "xhigh".to_string(),
-                            "high".to_string(),
+                            Some("high".to_string()),
                         )])),
                         ..ModelConfig::default()
                     }]),
@@ -8867,7 +9603,7 @@ mod tests {
             .as_ref()
             .and_then(|compat| compat.thinking_level_map.as_ref())
             .expect("thinkingLevelMap should be carried on merged compat");
-        assert_eq!(map.get("xhigh").map(String::as_str), Some("high"));
+        assert_eq!(map.get("xhigh").and_then(Option::as_deref), Some("high"));
         assert!(
             entry.supports_xhigh(),
             "declared xhigh mapping must survive clamping"
@@ -10191,6 +10927,7 @@ mod tests {
                     context_window: 128_000,
                     max_tokens: 4096,
                     cost: ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,
@@ -10305,6 +11042,7 @@ mod tests {
                     context_window: 128_000,
                     max_tokens: 4096,
                     cost: ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,

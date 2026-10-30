@@ -11,8 +11,151 @@
 //! (401/403/invalid key) NEVER trigger failover — they are loud user errors,
 //! not provider capacity problems.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+pub(crate) mod provider_code;
+
+/// Pair recovery events independently of the counters used to admit attempts.
+/// A new retry or fallback closes the preceding unsuccessful attempt before
+/// announcing its successor. Resetting a provider's retry budget cannot lose
+/// an open lifecycle, and duplicate terminal events cannot close it twice.
+#[derive(Default)]
+pub(crate) struct RecoveryEventLifecycle {
+    retry: Option<u32>,
+    fallback: Option<(String, String)>,
+}
+
+impl RecoveryEventLifecycle {
+    fn end_retry(
+        &mut self,
+        success: bool,
+        error: Option<String>,
+    ) -> Option<crate::agent::AgentEvent> {
+        self.retry
+            .take()
+            .map(|attempt| crate::agent::AgentEvent::AutoRetryEnd {
+                success,
+                attempt,
+                final_error: error,
+            })
+    }
+
+    fn end_fallback(&mut self, success: bool) -> Option<crate::agent::AgentEvent> {
+        self.fallback
+            .take()
+            .map(|(provider, model)| crate::agent::AgentEvent::FailoverEnd {
+                success,
+                provider,
+                model,
+                restored_primary: false,
+            })
+    }
+
+    /// At most two closers precede the input event. Non-recovery events pass
+    /// through unchanged; the execution surface still owns AgentStart/End.
+    pub(crate) fn observe(
+        &mut self,
+        mut event: crate::agent::AgentEvent,
+    ) -> [Option<crate::agent::AgentEvent>; 3] {
+        use crate::agent::AgentEvent;
+
+        let mut retry_end = None;
+        let mut fallback_end = None;
+        let forward = match &mut event {
+            AgentEvent::AutoRetryStart {
+                attempt,
+                error_message,
+                ..
+            } => {
+                retry_end = self.end_retry(false, Some(error_message.clone()));
+                self.retry = Some(*attempt);
+                true
+            }
+            AgentEvent::AutoRetryEnd { attempt, .. } => {
+                let matches = self.retry == Some(*attempt);
+                if matches {
+                    self.retry = None;
+                }
+                matches
+            }
+            AgentEvent::FailoverStart {
+                to_provider,
+                to_model,
+                ..
+            } => {
+                retry_end = self.end_retry(false, Some("Retry budget exhausted".to_string()));
+                fallback_end = self.end_fallback(false);
+                self.fallback = Some((to_provider.clone(), to_model.clone()));
+                true
+            }
+            AgentEvent::FailoverEnd {
+                provider,
+                model,
+                restored_primary: false,
+                ..
+            } => self.fallback.take().is_some_and(|target| {
+                // The matching Start owns this identity even if a later
+                // runtime transition changed the currently installed model.
+                (*provider, *model) = target;
+                true
+            }),
+            _ => true,
+        };
+        [retry_end, fallback_end, forward.then_some(event)]
+    }
+
+    pub(crate) fn finish(
+        &mut self,
+        success: bool,
+        error: Option<String>,
+    ) -> [Option<crate::agent::AgentEvent>; 2] {
+        [self.end_retry(success, error), self.end_fallback(success)]
+    }
+}
+
+/// A shared recovery-event sink for drivers with separate provider-attempt
+/// callbacks. Keep one sink for the whole logical request, including every
+/// provider hop, and finish it with the request's actual terminal outcome.
+pub struct RecoveryEventStream {
+    lifecycle: Mutex<RecoveryEventLifecycle>,
+    output: Arc<dyn Fn(crate::agent::AgentEvent) + Send + Sync>,
+}
+
+impl RecoveryEventStream {
+    #[must_use]
+    pub fn new(output: impl Fn(crate::agent::AgentEvent) + Send + Sync + 'static) -> Self {
+        Self {
+            lifecycle: Mutex::new(RecoveryEventLifecycle::default()),
+            output: Arc::new(output),
+        }
+    }
+
+    pub fn emit(&self, event: crate::agent::AgentEvent) {
+        let events = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(event);
+        // The callback may inspect the driver or emit another event. It must
+        // never run while the lifecycle mutex is held.
+        for event in events.into_iter().flatten() {
+            (self.output)(event);
+        }
+    }
+
+    pub fn finish(&self, success: bool, error: Option<String>) {
+        let events = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .finish(success, error);
+        for event in events.into_iter().flatten() {
+            (self.output)(event);
+        }
+    }
+}
 
 /// Failure classes relevant to failover decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +166,124 @@ pub enum FailoverClass {
     Overload,
     /// Other transient failures after the retry budget is spent.
     Transient,
+}
+
+/// Which eligible provider failures may switch to a fallback model.
+/// Same-provider retries keep their own classification and budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FallbackOn {
+    #[default]
+    Any,
+    UsageLimit,
+    ExceptUsageLimit,
+}
+
+impl FallbackOn {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::UsageLimit => "usage-limit",
+            Self::ExceptUsageLimit => "except-usage-limit",
+        }
+    }
+
+    /// Filter an already eligible provider failure. This never makes an
+    /// authentication, context, or durability failure eligible for recovery.
+    #[must_use]
+    pub fn allows(self, error_text: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::UsageLimit => is_usage_limit(error_text),
+            Self::ExceptUsageLimit => !is_usage_limit(error_text),
+        }
+    }
+}
+
+/// Account or subscription exhaustion, distinct from short rate/concurrency
+/// throttles. A bare 402/429 carries no finer evidence; explicit throttle
+/// wording takes precedence over ambiguous quota language.
+fn is_usage_limit(error_text: &str) -> bool {
+    let lower = error_text.to_ascii_lowercase();
+    let status = recovery_http_status(&lower);
+    // Google quota ids name their window (`GenerateRequestsPerMinutePer...`)
+    // while the message says "quota exceeded" either way. A daily quota in
+    // the same body is real exhaustion.
+    let windowed_quota =
+        (lower.contains("perminute") || lower.contains("persecond")) && !lower.contains("perday");
+    if status != Some(402)
+        && ([
+            "per minute",
+            "per-minute",
+            "per second",
+            "per-second",
+            "requests/min",
+            "tokens/min",
+            "concurrent",
+            "concurrency",
+            "throttling.allocationquota",
+        ]
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+            || lower
+                .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                .any(|token| matches!(token, "rpm" | "tpm" | "rps" | "tps"))
+            || windowed_quota)
+    {
+        return false;
+    }
+    if is_quota_exhaustion(&lower)
+        || [
+            "usage_limit",
+            "usage limit",
+            "daily limit",
+            "weekly limit",
+            "monthly limit",
+            "daily quota",
+            "weekly quota",
+            "monthly quota",
+            "subscription limit",
+        ]
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
+        return true;
+    }
+    if !matches!(status, Some(402 | 429)) {
+        return false;
+    }
+    let headline = lower
+        .strip_prefix("provider error: ")
+        .map_or(lower.as_str(), |rest| {
+            rest.split_once(": ").map_or(rest, |(_, message)| message)
+        });
+    // Providers wrap the body as `<Vendor> API error (HTTP 429): <body>`.
+    // The vendor names the provider, not the failure; only the body counts.
+    let headline = headline
+        .split_once("api error (")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map_or(headline, |(_, body)| body);
+    headline
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .filter(|token| !token.is_empty())
+        .all(|token| {
+            matches!(
+                token,
+                "api"
+                    | "http"
+                    | "https"
+                    | "status"
+                    | "error"
+                    | "code"
+                    | "response"
+                    | "message"
+                    | "no"
+                    | "body"
+                    | "402"
+                    | "429"
+            )
+        })
 }
 
 /// Recognize response status evidence, never a numeric substring in an id.
@@ -90,17 +351,32 @@ fn is_quota_exhaustion(lower: &str) -> bool {
         "quota exceeded",
         "quota_exceeded",
         "quota has been exceeded",
+        "quota exhausted",
+        "quota_exhausted",
+        "quota will reset",
+        "exhausted your capacity",
         "billing hard limit",
         "billing_not_active",
         "not enough credits",
         "credit balance is too low",
         "spending limit",
+        "spending cap",
+        "usage_limit_reached",
+        "usage limit reached",
+        "usage limit exceeded",
+        "insufficient credits",
+        "credits exhausted",
+        "out of credits",
+        "prepaid balance is used up",
     ]
     .iter()
     .any(|pattern| lower.contains(pattern))
 }
 
 fn response_refuses_retry(lower: &str) -> bool {
+    if let Some(class) = provider_code::connect_recovery(lower) {
+        return class.is_none();
+    }
     recovery_http_status(lower)
         .is_some_and(|status| (400..=499).contains(&status) && !matches!(status, 408 | 429))
 }
@@ -113,8 +389,13 @@ fn provider_text_is_retryable(
     usage_input_tokens: Option<u64>,
     context_window: Option<u32>,
 ) -> bool {
-    if crate::error::is_context_overflow(error_text, usage_input_tokens, context_window) {
+    if marks_credential_pool_exhausted(error_text)
+        || crate::error::is_context_overflow(error_text, usage_input_tokens, context_window)
+    {
         return false;
+    }
+    if let Some(class) = provider_code::connect_recovery(error_text) {
+        return class.is_some();
     }
     let lower = error_text.to_ascii_lowercase();
     if let Some(status) = recovery_http_status(&lower)
@@ -208,10 +489,20 @@ pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
     if is_auth_failure(&text) {
         return None;
     }
-    if is_quota_exhaustion(&text) {
+    // A validated Connect code is the response classification, not an HTTP
+    // status inferred from its explanation. Refusals above still win.
+    if let Some(class) = provider_code::connect_recovery(error_text) {
+        return class;
+    }
+    // Broad usage-limit labels can describe invalid request fields. Only
+    // concrete exhaustion evidence may override a permanent client response.
+    let status = recovery_http_status(&text);
+    let usage_label_is_eligible = status
+        .is_none_or(|status| !(400..=499).contains(&status) || matches!(status, 402 | 408 | 429));
+    if is_quota_exhaustion(&text) || (usage_label_is_eligible && is_usage_limit(&text)) {
         return Some(FailoverClass::Quota);
     }
-    if let Some(status) = recovery_http_status(&text) {
+    if let Some(status) = status {
         match status {
             408 | 504 => return Some(FailoverClass::Transient),
             429 => return Some(FailoverClass::Quota),
@@ -240,62 +531,195 @@ pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
 /// One resolved chain: the specs the controller walks on failure.
 #[derive(Debug, Clone)]
 pub struct FailoverChain {
-    /// Ordered `provider/model` specs after the primary.
+    /// Ordered `provider/model[:thinking]` specs after the primary.
     pub entries: Vec<String>,
+}
+
+/// The host's recovery policy captured when native child work is admitted.
+/// Role ownership is explicit provenance, never inferred from a model ID.
+/// The wire representation contains routing settings only, never credentials.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildFallbackPolicy {
+    role: String,
+    retry: crate::config::RetrySettings,
+    disabled_providers: Vec<String>,
+}
+
+impl ChildFallbackPolicy {
+    /// Freeze both host and task workspace exclusions before isolation changes
+    /// the child's cwd. An absent map is frozen as an empty map as well.
+    #[must_use]
+    pub fn capture(
+        config: &crate::config::Config,
+        role: crate::models::ModelRole,
+        directories: &[&std::path::Path],
+    ) -> Self {
+        let mut retry = config.retry.clone().unwrap_or_default();
+        retry.fallback_chains.get_or_insert_with(HashMap::new);
+        let mut disabled_providers = config.disabled_providers.clone().unwrap_or_default();
+        if let Some(overrides) = config.model_scope_overrides.as_deref() {
+            for directory in directories {
+                if let Some(scope) = best_scope_override(overrides, directory)
+                    && let Some(disabled) = scope.disabled_providers.as_ref()
+                {
+                    disabled_providers.extend(disabled.iter().cloned());
+                }
+            }
+        }
+        disabled_providers.sort();
+        disabled_providers.dedup();
+        Self {
+            role: role.as_str().to_string(),
+            retry,
+            disabled_providers,
+        }
+    }
+
+    /// Validate and bound the hidden process argument before publishing work.
+    pub fn to_cli_arg(&self) -> Result<String, String> {
+        let encoded = serde_json::to_string(self)
+            .map_err(|_| "could not encode child fallback policy".to_string())?;
+        if encoded.len() > 32 * 1024 {
+            return Err("child fallback policy exceeds 32 KiB".to_string());
+        }
+        Ok(encoded)
+    }
+
+    /// Startup recovery drivers use this same snapshot for their retry gates,
+    /// cooldowns and budgets even when the child has a different working tree.
+    pub fn apply_to_config(&self, config: &mut crate::config::Config) {
+        config.retry = Some(self.retry.clone());
+        let disabled = config.disabled_providers.get_or_insert_with(Vec::new);
+        disabled.extend(self.disabled_providers.iter().cloned());
+        disabled.sort();
+        disabled.dedup();
+    }
+
+    #[must_use]
+    pub fn allows_provider(&self, provider: &str) -> bool {
+        !provider_is_disabled(&self.disabled_providers, None, provider)
+    }
+
+    /// An explicit user selection retires role ownership while retaining the
+    /// admitted host policy and provider exclusions for this child lifetime.
+    pub(crate) fn use_default_role(&mut self) {
+        self.role = "default".to_string();
+    }
+
+    #[must_use]
+    pub fn chain(
+        &self,
+        provider: &str,
+        model_id: &str,
+        models: &[crate::models::ModelEntry],
+    ) -> Option<FailoverChain> {
+        if self.retry.enabled == Some(false) || self.retry.model_fallback == Some(false) {
+            return None;
+        }
+        let chains = self.retry.fallback_chains.as_ref()?;
+        // A missing role inherits default; an explicitly empty role owns the
+        // decision and disables fallback, including exact-model chains.
+        let role = if chains.contains_key(&self.role) {
+            self.role.as_str()
+        } else {
+            "default"
+        };
+        chain_for(chains, role, provider, model_id, models)
+    }
+}
+
+impl std::str::FromStr for ChildFallbackPolicy {
+    type Err = String;
+
+    fn from_str(encoded: &str) -> Result<Self, Self::Err> {
+        if encoded.len() > 32 * 1024 {
+            return Err("child fallback policy exceeds 32 KiB".to_string());
+        }
+        let policy: Self = serde_json::from_str(encoded)
+            .map_err(|_| "invalid child fallback policy".to_string())?;
+        if crate::models::ModelRole::from_name(&policy.role)
+            .is_none_or(|role| role.as_str() != policy.role)
+            || policy.retry.fallback_chains.is_none()
+        {
+            return Err("invalid child fallback role or chain map".to_string());
+        }
+        Ok(policy)
+    }
 }
 
 /// Resolve the chain for a role name or an exact `provider/model` spec.
 ///
 /// Looks up fallback chains from `retry.fallbackChains`. Role keys take precedence
 /// over exact model specs. Provider aliases and surrounding spec whitespace follow
-/// model resolution. An exact key wins over equivalent spellings; otherwise the
-/// lexicographically first matching key wins, independent of `HashMap` iteration order.
+/// model resolution in the full catalog, before credential filtering. Separately
+/// declared providers cannot borrow each other's policy through a built-in alias.
+/// An exact key wins over equivalent spellings; otherwise the lexicographically
+/// first matching key wins, independent of `HashMap` iteration order.
+/// An explicitly empty chain owns its key and disables further fallback.
 pub fn chain_for<S: std::hash::BuildHasher>(
     chains: &HashMap<String, Vec<String>, S>,
     role: &str,
     provider: &str,
     model_id: &str,
+    models: &[crate::models::ModelEntry],
 ) -> Option<FailoverChain> {
-    if let Some(entries) = chains.get(role)
-        && !entries.is_empty()
-    {
+    if let Some(entries) = chains.get(role) {
         return Some(FailoverChain {
             entries: entries.clone(),
         });
     }
     let full = format!("{provider}/{model_id}");
-    if let Some(entries) = chains.get(&full)
-        && !entries.is_empty()
-    {
+    if let Some(entries) = chains.get(&full) {
         return Some(FailoverChain {
             entries: entries.clone(),
         });
     }
     chains
         .iter()
-        .filter(|(key, entries)| !entries.is_empty() && model_spec_matches(key, provider, model_id))
+        .filter(|(key, _)| model_spec_matches(key, provider, model_id, models))
         .min_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(_, entries)| FailoverChain {
             entries: entries.clone(),
         })
 }
 
-/// Use the same identity relation as `resolve_chain_spec`, including provider
-/// aliases and nested model ids. Raw string equality is not model identity.
-fn model_spec_matches(spec: &str, provider: &str, model_id: &str) -> bool {
+/// Policy ownership uses the same declared destinations as chain walking.
+fn model_spec_matches(
+    spec: &str,
+    provider: &str,
+    model_id: &str,
+    models: &[crate::models::ModelEntry],
+) -> bool {
     crate::provider_metadata::split_provider_model_spec(spec).is_some_and(
         |(candidate_provider, candidate_model)| {
-            crate::provider_metadata::provider_ids_match(provider, candidate_provider)
-                && model_id.eq_ignore_ascii_case(candidate_model)
+            crate::models::model_identities_match(
+                models,
+                provider,
+                model_id,
+                candidate_provider,
+                candidate_model,
+            )
         },
     )
 }
 
-fn model_specs_match(left: &str, right: &str) -> bool {
-    crate::provider_metadata::split_provider_model_spec(right).map_or_else(
-        || left.eq_ignore_ascii_case(right),
-        |(provider, model_id)| model_spec_matches(left, provider, model_id),
-    )
+fn model_specs_match(left: &str, right: &str, models: &[crate::models::ModelEntry]) -> bool {
+    match (
+        chain_spec_parts(left, models),
+        chain_spec_parts(right, models),
+    ) {
+        (Some((left_provider, left_model, _)), Some((right_provider, right_model, _))) => {
+            crate::models::model_identities_match(
+                models,
+                left_provider,
+                left_model,
+                right_provider,
+                right_model,
+            )
+        }
+        _ => left.eq_ignore_ascii_case(right),
+    }
 }
 
 /// Cooldown FSM for the primary after a failover.
@@ -386,34 +810,83 @@ impl CooldownTracker {
 #[derive(Debug, Clone)]
 pub struct CredentialRing {
     keys: Vec<String>,
-    backoff_until: Vec<Option<Instant>>,
+    backoff: Vec<CredentialBackoff>,
     /// Stable affinity index derived from the session hash at construction.
     affinity: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct CredentialBackoff {
+    last_rate_limit: Option<Instant>,
+    delay: Duration,
+}
+
+impl CredentialBackoff {
+    fn is_cooling(self, now: Instant) -> bool {
+        self.last_rate_limit
+            .is_some_and(|failed_at| now.saturating_duration_since(failed_at) < self.delay)
+    }
+}
+
 impl CredentialRing {
+    fn deduplicate_keys(keys: &mut Vec<String>) {
+        let mut seen = HashSet::with_capacity(keys.len());
+        keys.retain(|key| seen.insert(key.clone()));
+    }
+
     /// Build a ring from a non-empty key list with session-affinity index.
+    /// Repeated credentials share one slot, retaining their configured order.
     #[must_use]
-    pub fn new(keys: Vec<String>, session_hash: u64) -> Option<Self> {
+    pub fn new(mut keys: Vec<String>, session_hash: u64) -> Option<Self> {
+        Self::deduplicate_keys(&mut keys);
         if keys.is_empty() {
             return None;
         }
         // Hash-first modulo keeps the affinity index within pointer width on
         // every target (no u64→usize truncation).
         let affinity = usize::try_from(session_hash % keys.len() as u64).unwrap_or(0);
-        let backoff_until = vec![None; keys.len()];
+        let backoff = vec![CredentialBackoff::default(); keys.len()];
         Some(Self {
             keys,
-            backoff_until,
+            backoff,
             affinity,
         })
+    }
+
+    /// Replace a non-empty configured key list without forgetting the failure
+    /// history of credentials that remain. New keys start healthy, and the
+    /// caller's affinity is recalculated even when only its auth path changed.
+    /// An empty list leaves the ring unchanged and returns false.
+    pub(crate) fn reconfigure(&mut self, mut keys: Vec<String>, session_hash: u64) -> bool {
+        Self::deduplicate_keys(&mut keys);
+        if keys.is_empty() {
+            return false;
+        }
+        let affinity = usize::try_from(session_hash % keys.len() as u64).unwrap_or(0);
+        if self.keys != keys {
+            let previous: HashMap<&str, CredentialBackoff> = self
+                .keys
+                .iter()
+                .zip(&self.backoff)
+                .map(|(key, backoff)| (key.as_str(), *backoff))
+                .collect();
+            let backoff = keys
+                .iter()
+                .map(|key| previous.get(key.as_str()).copied().unwrap_or_default())
+                .collect();
+            drop(previous);
+            self.keys = keys;
+            self.backoff = backoff;
+        }
+        self.affinity = affinity;
+        true
     }
 
     /// The current usable key at `now`: the affinity key when healthy, else
     /// the next key without an active backoff; `None` when all are cooling.
     #[must_use]
     pub fn current_key(&self, now: Instant) -> Option<&str> {
-        let usable = |idx: usize| self.backoff_until[idx].is_none_or(|until| now >= until);
+        let usable = |idx: usize| !self.backoff[idx].is_cooling(now);
         if usable(self.affinity) {
             return Some(self.keys[self.affinity].as_str());
         }
@@ -422,8 +895,30 @@ impl CredentialRing {
             .map(|idx| self.keys[idx].as_str())
     }
 
-    /// Report a 429 for `key`: exponential backoff `base * 2^strikes` clamped
-    /// to `max`. Returns the new backoff expiry for observability.
+    /// Time until at least one configured key becomes usable. The production
+    /// ring caps each cooldown at five minutes; this never introduces a wait.
+    #[must_use]
+    pub(crate) fn next_usable_after(&self, now: Instant) -> Duration {
+        self.backoff
+            .iter()
+            .map(|backoff| {
+                backoff.last_rate_limit.map_or(Duration::ZERO, |failed_at| {
+                    backoff
+                        .delay
+                        .saturating_sub(now.saturating_duration_since(failed_at))
+                })
+            })
+            .min()
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// Report a 429 for `key`: repeated failures double the previous delay,
+    /// clamped to `max`, even if its previous cooldown already expired.
+    /// Success, rather than elapsed time, resets the failure history.
+    ///
+    /// Returns the new expiry when the key exists and the deadline fits in an
+    /// `Instant`. An unrepresentable deadline still leaves the key cooling;
+    /// elapsed-time checks do not overflow or accidentally release it.
     pub fn report_rate_limited(
         &mut self,
         key: &str,
@@ -432,20 +927,42 @@ impl CredentialRing {
         max: Duration,
     ) -> Option<Instant> {
         let idx = self.keys.iter().position(|k| k == key)?;
-        let previous = self.backoff_until[idx];
-        let strikes = previous.filter(|until| now < *until).map_or(0, |_| 1);
-        let delay = (base * 2_u32.pow(strikes)).min(max);
-        let expiry = now + delay;
-        self.backoff_until[idx] = Some(expiry);
-        Some(expiry)
+        let backoff = &mut self.backoff[idx];
+        let delay = if backoff.last_rate_limit.is_some() {
+            backoff.delay.saturating_mul(2).max(base)
+        } else {
+            base
+        }
+        .min(max);
+        backoff.last_rate_limit = Some(now);
+        backoff.delay = delay;
+        now.checked_add(delay)
+    }
+
+    /// A successful provider request resets only the credential it used.
+    /// A request that started before the latest 429 cannot erase a newer
+    /// cooldown when its older stream finally completes.
+    pub fn report_success(&mut self, key: &str, started_at: Instant) -> bool {
+        let Some(idx) = self.keys.iter().position(|candidate| candidate == key) else {
+            return false;
+        };
+        let backoff = &mut self.backoff[idx];
+        if backoff
+            .last_rate_limit
+            .is_some_and(|failed_at| started_at <= failed_at)
+        {
+            return false;
+        }
+        *backoff = CredentialBackoff::default();
+        true
     }
 
     /// All keys currently cooling (observability/testing).
     #[must_use]
     pub(crate) fn cooling_count(&self, now: Instant) -> usize {
-        self.backoff_until
+        self.backoff
             .iter()
-            .filter(|until| until.is_some_and(|u| now < u))
+            .filter(|backoff| backoff.is_cooling(now))
             .count()
     }
 
@@ -886,15 +1403,25 @@ impl<'a> FailoverWalk<'a> {
     /// The next candidate spec and the chain index it occupies, advancing past
     /// it. The index is captured BEFORE the advance: reporting the post-advance
     /// cursor as the chain index is off by one (bd-oqo03).
-    pub fn next_spec(&mut self) -> Option<(usize, &'a str)> {
+    /// Pass the full catalog so separately declared providers are not skipped
+    /// as aliases of the live model or of earlier entries.
+    pub fn next_spec(&mut self, models: &[crate::models::ModelEntry]) -> Option<(usize, &'a str)> {
         while self.position < self.entries.len() {
             let index = self.position;
             let spec = self.entries[index].as_str();
             self.position += 1;
-            let is_current = model_spec_matches(spec, self.current_provider, self.current_model);
+            let is_current = chain_spec_parts(spec, models).is_some_and(|(provider, model, _)| {
+                crate::models::model_identities_match(
+                    models,
+                    provider,
+                    model,
+                    self.current_provider,
+                    self.current_model,
+                )
+            });
             let is_duplicate = self.entries[..index]
                 .iter()
-                .any(|earlier| model_specs_match(earlier, spec));
+                .any(|earlier| model_specs_match(earlier, spec, models));
             if is_current || is_duplicate {
                 continue;
             }
@@ -912,23 +1439,43 @@ impl<'a> FailoverWalk<'a> {
 
 /// Resolve one `provider/model` chain spec against the configured model list.
 ///
-/// A well-formed pair that is simply not configured falls back to an ad-hoc
-/// entry. `None` means the spec names nothing usable and the walk should move
-/// on.
+/// Native providers can resolve unlisted models from their routing defaults.
+/// A separately declared provider keeps its own identity and cannot borrow
+/// a built-in alias's route. `None` lets the walk try its next configured spec.
 #[must_use]
 pub fn resolve_chain_spec(
     spec: &str,
-    available_models: &[crate::models::ModelEntry],
+    models: &[crate::models::ModelEntry],
 ) -> Option<crate::models::ModelEntry> {
+    resolve_chain_selection(spec, models).map(|(entry, _)| entry)
+}
+
+/// Resolve a fallback destination and its optional effort. A registered literal
+/// ID wins over suffix parsing, preserving local model tags such as `:high`.
+#[must_use]
+pub fn resolve_chain_selection(
+    spec: &str,
+    models: &[crate::models::ModelEntry],
+) -> Option<(
+    crate::models::ModelEntry,
+    Option<crate::model::ThinkingLevel>,
+)> {
+    let (provider, model_id, thinking) = chain_spec_parts(spec, models)?;
+    crate::models::resolve_model_entry(models, provider, model_id).map(|entry| (entry, thinking))
+}
+
+fn chain_spec_parts<'a>(
+    spec: &'a str,
+    models: &[crate::models::ModelEntry],
+) -> Option<(&'a str, &'a str, Option<crate::model::ThinkingLevel>)> {
     let (provider, model_id) = crate::provider_metadata::split_provider_model_spec(spec)?;
-    available_models
-        .iter()
-        .find(|entry| {
-            crate::provider_metadata::provider_ids_match(&entry.model.provider, provider)
-                && entry.model.id.eq_ignore_ascii_case(model_id)
-        })
-        .cloned()
-        .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id))
+    if crate::models::find_model_entry(models, provider, model_id).is_none()
+        && let Some((model, suffix)) = model_id.rsplit_once(':')
+        && let Ok(thinking) = suffix.parse::<crate::model::ThinkingLevel>()
+    {
+        return Some((provider, model, Some(thinking)));
+    }
+    Some((provider, model_id, None))
 }
 
 // ---------------------------------------------------------------------------
@@ -975,6 +1522,13 @@ pub fn retry_delay_ms(base_delay_ms: u32, max_delay_ms: u32, attempt: u32) -> u3
 #[must_use]
 pub fn marks_session_persistence(error_text: &str) -> bool {
     error_text.contains(crate::error::Error::SESSION_PERSISTENCE_PREFIX)
+}
+
+/// No credential is available until a local cooldown expires. Repeating the
+/// current provider request cannot help; an eligible different provider may.
+#[must_use]
+pub fn marks_credential_pool_exhausted(error_text: &str) -> bool {
+    error_text.contains(crate::auth::CREDENTIAL_POOL_EXHAUSTED)
 }
 
 /// Whether a completed turn that ended in [`StopReason::Error`] should be
@@ -1031,6 +1585,7 @@ pub fn call_error_is_retryable(error: &crate::error::Error) -> bool {
     let error_text = error.to_string();
     let lower = error_text.to_ascii_lowercase();
     if marks_session_persistence(&error_text)
+        || marks_credential_pool_exhausted(&error_text)
         || is_auth_failure(&lower)
         || crate::error::is_context_overflow(&error_text, None, None)
         || response_refuses_retry(&lower)
@@ -1047,6 +1602,65 @@ pub enum TurnOutcome<'a> {
     Completed(&'a crate::model::AssistantMessage),
     /// The call failed before a message could be produced.
     Failed(&'a crate::error::Error),
+}
+
+/// Actual provider quota failures may update credential cooldowns after their
+/// transcript is durable. Local refusals, synthetic pool exhaustion, aborts,
+/// and persistence errors are not new evidence against a credential.
+#[must_use]
+pub fn is_credential_rate_limit(outcome: TurnOutcome<'_>) -> bool {
+    let text = match outcome {
+        TurnOutcome::Completed(message)
+            if message.stop_reason == crate::model::StopReason::Error =>
+        {
+            std::borrow::Cow::Borrowed(message.error_message.as_deref().unwrap_or(""))
+        }
+        TurnOutcome::Failed(error) if is_provider_call_error(error) => {
+            std::borrow::Cow::Owned(error.to_string())
+        }
+        _ => return false,
+    };
+    !marks_credential_pool_exhausted(&text)
+        && classify_failover(&text) == Some(FailoverClass::Quota)
+}
+
+/// Overflow can justify changing the context, never resending it unchanged.
+/// Keep the ordinary recovery refusals ahead of this separate maintenance path:
+/// a local/session failure or mixed authentication diagnostic must not trigger
+/// summary-provider calls. Byte-size HTTP 413 refusals need token evidence.
+#[must_use]
+pub(crate) fn needs_context_compaction(
+    outcome: TurnOutcome<'_>,
+    context_window: Option<u32>,
+) -> bool {
+    let (error_text, input_tokens) = match outcome {
+        TurnOutcome::Completed(message)
+            if message.stop_reason == crate::model::StopReason::Error =>
+        {
+            (
+                message
+                    .error_message
+                    .as_deref()
+                    .unwrap_or("Request error")
+                    .to_string(),
+                Some(message.usage.input),
+            )
+        }
+        TurnOutcome::Failed(error) if is_provider_call_error(error) => (error.to_string(), None),
+        _ => return false,
+    };
+    let lower = error_text.to_ascii_lowercase();
+    if marks_session_persistence(&error_text) || is_auth_failure(&lower) {
+        return false;
+    }
+    if recovery_http_status(&lower) == Some(413)
+        && input_tokens
+            .zip(context_window)
+            .is_none_or(|(tokens, window)| tokens <= u64::from(window))
+    {
+        return false;
+    }
+    crate::error::is_context_overflow(&error_text, input_tokens, context_window)
 }
 
 /// Why a turn must end without another provider call.
@@ -1090,6 +1704,10 @@ pub enum TurnDecision {
 /// The configured limits a turn is decided against.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
+    /// Whether recovery may switch models at all.
+    pub model_fallback: bool,
+    /// Which eligible provider failures may switch models.
+    pub fallback_on: FallbackOn,
     /// Same-provider retries allowed per chain entry.
     pub max_retries: u32,
     /// Successful fallback swaps allowed in one turn. The chain walk itself is
@@ -1109,13 +1727,15 @@ impl RetryPolicy {
     /// default — the whole point of `retry.enabled = false` is that nobody
     /// re-enters the provider on the user's behalf.
     ///
-    /// One reader for the four config keys, so a surface adopting this policy
+    /// One reader for the recovery settings, so a surface adopting this policy
     /// cannot accidentally consult a different set (bd-u2qv4). Print mode
     /// supplies its own `max_retries` from the CLI and so builds its policy
     /// directly.
     #[must_use]
     pub fn from_config(config: &crate::config::Config) -> Option<Self> {
         config.retry_enabled().then(|| Self {
+            model_fallback: config.model_fallback_enabled(),
+            fallback_on: config.retry_fallback_on(),
             max_retries: config.retry_max_retries(),
             max_failovers_per_turn: config.max_failovers_per_turn(),
             base_delay_ms: config.retry_base_delay_ms(),
@@ -1167,8 +1787,9 @@ pub fn decide(
     let budget_left = progress.retry_count < policy.max_retries && progress.stream_can_retry;
     // A fallback also re-enters the provider. A surface that cannot retract
     // visible output must not bypass its no-retry boundary by changing models.
-    let may_fail_over =
-        progress.stream_can_retry && progress.failovers_this_turn < policy.max_failovers_per_turn;
+    let may_fail_over = policy.model_fallback
+        && progress.stream_can_retry
+        && progress.failovers_this_turn < policy.max_failovers_per_turn;
 
     // Each outcome shape decides only what is specific to it — whether the turn
     // is terminal, and whether its failure is retryable. The budget arithmetic
@@ -1203,7 +1824,8 @@ pub fn decide(
             let retryable = error_result_is_retryable(message, context_window);
             (
                 retryable,
-                retryable || classify_failover(error_text).is_some(),
+                policy.fallback_on.allows(error_text)
+                    && (retryable || classify_failover(error_text).is_some()),
             )
         }
         TurnOutcome::Failed(error) => {
@@ -1225,7 +1847,8 @@ pub fn decide(
             let retryable = call_error_is_retryable(error);
             (
                 retryable,
-                retryable || classify_failover(&error_text).is_some(),
+                policy.fallback_on.allows(&error_text)
+                    && (retryable || classify_failover(&error_text).is_some()),
             )
         }
     };
@@ -1239,6 +1862,189 @@ pub fn decide(
         return TurnDecision::FailOver;
     }
     TurnDecision::Finish { success: false }
+}
+
+#[cfg(test)]
+mod recovery_event_tests {
+    use super::*;
+    use crate::agent::AgentEvent;
+
+    fn retry(attempt: u32, error: &str) -> AgentEvent {
+        AgentEvent::AutoRetryStart {
+            attempt,
+            max_attempts: 3,
+            delay_ms: 1,
+            error_message: error.to_string(),
+        }
+    }
+
+    fn fallback(attempt: u32, model: &str) -> AgentEvent {
+        AgentEvent::FailoverStart {
+            from_provider: "primary".to_string(),
+            from_model: "original".to_string(),
+            to_provider: "backup".to_string(),
+            to_model: model.to_string(),
+            class: "overload".to_string(),
+            attempt,
+            chain_index: attempt - 1,
+        }
+    }
+
+    #[test]
+    fn each_retry_attempt_finishes_before_its_successor_starts() {
+        let mut lifecycle = RecoveryEventLifecycle::default();
+        let [
+            None,
+            None,
+            Some(AgentEvent::AutoRetryStart { attempt: 1, .. }),
+        ] = lifecycle.observe(retry(1, "first failure"))
+        else {
+            panic!("first retry must open exactly one lifecycle");
+        };
+        let [
+            Some(AgentEvent::AutoRetryEnd {
+                success: false,
+                attempt: 1,
+                final_error: Some(error),
+            }),
+            None,
+            Some(AgentEvent::AutoRetryStart { attempt: 2, .. }),
+        ] = lifecycle.observe(retry(2, "retry one failed"))
+        else {
+            panic!("retry two must close retry one before opening");
+        };
+        assert_eq!(error, "retry one failed");
+        assert!(matches!(
+            lifecycle.finish(true, None),
+            [
+                Some(AgentEvent::AutoRetryEnd {
+                    success: true,
+                    attempt: 2,
+                    final_error: None,
+                }),
+                None
+            ]
+        ));
+        assert!(lifecycle.finish(true, None).iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn a_new_fallback_closes_the_failed_retry_and_previous_target_in_order() {
+        let mut lifecycle = RecoveryEventLifecycle::default();
+        let _ = lifecycle.observe(fallback(1, "first"));
+        let _ = lifecycle.observe(retry(1, "first fallback overloaded"));
+        let [
+            Some(AgentEvent::AutoRetryEnd {
+                success: false,
+                attempt: 1,
+                ..
+            }),
+            Some(AgentEvent::FailoverEnd {
+                success: false,
+                provider,
+                model,
+                restored_primary: false,
+            }),
+            Some(AgentEvent::FailoverStart {
+                attempt: 2,
+                to_model,
+                ..
+            }),
+        ] = lifecycle.observe(fallback(2, "second"))
+        else {
+            panic!("old retry and fallback must close before the next hop");
+        };
+        assert_eq!((provider.as_str(), model.as_str()), ("backup", "first"));
+        assert_eq!(to_model, "second");
+
+        // The start owns the target identity even if a model transition
+        // changes what the terminal emitter observes in the live runtime.
+        let [
+            None,
+            None,
+            Some(AgentEvent::FailoverEnd {
+                success: true,
+                provider,
+                model,
+                restored_primary: false,
+            }),
+        ] = lifecycle.observe(AgentEvent::FailoverEnd {
+            success: true,
+            provider: "later-provider".to_string(),
+            model: "later-model".to_string(),
+            restored_primary: false,
+        })
+        else {
+            panic!("last fallback must close exactly once");
+        };
+        assert_eq!((provider.as_str(), model.as_str()), ("backup", "second"));
+        assert!(lifecycle.finish(true, None).iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn terminal_failures_close_both_pending_lifecycles_once() {
+        for error in [
+            "Aborted",
+            "session persistence failed",
+            "failover setup failed",
+        ] {
+            let mut lifecycle = RecoveryEventLifecycle::default();
+            let _ = lifecycle.observe(fallback(1, "first"));
+            let _ = lifecycle.observe(retry(1, "overloaded"));
+            let [
+                Some(AgentEvent::AutoRetryEnd {
+                    success: false,
+                    attempt: 1,
+                    final_error: Some(actual),
+                }),
+                Some(AgentEvent::FailoverEnd {
+                    success: false,
+                    model,
+                    restored_primary: false,
+                    ..
+                }),
+            ] = lifecycle.finish(false, Some(error.to_string()))
+            else {
+                panic!("terminal failure must close the retry before the fallback");
+            };
+            assert_eq!(actual, error);
+            assert_eq!(model, "first");
+            assert!(
+                lifecycle
+                    .observe(AgentEvent::AutoRetryEnd {
+                        success: true,
+                        attempt: 1,
+                        final_error: None,
+                    })
+                    .iter()
+                    .all(Option::is_none)
+            );
+            assert!(lifecycle.finish(true, None).iter().all(Option::is_none));
+        }
+    }
+
+    #[test]
+    fn cooldown_restoration_is_independent_of_the_finished_turn() {
+        let mut lifecycle = RecoveryEventLifecycle::default();
+        let _ = lifecycle.observe(fallback(1, "first"));
+        let _ = lifecycle.finish(true, None);
+        assert!(matches!(
+            lifecycle.observe(AgentEvent::FailoverEnd {
+                success: true,
+                provider: "primary".to_string(),
+                model: "original".to_string(),
+                restored_primary: true,
+            }),
+            [
+                None,
+                None,
+                Some(AgentEvent::FailoverEnd {
+                    restored_primary: true,
+                    ..
+                })
+            ]
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -1262,6 +2068,8 @@ mod recovery_boundary_tests {
 
     fn policy() -> RetryPolicy {
         RetryPolicy {
+            model_fallback: true,
+            fallback_on: FallbackOn::Any,
             max_retries: 3,
             max_failovers_per_turn: 2,
             base_delay_ms: 0,
@@ -1425,21 +2233,21 @@ mod tests {
             vec!["google/gemini-3-pro".to_string()],
         );
         assert_eq!(
-            chain_for(&chains, "default", "anthropic", "claude-opus-4-7")
+            chain_for(&chains, "default", "anthropic", "claude-opus-4-7", &[])
                 .unwrap()
                 .entries,
             vec!["openai/gpt-5-mini".to_string()]
         );
         // Non-default role name that is not configured: falls to the exact model key.
         assert_eq!(
-            chain_for(&chains, "task", "anthropic", "claude-opus-4-7")
+            chain_for(&chains, "task", "anthropic", "claude-opus-4-7", &[])
                 .unwrap()
                 .entries,
             vec!["google/gemini-3-pro".to_string()]
         );
         // The "default" role key matches any model by design; an UNCONFIGURED
         // role + unconfigured exact model yields no chain.
-        assert!(chain_for(&chains, "task", "openai", "gpt-5.5").is_none());
+        assert!(chain_for(&chains, "task", "openai", "gpt-5.5", &[]).is_none());
     }
 
     #[test]
@@ -1449,7 +2257,7 @@ mod tests {
             vec!["openai/gpt-y".to_string()],
         )]);
         for provider in ["google", "gemini", "GOOGLE"] {
-            let resolved = chain_for(&chains, "task", provider, "gemini-z")
+            let resolved = chain_for(&chains, "task", provider, "gemini-z", &[])
                 .expect("configured aliases must resolve like model selection");
             assert_eq!(resolved.entries, vec!["openai/gpt-y".to_string()]);
         }
@@ -1473,13 +2281,13 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            chain_for(&chains, "task", "google", "gemini-z")
+            chain_for(&chains, "task", "google", "gemini-z", &[])
                 .unwrap()
                 .entries,
             vec!["role/winner".to_string()]
         );
         assert_eq!(
-            chain_for(&chains, "unconfigured", "google", "gemini-z")
+            chain_for(&chains, "unconfigured", "google", "gemini-z", &[])
                 .unwrap()
                 .entries,
             vec!["exact/winner".to_string()]
@@ -1497,7 +2305,7 @@ mod tests {
                 .map(|key| (key.to_string(), vec![key.to_string()]))
                 .collect();
             assert_eq!(
-                chain_for(&chains, "task", "google", "gemini-z")
+                chain_for(&chains, "task", "google", "gemini-z", &[])
                     .unwrap()
                     .entries,
                 vec!["GEMINI/GEMINI-Z".to_string()]
@@ -1506,8 +2314,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_role_and_exact_chains_do_not_hide_a_nonempty_alias_chain() {
-        let chains = HashMap::from([
+    fn explicit_empty_role_and_exact_chains_disable_inherited_fallback() {
+        let mut chains = HashMap::from([
             ("task".to_string(), Vec::new()),
             ("google/gemini-z".to_string(), Vec::new()),
             (
@@ -1515,12 +2323,217 @@ mod tests {
                 vec!["openai/gpt-y".to_string()],
             ),
         ]);
+        assert!(
+            chain_for(&chains, "task", "google", "gemini-z", &[])
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        chains.remove("task");
+        assert!(
+            chain_for(&chains, "task", "google", "gemini-z", &[])
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        chains.remove("google/gemini-z");
         assert_eq!(
-            chain_for(&chains, "task", "google", "gemini-z")
+            chain_for(&chains, "task", "google", "gemini-z", &[])
                 .unwrap()
                 .entries,
             vec!["openai/gpt-y".to_string()]
         );
+    }
+
+    #[test]
+    fn child_policy_freezes_role_ownership_empty_opt_out_and_retry_controls() {
+        let mut config = crate::config::Config {
+            retry: Some(crate::config::RetrySettings {
+                fallback_chains: Some(HashMap::from([
+                    ("task".to_string(), vec![]),
+                    ("default".to_string(), vec!["openai/default".to_string()]),
+                    (
+                        "openai/primary".to_string(),
+                        vec!["openai/exact".to_string()],
+                    ),
+                ])),
+                fallback_on: Some(FallbackOn::UsageLimit),
+                max_failovers_per_turn: Some(2),
+                failover_cooldown_secs: Some(17),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let task = ChildFallbackPolicy::capture(&config, crate::models::ModelRole::Task, &[]);
+        assert!(
+            task.chain("openai", "primary", &[])
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        let smol = ChildFallbackPolicy::capture(&config, crate::models::ModelRole::Smol, &[]);
+        assert_eq!(
+            smol.chain("openai", "primary", &[]).unwrap().entries,
+            vec!["openai/default"]
+        );
+        config
+            .retry
+            .as_mut()
+            .unwrap()
+            .fallback_chains
+            .as_mut()
+            .unwrap()
+            .insert("task".to_string(), vec!["openai/later".to_string()]);
+        assert!(
+            task.chain("openai", "changed-by-prewalk", &[])
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        let encoded = task.to_cli_arg().unwrap();
+        let restored: ChildFallbackPolicy = encoded.parse().unwrap();
+        let mut child_config = crate::config::Config::default();
+        restored.apply_to_config(&mut child_config);
+        assert_eq!(child_config.retry_fallback_on(), FallbackOn::UsageLimit);
+        assert_eq!(child_config.max_failovers_per_turn(), 2);
+        assert_eq!(child_config.failover_cooldown_secs(), 17);
+        assert!(
+            restored
+                .chain("openai", "primary", &[])
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn child_policy_preserves_host_and_task_exclusions_after_explicit_selection() {
+        let config = crate::config::Config {
+            disabled_providers: Some(vec!["open-router".to_string()]),
+            model_scope_overrides: Some(vec![
+                crate::config::ModelScopeOverride {
+                    path: "/host".to_string(),
+                    enabled_models: None,
+                    disabled_providers: Some(vec!["anthropic".to_string()]),
+                },
+                crate::config::ModelScopeOverride {
+                    path: "/task".to_string(),
+                    enabled_models: None,
+                    disabled_providers: Some(vec!["google".to_string()]),
+                },
+            ]),
+            ..Default::default()
+        };
+        let mut policy = ChildFallbackPolicy::capture(
+            &config,
+            crate::models::ModelRole::Task,
+            &[
+                std::path::Path::new("/host/project"),
+                std::path::Path::new("/task/project"),
+            ],
+        );
+        policy.use_default_role();
+        for provider in ["openrouter", "anthropic", "gemini"] {
+            assert!(!policy.allows_provider(provider), "{provider}");
+        }
+        assert!(policy.allows_provider("openai"));
+        assert!(policy.chain("openai", "primary", &[]).is_none());
+        assert!("{}".parse::<ChildFallbackPolicy>().is_err());
+        assert!(
+            " ".repeat(32 * 1024 + 1)
+                .parse::<ChildFallbackPolicy>()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn chain_policies_belong_to_declared_providers_in_either_catalog_order() {
+        for (native_provider, declared_provider) in
+            [("openrouter", "open-router"), ("google", "gemini")]
+        {
+            let native = crate::models::ad_hoc_model_entry(native_provider, "vendor/shared")
+                .expect("native policy fixture");
+            let mut declared = native.clone();
+            declared.model.provider = declared_provider.to_string();
+            declared.model.base_url = "https://declared.example.test/v1".to_string();
+            // An unavailable declaration still owns its policy namespace.
+            declared.api_key = None;
+            for reverse in [false, true] {
+                let mut catalog = vec![native.clone(), declared.clone()];
+                if reverse {
+                    catalog.reverse();
+                }
+                for (current, other) in [
+                    (native_provider, declared_provider),
+                    (declared_provider, native_provider),
+                ] {
+                    let mut chains = HashMap::from([(
+                        format!("{other}/vendor/shared"),
+                        vec!["wrong/policy".to_string()],
+                    )]);
+                    assert!(
+                        chain_for(&chains, "task", current, "vendor/shared", &catalog).is_none(),
+                        "{current} cannot borrow {other}'s policy (reverse={reverse})"
+                    );
+                    chains.insert(
+                        format!(" {} / VENDOR/SHARED ", current.to_ascii_uppercase()),
+                        vec!["own/policy".to_string()],
+                    );
+                    assert_eq!(
+                        chain_for(&chains, "task", current, "vendor/shared", &catalog)
+                            .expect("own normalized policy")
+                            .entries,
+                        vec!["own/policy".to_string()]
+                    );
+                    chains.insert(
+                        format!("{current}/vendor/shared"),
+                        vec!["exact/policy".to_string()],
+                    );
+                    assert_eq!(
+                        chain_for(&chains, "task", current, "vendor/shared", &catalog)
+                            .expect("exact policy takes precedence")
+                            .entries,
+                        vec!["exact/policy".to_string()]
+                    );
+                    chains.insert("task".to_string(), vec!["role/policy".to_string()]);
+                    assert_eq!(
+                        chain_for(&chains, "task", current, "vendor/shared", &catalog)
+                            .expect("role policy takes precedence")
+                            .entries,
+                        vec!["role/policy".to_string()]
+                    );
+                }
+            }
+            // Declaring a different model still reserves the provider identity;
+            // removing an unavailable model from the pool cannot grant its policy.
+            declared.model.id = "vendor/other".to_string();
+            let chains = HashMap::from([(
+                format!("{native_provider}/vendor/shared"),
+                vec!["native/policy".to_string()],
+            )]);
+            assert!(
+                chain_for(
+                    &chains,
+                    "task",
+                    declared_provider,
+                    "vendor/shared",
+                    &[native.clone(), declared],
+                )
+                .is_none()
+            );
+            assert_eq!(
+                chain_for(
+                    &chains,
+                    "task",
+                    declared_provider,
+                    "vendor/shared",
+                    &[native],
+                )
+                .expect("an undeclared native alias retains its policy")
+                .entries,
+                vec!["native/policy".to_string()]
+            );
+        }
     }
 
     #[test]
@@ -1589,6 +2602,198 @@ mod tests {
             Duration::from_secs(60),
         );
         assert!(ring.current_key(later).is_none());
+    }
+
+    #[test]
+    fn credential_backoff_grows_after_expiry_and_stays_capped() {
+        let mut ring = CredentialRing::new(vec!["primary".into(), "sibling".into()], 0)
+            .expect("credential ring");
+        let mut now = Instant::now();
+        for seconds in [15, 30, 60, 120, 240, 300, 300] {
+            let until = ring
+                .report_rate_limited(
+                    "primary",
+                    now,
+                    Duration::from_secs(15),
+                    Duration::from_secs(300),
+                )
+                .expect("representable cooldown");
+            assert_eq!(until.duration_since(now), Duration::from_secs(seconds));
+            assert_eq!(ring.current_key(now), Some("sibling"));
+            assert_eq!(
+                ring.current_key(until - Duration::from_nanos(1)),
+                Some("sibling")
+            );
+            assert_eq!(ring.current_key(until), Some("primary"));
+            // Retrying an expired key is not proof it recovered. Its next
+            // 429 must continue the same failure streak.
+            now = until;
+        }
+    }
+
+    #[test]
+    fn credential_pool_retry_after_uses_the_first_expiring_key() {
+        let now = Instant::now();
+        let mut ring = CredentialRing::new(vec!["first".into(), "second".into()], 0).unwrap();
+        assert_eq!(ring.next_usable_after(now), Duration::ZERO);
+        ring.report_rate_limited(
+            "first",
+            now,
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+        );
+        assert_eq!(ring.next_usable_after(now), Duration::ZERO);
+        ring.report_rate_limited(
+            "second",
+            now,
+            Duration::from_secs(15),
+            Duration::from_secs(300),
+        );
+        assert_eq!(
+            ring.next_usable_after(now + Duration::from_secs(5)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            ring.next_usable_after(now + Duration::from_secs(15)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            ring.current_key(now + Duration::from_secs(15)),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn credential_success_resets_only_its_key_and_rejects_stale_requests() {
+        let start = Instant::now();
+        let base = Duration::from_secs(15);
+        let max = Duration::from_secs(300);
+        let mut ring = CredentialRing::new(vec!["primary".into(), "sibling".into()], 0)
+            .expect("credential ring");
+        let _ = ring.report_rate_limited("primary", start, base, max);
+        let _ = ring.report_rate_limited("sibling", start, base, max);
+        let newer_failure = start + Duration::from_secs(2);
+        let _ = ring.report_rate_limited("primary", newer_failure, base, max);
+        assert!(!ring.report_success("primary", start + Duration::from_secs(1)));
+        assert!(!ring.report_success("primary", newer_failure));
+        assert_eq!(ring.cooling_count(newer_failure), 2);
+
+        let successful_request = newer_failure + Duration::from_secs(1);
+        assert!(ring.report_success("primary", successful_request));
+        assert_eq!(ring.current_key(successful_request), Some("primary"));
+        assert_eq!(ring.cooling_count(successful_request), 1);
+        assert!(!ring.report_success("unknown", successful_request));
+        assert_eq!(
+            ring.report_rate_limited("primary", successful_request, base, max),
+            Some(successful_request + base)
+        );
+        assert_eq!(
+            ring.report_rate_limited("sibling", successful_request, base, max),
+            Some(successful_request + Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn credential_backoff_saturates_without_releasing_extreme_deadlines() {
+        let start = Instant::now();
+        let max = Duration::from_secs(300);
+        let mut ring = CredentialRing::new(vec!["primary".into(), "sibling".into()], 0)
+            .expect("credential ring");
+        for _ in 0..3 {
+            assert_eq!(
+                ring.report_rate_limited("primary", start, Duration::MAX, max),
+                Some(start + max)
+            );
+        }
+        // An elapsed-time cooldown remains effective even when an absolute
+        // deadline cannot be represented by the platform's Instant type.
+        let _ = ring.report_rate_limited("primary", start, Duration::MAX, Duration::MAX);
+        let _ = ring.report_rate_limited("primary", start, Duration::MAX, Duration::MAX);
+        assert_eq!(
+            ring.current_key(start + Duration::from_secs(86_400)),
+            Some("sibling")
+        );
+        assert!(ring.report_success("primary", start + Duration::from_secs(1)));
+        assert_eq!(
+            ring.current_key(start + Duration::from_secs(1)),
+            Some("primary")
+        );
+    }
+
+    #[test]
+    fn credential_reconfiguration_preserves_surviving_failures_and_updates_affinity() {
+        let start = Instant::now();
+        let base = Duration::from_secs(15);
+        let max = Duration::from_secs(300);
+        let mut ring = CredentialRing::new(vec!["limited".into(), "revoked".into()], 0)
+            .expect("credential ring");
+        let _ = ring.report_rate_limited("limited", start, base, max);
+        assert!(ring.reconfigure(vec!["new".into(), "limited".into()], 1));
+        assert_eq!(ring.current_key(start), Some("new"));
+        assert_eq!(ring.cooling_count(start), 1);
+        assert_eq!(ring.report_rate_limited("revoked", start, base, max), None);
+        let retry = start + base;
+        assert_eq!(
+            ring.report_rate_limited("limited", retry, base, max),
+            Some(retry + Duration::from_secs(30))
+        );
+        assert_eq!(
+            ring.report_rate_limited("new", retry, base, max),
+            Some(retry + base)
+        );
+
+        let recovered = retry + Duration::from_secs(31);
+        assert_eq!(ring.current_key(recovered), Some("limited"));
+        assert!(ring.reconfigure(vec!["new".into(), "limited".into()], 0));
+        assert_eq!(ring.current_key(recovered), Some("new"));
+        assert!(!ring.reconfigure(Vec::new(), 0));
+        assert_eq!(ring.current_key(recovered), Some("new"));
+    }
+
+    #[test]
+    fn duplicate_credentials_cannot_escape_cooldown_or_erase_failure_history() {
+        let start = Instant::now();
+        let base = Duration::from_secs(15);
+        let max = Duration::from_secs(300);
+        let mut ring = CredentialRing::new(
+            vec!["limited".into(), "limited".into(), "sibling".into()],
+            0,
+        )
+        .expect("credential ring");
+        assert_eq!(ring.current_key(start), Some("limited"));
+        let _ = ring.report_rate_limited("limited", start, base, max);
+        assert_eq!(ring.current_key(start), Some("sibling"));
+        let _ = ring.report_rate_limited("sibling", start, base, max);
+        assert!(ring.current_key(start).is_none());
+
+        assert!(ring.reconfigure(
+            vec![
+                "limited".into(),
+                "new".into(),
+                "limited".into(),
+                "new".into()
+            ],
+            0,
+        ));
+        assert_eq!(ring.current_key(start), Some("new"));
+        assert_eq!(
+            ring.report_rate_limited("limited", start, base, max),
+            Some(start + Duration::from_secs(30))
+        );
+        let _ = ring.report_rate_limited("new", start, base, max);
+        assert!(ring.current_key(start).is_none());
+
+        let ring = CredentialRing::new(
+            vec![
+                "first".into(),
+                "first".into(),
+                "second".into(),
+                "third".into(),
+            ],
+            2,
+        )
+        .expect("stable distinct order");
+        assert_eq!(ring.current_key(start), Some("third"));
     }
 
     #[test]
@@ -1879,9 +3084,9 @@ mod tests {
             "google/gemini-z",
         ]);
         let mut walk = FailoverWalk::new(&chain, 0, "anthropic", "claude-x");
-        assert_eq!(walk.next_spec(), Some((1, "openai/gpt-y")));
-        assert_eq!(walk.next_spec(), Some((3, "google/gemini-z")));
-        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.next_spec(&[]), Some((1, "openai/gpt-y")));
+        assert_eq!(walk.next_spec(&[]), Some((3, "google/gemini-z")));
+        assert_eq!(walk.next_spec(&[]), None);
         assert_eq!(walk.position(), 4);
     }
 
@@ -1894,10 +3099,10 @@ mod tests {
             "google/gemini-next",
         ]);
         let mut walk = FailoverWalk::new(&chain, 0, "anthropic", "claude-x");
-        assert_eq!(walk.next_spec(), Some((0, "google/gemini-z")));
-        assert_eq!(walk.next_spec(), Some((1, "openai/gpt-y")));
-        assert_eq!(walk.next_spec(), Some((3, "google/gemini-next")));
-        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.next_spec(&[]), Some((0, "google/gemini-z")));
+        assert_eq!(walk.next_spec(&[]), Some((1, "openai/gpt-y")));
+        assert_eq!(walk.next_spec(&[]), Some((3, "google/gemini-next")));
+        assert_eq!(walk.next_spec(&[]), None);
         assert_eq!(walk.position(), 4);
     }
 
@@ -1910,9 +3115,9 @@ mod tests {
             "anthropic/claude-x",
         ]);
         let mut walk = FailoverWalk::new(&chain, 2, "openai", "gpt-y");
-        assert_eq!(walk.next_spec(), Some((3, "anthropic/claude-x")));
+        assert_eq!(walk.next_spec(&[]), Some((3, "anthropic/claude-x")));
         assert_eq!(walk.position(), 4);
-        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.next_spec(&[]), None);
     }
 
     #[test]
@@ -1926,9 +3131,9 @@ mod tests {
         ]);
         let mut walk = FailoverWalk::new(&chain, 0, "openai", "gpt-y");
         for (index, spec) in chain.entries[..4].iter().enumerate() {
-            assert_eq!(walk.next_spec(), Some((index, spec.as_str())));
+            assert_eq!(walk.next_spec(&[]), Some((index, spec.as_str())));
         }
-        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.next_spec(&[]), None);
         assert_eq!(walk.position(), 5);
     }
 
@@ -1938,7 +3143,7 @@ mod tests {
         // off by one, and that index is what reaches the failover event.
         let chain = chain(&["openai/gpt-y", "google/gemini-z"]);
         let mut walk = FailoverWalk::new(&chain, 0, "anthropic", "claude-x");
-        let (index, spec) = walk.next_spec().expect("first candidate");
+        let (index, spec) = walk.next_spec(&[]).expect("first candidate");
         assert_eq!((index, spec), (0, "openai/gpt-y"));
         assert_eq!(
             walk.position(),
@@ -1953,8 +3158,8 @@ mod tests {
         // one must still reach entry two on the next turn.
         let chain = chain(&["openai/gpt-y", "google/gemini-z"]);
         let mut walk = FailoverWalk::new(&chain, 1, "anthropic", "claude-x");
-        assert_eq!(walk.next_spec(), Some((1, "google/gemini-z")));
-        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.next_spec(&[]), Some((1, "google/gemini-z")));
+        assert_eq!(walk.next_spec(&[]), None);
     }
 
     #[test]
@@ -1963,9 +3168,9 @@ mod tests {
         // caller; the walk only decides what is worth looking at.
         let chain = chain(&["not-a-spec", "openai/gpt-y"]);
         let mut walk = FailoverWalk::new(&chain, 0, "anthropic", "claude-x");
-        assert_eq!(walk.next_spec(), Some((0, "not-a-spec")));
+        assert_eq!(walk.next_spec(&[]), Some((0, "not-a-spec")));
         assert!(resolve_chain_spec("not-a-spec", &[]).is_none());
-        assert_eq!(walk.next_spec(), Some((1, "openai/gpt-y")));
+        assert_eq!(walk.next_spec(&[]), Some((1, "openai/gpt-y")));
     }
 
     #[test]
@@ -1977,6 +3182,61 @@ mod tests {
             "openai"
         ));
         assert!(entry.model.id.eq_ignore_ascii_case("gpt-y"));
+    }
+
+    #[test]
+    fn fallback_effort_suffixes_respect_literal_ids_and_skip_duplicate_models() {
+        let (entry, thinking) = resolve_chain_selection("openai/gpt-y:low", &[]).unwrap();
+        assert_eq!(entry.model.id, "gpt-y");
+        assert_eq!(thinking, Some(crate::model::ThinkingLevel::Low));
+        let literal = crate::models::ad_hoc_model_entry("openai", "gpt-y:high").unwrap();
+        let (selected, thinking) =
+            resolve_chain_selection("openai/gpt-y:high", &[literal]).unwrap();
+        assert_eq!(selected.model.id, "gpt-y:high");
+        assert_eq!(thinking, None);
+        let chain = chain(&[
+            "openai/current:high",
+            "openai/gpt-y:low",
+            "openai/gpt-y:high",
+            "openai/gpt-z",
+        ]);
+        let mut walk = FailoverWalk::new(&chain, 0, "openai", "current");
+        assert_eq!(walk.next_spec(&[]), Some((1, "openai/gpt-y:low")));
+        assert_eq!(walk.next_spec(&[]), Some((3, "openai/gpt-z")));
+        assert_eq!(walk.next_spec(&[]), None);
+    }
+
+    #[test]
+    fn chain_resolution_keeps_declared_provider_routes_in_either_catalog_order() {
+        let mut native = crate::models::ad_hoc_model_entry("openrouter", "vendor/shared")
+            .expect("native model fixture");
+        native.api_key = Some("native-fixture-key".to_string());
+        let mut custom = native.clone();
+        custom.model.provider = "open-router".to_string();
+        custom.model.base_url = "https://declared.example.test/v1".to_string();
+        custom.api_key = Some("declared-fixture-key".to_string());
+        custom
+            .headers
+            .insert("x-route".to_string(), "declared".to_string());
+        let mut unlisted = native.clone();
+        unlisted.model.id = "vendor/unlisted".to_string();
+        for reverse in [false, true] {
+            let mut catalog = vec![native.clone(), unlisted.clone(), custom.clone()];
+            if reverse {
+                catalog.reverse();
+            }
+            let entry = resolve_chain_spec("open-router/vendor/shared", &catalog)
+                .expect("declared failover destination");
+            assert_eq!(entry.model.provider, "open-router");
+            assert_eq!(entry.model.id, "vendor/shared");
+            assert_eq!(entry.model.base_url, custom.model.base_url);
+            assert_eq!(entry.api_key, custom.api_key);
+            assert_eq!(entry.headers, custom.headers);
+            assert!(resolve_chain_spec("open-router/vendor/unlisted", &catalog).is_none());
+        }
+        let alias = resolve_chain_spec("open-router/vendor/shared", &[native])
+            .expect("undeclared alias remains supported");
+        assert_eq!(alias.model.provider, "openrouter");
     }
 
     // -- shared retry policy (bd-u2qv4) ------------------------------------
@@ -2075,6 +3335,8 @@ mod tests {
 
     fn policy() -> RetryPolicy {
         RetryPolicy {
+            model_fallback: true,
+            fallback_on: FallbackOn::Any,
             max_retries: 2,
             max_failovers_per_turn: 1,
             base_delay_ms: 500,
@@ -2095,6 +3357,8 @@ mod tests {
         let settings = |enabled: bool| crate::config::Config {
             retry: Some(crate::config::RetrySettings {
                 enabled: Some(enabled),
+                model_fallback: Some(false),
+                fallback_on: Some(FallbackOn::UsageLimit),
                 max_retries: Some(4),
                 base_delay_ms: Some(250),
                 max_delay_ms: Some(9_000),
@@ -2109,6 +3373,8 @@ mod tests {
         assert_eq!(policy.base_delay_ms, 250);
         assert_eq!(policy.max_delay_ms, 9_000);
         assert_eq!(policy.max_failovers_per_turn, 2);
+        assert!(!policy.model_fallback);
+        assert_eq!(policy.fallback_on, FallbackOn::UsageLimit);
 
         // "off" must mean off. A surface that substituted a default here would
         // re-enter the provider on behalf of a user who said not to.
@@ -2128,6 +3394,221 @@ mod tests {
             ),
             TurnDecision::Finish { success: true }
         );
+    }
+
+    #[test]
+    fn fallback_filters_distinguish_account_exhaustion_from_transient_throttles() {
+        let cases = [
+            ("HTTP 429: insufficient_quota", true),
+            ("HTTP 400: usage_limit_reached", true),
+            ("HTTP 400: quota exhausted", true),
+            ("HTTP 402: credit balance is too low", true),
+            ("HTTP 402", true),
+            ("usage_limit_reached: your weekly limit is exhausted", true),
+            ("HTTP 429: quota will reset tomorrow", true),
+            ("HTTP 429", true),
+            ("HTTP 429: rate limit exceeded", false),
+            ("HTTP 429: requests per minute quota exceeded", false),
+            ("HTTP 429: tpm exhausted (quota_exceeded)", false),
+            ("HTTP 429: concurrent requests quota exceeded", false),
+            ("HTTP 503: service unavailable", false),
+            ("connection reset by peer", false),
+        ];
+        for (text, usage_limit) in cases {
+            let message = errored_message(Some(text), 0);
+            let error = crate::error::Error::api(text);
+            for (filter, allowed) in [
+                (FallbackOn::Any, true),
+                (FallbackOn::UsageLimit, usage_limit),
+                (FallbackOn::ExceptUsageLimit, !usage_limit),
+            ] {
+                let policy = RetryPolicy {
+                    fallback_on: filter,
+                    ..policy()
+                };
+                for outcome in [
+                    TurnOutcome::Completed(&message),
+                    TurnOutcome::Failed(&error),
+                ] {
+                    assert_eq!(
+                        decide(outcome, &progress(2, 0), &policy, None),
+                        if allowed {
+                            TurnDecision::FailOver
+                        } else {
+                            TurnDecision::Finish { success: false }
+                        },
+                        "{filter:?}: {text}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_wrapped_errors_are_classified_by_their_body() {
+        let gemini = |quota_id: &str| {
+            format!(
+                "Gemini API error (HTTP 429): {{\"error\":{{\"code\":429,\"message\":\"You exceeded your current quota, please check your plan and billing details.\\n* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 10\\nPlease retry in 43.7s.\",\"status\":\"RESOURCE_EXHAUSTED\",\"details\":[{{\"@type\":\"type.googleapis.com/google.rpc.QuotaFailure\",\"violations\":[{{\"quotaId\":\"{quota_id}\"}}]}}]}}}}"
+            )
+        };
+        for (provider, message, usage_limit) in [
+            (
+                "anthropic",
+                "Anthropic API error (HTTP 429): ".to_string(),
+                true,
+            ),
+            (
+                "azure-openai",
+                "Azure OpenAI API error (HTTP 402): {\"error\":{\"message\":\"\"}}".to_string(),
+                true,
+            ),
+            (
+                "openai",
+                "OpenAI API error (HTTP 429): Rate limit reached for requests".to_string(),
+                false,
+            ),
+            (
+                "google",
+                gemini("GenerateRequestsPerMinutePerProjectPerModel-FreeTier"),
+                false,
+            ),
+            (
+                "google",
+                gemini("GenerateRequestsPerDayPerProjectPerModel-FreeTier"),
+                true,
+            ),
+        ] {
+            let error = crate::error::Error::provider(provider, message.as_str()).to_string();
+            for text in [error.as_str(), message.as_str()] {
+                assert_eq!(FallbackOn::UsageLimit.allows(text), usage_limit, "{text}");
+                assert_eq!(
+                    FallbackOn::ExceptUsageLimit.allows(text),
+                    !usage_limit,
+                    "{text}"
+                );
+            }
+        }
+        // A status-only 402 is billing exhaustion and must reach the chain.
+        let error = crate::error::Error::provider("anthropic", "Anthropic API error (HTTP 402): ");
+        assert_eq!(
+            classify_failover(&error.to_string()),
+            Some(FailoverClass::Quota)
+        );
+    }
+
+    #[test]
+    fn usage_limit_labels_cannot_override_invalid_request_responses() {
+        for text in [
+            "HTTP 400: invalid request parameter usage_limit",
+            "HTTP 400: invalid daily limit parameter",
+            "HTTP 404: model usage_limit does not exist",
+            "HTTP 422: unsupported subscription limit argument",
+        ] {
+            let message = errored_message(Some(text), 0);
+            let error = crate::error::Error::api(text);
+            assert_eq!(classify_failover(text), None, "{text}");
+            for filter in [
+                FallbackOn::Any,
+                FallbackOn::UsageLimit,
+                FallbackOn::ExceptUsageLimit,
+            ] {
+                let policy = RetryPolicy {
+                    fallback_on: filter,
+                    ..policy()
+                };
+                for state in [progress(0, 0), progress(2, 0)] {
+                    for outcome in [
+                        TurnOutcome::Completed(&message),
+                        TurnOutcome::Failed(&error),
+                    ] {
+                        assert_eq!(
+                            decide(outcome, &state, &policy, None),
+                            TurnDecision::Finish { success: false },
+                            "{filter:?}: {text}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn disabling_model_fallback_preserves_same_provider_retries() {
+        let message = errored_message(Some("503 service unavailable"), 0);
+        let disabled = RetryPolicy {
+            model_fallback: false,
+            ..policy()
+        };
+        assert!(matches!(
+            decide(
+                TurnOutcome::Completed(&message),
+                &progress(0, 0),
+                &disabled,
+                None
+            ),
+            TurnDecision::Retry { attempt: 1, .. }
+        ));
+        assert_eq!(
+            decide(
+                TurnOutcome::Completed(&message),
+                &progress(2, 0),
+                &disabled,
+                None
+            ),
+            TurnDecision::Finish { success: false }
+        );
+        let filtered = RetryPolicy {
+            fallback_on: FallbackOn::UsageLimit,
+            ..policy()
+        };
+        assert!(matches!(
+            decide(
+                TurnOutcome::Completed(&message),
+                &progress(0, 0),
+                &filtered,
+                None
+            ),
+            TurnDecision::Retry { attempt: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn no_fallback_filter_can_admit_authentication_context_or_durability_failures() {
+        for filter in [
+            FallbackOn::Any,
+            FallbackOn::UsageLimit,
+            FallbackOn::ExceptUsageLimit,
+        ] {
+            let policy = RetryPolicy {
+                fallback_on: filter,
+                ..policy()
+            };
+            let persistence = format!(
+                "{}quota exceeded",
+                crate::error::Error::SESSION_PERSISTENCE_PREFIX
+            );
+            for text in [
+                "HTTP 401: insufficient_quota",
+                "HTTP 403: quota exceeded",
+                "context window exceeded",
+                persistence.as_str(),
+            ] {
+                let message = errored_message(Some(text), 0);
+                let error = crate::error::Error::api(text);
+                for outcome in [
+                    TurnOutcome::Completed(&message),
+                    TurnOutcome::Failed(&error),
+                ] {
+                    assert!(
+                        !matches!(
+                            decide(outcome, &progress(2, 0), &policy, None),
+                            TurnDecision::FailOver
+                        ),
+                        "{filter:?}: {text}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2542,6 +4023,43 @@ mod tests {
     }
 
     #[test]
+    fn context_compaction_requires_provider_overflow_and_preserves_terminal_refusals() {
+        use crate::error::Error;
+
+        let overflow = Error::api("context_length_exceeded: prompt is too long");
+        assert!(needs_context_compaction(
+            TurnOutcome::Failed(&overflow),
+            None
+        ));
+        for error in [
+            Error::session("context_length_exceeded"),
+            Error::Auth("context_length_exceeded".to_string()),
+            Error::api("HTTP 401 unauthorized: context_length_exceeded"),
+            Error::api("HTTP 413: context_length_exceeded"),
+            Error::api(Error::session_persistence("context_length_exceeded").to_string()),
+        ] {
+            assert!(
+                !needs_context_compaction(TurnOutcome::Failed(&error), Some(8_192)),
+                "{error}",
+            );
+        }
+        let silent = errored_message(Some("500 internal server error"), 8_193);
+        assert!(needs_context_compaction(
+            TurnOutcome::Completed(&silent),
+            Some(8_192),
+        ));
+        assert!(!needs_context_compaction(
+            TurnOutcome::Completed(&silent),
+            None
+        ));
+        let payload = errored_message(Some("HTTP 413: payload rejected"), 8_193);
+        assert!(needs_context_compaction(
+            TurnOutcome::Completed(&payload),
+            Some(8_192),
+        ));
+    }
+
+    #[test]
     fn call_errors_classify_from_the_typed_error_before_its_prose() {
         let persistence = crate::error::Error::session_persistence("write failed");
         assert!(!call_error_is_retryable(&persistence));
@@ -2786,7 +4304,13 @@ mod tests {
             "HTTP 400: credit balance is too low",
             "HTTP 402: not enough credits",
             "HTTP 400: insufficient_quota",
+            "HTTP 400: usage_limit_reached",
+            "HTTP 400: quota exhausted",
+            "HTTP 400: quota_exhausted",
+            "HTTP 400: quota will reset tomorrow",
+            "HTTP 400: exhausted your capacity",
             "HTTP 402: billing_not_active",
+            "HTTP 402",
         ] {
             assert_eq!(classify_failover(text), Some(FailoverClass::Quota));
             let message = errored_message(Some(text), 0);
@@ -2806,6 +4330,148 @@ mod tests {
         }
         assert_eq!(classify_failover("HTTP 401: insufficient_quota"), None);
         assert_eq!(classify_failover("HTTP 400: invalid billing field"), None);
+    }
+
+    #[test]
+    fn exhausted_credential_pools_skip_retries_and_obey_fallback_filters_and_budgets() {
+        let error = crate::auth::CredentialResolution::Exhausted {
+            retry_after: Duration::from_secs(15),
+        }
+        .into_result("openai")
+        .expect_err("configured pool is cooling");
+        let text = error.to_string();
+        let message = errored_message(Some(&text), 0);
+        assert!(!call_error_is_retryable(&error));
+        assert!(!error_result_is_retryable(&message, None));
+        assert_eq!(classify_failover(&text), Some(FailoverClass::Quota));
+
+        for outcome in [
+            TurnOutcome::Completed(&message),
+            TurnOutcome::Failed(&error),
+        ] {
+            assert!(
+                !is_credential_rate_limit(outcome),
+                "local exhaustion is not another provider failure"
+            );
+            for filter in [
+                FallbackOn::Any,
+                FallbackOn::UsageLimit,
+                FallbackOn::ExceptUsageLimit,
+            ] {
+                let allowed = !matches!(filter, FallbackOn::UsageLimit);
+                let policy = RetryPolicy {
+                    fallback_on: filter,
+                    ..policy()
+                };
+                for retries in [0, policy.max_retries] {
+                    // A temporarily cooling pool is a throttle, not account
+                    // exhaustion. No spare same-provider retry can bypass it.
+                    assert_eq!(
+                        decide(outcome, &progress(retries, 0), &policy, None),
+                        if allowed {
+                            TurnDecision::FailOver
+                        } else {
+                            TurnDecision::Finish { success: false }
+                        },
+                        "{filter:?}, retries={retries}",
+                    );
+                    assert_eq!(
+                        decide(
+                            outcome,
+                            &progress(retries, policy.max_failovers_per_turn),
+                            &policy,
+                            None
+                        ),
+                        TurnDecision::Finish { success: false },
+                    );
+                    assert_eq!(
+                        decide(
+                            outcome,
+                            &progress(retries, 0),
+                            &RetryPolicy {
+                                model_fallback: false,
+                                ..policy
+                            },
+                            None
+                        ),
+                        TurnDecision::Finish { success: false },
+                    );
+                    assert_eq!(
+                        decide(
+                            outcome,
+                            &TurnProgress {
+                                stream_can_retry: false,
+                                ..progress(retries, 0)
+                            },
+                            &policy,
+                            None
+                        ),
+                        TurnDecision::Finish { success: false },
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_admission_persistence_and_abort_outrank_credential_pool_exhaustion() {
+        let exhausted = crate::auth::CredentialResolution::Exhausted {
+            retry_after: Duration::from_secs(15),
+        }
+        .into_result("openai")
+        .expect_err("configured pool is cooling")
+        .to_string();
+        let admission =
+            crate::error::Error::validation(format!("Provider admission unavailable: {exhausted}"));
+        assert_eq!(
+            decide(
+                TurnOutcome::Failed(&admission),
+                &progress(0, 0),
+                &policy(),
+                None
+            ),
+            TurnDecision::Finish { success: false },
+            "refusal before accepting a prompt cannot become an automatic continuation",
+        );
+        assert!(!is_credential_rate_limit(TurnOutcome::Failed(&admission)));
+
+        let persistence_text = format!(
+            "{} {exhausted}",
+            crate::error::Error::SESSION_PERSISTENCE_PREFIX
+        );
+        let persistence_error = crate::error::Error::api(&persistence_text);
+        let persistence_message = errored_message(Some(&persistence_text), 0);
+        let abort_error = crate::error::Error::Aborted;
+        let mut abort_message = errored_message(Some(&exhausted), 0);
+        abort_message.stop_reason = crate::model::StopReason::Aborted;
+        for (outcome, expected) in [
+            (
+                TurnOutcome::Failed(&persistence_error),
+                TerminalReason::SessionPersistence,
+            ),
+            (
+                TurnOutcome::Completed(&persistence_message),
+                TerminalReason::SessionPersistence,
+            ),
+            (TurnOutcome::Failed(&abort_error), TerminalReason::Aborted),
+            (
+                TurnOutcome::Completed(&abort_message),
+                TerminalReason::Aborted,
+            ),
+        ] {
+            assert_eq!(
+                decide(outcome, &progress(0, 0), &policy(), None),
+                TurnDecision::Terminal(expected)
+            );
+            assert!(!is_credential_rate_limit(outcome));
+        }
+
+        let real_quota = crate::error::Error::provider("openai", "HTTP 429: rate limit exceeded");
+        let real_message = errored_message(Some("HTTP 429: rate limit exceeded"), 0);
+        assert!(is_credential_rate_limit(TurnOutcome::Failed(&real_quota)));
+        assert!(is_credential_rate_limit(TurnOutcome::Completed(
+            &real_message
+        )));
     }
 
     #[test]

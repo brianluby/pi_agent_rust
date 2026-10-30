@@ -3980,6 +3980,7 @@ impl ExtensionManager {
     /// merging into the `ModelRegistry`.
     #[allow(clippy::too_many_lines)]
     pub fn extension_model_entries(&self) -> Vec<crate::models::ModelEntry> {
+        use crate::models::{CompatConfig, merge_compat};
         use crate::provider::{InputType, Model, ModelCost};
         use std::collections::HashMap;
 
@@ -4011,6 +4012,24 @@ impl ExtensionManager {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            let parse_compat = |spec: &Value| {
+                spec.get("compat")
+                    .filter(|value| !value.is_null())
+                    .and_then(
+                        |value| match serde_json::from_value::<CompatConfig>(value.clone()) {
+                            Ok(compat) => Some(compat),
+                            Err(error) => {
+                                tracing::warn!(
+                                    provider = %provider_id,
+                                    %error,
+                                    "Invalid extension provider compatibility settings"
+                                );
+                                None
+                            }
+                        },
+                    )
+            };
+            let provider_compat = parse_compat(provider_spec);
 
             // Resolve API key (supports env var names).
             let resolved_key = if api_key_ref.is_empty() {
@@ -4090,6 +4109,27 @@ impl ExtensionManager {
                     .get("reasoning")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                let model_compat = parse_compat(model_spec);
+                let mut compat = merge_compat(provider_compat.as_ref(), model_compat.as_ref());
+                if let Some(map) = model_spec
+                    .get("thinkingLevelMap")
+                    .or_else(|| model_spec.get("thinking_level_map"))
+                    .filter(|value| !value.is_null())
+                {
+                    match serde_json::from_value::<HashMap<String, Option<String>>>(map.clone()) {
+                        Ok(map) => {
+                            compat
+                                .get_or_insert_with(CompatConfig::default)
+                                .thinking_level_map = Some(map);
+                        }
+                        Err(error) => tracing::warn!(
+                            provider = %provider_id,
+                            model = %model_id,
+                            %error,
+                            "Invalid extension model thinkingLevelMap"
+                        ),
+                    }
+                }
                 #[allow(clippy::cast_possible_truncation)]
                 let context_window = model_spec
                     .get("contextWindow")
@@ -4138,12 +4178,17 @@ impl ExtensionManager {
 
                 let cost = model_spec.get("cost").and_then(Value::as_object).map_or(
                     ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,
                         cache_write: 0.0,
                     },
                     |c| ModelCost {
+                        audio: c.get("audio").and_then(|audio| {
+                            serde_json::from_value::<crate::provider::AudioModelCost>(audio.clone())
+                                .ok()
+                        }),
                         input: c.get("input").and_then(Value::as_f64).unwrap_or(0.0),
                         output: c.get("output").and_then(Value::as_f64).unwrap_or(0.0),
                         cache_read: c
@@ -4176,7 +4221,7 @@ impl ExtensionManager {
                     api_key: resolved_key.clone(),
                     headers: model_headers,
                     auth_header: true,
-                    compat: None,
+                    compat,
                     oauth_config: oauth_config.clone(),
                 });
             }
@@ -4755,6 +4800,48 @@ impl ExtensionManager {
         self.dispatch_event_value(event, data, timeout_ms).await
     }
 
+    /// Dispatch `user_bash` for a `!command` the user typed. A hook that ran
+    /// the command itself answers `{ result: BashResult }`, which replaces the
+    /// shell run; any other answer lets the command run.
+    pub async fn dispatch_user_bash(
+        &self,
+        command: &str,
+        exclude_from_context: bool,
+        cwd: &Path,
+    ) -> Option<crate::tools::BashRunResult> {
+        let response = match self
+            .dispatch_event_with_response(
+                ExtensionEventName::UserBash,
+                Some(json!({
+                    "command": command,
+                    "excludeFromContext": exclude_from_context,
+                    "cwd": cwd.display().to_string(),
+                })),
+                EXTENSION_EVENT_TIMEOUT_MS,
+            )
+            .await
+        {
+            Ok(response) => response?,
+            Err(err) => {
+                tracing::warn!(
+                    event = "ext.user_bash.failed",
+                    error = %err,
+                    "Failed to dispatch user_bash"
+                );
+                return None;
+            }
+        };
+        if response.get("operations").is_some() {
+            // pi-mono's `{ operations }` (run through the extension's own
+            // exec) cannot cross the bridge: its members are functions.
+            tracing::warn!(
+                event = "ext.user_bash.operations_unsupported",
+                "A user_bash hook returned shell operations; running the command locally"
+            );
+        }
+        user_bash_result(response.get("result")?)
+    }
+
     pub async fn discover_resources(&self, cwd: &Path, reason: &str) -> ExtensionResourcePaths {
         let payload = json!({
             "cwd": cwd.display().to_string(),
@@ -5187,4 +5274,60 @@ impl ExtensionManager {
     pub fn has_any_event_hooks(&self) -> bool {
         self.read_snapshot().has_any_hooks
     }
+}
+
+/// A `user_bash` hook's `result` (OMP's `BashResult`, camelCase or
+/// snake_case keys).
+fn user_bash_result(result: &Value) -> Option<crate::tools::BashRunResult> {
+    let obj = result.as_object()?;
+
+    let output = obj
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let exit_code = obj
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .or_else(|| obj.get("exit_code").and_then(Value::as_i64))
+        .unwrap_or(0);
+    let cancelled = obj
+        .get("cancelled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let truncated = obj
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let full_output_path = obj
+        .get("fullOutputPath")
+        .or_else(|| obj.get("full_output_path"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let cancellation = obj.get("cancellation").and_then(Value::as_object);
+    let cancellation_reason = cancellation
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+        .and_then(|reason| match reason {
+            "timeout" => Some(crate::tools::BashCancellationReason::Timeout),
+            "ambient_cancellation" => {
+                Some(crate::tools::BashCancellationReason::AmbientCancellation)
+            }
+            _ => None,
+        });
+    let timeout_ms = cancellation
+        .and_then(|details| details.get("timeoutMs"))
+        .or_else(|| obj.get("timeoutMs"))
+        .and_then(Value::as_u64);
+
+    Some(crate::tools::BashRunResult {
+        output,
+        exit_code: i32::try_from(exit_code).unwrap_or(0),
+        cancelled,
+        cancellation_reason,
+        timeout_ms,
+        truncated,
+        full_output_path,
+        truncation: None,
+    })
 }

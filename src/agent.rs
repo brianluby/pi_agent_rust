@@ -63,12 +63,14 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tracing::warn;
+
+mod sampling;
 
 const MIN_COMPATIBLE_TOOL_PARALLELISM: usize = 8;
 const MAX_AUTO_COMPATIBLE_TOOL_PARALLELISM: usize = 64;
@@ -748,6 +750,9 @@ pub struct AgentConfig {
     /// instead of starting another turn.
     pub max_time: Option<std::time::Duration>,
 
+    /// Shared parent/child model-spend admission; never reset by retries.
+    pub cost_budget: Option<crate::cost::CostBudget>,
+
     /// Auto-continue policy for unexpected mid-task stops (bd-cv653.3.15).
     pub turn_recovery: crate::turn_recovery::TurnRecoveryMode,
 
@@ -773,6 +778,7 @@ impl fmt::Debug for AgentConfig {
             .field("tool_approval", &self.tool_approval.is_some())
             .field("keyword_settings", &self.keyword_settings)
             .field("max_time", &self.max_time)
+            .field("cost_budget", &self.cost_budget)
             .field("turn_recovery", &self.turn_recovery)
             .field("approval_state", &self.approval_state)
             .field("bash_settings", &self.bash_settings)
@@ -820,6 +826,7 @@ impl Default for AgentConfig {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            cost_budget: None,
             turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
@@ -1057,7 +1064,41 @@ impl QueuedAgentMessage {
 pub type MessageFetcher =
     Arc<dyn Fn() -> BoxFuture<'static, Vec<QueuedAgentMessage>> + Send + Sync + 'static>;
 
+/// One additive message source. Permanent RPC/extension sources carry no
+/// lifetime; turn-scoped SDK sources carry a weak lease and are removed before
+/// the next poll once their owning turn retires.
+struct RegisteredMessageFetcher {
+    fetcher: MessageFetcher,
+    lifetime: Option<Weak<()>>,
+}
+
+impl RegisteredMessageFetcher {
+    fn permanent(fetcher: MessageFetcher) -> Self {
+        Self {
+            fetcher,
+            lifetime: None,
+        }
+    }
+
+    fn scoped(fetcher: MessageFetcher, lifetime: &Arc<()>) -> Self {
+        Self {
+            fetcher,
+            lifetime: Some(Arc::downgrade(lifetime)),
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        self.lifetime
+            .as_ref()
+            .is_none_or(|lifetime| lifetime.strong_count() > 0)
+    }
+}
+
 type AgentEventHandler = Arc<dyn Fn(AgentEvent) + Send + Sync + 'static>;
+
+/// Persists completed messages mid-run, resolving to whether they reached the
+/// session. Each pair carries whether the message is an authored queued input.
+type TurnCheckpoint = Arc<dyn Fn(Vec<(Message, bool)>) -> BoxFuture<'static, bool> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueMode {
@@ -1278,6 +1319,13 @@ impl MessageQueue {
             QueueMode::All => self.follow_up.len(),
             QueueMode::OneAtATime => usize::from(!self.follow_up.is_empty()),
         }
+    }
+
+    fn follow_up_batch_has_authored_input(&self) -> bool {
+        self.follow_up
+            .iter()
+            .take(self.follow_up_batch_len())
+            .any(|entry| entry.delivery.keyword_scan_source().is_some())
     }
 
     fn pop_kind(&mut self, kind: QueueKind) -> Vec<QueuedAgentMessage> {
@@ -1505,8 +1553,20 @@ pub enum AgentEvent {
         #[serde(rename = "restoredPrimary")]
         restored_primary: bool,
     },
-    /// Advisor verdict delivered into the session (bd-cv653.3.3).
+    /// Advisor verdict recorded for the session, before queued delivery (bd-cv653.3.3).
     AdvisorNote { level: String, rationale: String },
+    /// A shared model-spend warning crossed its configured USD threshold.
+    CostWarning {
+        spent: f64,
+        threshold: f64,
+        message: String,
+    },
+    /// A planned one-shot handoff committed after a complete tool batch.
+    PrewalkSwitched {
+        provider: String,
+        model: String,
+        thinking: crate::model::ThinkingLevel,
+    },
     /// A provider request failed and ended the turn (#209). Emitted right
     /// before the `TurnEnd`/`AgentEnd` pair so consumers get the provider,
     /// HTTP status, and retryability as structured fields rather than having
@@ -1568,6 +1628,17 @@ impl AbortHandle {
         )
     }
 
+    /// Observe this handle's cancellation, including an already requested abort.
+    ///
+    /// This lets an admitted operation keep the same cancellation state when
+    /// its driver starts later.
+    #[must_use]
+    pub fn signal(&self) -> AbortSignal {
+        AbortSignal {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
     /// Trigger an abort.
     pub fn abort(&self) {
         if !self.inner.aborted.swap(true, Ordering::SeqCst) {
@@ -1614,7 +1685,8 @@ pub struct FailoverSwapAttempt<'a> {
     pub chain: &'a crate::failover::FailoverChain,
     /// Where to resume the walk, from the caller's cross-turn state.
     pub start_position: usize,
-    /// Models a chain spec can resolve against.
+    /// Admitted destinations after availability and provider filtering. The
+    /// session's full registry, when present, establishes provider identity.
     pub available_models: &'a [crate::models::ModelEntry],
     /// Credential store consulted for each candidate.
     pub auth: &'a crate::auth::AuthStorage,
@@ -1786,14 +1858,26 @@ pub struct Agent {
     /// Message history.
     messages: Vec<Message>,
 
+    /// Authored queued inputs that reached the live transcript but have not
+    /// yet reached Session persistence. Absolute, sorted message indices retain
+    /// provenance after the ephemeral delivery envelope is consumed.
+    authored_queue_delivery_indices: Vec<usize>,
+
+    /// Set by an [`AgentSession`] run: receives each completed turn's
+    /// messages before the next provider request, so a crash mid-run loses
+    /// at most the turn in flight. `turn_checkpoint_cursor` is the first
+    /// message index it has not received.
+    turn_checkpoint: Option<TurnCheckpoint>,
+    turn_checkpoint_cursor: usize,
+
     /// Fetchers for queued steering messages (interrupts).
-    steering_fetchers: Vec<MessageFetcher>,
+    steering_fetchers: Vec<RegisteredMessageFetcher>,
 
     /// Owning surface's bounded follow-up source used for resumed handoffs.
     initial_follow_up_fetcher: Option<MessageFetcher>,
 
     /// Fetchers for queued follow-up messages (idle).
-    follow_up_fetchers: Vec<MessageFetcher>,
+    follow_up_fetchers: Vec<RegisteredMessageFetcher>,
 
     /// Whether queue sources may be polled and dispatched automatically.
     /// Hosts can pause either lane and explicitly take already staged batches.
@@ -1815,6 +1899,20 @@ pub struct Agent {
     /// Path-scoped imported workspace rules (bd-cv653.6.2), delivered as
     /// steering messages the first time a tool call touches a matching path.
     scoped_rules: Option<ScopedRuleState>,
+
+    /// Dormant stream rules are evaluated by the common provider path, so
+    /// CLI, interactive, SDK and protocol sessions enforce the same policy.
+    stream_rules: Vec<crate::stream_rules::StreamRule>,
+    stream_rule_source: Option<crate::stream_rules::StreamRuleSource>,
+    stream_rule_coordinator: crate::stream_rules::TtsrCoordinator,
+    /// Logical user turns, rather than provider attempts or tool iterations.
+    /// Automatic retry/failover must not replenish the injection allowance.
+    stream_rule_turn: usize,
+
+    /// A prewalk only yields to the owning session driver; it never installs
+    /// a provider inside the tool loop or lets a tool choose the destination.
+    prewalk: Option<crate::prewalk::PrewalkState>,
+    prewalk_budget: Option<PrewalkRunBudget>,
 
     /// Discoverable tools promoted into the live schema mid-session via
     /// `xdev promote` (bd-cv653.1.6). Interior-mutable because tool
@@ -1903,6 +2001,30 @@ struct ScopedRuleState {
     activated: std::collections::HashSet<usize>,
 }
 
+/// A prewalk continuation and any recovery attempts share the original run
+/// clock and tool budget. The SDK resets this only at a public turn boundary.
+#[derive(Clone, Copy)]
+struct PrewalkRunBudget {
+    started: std::time::Instant,
+    max_time: Option<Duration>,
+    iterations: usize,
+    pause_continuations: usize,
+    turn_index: usize,
+    warned: bool,
+}
+
+/// A rule interruption is distinct from a provider failure or user abort.
+/// Its transient assistant is closed for observers but never authorizes tool
+/// execution or enters the next provider request's conversation history.
+enum AssistantStreamAttempt {
+    Complete(AssistantMessage),
+    RuleInterrupted {
+        rule: crate::stream_rules::StreamRule,
+        retry: bool,
+        message: AssistantMessage,
+    },
+}
+
 /// JSON keys of tool inputs that name filesystem paths, used to decide when
 /// a scoped rule's globs are touched. Budget-capped: only string values and
 /// first-level arrays of strings are inspected.
@@ -1953,11 +2075,16 @@ impl Agent {
         tools: crate::tools::SharedToolRegistry,
         config: AgentConfig,
     ) -> Self {
+        let provider = config.cost_budget.as_ref().map_or_else(
+            || Arc::clone(&provider),
+            |budget| crate::provider::guard_with_cost_budget(Arc::clone(&provider), budget.clone()),
+        );
         let keyword_max_thinking_level = config
             .stream_options
             .thinking_level
             .unwrap_or(crate::model::ThinkingLevel::Off);
         let registry = tools.snapshot();
+        registry.cost_scope().set(config.cost_budget.clone());
         let job_session_scope = registry.job_session_scope();
         registry
             .model_scope()
@@ -1971,6 +2098,9 @@ impl Agent {
             config,
             extensions: None,
             messages: Vec::new(),
+            authored_queue_delivery_indices: Vec::new(),
+            turn_checkpoint: None,
+            turn_checkpoint_cursor: 0,
             steering_fetchers: Vec::new(),
             initial_follow_up_fetcher: None,
             follow_up_fetchers: Vec::new(),
@@ -1980,6 +2110,16 @@ impl Agent {
             message_queue: MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime),
             cached_tool_defs: None,
             scoped_rules: None,
+            stream_rules: Vec::new(),
+            stream_rule_source: None,
+            stream_rule_coordinator: crate::stream_rules::TtsrCoordinator::new(
+                &[],
+                crate::stream_rules::DEFAULT_MAX_INJECTIONS_PER_TURN,
+                crate::stream_rules::DEFAULT_ROLLING_LOOKBACK_BYTES,
+            ),
+            stream_rule_turn: 0,
+            prewalk: None,
+            prewalk_budget: None,
             promoted_tools: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             tool_defs_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             plan_state: crate::plan::PlanState::new(),
@@ -2089,6 +2229,64 @@ impl Agent {
         self.secrets_vault = crate::secrets::SecretVault::default();
         self.refresh_compaction_privacy();
         self.plan_state.reset_for_session(plan_mode);
+        self.stream_rule_coordinator = crate::stream_rules::TtsrCoordinator::new(
+            &self.stream_rules,
+            crate::stream_rules::DEFAULT_MAX_INJECTIONS_PER_TURN,
+            crate::stream_rules::DEFAULT_ROLLING_LOOKBACK_BYTES,
+        );
+        self.stream_rule_turn = 0;
+        self.prewalk = None;
+        self.prewalk_budget = None;
+    }
+
+    /// The destination armed for this live session, never restored from disk.
+    #[must_use]
+    pub fn prewalk_target(&self) -> Option<&crate::prewalk::PrewalkTarget> {
+        self.prewalk.as_ref().map(|state| &state.target)
+    }
+
+    pub(crate) fn begin_prewalk_run(&mut self) {
+        // An abandoned SDK future may have yielded before it installed the
+        // target. A later public prompt must not silently resume that decision.
+        if self
+            .prewalk
+            .as_ref()
+            .is_some_and(crate::prewalk::PrewalkState::yielded)
+        {
+            self.prewalk = None;
+        }
+        self.prewalk_budget = self.prewalk.as_ref().map(|_| PrewalkRunBudget {
+            started: std::time::Instant::now(),
+            max_time: self.config.max_time,
+            iterations: 0,
+            pause_continuations: 0,
+            turn_index: 0,
+            warned: false,
+        });
+    }
+
+    pub(crate) fn finish_prewalk_run(&mut self, interrupted: bool) {
+        self.prewalk_budget = None;
+        if interrupted {
+            self.prewalk = None;
+        }
+    }
+
+    pub(crate) fn take_prewalk_handoff(&mut self) -> Option<crate::prewalk::PrewalkTarget> {
+        if self
+            .prewalk
+            .as_ref()
+            .is_some_and(crate::prewalk::PrewalkState::yielded)
+        {
+            self.prewalk.take().map(|state| state.target)
+        } else {
+            None
+        }
+    }
+
+    /// Explicitly cancel a pending one-shot model handoff.
+    pub fn disarm_prewalk(&mut self) {
+        self.prewalk = None;
     }
 
     /// The shared tool approval state (bd-cv653.3.19).
@@ -2123,6 +2321,48 @@ impl Agent {
     /// to persist as Custom entries.
     pub fn drain_keyword_ledger(&mut self) -> Vec<crate::magic_keywords::KeywordActivation> {
         std::mem::take(&mut self.keyword_ledger)
+    }
+
+    /// Install explicitly supplied stream rules. Invalid rules leave the
+    /// current policy intact. This replaces filesystem discovery for callers
+    /// that own their configuration, without resetting an active turn's cap.
+    pub fn set_stream_rules(&mut self, rules: Vec<crate::stream_rules::StreamRule>) -> Result<()> {
+        crate::stream_rules::validate_stream_rules(&rules)?;
+        self.install_stream_rules(rules);
+        self.stream_rule_source = None;
+        Ok(())
+    }
+
+    /// Configure trusted project/global rule discovery. The initial load is
+    /// validated before installation. Further loads happen at authored prompt
+    /// boundaries, never during a provider retry or tool batch.
+    pub fn set_stream_rule_source(
+        &mut self,
+        source: crate::stream_rules::StreamRuleSource,
+    ) -> Result<()> {
+        let rules = source.load()?;
+        self.install_stream_rules(rules);
+        self.stream_rule_source = Some(source);
+        Ok(())
+    }
+
+    fn install_stream_rules(&mut self, rules: Vec<crate::stream_rules::StreamRule>) {
+        self.stream_rule_coordinator.replace_rules(&rules);
+        self.stream_rules = rules;
+    }
+
+    fn refresh_stream_rules(&mut self) -> Result<()> {
+        if let Some(source) = &self.stream_rule_source {
+            let rules = source.load()?;
+            self.install_stream_rules(rules);
+        }
+        Ok(())
+    }
+
+    fn begin_stream_rule_turn(&mut self) {
+        self.stream_rule_turn = self.stream_rule_turn.saturating_add(1);
+        self.stream_rule_coordinator
+            .advance_turn(self.stream_rule_turn);
     }
 
     /// Install glob-scoped imported workspace rules (bd-cv653.6.2). Each rule
@@ -2199,12 +2439,69 @@ impl Agent {
     /// Clear the message history.
     pub fn clear_messages(&mut self) {
         self.messages.clear();
+        self.authored_queue_delivery_indices.clear();
     }
 
     /// Truncate the active message history to `len` (rewind/retry keep the
     /// full span in the session tree — bd-cv653.3.7).
     pub fn truncate_messages(&mut self, len: usize) {
         self.messages.truncate(len);
+        self.authored_queue_delivery_indices
+            .retain(|index| *index < len);
+    }
+
+    /// Used by terminal recovery when a dropped Agent future left completed
+    /// tool work in memory. Generated user-role messages never qualify.
+    pub(crate) fn is_authored_queue_delivery(&self, index: usize) -> bool {
+        self.authored_queue_delivery_indices
+            .binary_search(&index)
+            .is_ok()
+    }
+
+    /// Hand completed turns to `checkpoint` during the next run, starting at
+    /// message index `cursor`.
+    fn arm_turn_checkpoint(&mut self, checkpoint: TurnCheckpoint, cursor: usize) {
+        self.turn_checkpoint = Some(checkpoint);
+        self.turn_checkpoint_cursor = cursor;
+    }
+
+    /// The first message index the checkpoint has not persisted, or `None`
+    /// when no checkpoint was armed.
+    fn disarm_turn_checkpoint(&mut self) -> Option<usize> {
+        self.turn_checkpoint
+            .take()
+            .map(|_| self.turn_checkpoint_cursor)
+    }
+
+    /// At a turn boundary every message is complete. Stop at a failed or
+    /// aborted assistant: the run's final save decides whether it is kept and
+    /// where.
+    async fn checkpoint_completed_turns(&mut self) {
+        let Some(checkpoint) = self.turn_checkpoint.clone() else {
+            return;
+        };
+        let start = self.turn_checkpoint_cursor.min(self.messages.len());
+        let end = self.messages[start..]
+            .iter()
+            .position(is_incomplete_assistant_message)
+            .map_or(self.messages.len(), |offset| start + offset);
+        if start == end {
+            return;
+        }
+        let completed = (start..end)
+            .map(|index| {
+                (
+                    self.messages[index].clone(),
+                    self.is_authored_queue_delivery(index),
+                )
+            })
+            .collect();
+        if !checkpoint(completed).await {
+            return;
+        }
+        self.turn_checkpoint_cursor = end;
+        self.authored_queue_delivery_indices
+            .retain(|index| *index >= end);
     }
 
     /// Add a message to the history.
@@ -2215,6 +2512,13 @@ impl Agent {
                 MAX_AGENT_MESSAGES
             );
             self.messages.remove(0);
+            self.authored_queue_delivery_indices.retain_mut(|index| {
+                index.checked_sub(1).is_some_and(|shifted| {
+                    *index = shifted;
+                    true
+                })
+            });
+            self.turn_checkpoint_cursor = self.turn_checkpoint_cursor.saturating_sub(1);
         }
         self.messages.push(message);
     }
@@ -2222,6 +2526,7 @@ impl Agent {
     /// Replace the message history.
     pub fn replace_messages(&mut self, messages: Vec<Message>) {
         self.messages = messages;
+        self.authored_queue_delivery_indices.clear();
     }
 
     /// Replace the provider implementation (used for model/provider switching).
@@ -2230,7 +2535,10 @@ impl Agent {
     /// thinking to disabled and the tool-call dialect to native; catalog-aware
     /// callers must install the selected model's capabilities afterwards.
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
-        self.provider = provider;
+        self.provider = self.config.cost_budget.as_ref().map_or_else(
+            || Arc::clone(&provider),
+            |budget| crate::provider::guard_with_cost_budget(Arc::clone(&provider), budget.clone()),
+        );
         self.tools
             .snapshot()
             .model_scope()
@@ -2242,6 +2550,49 @@ impl Agent {
         self.keyword_max_thinking_level = crate::model::ThinkingLevel::Off;
         self.tool_call_dialect = crate::dialects::Dialect::Native;
         self.config.model_accepts_images = false;
+    }
+
+    #[must_use]
+    pub fn cost_budget(&self) -> Option<&crate::cost::CostBudget> {
+        self.config.cost_budget.as_ref()
+    }
+
+    pub fn replacement_cost_budget(
+        &self,
+        session: &Session,
+        preserve: bool,
+    ) -> Result<Option<crate::cost::CostBudget>> {
+        self.cost_budget()
+            .map(|budget| budget.for_replacement(session, preserve))
+            .transpose()
+    }
+
+    /// Rebind only for an explicitly selected new/different session. Model
+    /// switches, retries, forks and history navigation keep the same handle.
+    pub fn set_cost_budget(&mut self, budget: Option<crate::cost::CostBudget>) {
+        self.config.cost_budget = budget.clone();
+        self.tools.snapshot().cost_scope().set(budget);
+        let provider = self
+            .provider
+            .unguarded_provider()
+            .unwrap_or_else(|| Arc::clone(&self.provider));
+        self.provider = self.config.cost_budget.as_ref().map_or_else(
+            || Arc::clone(&provider),
+            |budget| crate::provider::guard_with_cost_budget(Arc::clone(&provider), budget.clone()),
+        );
+    }
+
+    fn emit_cost_warning(&self, on_event: &AgentEventHandler) {
+        if let Some(warning) = self
+            .cost_budget()
+            .and_then(crate::cost::CostBudget::take_warning)
+        {
+            on_event(AgentEvent::CostWarning {
+                spent: warning.spent,
+                threshold: warning.threshold,
+                message: warning.message,
+            });
+        }
     }
 
     /// Set the model-clamped target used when a turn contains `ultrathink`.
@@ -2288,10 +2639,33 @@ impl Agent {
         follow_up: Option<MessageFetcher>,
     ) {
         if let Some(fetcher) = steering {
-            self.steering_fetchers.push(fetcher);
+            self.steering_fetchers
+                .push(RegisteredMessageFetcher::permanent(fetcher));
         }
         if let Some(fetcher) = follow_up {
-            self.follow_up_fetchers.push(fetcher);
+            self.follow_up_fetchers
+                .push(RegisteredMessageFetcher::permanent(fetcher));
+        }
+    }
+
+    /// Register message sources whose lifetime is owned by one SDK turn.
+    ///
+    /// The Agent keeps the closures only until their lease expires. This keeps
+    /// long-lived sessions from accumulating inert readers while leaving
+    /// permanent RPC/extension sources additive.
+    pub(crate) fn register_scoped_message_fetchers(
+        &mut self,
+        lifetime: &Arc<()>,
+        steering: Option<MessageFetcher>,
+        follow_up: Option<MessageFetcher>,
+    ) {
+        if let Some(fetcher) = steering {
+            self.steering_fetchers
+                .push(RegisteredMessageFetcher::scoped(fetcher, lifetime));
+        }
+        if let Some(fetcher) = follow_up {
+            self.follow_up_fetchers
+                .push(RegisteredMessageFetcher::scoped(fetcher, lifetime));
         }
     }
 
@@ -2479,16 +2853,17 @@ impl Agent {
         // would only spend context budget. Until 2026-09-02 every hidden
         // custom message was dropped here, which silently discarded hidden
         // hook injections.
-        let has_excluded = self
-            .messages
-            .iter()
-            .any(|m| matches!(m, Message::Custom(c) if context_excluded_custom_message(c)));
+        let has_excluded = self.messages.iter().any(|m| {
+            matches!(m, Message::Custom(c) if context_excluded_custom_message(c))
+                || crate::turn_recovery::context_excludes_empty_response(m)
+        });
         let needs_image_filter = (self.config.block_images || !self.config.model_accepts_images)
             && self.messages.iter().any(message_has_images);
         let messages: Cow<'_, [Message]> = if needs_image_filter || has_excluded {
             let mut msgs = self.messages.clone();
             msgs.retain(|m| match m {
                 Message::Custom(c) => !context_excluded_custom_message(c),
+                Message::Assistant(_) => !crate::turn_recovery::context_excludes_empty_response(m),
                 _ => true,
             });
             apply_image_input_policy(
@@ -2541,8 +2916,15 @@ impl Agent {
                 .expect("cache populated above"),
         );
 
+        let system_prompt = if self.prewalk_budget.is_some() && self.prewalk.is_some() {
+            let mut prompt = self.config.system_prompt.clone().unwrap_or_default();
+            prompt.push_str("\n\n## Prewalk\nInvestigate the request and plan the implementation before making changes. If the todo tool is available, record a concrete todo list before editing project files. Begin the first real implementation change; the session will automatically hand off after that completed tool batch. Do not stop to announce or request the handoff. For discussion or read-only requests, answer normally without making an artificial edit.");
+            Some(Cow::Owned(prompt))
+        } else {
+            self.config.system_prompt.as_deref().map(Cow::Borrowed)
+        };
         Context {
-            system_prompt: self.config.system_prompt.as_deref().map(Cow::Borrowed),
+            system_prompt,
             messages,
             tools,
         }
@@ -3209,6 +3591,12 @@ impl Agent {
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
+        if !prompts.is_empty() || initial_follow_up || self.stream_rule_turn == 0 {
+            self.refresh_stream_rules()?;
+        }
+        if !prompts.is_empty() || (!initial_follow_up && self.stream_rule_turn == 0) {
+            self.begin_stream_rule_turn();
+        }
         if !prompts.is_empty() || initial_follow_up {
             self.retry_keyword_activations.clear();
         }
@@ -3293,6 +3681,17 @@ impl Agent {
         }
     }
 
+    /// Consume a delivery immediately before appending its message. Every
+    /// normal and terminal drain uses this boundary so persistence can still
+    /// distinguish authored input from generated user-role messages.
+    fn consume_queued_delivery(&mut self, delivery: QueuedAgentMessage) -> Message {
+        if delivery.keyword_scan_source().is_some() {
+            self.authored_queue_delivery_indices
+                .push(self.messages.len());
+        }
+        delivery.into_message()
+    }
+
     fn apply_magic_keywords_for_text(
         &mut self,
         scan_text: &str,
@@ -3329,10 +3728,11 @@ impl Agent {
             .as_deref()
             .unwrap_or("")
             .into();
-        let mut iterations = 0usize;
-        let mut pause_turn_continuations = 0usize;
-        let mut warned_at_handoff_threshold = false;
-        let mut turn_index: usize = 0;
+        let budget = self.prewalk_budget;
+        let mut iterations = budget.map_or(0, |budget| budget.iterations);
+        let mut pause_turn_continuations = budget.map_or(0, |budget| budget.pause_continuations);
+        let mut warned_at_handoff_threshold = budget.is_some_and(|budget| budget.warned);
+        let mut turn_index = budget.map_or(0, |budget| budget.turn_index);
         let mut new_messages: Vec<Message> = Vec::with_capacity(prompts.len() + 8);
         let mut last_assistant: Option<Arc<AssistantMessage>> = None;
         let mut turn_keyword_words = std::collections::HashSet::new();
@@ -3412,8 +3812,8 @@ impl Agent {
         // Wall-clock run cap (bd-cv653.3.7, --max-time): checked at turn
         // boundaries — never mid-tool-call. On expiry the run stops with a
         // marker instead of starting another turn.
-        let run_started = std::time::Instant::now();
-        let max_time = self.config.max_time;
+        let run_started = budget.map_or_else(std::time::Instant::now, |budget| budget.started);
+        let max_time = budget.map_or(self.config.max_time, |budget| budget.max_time);
 
         'agent: loop {
             let mut has_more_tool_calls = true;
@@ -3457,7 +3857,24 @@ impl Agent {
 
                 let delivering_follow_up = follow_up_staged;
                 if delivering_follow_up {
-                    let current_follow_up = self.pop_follow_up_for_current_session().await;
+                    self.refresh_follow_up_session_ownership().await;
+                    let authored_follow_up =
+                        self.message_queue.follow_up_batch_has_authored_input();
+                    if authored_follow_up && let Err(err) = self.refresh_stream_rules() {
+                        // Validate before taking the accepted batch. Its order,
+                        // persistence identities and job ownership must survive
+                        // an invalid edit so the user can fix it and resume.
+                        let agent_end_event = AgentEvent::AgentEnd {
+                            session_id: session_id.clone(),
+                            messages: std::mem::take(&mut new_messages),
+                            error: Some(err.to_string()),
+                        };
+                        self.dispatch_extension_lifecycle_event(&agent_end_event)
+                            .await;
+                        on_event(agent_end_event);
+                        return Err(err);
+                    }
+                    let current_follow_up = self.message_queue.pop_follow_up();
                     follow_up_staged = false;
                     required_initial_follow_up_pending = false;
                     if current_follow_up.is_empty() {
@@ -3466,6 +3883,9 @@ impl Agent {
                         // normal idle restaging boundary without emitting a
                         // lifecycle start or invoking the provider empty.
                         break;
+                    }
+                    if authored_follow_up {
+                        self.begin_stream_rule_turn();
                     }
                     // Follow-ups are new logical user turns. Restore the
                     // caller's baseline before scanning their keywords so
@@ -3479,6 +3899,7 @@ impl Agent {
                     pending_messages = current_follow_up;
                 }
 
+                self.checkpoint_completed_turns().await;
                 let current_turn_index = turn_index;
                 let turn_latency = Arc::new(StdMutex::new(TurnLatencyAccumulator::started()));
                 let turn_start_event = AgentEvent::TurnStart {
@@ -3492,20 +3913,7 @@ impl Agent {
 
                 for delivery in std::mem::take(&mut pending_messages) {
                     self.apply_magic_keywords_for_delivery(&delivery, &mut turn_keyword_words);
-                    let message = delivery.into_message();
-                    // Advisor notes get a dedicated event on delivery
-                    // (bd-cv653.3.3) so RPC/ACP surfaces can render them.
-                    if let Message::User(user) = &message
-                        && let crate::model::UserContent::Text(text) = &user.content
-                        && let Some(rest) = text.strip_prefix("[ADVISOR:")
-                    {
-                        let level = rest.split(']').next().unwrap_or("NOTE").to_string();
-                        let rationale = rest
-                            .split_once(']')
-                            .map(|(_, tail)| tail.trim().to_string())
-                            .unwrap_or_default();
-                        on_event(AgentEvent::AdvisorNote { level, rationale });
-                    }
+                    let message = self.consume_queued_delivery(delivery);
                     self.messages.push(message.clone());
                     on_event(AgentEvent::MessageStart {
                         message: message.clone(),
@@ -3556,8 +3964,16 @@ impl Agent {
                 }
 
                 let provider_streaming_started_at = Instant::now();
+                let empty_response_limit_reached = self.automatic_follow_up_dispatch
+                    && turn_recovery.empty_response_limit_reached();
                 let assistant_result = self
-                    .stream_assistant_response(Arc::clone(&on_event), abort.clone(), &loop_cx)
+                    .stream_assistant_response(
+                        Arc::clone(&on_event),
+                        abort.clone(),
+                        &loop_cx,
+                        &mut new_messages,
+                        empty_response_limit_reached,
+                    )
                     .await;
                 record_provider_streaming_latency(
                     &turn_latency,
@@ -3574,7 +3990,7 @@ impl Agent {
                                 &delivery,
                                 &mut turn_keyword_words,
                             );
-                            let message = delivery.into_message();
+                            let message = self.consume_queued_delivery(delivery);
                             self.messages.push(message.clone());
                             on_event(AgentEvent::MessageStart {
                                 message: message.clone(),
@@ -3634,7 +4050,7 @@ impl Agent {
                     let steering_to_add = self.drain_steering_messages().await;
                     for delivery in steering_to_add {
                         self.apply_magic_keywords_for_delivery(&delivery, &mut turn_keyword_words);
-                        let message = delivery.into_message();
+                        let message = self.consume_queued_delivery(delivery);
                         self.messages.push(message.clone());
                         on_event(AgentEvent::MessageStart {
                             message: message.clone(),
@@ -3690,6 +4106,9 @@ impl Agent {
                 has_more_tool_calls = execute_local_tools;
                 if pause_turn {
                     pause_turn_continuations = pause_turn_continuations.saturating_add(1);
+                    if let Some(budget) = &mut self.prewalk_budget {
+                        budget.pause_continuations = pause_turn_continuations;
+                    }
                     if pause_turn_continuations <= MAX_PAUSE_TURN_CONTINUATIONS {
                         // The completed assistant message is already in history. The
                         // next stream request therefore resubmits it verbatim with
@@ -3708,6 +4127,9 @@ impl Agent {
                 let mut tool_results: Vec<Arc<ToolResultMessage>> = Vec::new();
                 if execute_local_tools {
                     iterations += 1;
+                    if let Some(budget) = &mut self.prewalk_budget {
+                        budget.iterations = iterations;
+                    }
                     // Soft handoff: at >=80% of the cap, push a one-shot
                     // steering message so the agent has room to write an
                     // incomplete-handoff envelope before the hard stop. The
@@ -3774,7 +4196,7 @@ impl Agent {
                                 &delivery,
                                 &mut turn_keyword_words,
                             );
-                            let message = delivery.into_message();
+                            let message = self.consume_queued_delivery(delivery);
                             self.messages.push(message.clone());
                             on_event(AgentEvent::MessageStart {
                                 message: message.clone(),
@@ -3826,7 +4248,7 @@ impl Agent {
                                     &delivery,
                                     &mut turn_keyword_words,
                                 );
-                                let message = delivery.into_message();
+                                let message = self.consume_queued_delivery(delivery);
                                 self.messages.push(message.clone());
                                 on_event(AgentEvent::MessageStart {
                                     message: message.clone(),
@@ -3880,6 +4302,39 @@ impl Agent {
                 on_event(turn_end_event);
 
                 turn_index = turn_index.saturating_add(1);
+                if let Some(budget) = &mut self.prewalk_budget {
+                    budget.turn_index = turn_index;
+                    budget.warned = warned_at_handoff_threshold;
+                }
+                let handoff = if self.prewalk_budget.is_some()
+                    && let Some(prewalk) = &mut self.prewalk
+                {
+                    prewalk.observe(&tool_calls, &tool_results);
+                    !tool_results.is_empty()
+                        && !abort.as_ref().is_some_and(AbortSignal::is_aborted)
+                        && prewalk.yield_at_boundary()
+                } else {
+                    false
+                };
+                if handoff {
+                    // The tool executor may already have drained steering
+                    // (including the original iteration-budget warning).
+                    // Persist those deliveries exactly once before the SDK
+                    // continues; unfetched input stays in the live mailbox.
+                    for delivery in steering_after_tools.take().unwrap_or_default() {
+                        self.apply_magic_keywords_for_delivery(&delivery, &mut turn_keyword_words);
+                        let message = self.consume_queued_delivery(delivery);
+                        self.messages.push(message.clone());
+                        on_event(AgentEvent::MessageStart {
+                            message: message.clone(),
+                        });
+                        on_event(AgentEvent::MessageEnd {
+                            message: message.clone(),
+                        });
+                        new_messages.push(message);
+                    }
+                    break 'agent;
+                }
 
                 if let Some(steering) = steering_after_tools.take() {
                     pending_messages = steering;
@@ -3896,9 +4351,9 @@ impl Agent {
                 if self.automatic_follow_up_dispatch
                     && pending_messages.is_empty()
                     && !has_more_tool_calls
+                    && !abort.as_ref().is_some_and(AbortSignal::is_aborted)
                 {
-                    let text = assistant_text_content(&assistant_arc.content);
-                    if let Some(action) = turn_recovery.evaluate(assistant_arc.stop_reason, &text) {
+                    if let Some(action) = turn_recovery.evaluate_assistant(&assistant_arc) {
                         pending_messages =
                             vec![QueuedAgentMessage::generated(Message::User(UserMessage {
                                 content: UserContent::Text(action.nudge_text),
@@ -4087,8 +4542,10 @@ impl Agent {
         if !self.automatic_steering_dispatch {
             return Vec::new();
         }
-        for fetcher in &self.steering_fetchers {
-            let fetched = self.fetch_messages(Some(fetcher)).await;
+        self.steering_fetchers
+            .retain(RegisteredMessageFetcher::is_live);
+        for registered in &self.steering_fetchers {
+            let fetched = self.fetch_messages(Some(&registered.fetcher)).await;
             for message in fetched {
                 // Fetchers own their admission and queue bounds. Preserve the
                 // complete accepted batch at the synchronous handoff instead
@@ -4133,8 +4590,10 @@ impl Agent {
     }
 
     async fn fetch_additive_follow_up_messages(&mut self) {
-        for fetcher in &self.follow_up_fetchers {
-            let fetched = self.fetch_messages(Some(fetcher)).await;
+        self.follow_up_fetchers
+            .retain(RegisteredMessageFetcher::is_live);
+        for registered in &self.follow_up_fetchers {
+            let fetched = self.fetch_messages(Some(&registered.fetcher)).await;
             for message in fetched {
                 self.message_queue.push_follow_up(message);
             }
@@ -4164,9 +4623,13 @@ impl Agent {
     }
 
     async fn pop_follow_up_for_current_session(&mut self) -> Vec<QueuedAgentMessage> {
+        self.refresh_follow_up_session_ownership().await;
+        self.message_queue.pop_follow_up()
+    }
+
+    async fn refresh_follow_up_session_ownership(&mut self) {
         let owner_session_id = self.job_session_scope.session_id().await.ok();
         self.restore_job_follow_ups_except(owner_session_id.as_deref());
-        self.message_queue.pop_follow_up()
     }
 
     fn restore_job_follow_ups_except(&mut self, owner_session_id: Option<&str>) {
@@ -4203,7 +4666,204 @@ impl Agent {
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
         checkpoint_cx: &crate::agent_cx::AgentCx,
+        new_messages: &mut Vec<Message>,
+        empty_response_limit_reached: bool,
     ) -> Result<AssistantMessage> {
+        loop {
+            self.stream_rule_coordinator.reset_attempt();
+            let attempt_start = self.messages.len();
+            match self
+                .stream_assistant_attempt(
+                    Arc::clone(&on_event),
+                    abort.clone(),
+                    checkpoint_cx,
+                    empty_response_limit_reached,
+                )
+                .await?
+            {
+                AssistantStreamAttempt::Complete(message) => return Ok(message),
+                AssistantStreamAttempt::RuleInterrupted {
+                    rule,
+                    retry,
+                    message,
+                } => {
+                    // Only the current attempt can have appended a partial
+                    // assistant. Already completed tools and earlier messages
+                    // are untouched. In particular, no abandoned tool call
+                    // can leak into a retry's provider context or executor.
+                    self.messages.truncate(attempt_start);
+                    if !retry {
+                        // The interruption already emitted its paired terminal
+                        // message. Retain the named cap refusal once, and let
+                        // the normal loop settle TurnEnd/AgentEnd without a
+                        // provider retry, failover or advisor continuation.
+                        self.messages.push(Message::assistant(message.clone()));
+                        return Ok(message);
+                    }
+
+                    let reminder = Message::Custom(CustomMessage {
+                        custom_type: crate::stream_rules::TTSR_CUSTOM_ENTRY_TYPE.to_string(),
+                        content: format!(
+                            "[Stream rule: {}]\n\n{}\n\n\
+                             The interrupted draft was discarded. Continue from the prior \
+                             conversation and follow this directive.",
+                            rule.name,
+                            rule.body.trim(),
+                        ),
+                        display: true,
+                        details: Some(json!({
+                            "ruleId": rule.id,
+                            "ruleName": rule.name,
+                            "turn": self.stream_rule_turn,
+                            "injection": self.stream_rule_coordinator.current_turn_injections(),
+                            "maxInjections": crate::stream_rules::DEFAULT_MAX_INJECTIONS_PER_TURN,
+                            "discardedUsage": message.usage,
+                        })),
+                        timestamp: Utc::now().timestamp_millis(),
+                    });
+                    // The ordinary session transcript transaction owns this
+                    // record. Do not persist the offending excerpt or partial
+                    // tool arguments: they may contain generated credentials.
+                    self.messages.push(reminder.clone());
+                    on_event(AgentEvent::MessageStart {
+                        message: reminder.clone(),
+                    });
+                    on_event(AgentEvent::MessageEnd {
+                        message: reminder.clone(),
+                    });
+                    new_messages.push(reminder);
+                    // The next attempt checks the same owner's cancellation
+                    // before opening a provider stream. A rule match never
+                    // clears a user abort or replenishes a turn allowance.
+                }
+            }
+        }
+    }
+
+    fn stream_rule_interruption(
+        &mut self,
+        event: &StreamEvent,
+    ) -> Option<(crate::stream_rules::StreamRule, bool)> {
+        use crate::stream_rules::{StreamChannel, TtsrAction};
+        if self.stream_rules.is_empty() {
+            return None;
+        }
+        let action = match event {
+            StreamEvent::TextDelta { delta, .. } => self
+                .stream_rule_coordinator
+                .process_chunk(delta, StreamChannel::AssistantText),
+            StreamEvent::ThinkingDelta { delta, .. } => self
+                .stream_rule_coordinator
+                .process_chunk(delta, StreamChannel::Thinking),
+            StreamEvent::Start { partial } => self.check_stream_rule_snapshot(partial),
+            StreamEvent::Done { reason, message }
+                if !matches!(
+                    reason,
+                    StopReason::Error | StopReason::Aborted | StopReason::Refusal
+                ) && !matches!(
+                    message.stop_reason,
+                    StopReason::Error | StopReason::Aborted | StopReason::Refusal
+                ) =>
+            {
+                // A provider may send only a terminal snapshot, or replace its
+                // streamed text at the terminal. Check that authoritative
+                // content before any tool is eligible to execute. Resetting
+                // avoids joining a full snapshot onto its own earlier deltas.
+                self.check_stream_rule_snapshot(message)
+            }
+            // Tool argument JSON is deliberately excluded. End-of-block text
+            // is covered by the terminal snapshot without double-feeding the
+            // rolling matcher and inventing matches across duplicated text.
+            _ => TtsrAction::Continue,
+        };
+        match action {
+            TtsrAction::Continue => None,
+            TtsrAction::AbortAndInject { rule, .. } => Some((rule, true)),
+            TtsrAction::CapExceeded { rule, .. } => Some((rule, false)),
+        }
+    }
+
+    fn check_stream_rule_snapshot(
+        &mut self,
+        message: &AssistantMessage,
+    ) -> crate::stream_rules::TtsrAction {
+        use crate::stream_rules::{StreamChannel, TtsrAction};
+        self.stream_rule_coordinator.reset_attempt();
+        for block in &message.content {
+            let action = match block {
+                ContentBlock::Text(text) => self
+                    .stream_rule_coordinator
+                    .process_chunk(&text.text, StreamChannel::AssistantText),
+                ContentBlock::Thinking(thinking) => self
+                    .stream_rule_coordinator
+                    .process_chunk(&thinking.thinking, StreamChannel::Thinking),
+                _ => TtsrAction::Continue,
+            };
+            if !matches!(action, TtsrAction::Continue) {
+                return action;
+            }
+        }
+        TtsrAction::Continue
+    }
+
+    fn close_stream_rule_attempt(
+        &self,
+        rule: &crate::stream_rules::StreamRule,
+        retry: bool,
+        partial: Option<&AssistantMessage>,
+        sent_start: bool,
+        on_event: &AgentEventHandler,
+    ) -> AssistantMessage {
+        let mut message = self.build_abort_message(partial);
+        let diagnostic = if retry {
+            format!(
+                "PI_STREAM_RULE_RETRY: discarded a response matching stream rule '{}'",
+                rule.name
+            )
+        } else {
+            format!(
+                "PI_STREAM_RULE_LIMIT: stream rule '{}' still matched after {} corrections; \
+                 stopped without executing this response's tool calls",
+                rule.name,
+                crate::stream_rules::DEFAULT_MAX_INJECTIONS_PER_TURN,
+            )
+        };
+        message.content = vec![ContentBlock::Text(TextContent::new(diagnostic.clone()))];
+        message.error_message = Some(diagnostic);
+        message.stop_details = None;
+        if let Some(rates) = self.provider.model_cost()
+            && let Err(error) = rates.price_usage(&mut message.usage)
+        {
+            tracing::warn!(%error, "stream-rule response has unavailable billing");
+        }
+        let shared = Arc::new(message);
+        if !sent_start {
+            on_event(AgentEvent::MessageStart {
+                message: Message::Assistant(Arc::clone(&shared)),
+            });
+        }
+        on_event(AgentEvent::MessageUpdate {
+            message: Message::Assistant(Arc::clone(&shared)),
+            assistant_message_event: AssistantMessageEvent::Error {
+                reason: StopReason::Aborted,
+                error: Arc::clone(&shared),
+            },
+        });
+        on_event(AgentEvent::MessageEnd {
+            message: Message::Assistant(Arc::clone(&shared)),
+        });
+        Arc::unwrap_or_clone(shared)
+    }
+
+    #[allow(clippy::too_many_lines)] // one provider stream attempt, consumed event by event
+    async fn stream_assistant_attempt(
+        &mut self,
+        on_event: AgentEventHandler,
+        abort: Option<AbortSignal>,
+        checkpoint_cx: &crate::agent_cx::AgentCx,
+        empty_response_limit_reached: bool,
+    ) -> Result<AssistantStreamAttempt> {
+        self.emit_cost_warning(&on_event);
         // Refresh admitted MCP catalogs before capturing the provider's tool
         // schema, under the same owner and cancellation as this request.
         crate::mcp::refresh_agent_tools(&self.tools, abort.as_ref(), checkpoint_cx).await;
@@ -4264,6 +4924,7 @@ impl Agent {
             ));
         }
 
+        let request_started_at = Instant::now();
         let stream_fut = provider.stream(&context, &stream_options);
         let mut stream = if let Some(signal) = abort.as_ref() {
             let abort_fut = signal.wait().fuse();
@@ -4450,6 +5111,32 @@ impl Agent {
                     return Ok(self.finalize_assistant_message(msg, &on_event, added_partial));
                 }
             };
+
+            if checkpoint_cx.checkpoint().is_err()
+                || abort.as_ref().is_some_and(AbortSignal::is_aborted)
+            {
+                continue 'stream;
+            }
+            if let Some((rule, retry)) = self.stream_rule_interruption(&event) {
+                let partial = match &event {
+                    StreamEvent::Start { partial } => Some(partial),
+                    StreamEvent::Done { message, .. } => Some(message),
+                    _ if added_partial => match self.messages.last() {
+                        Some(Message::Assistant(message)) => Some(message.as_ref()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let message =
+                    self.close_stream_rule_attempt(&rule, retry, partial, sent_start, &on_event);
+                // Returning drops the provider stream before the next attempt
+                // can open. No terminal tool snapshot reaches the executor.
+                return Ok(AssistantStreamAttempt::RuleInterrupted {
+                    rule,
+                    retry,
+                    message,
+                });
+            }
 
             match event {
                 StreamEvent::Start { partial } => {
@@ -4939,7 +5626,26 @@ impl Agent {
                         message.stop_reason = StopReason::Error;
                         message.error_message = Some(TRUNCATED_TOOL_CALL_ERROR.to_string());
                     }
-                    return Ok(self.finalize_assistant_message(message, &on_event, added_partial));
+                    crate::turn_recovery::finish_empty_response(
+                        &mut message,
+                        empty_response_limit_reached,
+                    );
+                    let completed =
+                        self.finalize_assistant_message(message, &on_event, added_partial);
+                    if let AssistantStreamAttempt::Complete(message) = &completed
+                        && !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+                        && let Some(key) = stream_options.api_key.as_deref()
+                    {
+                        // Use the request's captured provider and credential.
+                        // Later callbacks or concurrent requests may have
+                        // changed the session key or reported a newer limit.
+                        crate::auth::report_provider_success(
+                            provider.name(),
+                            key,
+                            request_started_at,
+                        );
+                    }
+                    return Ok(completed);
                 }
                 StreamEvent::Error { reason, mut error } => {
                     // Custom providers can leave the partial snapshot stamped
@@ -5045,7 +5751,7 @@ impl Agent {
         mut message: AssistantMessage,
         on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
         added_partial: bool,
-    ) -> AssistantMessage {
+    ) -> AssistantStreamAttempt {
         // Repair before the execution check and terminal publication so the
         // persisted message, MessageEnd, and local executor see one batch.
         message = self.maybe_repair_dialect_tool_calls(message);
@@ -5057,9 +5763,12 @@ impl Agent {
         // gh #221: price the finished turn from the catalog rates. Transports
         // only fill token counts (plus OpenRouter's billed total); without
         // this every `usage.cost` stayed 0.0 on every provider.
-        if let Some(rates) = self.provider.model_cost() {
-            rates.price_usage(&mut message.usage);
+        if let Some(rates) = self.provider.model_cost()
+            && let Err(error) = rates.price_usage(&mut message.usage)
+        {
+            tracing::warn!(%error, "completed response has unavailable billing");
         }
+        self.emit_cost_warning(on_event);
         let arc = Arc::new(message);
         if added_partial {
             if let Some(target) = self
@@ -5090,7 +5799,7 @@ impl Agent {
         on_event(AgentEvent::MessageEnd {
             message: Message::Assistant(Arc::clone(&arc)),
         });
-        Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())
+        AssistantStreamAttempt::Complete(Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()))
     }
 
     async fn execute_tool_batch(
@@ -5168,12 +5877,7 @@ impl Agent {
         // Phase 2: Execute tools in contiguous compatible-effect batches.
         let effect_plan = tool_calls
             .iter()
-            .map(|tool_call| {
-                self.tools
-                    .snapshot()
-                    .get(&tool_call.name)
-                    .map_or_else(ToolEffects::write, Tool::effects)
-            })
+            .map(|tool_call| self.effects_for_call(tool_call))
             .collect::<Vec<_>>();
         let effect_batches = plan_tool_effect_batches(&effect_plan);
         let mut recorded_results: Vec<Option<Arc<ToolResultMessage>>> =
@@ -5366,6 +6070,44 @@ impl Agent {
         on_event: AgentEventHandler,
         latency: SharedTurnLatencyAccumulator,
     ) -> (ToolOutput, bool) {
+        self.execute_tool_in_session(tool_call, on_event, latency, None)
+            .await
+    }
+
+    async fn check_invocation_session(&self, expected: Option<&str>) -> Result<()> {
+        if let Some(expected) = expected {
+            crate::agent_cx::AgentCx::for_current_or_request()
+                .checkpoint()
+                .map_err(|_| Error::tool("eval", "EVAL_CANCELLED: nested tool stopped"))?;
+            let current = self.job_session_scope.session_id().await.map_err(|_| {
+                Error::tool(
+                    "eval",
+                    "EVAL_SESSION_UNAVAILABLE: nested tool owner unavailable",
+                )
+            })?;
+            if current != expected {
+                return Err(Error::tool(
+                    "eval",
+                    "EVAL_SESSION_CHANGED: nested tool no longer owns the current session",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Both top-level and eval-host calls enter the same policy/hook path.
+    /// Nested calls additionally pin the session across approval and hook
+    /// awaits; a session-switching prompt cannot authorize the replacement.
+    async fn execute_tool_in_session(
+        &self,
+        tool_call: ToolCall,
+        on_event: AgentEventHandler,
+        latency: SharedTurnLatencyAccumulator,
+        expected_session: Option<&str>,
+    ) -> (ToolOutput, bool) {
+        if let Err(error) = self.check_invocation_session(expected_session).await {
+            return (Self::xdev_text_output(&error.to_string(), true), true);
+        }
         let extensions = self.extensions.clone();
 
         // Inbound secrets restore (bd-cv653.7.9): placeholders in tool-call
@@ -5398,6 +6140,9 @@ impl Agent {
         let approval_denied_output = self
             .request_tool_approval(&tool_call, Arc::clone(&on_event))
             .await;
+        if let Err(error) = self.check_invocation_session(expected_session).await {
+            return (Self::xdev_text_output(&error.to_string(), true), true);
+        }
 
         let (mut output, is_error) = if let Some(output) = approval_denied_output {
             (output, true)
@@ -5410,13 +6155,16 @@ impl Agent {
             )
             .await;
             record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
+            if let Err(error) = self.check_invocation_session(expected_session).await {
+                return (Self::xdev_text_output(&error.to_string(), true), true);
+            }
 
             if let Some(blocked_output) = hook_outcome {
                 (blocked_output, true)
             } else {
                 let tool_started_at = Instant::now();
                 let outcome = self
-                    .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event))
+                    .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event), expected_session)
                     .await;
                 record_local_tool_latency(&latency, tool_started_at.elapsed());
                 outcome
@@ -5424,12 +6172,15 @@ impl Agent {
         } else {
             let tool_started_at = Instant::now();
             let outcome = self
-                .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event))
+                .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event), expected_session)
                 .await;
             record_local_tool_latency(&latency, tool_started_at.elapsed());
             outcome
         };
 
+        if let Err(error) = self.check_invocation_session(expected_session).await {
+            return (Self::xdev_text_output(&error.to_string(), true), true);
+        }
         if let Some(extensions) = &extensions {
             let hook_started_at = Instant::now();
             Self::apply_tool_result_hook(extensions, &tool_call, &mut output, is_error).await;
@@ -5549,6 +6300,15 @@ impl Agent {
         privacy: &crate::text_completion::AuxiliaryPrivacy,
     ) -> Result<Vec<String>> {
         crate::text_completion::redact_inputs_with_vault(parts, privacy, &self.secrets_vault)
+    }
+
+    pub(crate) fn auxiliary_privacy_snapshot(
+        &self,
+    ) -> crate::text_completion::AuxiliaryPrivacySnapshot {
+        crate::text_completion::AuxiliaryPrivacySnapshot::with_vault(
+            crate::text_completion::AuxiliaryPrivacy::from_settings(self.secrets_settings()),
+            &self.secrets_vault,
+        )
     }
 
     /// Export hygiene (bd-cv653.7.9): mask known secret values in arbitrary
@@ -5706,7 +6466,11 @@ impl Agent {
     /// validation produces the named errors); `promote` moves the tool into
     /// the live schema and invalidates the def cache. Returns `None` for
     /// `list`/`describe` (the XdevTool handles those itself).
-    async fn dispatch_xdev(&self, tool_call: &ToolCall) -> Option<ToolOutput> {
+    async fn dispatch_xdev(
+        &self,
+        tool_call: &ToolCall,
+        on_event: AgentEventHandler,
+    ) -> Option<ToolOutput> {
         let args = &tool_call.arguments;
         let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
         match action {
@@ -5739,8 +6503,26 @@ impl Agent {
                     );
                     self.project_auxiliary_inputs(parts, &privacy)
                 };
+                let host = AgentToolInvocationHost::new(self, on_event);
+                let snapshot_privacy = || {
+                    crate::text_completion::AuxiliaryPrivacySnapshot::with_vault(
+                        crate::text_completion::AuxiliaryPrivacy::from_settings(
+                            self.config.secrets.as_ref(),
+                        ),
+                        &self.secrets_vault,
+                    )
+                };
                 let mut output = inner
-                    .execute_with_auxiliary_privacy(&tool_call.id, inner_args, None, &protect)
+                    .execute_with_invocation(
+                        &tool_call.id,
+                        inner_args,
+                        None,
+                        crate::tools::ToolInvocationContext {
+                            protect: &protect,
+                            host: Some(&host),
+                            snapshot_privacy: &snapshot_privacy,
+                        },
+                    )
                     .await
                     .unwrap_or_else(|err| Self::xdev_text_output(&err.to_string(), true));
                 output.details = Some(Self::xdev_dispatch_details(name, output.details.take()));
@@ -5849,7 +6631,11 @@ impl Agent {
         &self,
         tool_call: &ToolCall,
         on_event: AgentEventHandler,
+        expected_session: Option<&str>,
     ) -> (ToolOutput, bool) {
+        if let Err(error) = self.check_invocation_session(expected_session).await {
+            return (Self::xdev_text_output(&error.to_string(), true), true);
+        }
         // Plan-mode gate (bd-cv653.3.5): Planning/PendingApproval reject any
         // tool whose effects intersect the mutation/process BARRIER set. For
         // xdev run calls the INNER tool's effects decide, not the union.
@@ -5870,7 +6656,7 @@ impl Agent {
         // run/promote actions so the inner tool executes through the normal
         // path (effects/approval already applied to this outer call).
         if tool_call.name == "xdev"
-            && let Some(output) = self.dispatch_xdev(tool_call).await
+            && let Some(output) = self.dispatch_xdev(tool_call, Arc::clone(&on_event)).await
         {
             let is_error = output.is_error;
             return (output, is_error);
@@ -5886,10 +6672,10 @@ impl Agent {
         let tool_name = tool_call.name.clone();
         let tool_id = tool_call.id.clone();
         let tool_args = tool_call.arguments.clone();
-        let on_event = Arc::clone(&on_event);
+        let update_event = Arc::clone(&on_event);
 
         let update_callback = move |update: ToolUpdate| {
-            on_event(AgentEvent::ToolExecutionUpdate {
+            update_event(AgentEvent::ToolExecutionUpdate {
                 tool_call_id: tool_id.clone(),
                 tool_name: tool_name.clone(),
                 args: tool_args.clone(),
@@ -5919,15 +6705,35 @@ impl Agent {
             );
             self.project_auxiliary_inputs(parts, &privacy)
         };
-        match tool
-            .execute_with_auxiliary_privacy(
+        let host = AgentToolInvocationHost::new(self, on_event);
+        let snapshot_privacy = || {
+            crate::text_completion::AuxiliaryPrivacySnapshot::with_vault(
+                crate::text_completion::AuxiliaryPrivacy::from_settings(
+                    self.config.secrets.as_ref(),
+                ),
+                &self.secrets_vault,
+            )
+        };
+        // Nested calls may capture a read-only privacy snapshot but never
+        // renew eval's tool-call authority or acquire its kernel recursively.
+        let context = crate::tools::ToolInvocationContext {
+            protect: &protect,
+            host: if expected_session.is_none() {
+                Some(&host)
+            } else {
+                None
+            },
+            snapshot_privacy: &snapshot_privacy,
+        };
+        let outcome = tool
+            .execute_with_invocation(
                 &tool_call.id,
                 tool_call.arguments.clone(),
                 Some(Box::new(update_callback)),
-                &protect,
+                context,
             )
-            .await
-        {
+            .await;
+        match outcome {
             Ok(output) => {
                 let is_error = output.is_error;
                 (output, is_error)
@@ -6102,6 +6908,161 @@ impl Agent {
     }
 }
 
+/// A borrowed bridge into this Agent, never an interpreter-owned registry.
+/// Native eval admission supplies the original session even for the first
+/// nested call. No host is forwarded to a nested tool invocation.
+struct AgentToolInvocationHost<'a> {
+    agent: &'a Agent,
+    on_event: AgentEventHandler,
+    revoked: AtomicBool,
+}
+
+impl<'a> AgentToolInvocationHost<'a> {
+    fn new(agent: &'a Agent, on_event: AgentEventHandler) -> Self {
+        Self {
+            agent,
+            on_event,
+            revoked: AtomicBool::new(false),
+        }
+    }
+
+    async fn check_session(&self, expected: &str) -> Result<()> {
+        if self.revoked.load(Ordering::Acquire) {
+            return Err(Error::tool(
+                "eval",
+                "EVAL_SESSION_CHANGED: invocation host was revoked",
+            ));
+        }
+        let current = self
+            .agent
+            .job_session_scope
+            .session_id()
+            .await
+            .map_err(|_| {
+                self.revoked.store(true, Ordering::Release);
+                Error::tool(
+                    "eval",
+                    "EVAL_SESSION_UNAVAILABLE: invocation host owner unavailable",
+                )
+            })?;
+        if current != expected {
+            self.revoked.store(true, Ordering::Release);
+            return Err(Error::tool(
+                "eval",
+                "EVAL_SESSION_CHANGED: invocation host cannot follow a session switch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Complete the live nested card even when cancellation drops its future.
+/// An interrupted action is indeterminate, never a fabricated successful call.
+struct NestedToolEvent {
+    call: ToolCall,
+    on_event: AgentEventHandler,
+    completed: bool,
+}
+
+impl NestedToolEvent {
+    fn finish(&mut self, output: &ToolOutput) {
+        self.completed = true;
+        (self.on_event)(AgentEvent::ToolExecutionEnd {
+            tool_call_id: self.call.id.clone(),
+            tool_name: self.call.name.clone(),
+            result: output.clone(),
+            is_error: output.is_error,
+        });
+    }
+}
+
+impl Drop for NestedToolEvent {
+    fn drop(&mut self) {
+        if !self.completed {
+            let output = Agent::xdev_text_output(
+                "EVAL_HOST_INTERRUPTED: nested tool did not return; side effects may have occurred",
+                true,
+            );
+            self.finish(&output);
+        }
+    }
+}
+
+#[async_trait]
+impl crate::tools::ToolInvocationHost for AgentToolInvocationHost<'_> {
+    fn sampling_model(&self) -> Result<crate::tools::ToolSamplingModel> {
+        sampling::model(self)
+    }
+
+    async fn check_sampling_session(&self, expected_session: &str) -> Result<()> {
+        sampling::check_session(self, expected_session).await
+    }
+
+    async fn sample(
+        &self,
+        request: crate::tools::ToolSamplingRequest,
+        expected_session: &str,
+    ) -> Result<crate::tools::ToolSamplingResult> {
+        sampling::sample(self, request, expected_session).await
+    }
+
+    async fn call_tool(&self, call: ToolCall, expected_session: &str) -> Result<ToolOutput> {
+        // Eval owns an exclusive kernel lease. The dispatcher is unnecessary:
+        // registered discoverable tools can be called by their actual names.
+        // Rejecting all wrappers here also prevents xdev -> xdev -> eval.
+        if matches!(call.name.as_str(), "eval" | "xdev") || call.name.starts_with("__pi_") {
+            return Err(Error::tool(
+                "eval",
+                "EVAL_BRIDGE_RECURSION: eval and dispatch wrappers cannot be called from a cell; call the target tool directly",
+            ));
+        }
+        if self.agent.tools.snapshot().get(&call.name).is_none() {
+            return Err(Error::tool(
+                "eval",
+                "EVAL_BRIDGE_UNAVAILABLE: tool is not enabled in this Agent",
+            ));
+        }
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("eval", "EVAL_CANCELLED: nested tool stopped"))?;
+        self.check_session(expected_session).await?;
+        let mut event = NestedToolEvent {
+            call: call.clone(),
+            on_event: Arc::clone(&self.on_event),
+            completed: false,
+        };
+        (self.on_event)(AgentEvent::ToolExecutionStart {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            args: call.arguments.clone(),
+        });
+        // The start callback can switch sessions or cancel the owning turn.
+        self.agent
+            .check_invocation_session(Some(expected_session))
+            .await?;
+        // The outer eval already measures this entire interval. Do not add
+        // nested samples to its accumulator and double-count tool latency.
+        let latency = Arc::new(StdMutex::new(TurnLatencyAccumulator::started()));
+        let (mut output, is_error) = self
+            .agent
+            .execute_tool_in_session(
+                call,
+                Arc::clone(&self.on_event),
+                latency,
+                Some(expected_session),
+            )
+            .await;
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("eval", "EVAL_CANCELLED: nested tool stopped"))?;
+        self.check_session(expected_session).await?;
+        output.is_error = is_error;
+        event.finish(&output);
+        Ok(output)
+    }
+}
+
 // ============================================================================
 // Agent Session (Agent + Session persistence)
 // ============================================================================
@@ -6172,6 +7133,28 @@ impl Drop for AtomicBoolGuard {
     }
 }
 
+/// Bind a generated context edit to its exact source and persistence target.
+/// Provider and extension callbacks may inspect or change the store while a
+/// summary runs. These bytes remain local and are checked under the store lock.
+#[derive(PartialEq, Eq)]
+pub(crate) struct SessionEditSnapshot {
+    path: Option<PathBuf>,
+    session_dir: Option<PathBuf>,
+    leaf_id: Option<String>,
+    content: Vec<u8>,
+}
+
+impl SessionEditSnapshot {
+    pub(crate) fn capture(session: &Session) -> Result<Self> {
+        Ok(Self {
+            path: session.path.clone(),
+            session_dir: session.session_dir.clone(),
+            leaf_id: session.leaf_id().map(str::to_string),
+            content: serde_json::to_vec(&(&session.header, &session.entries))?,
+        })
+    }
+}
+
 pub struct AgentSession {
     pub agent: Agent,
     pub session: Arc<Mutex<Session>>,
@@ -6196,11 +7179,20 @@ pub struct AgentSession {
     /// The advisor runtime (bd-cv653.3.3): Some only when the advisor role
     /// resolved a model. None = zero-overhead path (no digest is built).
     pub advisor: Option<crate::advisor::AdvisorRuntime>,
+    memory_settings: Option<crate::config::MemorySettings>,
     runtime_handle: Option<RuntimeHandle>,
     compaction_worker: CompactionWorkerState,
     model_registry: Option<ModelRegistry>,
     auth_storage: Option<AuthStorage>,
     api_key_override: Option<String>,
+    /// A CLI/API override belongs to the provider selected when it was set.
+    /// Role switches must not forward that secret to a different provider.
+    api_key_override_provider: Option<String>,
+    /// Recovery configuration on a pre-built handle may carry an unbound CLI
+    /// key. Keep it visible to ordinary turn admission as well as chain swaps.
+    recovery_cli_api_key: Option<String>,
+    /// Frozen role ownership and exclusions for admitted native child work.
+    child_fallback_policy: Option<crate::failover::ChildFallbackPolicy>,
     semantic_context_bundle: Option<SemanticContextBundleInjection>,
     /// One process-local authority for provider admission and transition
     /// quarantine. Extension hostcalls hold its permit across the complete
@@ -6213,21 +7205,197 @@ pub struct AgentSession {
     session_action_admission: SessionActionAdmissionGate,
 }
 
+const MAX_ADVISOR_CONTINUATIONS: u64 = 2;
+const ADVISOR_CONTINUATION_ENTRY: &str = "advisor_continuation";
+
+/// Couple an authored queued input to its advisor budget boundary. The stable
+/// identity also lets terminal RPC recovery replay a cancelled candidate save
+/// without creating another reset or a divergent session branch.
+pub(crate) fn append_advisor_input_reset(
+    session: &mut Session,
+    message_entry_id: &str,
+) -> Result<String> {
+    let timestamp = match session.get_entry(message_entry_id) {
+        Some(crate::session::SessionEntry::Message(entry))
+            if matches!(&entry.message, crate::session::SessionMessage::User { .. }) =>
+        {
+            entry.base.timestamp.clone()
+        }
+        _ => {
+            return Err(Error::session(
+                "advisor input reset requires a persisted user message",
+            ));
+        }
+    };
+    session.append_custom_entry_with_identity(
+        ADVISOR_CONTINUATION_ENTRY.to_string(),
+        Some(json!({"count": 0})),
+        &format!("advisor-input-{message_entry_id}"),
+        &timestamp,
+        Some(message_entry_id),
+    )
+}
+
+/// One host-visible turn can contain a completed attempt plus advisor-driven
+/// continuations. Keep its terminal event until the final durable result;
+/// ordinary message/tool events and native extension lifecycle still stream.
+struct AdvisorTurn {
+    on_event: AgentEventHandler,
+    terminal: Option<Arc<StdMutex<Option<AgentEvent>>>>,
+    started: Instant,
+    max_time: Option<Duration>,
+}
+
+impl AdvisorTurn {
+    fn new(session: &AgentSession, on_event: AgentEventHandler) -> Self {
+        Self {
+            on_event,
+            terminal: session
+                .advisor
+                .as_ref()
+                .map(|_| Arc::new(StdMutex::new(None))),
+            started: session
+                .agent
+                .prewalk_budget
+                .map_or_else(Instant::now, |budget| budget.started),
+            max_time: session
+                .agent
+                .prewalk_budget
+                .map_or(session.agent.config.max_time, |budget| budget.max_time),
+        }
+    }
+
+    fn event_handler(&self) -> AgentEventHandler {
+        let Some(terminal) = &self.terminal else {
+            return Arc::clone(&self.on_event);
+        };
+        let terminal = Arc::clone(terminal);
+        let on_event = Arc::clone(&self.on_event);
+        Arc::new(move |event| {
+            if let AgentEvent::AgentEnd {
+                session_id,
+                mut messages,
+                error,
+            } = event
+            {
+                let mut held = terminal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(AgentEvent::AgentEnd {
+                    messages: previous,
+                    error: previous_error,
+                    ..
+                }) = held.as_mut()
+                {
+                    previous.append(&mut messages);
+                    *previous_error = error;
+                } else {
+                    *held = Some(AgentEvent::AgentEnd {
+                        session_id,
+                        messages,
+                        error,
+                    });
+                }
+            } else {
+                on_event(event);
+            }
+        })
+    }
+
+    fn remaining_time(&self) -> Option<Duration> {
+        self.max_time
+            .map(|budget| budget.saturating_sub(self.started.elapsed()))
+    }
+
+    fn time_exhausted(&self) -> bool {
+        self.remaining_time().is_some_and(|time| time.is_zero())
+    }
+
+    fn may_continue(&self, agent: &Agent, abort: Option<&AbortSignal>) -> bool {
+        !self.time_exhausted()
+            && !abort.is_some_and(AbortSignal::is_aborted)
+            && !crate::advisor::ADVISOR_PAUSED.load(Ordering::SeqCst)
+            && agent.automatic_queue_dispatch() == (true, true)
+            && matches!(
+                agent.plan_state.mode(),
+                crate::plan::PlanMode::Off | crate::plan::PlanMode::Approved
+            )
+    }
+
+    fn finish(self, result: Result<AssistantMessage>) -> Result<AssistantMessage> {
+        if let Some(terminal) = &self.terminal {
+            let held = terminal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(mut event) = held {
+                if let Err(failure) = &result
+                    && let AgentEvent::AgentEnd { error, .. } = &mut event
+                {
+                    *error = Some(failure.to_string());
+                }
+                (self.on_event)(event);
+            }
+        }
+        result
+    }
+}
+
+impl Drop for AdvisorTurn {
+    fn drop(&mut self) {
+        let Some(terminal) = &self.terminal else {
+            return;
+        };
+        let held = terminal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut event) = held {
+            // The native attempt already produced this terminal, but its
+            // owning future was abandoned during review or publication.
+            if let AgentEvent::AgentEnd { error, .. } = &mut event {
+                error.get_or_insert_with(|| "Aborted".to_string());
+            }
+            (self.on_event)(event);
+        }
+    }
+}
+
 /// Keep an extension-selected prompt local to one provider attempt, including
 /// when its future is dropped inside the agent loop or session persistence.
 /// Owning the session borrow lets `Drop` restore state without an async lock.
 struct SessionTurnPromptGuard<'a> {
     session: &'a mut AgentSession,
     base_system_prompt: Option<String>,
+    base_max_time: Option<Duration>,
+    base_prewalk_max_time: Option<(Instant, Option<Duration>)>,
 }
 
 impl<'a> SessionTurnPromptGuard<'a> {
     fn new(session: &'a mut AgentSession, system_prompt: Option<String>) -> Self {
         let base_system_prompt = session.agent.system_prompt().map(str::to_string);
+        let base_max_time = session.agent.config.max_time;
         session.agent.set_system_prompt(system_prompt);
         Self {
             session,
             base_system_prompt,
+            base_max_time,
+            base_prewalk_max_time: None,
+        }
+    }
+
+    fn limit_max_time(&mut self, started: Instant, max_time: Option<Duration>) {
+        self.session.agent.config.max_time =
+            max_time.map(|cap| cap.saturating_sub(started.elapsed()));
+        if let (Some(cap), Some(budget)) = (max_time, self.session.agent.prewalk_budget.as_mut()) {
+            self.base_prewalk_max_time = Some((budget.started, budget.max_time));
+            // Prewalk keeps its original clock through retries and handoffs.
+            // Convert this wake's deadline to that clock before clamping it;
+            // assigning the relative cap would count earlier work twice.
+            let deadline = started
+                .saturating_duration_since(budget.started)
+                .saturating_add(cap);
+            budget.max_time = Some(budget.max_time.map_or(deadline, |base| base.min(deadline)));
         }
     }
 }
@@ -6237,6 +7405,16 @@ impl Drop for SessionTurnPromptGuard<'_> {
         self.session
             .agent
             .set_system_prompt(self.base_system_prompt.take());
+        self.session.agent.config.max_time = self.base_max_time;
+        if let (Some((started, max_time)), Some(budget)) = (
+            self.base_prewalk_max_time,
+            self.session.agent.prewalk_budget.as_mut(),
+        ) && budget.started == started
+        {
+            // Restore the limit, retaining completed tool/turn accounting.
+            // Do not resurrect a disarmed or replaced logical request.
+            budget.max_time = max_time;
+        }
         // The agent normally consumes this at loop entry. Early returns and
         // cancellation must not hand this turn's provenance to another input.
         let _ = self.session.agent.magic_keyword_scan_override.take();
@@ -6583,14 +7761,162 @@ struct ExtensionAiCompletionHostState {
     compaction_privacy: Arc<StdMutex<compaction::CompactionPrivacy>>,
 }
 
+/// Live model selection state shared by extension session adapters. Reading this
+/// handle never acquires the outer AgentSession lock held during a turn.
+#[derive(Clone)]
+pub(crate) struct ExtensionModelCatalog {
+    state: Arc<StdMutex<ExtensionAiCompletionHostState>>,
+}
+
+pub(crate) struct ExtensionModelCatalogSnapshot {
+    registry: Option<Arc<ModelRegistry>>,
+    active_provider: Arc<dyn Provider>,
+}
+
+impl ExtensionModelCatalog {
+    pub(crate) fn snapshot(&self) -> Result<ExtensionModelCatalogSnapshot> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::session("setModel: the live model catalog is unavailable"))?;
+        Ok(ExtensionModelCatalogSnapshot {
+            registry: state.compaction_models.registry.clone(),
+            active_provider: Arc::clone(&state.provider),
+        })
+    }
+}
+
+impl ExtensionModelCatalogSnapshot {
+    pub(crate) fn find(&self, provider: &str, model_id: &str) -> Option<ModelEntry> {
+        self.registry
+            .as_ref()
+            .and_then(|registry| registry.find(provider, model_id))
+    }
+
+    pub(crate) fn resolve_selection(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> Result<(String, String)> {
+        let provider = provider.trim();
+        let model_id = model_id.trim();
+        if provider.is_empty() || model_id.is_empty() {
+            return Err(Error::validation(
+                "setModel: provider and modelId must be non-empty strings",
+            ));
+        }
+        if let Some(entry) = self.find(provider, model_id) {
+            return Ok((entry.model.provider, entry.model.id));
+        }
+        if self.active_provider.name().eq_ignore_ascii_case(provider)
+            && self
+                .active_provider
+                .model_id()
+                .eq_ignore_ascii_case(model_id)
+        {
+            // Embedders can supply an active ad-hoc provider without a catalog.
+            // Re-selecting that exact destination remains a valid explicit action.
+            return Ok((
+                self.active_provider.name().to_string(),
+                self.active_provider.model_id().to_string(),
+            ));
+        }
+        Err(Error::validation(format!(
+            "setModel: unknown provider/model {provider}/{model_id}. Check the provider and model ID with ctx.modelRegistry.find(provider, modelId) before switching."
+        )))
+    }
+
+    pub(crate) fn select_resolved(
+        &self,
+        session: &mut Session,
+        mut provider: String,
+        mut model_id: String,
+    ) {
+        if let Some((current_provider, current_model)) = session.effective_model_for_current_path()
+            && let Some(current_entry) = self.find(&current_provider, &current_model)
+            && current_entry.model.provider.eq_ignore_ascii_case(&provider)
+            && current_entry.model.id.eq_ignore_ascii_case(&model_id)
+        {
+            // Preserve historical spelling only after the catalog proves that
+            // both names resolve to the same declared destination.
+            provider = current_provider;
+            model_id = current_model;
+        }
+        session.select_model(provider, model_id);
+    }
+}
+
 #[derive(Clone, Default)]
 struct ExtensionCompactionModelState {
     registry: Option<Arc<ModelRegistry>>,
     auth: Option<Arc<AuthStorage>>,
     js_provider_ids: Vec<String>,
+    api_key_override: Option<String>,
+    api_key_override_provider: Option<String>,
+    recovery_cli_api_key: Option<String>,
 }
 
 impl ExtensionCompactionModelState {
+    fn explicit_key(&self, provider: &str) -> Option<&str> {
+        if let Some(bound) = &self.api_key_override_provider {
+            return bound
+                .eq_ignore_ascii_case(provider)
+                .then_some(self.api_key_override.as_deref())
+                .flatten();
+        }
+        self.recovery_cli_api_key.as_deref()
+    }
+
+    /// Completion and native compaction hosts retain a snapshot between turns.
+    /// Revalidate managed credentials at actual admission, preserving explicit
+    /// session keys and configured authorization headers.
+    fn refresh_current_key(
+        &self,
+        provider: &dyn Provider,
+        options: &mut StreamOptions,
+    ) -> Result<()> {
+        let entry = self
+            .registry
+            .as_ref()
+            .and_then(|registry| registry.find(provider.name(), provider.model_id()));
+        Self::refresh_key_from_sources(
+            provider,
+            options,
+            entry.as_ref(),
+            self.auth.as_deref(),
+            self.explicit_key(provider.name()),
+        )
+    }
+
+    fn refresh_key_from_sources(
+        provider: &dyn Provider,
+        options: &mut StreamOptions,
+        entry: Option<&ModelEntry>,
+        auth: Option<&AuthStorage>,
+        explicit: Option<&str>,
+    ) -> Result<()> {
+        if Self::has_header_auth(provider.name(), provider.api(), &options.headers)
+            || entry.is_some_and(|entry| Self::has_registered_header_auth(entry, provider))
+        {
+            return Ok(());
+        }
+        if let Some(auth) = auth {
+            let resolved = entry.map_or_else(
+                || {
+                    auth.resolve_api_key_status(provider.name(), explicit)
+                        .into_result(provider.name())
+                },
+                |entry| crate::models::resolve_model_key(explicit, auth, entry),
+            )?;
+            if resolved.is_some() {
+                options.api_key = resolved;
+            }
+        } else if let Some(key) = explicit {
+            options.api_key = Some(key.to_string());
+        }
+        Ok(())
+    }
+
     fn resolve(
         &self,
         current_provider: Arc<dyn Provider>,
@@ -6637,6 +7963,7 @@ impl ExtensionCompactionModelState {
         // request. The summary engine also clears it for ordinary callers.
         stream_options.before_provider_request = None;
         if same_model {
+            self.refresh_current_key(current_provider.as_ref(), &mut stream_options)?;
             return Ok((current_provider, stream_options));
         }
 
@@ -6645,15 +7972,29 @@ impl ExtensionCompactionModelState {
                 "compact: model {provider_id}/{model_id} is not registered"
             ))
         })?;
-        let target_key = same_provider
-            .then(|| normalize_api_key_opt(stream_options.api_key.clone()))
-            .flatten()
-            .or_else(|| {
-                self.auth.as_ref().and_then(|auth| {
-                    normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None))
-                })
+        let explicit = self.explicit_key(&entry.model.provider);
+        let header_auth = Self::has_registered_header_auth_for_api(
+            &entry,
+            &entry.model.provider,
+            &entry.model.api,
+        );
+        let target_key = if header_auth {
+            None
+        } else if let Some(auth) = &self.auth {
+            crate::models::resolve_model_key(explicit, auth, &entry)?.or_else(|| {
+                same_provider
+                    .then(|| normalize_api_key_opt(stream_options.api_key.clone()))
+                    .flatten()
             })
-            .or_else(|| normalize_api_key_opt(entry.api_key.clone()));
+        } else {
+            normalize_api_key_opt(explicit.map(str::to_string))
+                .or_else(|| {
+                    same_provider
+                        .then(|| normalize_api_key_opt(stream_options.api_key.clone()))
+                        .flatten()
+                })
+                .or_else(|| normalize_api_key_opt(entry.api_key.clone()))
+        };
         // Some providers bind credentials during construction (Copilot's
         // token exchange). They must see the same resolved target credential
         // as providers that read it from StreamOptions for each request.
@@ -6675,18 +8016,38 @@ impl ExtensionCompactionModelState {
         stream_options.api_key = target_key;
         stream_options.headers.clone_from(&entry.headers);
         stream_options.max_tokens = Some(entry.model.max_tokens);
+        let provider = if let Some(budget) = current_provider.cost_budget() {
+            crate::provider::guard_with_cost_budget(provider, budget.clone())
+        } else {
+            provider
+        };
         Ok((provider, stream_options))
     }
 
     fn has_registered_header_auth(entry: &ModelEntry, provider: &dyn Provider) -> bool {
-        if crate::provider_metadata::canonical_provider_id(provider.name())
-            == Some("github-copilot")
-        {
+        Self::has_registered_header_auth_for_api(entry, provider.name(), provider.api())
+    }
+
+    fn has_registered_header_auth_for_api(entry: &ModelEntry, provider: &str, api: &str) -> bool {
+        Self::has_header_auth(provider, api, &entry.headers)
+            || entry
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.custom_headers.as_ref())
+                .is_some_and(|headers| Self::has_header_auth(provider, api, headers))
+    }
+
+    fn has_header_auth(
+        provider: &str,
+        api: &str,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        if crate::provider_metadata::canonical_provider_id(provider) == Some("github-copilot") {
             // Copilot reports openai-completions but requires its own GitHub
             // token exchange before it can send a completion request.
             return false;
         }
-        let names: &[&str] = match provider.api() {
+        let names: &[&str] = match api {
             "openai-completions"
             | "openai-responses"
             | "openai-codex-responses"
@@ -6698,16 +8059,7 @@ impl ExtensionCompactionModelState {
             // credential payloads; unrelated headers do not make them ready.
             _ => return false,
         };
-        let has_auth = |headers| {
-            crate::providers::first_non_empty_header_value_case_insensitive(headers, names)
-                .is_some()
-        };
-        has_auth(&entry.headers)
-            || entry
-                .compat
-                .as_ref()
-                .and_then(|compat| compat.custom_headers.as_ref())
-                .is_some_and(has_auth)
+        crate::providers::first_non_empty_header_value_case_insensitive(headers, names).is_some()
     }
 }
 
@@ -6829,15 +8181,20 @@ impl ExtensionHostActions for AgentSessionHostActions {
 
     async fn complete_ai(&self, request: ExtensionAiCompletionRequest) -> Result<Value> {
         let _provider_admission = self.acquire_provider_admission().await?;
-        let (provider, mut stream_options) = {
+        let (provider, mut stream_options, credentials) = {
             let state = self.ai_completion.lock().map_err(|_| {
                 Error::extension("extension completion host state mutex poisoned".to_string())
             })?;
-            (Arc::clone(&state.provider), state.stream_options.clone())
+            (
+                Arc::clone(&state.provider),
+                state.stream_options.clone(),
+                state.compaction_models.clone(),
+            )
         };
 
         apply_pi_ai_completion_options(&request.options, &mut stream_options)?;
         let context = build_pi_ai_completion_context(&request)?;
+        credentials.refresh_current_key(provider.as_ref(), &mut stream_options)?;
         let provider_name = provider.name().to_string();
         let mut events = provider.stream(&context, &stream_options).await?;
         let mut streamed_text = String::new();
@@ -6964,13 +8321,14 @@ impl ExtensionHostActions for AgentSessionHostActions {
         // pi's default compaction (never a fabricated result).
         let mut preparation = crate::compaction::compaction_preparation_from_value(&preparation)?;
 
-        let (provider, stream_options, privacy) = {
+        let (provider, mut stream_options, credentials, privacy) = {
             let state = self.ai_completion.lock().map_err(|_| {
                 Error::extension("extension completion host state mutex poisoned".to_string())
             })?;
             (
                 Arc::clone(&state.provider),
                 state.stream_options.clone(),
+                state.compaction_models.clone(),
                 Arc::clone(&state.compaction_privacy),
             )
         };
@@ -6990,6 +8348,7 @@ impl ExtensionHostActions for AgentSessionHostActions {
             })?
             .clone();
         let sanitized = privacy.screen_native_request(&mut preparation, &sanitized)?;
+        credentials.refresh_current_key(provider.as_ref(), &mut stream_options)?;
         let response = provider.compact_native(&sanitized, &stream_options).await?;
 
         let (read_files, modified_files) =
@@ -9387,6 +10746,7 @@ mod extensions_integration_tests {
                 reasoning: false,
                 input: vec![crate::provider::InputType::Text],
                 cost: crate::provider::ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -9436,6 +10796,7 @@ mod extensions_integration_tests {
             registry: Some(Arc::new(registry)),
             auth: Some(Arc::new(auth)),
             js_provider_ids: Vec::new(),
+            ..ExtensionCompactionModelState::default()
         };
         let current: Arc<dyn Provider> = Arc::new(PiAiCaptureProvider {
             calls: Arc::new(StdMutex::new(Vec::new())),
@@ -9469,6 +10830,154 @@ mod extensions_integration_tests {
         );
         assert_eq!(original.api_key.as_deref(), Some("source-provider-key"));
         assert_eq!(current.name(), "capturing-provider");
+    }
+
+    #[test]
+    fn extension_compaction_override_inherits_live_cost_cap_before_dispatch() {
+        let budget = crate::cost::CostBudget::new(None, Some(2.0), 1.0).expect("account");
+        let current = crate::provider::guard_with_cost_budget(
+            Arc::new(PiAiCaptureProvider {
+                calls: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            budget.clone(),
+        );
+        let mut registry = ModelRegistry::load_with_credential_resolver(None, |_| None);
+        registry.merge_entries(vec![compaction_override_entry(
+            "cost-summary",
+            "summary-model",
+            false,
+        )]);
+        let state = ExtensionCompactionModelState {
+            registry: Some(Arc::new(registry)),
+            ..ExtensionCompactionModelState::default()
+        };
+        let (provider, options) = state
+            .resolve(
+                current,
+                StreamOptions::default(),
+                &compaction_override("cost-summary", "summary-model"),
+            )
+            .expect("alternate model");
+        assert!(
+            provider
+                .cost_budget()
+                .is_some_and(|shared| shared.same_tree(&budget))
+        );
+        // The request is prepared before another branch spends the remainder.
+        // Admission must consult that same live account immediately at send.
+        budget.record(1.0).expect("sibling completion");
+        let result = futures::executor::block_on(provider.stream(&Context::default(), &options));
+        assert!(matches!(result, Err(Error::CostCap { .. })));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn extension_completion_and_compaction_revalidate_exhausted_pools() {
+        const CHILD: &str = "PI_COMPACTION_POOL_EXHAUSTION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "agent::extensions_integration_tests::extension_completion_and_compaction_revalidate_exhausted_pools", "--nocapture"])
+                .env(CHILD, "1")
+                .env("OPENAI_API_KEYS", "summary-pool-a,summary-pool-b")
+                .env("OPENAI_API_KEY", "must-not-use-singular")
+                .env_remove("PI_DEBUG_ROTATION")
+                .output().expect("isolated compaction pool fixture");
+            assert!(
+                output.status.success(),
+                "compaction pool fixture failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        crate::auth::reset_credential_rings_for_tests();
+        let directory = tempfile::tempdir().unwrap();
+        let auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+        let first = auth.resolve_api_key("openai", None).unwrap();
+        crate::auth::report_provider_rate_limit("openai", &first);
+        let second = auth.resolve_api_key("openai", None).unwrap();
+        crate::auth::report_provider_rate_limit("openai", &second);
+        let mut current_entry = compaction_override_entry("openai", "current", true);
+        current_entry.api_key = Some("must-not-use-catalog".to_string());
+        let mut alternate = current_entry.clone();
+        alternate.model.id = "alternate".to_string();
+        let current = crate::providers::create_provider(&current_entry, None).unwrap();
+        let mut state = ExtensionCompactionModelState {
+            registry: Some(Arc::new(ModelRegistry::from_entries_for_tests(vec![
+                current_entry,
+                alternate,
+            ]))),
+            auth: Some(Arc::new(auth)),
+            ..ExtensionCompactionModelState::default()
+        };
+        let cached = StreamOptions {
+            api_key: Some(first.clone()),
+            ..StreamOptions::default()
+        };
+        for options in [
+            ExtensionCompactionOptions::default(),
+            compaction_override("openai", "alternate"),
+        ] {
+            let error = state
+                .resolve(Arc::clone(&current), cached.clone(), &options)
+                .err()
+                .unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains(crate::auth::CREDENTIAL_POOL_EXHAUSTED)
+            );
+        }
+        // complete_ai and native compaction share this admission helper.
+        let error = state
+            .refresh_current_key(current.as_ref(), &mut cached.clone())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(crate::auth::CREDENTIAL_POOL_EXHAUSTED)
+        );
+
+        state.api_key_override = Some(first.clone());
+        state.api_key_override_provider = Some("openai".to_string());
+        for options in [
+            ExtensionCompactionOptions::default(),
+            compaction_override("openai", "alternate"),
+        ] {
+            let (_, options) = state
+                .resolve(Arc::clone(&current), cached.clone(), &options)
+                .unwrap();
+            assert_eq!(options.api_key.as_deref(), Some(first.as_str()));
+        }
+        state.api_key_override_provider = Some("unrelated-provider".to_string());
+        state.recovery_cli_api_key = Some("must-not-override-bound-provider".to_string());
+        assert!(
+            state
+                .refresh_current_key(current.as_ref(), &mut cached.clone())
+                .is_err()
+        );
+        state.api_key_override_provider = None;
+        state.api_key_override = None;
+        state.recovery_cli_api_key = Some(first.clone());
+        state
+            .refresh_current_key(current.as_ref(), &mut cached.clone())
+            .unwrap();
+
+        state.recovery_cli_api_key = None;
+        let mut header_pinned = cached.clone();
+        header_pinned.headers.insert(
+            "Authorization".to_string(),
+            "Bearer explicit-header".to_string(),
+        );
+        state
+            .refresh_current_key(current.as_ref(), &mut header_pinned)
+            .unwrap();
+        let mut explicitly_injected = cached;
+        ExtensionCompactionModelState::default()
+            .refresh_current_key(current.as_ref(), &mut explicitly_injected)
+            .unwrap();
+        assert_eq!(explicitly_injected.api_key.as_deref(), Some(first.as_str()));
     }
 
     #[test]
@@ -9577,6 +11086,7 @@ mod extensions_integration_tests {
             registry: Some(Arc::new(registry)),
             auth: Some(Arc::new(auth)),
             js_provider_ids: Vec::new(),
+            ..ExtensionCompactionModelState::default()
         };
         let current: Arc<dyn Provider> = Arc::new(PiAiCaptureProvider {
             calls: Arc::new(StdMutex::new(Vec::new())),
@@ -9607,6 +11117,7 @@ mod extensions_integration_tests {
             registry: Some(Arc::new(registry)),
             auth: None,
             js_provider_ids: vec!["compaction-js".to_string()],
+            ..ExtensionCompactionModelState::default()
         };
         let current: Arc<dyn Provider> = Arc::new(PiAiCaptureProvider {
             calls: Arc::new(StdMutex::new(Vec::new())),
@@ -9673,6 +11184,26 @@ mod extensions_integration_tests {
             "live-model",
             true,
         )]);
+
+        // Without extensions nothing can read the compaction registry, so
+        // setting the registry and auth does not build it.
+        session.set_model_registry(registry.clone());
+        session.set_auth_storage(auth.clone());
+        assert!(
+            session
+                .extension_ai_completion
+                .lock()
+                .unwrap()
+                .compaction_models
+                .registry
+                .is_none(),
+            "the compaction registry is built only for sessions with extensions"
+        );
+
+        // With extensions it follows every registry and auth update.
+        session.extensions = Some(crate::extensions::ExtensionRegion::new(
+            crate::extensions::ExtensionManager::new(),
+        ));
         session.set_model_registry(registry);
         for key in ["first-live-key", "replacement-live-key"] {
             auth.set(
@@ -10316,6 +11847,16 @@ mod extensions_integration_tests {
         });
     }
 
+    fn extension_session_model_state() -> Arc<StdMutex<ExtensionAiCompletionHostState>> {
+        Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
+            provider: Arc::new(NoopProvider),
+            stream_options: StreamOptions::default(),
+            models: Vec::new(),
+            compaction_models: ExtensionCompactionModelState::default(),
+            compaction_privacy: Arc::new(StdMutex::new(compaction::CompactionPrivacy::default())),
+        }))
+    }
+
     #[test]
     fn agent_extension_session_get_state_reports_agent_runtime_state() {
         let runtime = RuntimeBuilder::current_thread()
@@ -10337,6 +11878,9 @@ mod extensions_integration_tests {
 
             let extension_session = AgentExtensionSession {
                 handle: SessionHandle(Arc::clone(&session)),
+                model_catalog: ExtensionModelCatalog {
+                    state: extension_session_model_state(),
+                },
                 session_action_admission: SessionActionAdmissionGate::default(),
                 is_streaming: Arc::new(AtomicBool::new(true)),
                 is_compacting: Arc::new(AtomicBool::new(true)),
@@ -10398,6 +11942,9 @@ mod extensions_integration_tests {
 
             let extension_session = AgentExtensionSession {
                 handle: SessionHandle(Arc::clone(&session)),
+                model_catalog: ExtensionModelCatalog {
+                    state: extension_session_model_state(),
+                },
                 session_action_admission: SessionActionAdmissionGate::default(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
@@ -10431,6 +11978,9 @@ mod extensions_integration_tests {
             let session_action_admission = SessionActionAdmissionGate::default();
             let extension_session = AgentExtensionSession {
                 handle: SessionHandle(Arc::clone(&session)),
+                model_catalog: ExtensionModelCatalog {
+                    state: extension_session_model_state(),
+                },
                 session_action_admission: session_action_admission.clone(),
                 is_streaming: Arc::new(AtomicBool::new(false)),
                 is_compacting: Arc::new(AtomicBool::new(false)),
@@ -12303,6 +13853,24 @@ mod abort_tests {
     }
 
     #[test]
+    fn abort_handle_derived_signals_share_pending_and_latched_cancellation() {
+        let (handle, original) = AbortHandle::new();
+        let admitted = handle.signal();
+        assert!(!admitted.is_aborted());
+
+        handle.abort();
+        assert!(original.is_aborted());
+        assert!(admitted.is_aborted());
+
+        let started_later = handle.signal();
+        assert!(started_later.is_aborted());
+        let mut waiting = Box::pin(started_later.wait());
+        let waker = futures::task::noop_waker();
+        let mut task = TaskContext::from_waker(&waker);
+        assert!(std::future::Future::poll(waiting.as_mut(), &mut task).is_ready());
+    }
+
+    #[test]
     fn abort_signal_wakes_every_waiter_after_a_nonterminal_notification() {
         let (handle, signal) = AbortHandle::new();
         let cloned_signal = signal.clone();
@@ -12774,6 +14342,8 @@ mod abort_tests {
             AgentEvent::FailoverStart { .. } => "failover_start",
             AgentEvent::FailoverEnd { .. } => "failover_end",
             AgentEvent::AdvisorNote { .. } => "advisor_note",
+            AgentEvent::CostWarning { .. } => "cost_warning",
+            AgentEvent::PrewalkSwitched { .. } => "prewalk_switched",
             AgentEvent::ProviderError { .. } => "provider_error",
             AgentEvent::ExtensionError { .. } => "extension_error",
         }
@@ -13654,6 +15224,80 @@ mod turn_event_tests {
         }
     }
 
+    #[test]
+    fn provider_completion_resets_only_its_credential_and_preserves_newer_limits() {
+        let _rotation = crate::auth::ROTATION_TEST_LOCK
+            .lock()
+            .expect("rotation test lock");
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let request_key = "completed-request-key";
+        let other_key = "unrelated-request-key";
+
+        for (newer_limit, setup_failure) in [(false, false), (true, false), (false, true)] {
+            let mut ring = crate::failover::CredentialRing::new(
+                vec![request_key.to_string(), other_key.to_string()],
+                0,
+            )
+            .expect("nonempty ring");
+            let limited_at = Instant::now() - Duration::from_secs(1);
+            for key in [request_key, other_key] {
+                ring.report_rate_limited(
+                    key,
+                    limited_at,
+                    Duration::from_secs(60),
+                    Duration::from_secs(60),
+                )
+                .expect("known credential");
+            }
+            crate::auth::seed_credential_ring_for_tests("test-provider", ring);
+            let provider: Arc<dyn Provider> = if setup_failure {
+                Arc::new(StreamSetupErrorProvider)
+            } else {
+                Arc::new(SingleShotProvider)
+            };
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let mut agent = Agent::new(
+                provider,
+                tools,
+                AgentConfig {
+                    stream_options: StreamOptions {
+                        api_key: Some(request_key.to_string()),
+                        ..StreamOptions::default()
+                    },
+                    ..AgentConfig::default()
+                },
+            );
+            let on_event: AgentEventHandler = Arc::new(move |event| {
+                if newer_limit && matches!(event, AgentEvent::MessageStart { .. }) {
+                    // Simulate a concurrent request reporting a limit after
+                    // this successful request was already dispatched.
+                    crate::auth::report_provider_rate_limit("test-provider", request_key);
+                }
+            });
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let result =
+                runtime.block_on(agent.stream_assistant_attempt(on_event, None, &cx, false));
+            if setup_failure {
+                assert!(result.is_err(), "setup failure must remain an error");
+            } else {
+                assert!(matches!(result, Ok(AssistantStreamAttempt::Complete(_))));
+            }
+
+            let ring =
+                crate::auth::credential_ring_for_tests("test-provider").expect("installed ring");
+            let now = Instant::now();
+            if newer_limit || setup_failure {
+                assert_eq!(ring.cooling_count(now), 2);
+                assert!(ring.current_key(now).is_none());
+            } else {
+                assert_eq!(ring.cooling_count(now), 1);
+                assert_eq!(ring.current_key(now), Some(request_key));
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct EchoTool;
 
@@ -14181,6 +15825,7 @@ mod turn_event_tests {
 #[derive(Clone)]
 struct AgentExtensionSession {
     handle: SessionHandle,
+    model_catalog: ExtensionModelCatalog,
     session_action_admission: SessionActionAdmissionGate,
     is_streaming: Arc<AtomicBool>,
     is_compacting: Arc<AtomicBool>,
@@ -14320,13 +15965,17 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
         origin: Option<SessionActionOrigin>,
     ) -> crate::error::Result<()> {
         let _session_action_permit = self.acquire_session_action_admission(origin).await?;
-        <SessionHandle as crate::extensions::ExtensionSession>::set_model(
-            &self.handle,
-            provider,
-            model_id,
-            None,
-        )
-        .await
+        let catalog = self.model_catalog.snapshot()?;
+        let (provider, model_id) = catalog.resolve_selection(&provider, &model_id)?;
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let mut session = self
+            .handle
+            .0
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
+        catalog.select_resolved(&mut session, provider, model_id);
+        Ok(())
     }
 
     async fn get_model(&self) -> (Option<String>, Option<String>) {
@@ -14619,11 +16268,15 @@ impl AgentSession {
             compaction_settings,
             compaction_runtime: None,
             advisor: None,
+            memory_settings: None,
             runtime_handle: None,
             compaction_worker: CompactionWorkerState::new(CompactionQuota::default()),
             model_registry: None,
             auth_storage: None,
             api_key_override: None,
+            api_key_override_provider: None,
+            recovery_cli_api_key: None,
+            child_fallback_policy: None,
             semantic_context_bundle: None,
             provider_admission: ProviderAdmissionGate::default(),
             session_action_admission: SessionActionAdmissionGate::default(),
@@ -14632,6 +16285,33 @@ impl AgentSession {
 
     pub const fn set_input_source(&mut self, source: InputSource) {
         self.input_source = source;
+    }
+
+    /// Configure project memory learning without opening a store or making a request.
+    pub fn set_memory_settings(&mut self, settings: Option<&crate::config::MemorySettings>) {
+        self.memory_settings = settings.filter(|settings| settings.enabled()).cloned();
+    }
+
+    #[must_use]
+    pub fn with_memory_settings(
+        mut self,
+        settings: Option<&crate::config::MemorySettings>,
+    ) -> Self {
+        self.set_memory_settings(settings);
+        self
+    }
+
+    pub(crate) const fn memory_enabled(&self) -> bool {
+        self.memory_settings.is_some()
+    }
+
+    /// Extract and incrementally consolidate facts from the current saved branch.
+    /// This uses the active provider and resolves the current session workdir.
+    pub async fn sync_memory(&self) -> Result<crate::memory::MemorySyncReport> {
+        let settings = self.memory_settings.as_ref().ok_or_else(|| {
+            Error::validation("Memory is disabled; set memory.backend to local or cass")
+        })?;
+        crate::memory::extraction::synchronize(self, settings, false, None, None).await
     }
 
     /// Attach the MCP client registry that serves this session so its turn
@@ -14714,6 +16394,17 @@ impl AgentSession {
         self.refresh_extension_compaction_models();
     }
 
+    /// Keep a driver-supplied recovery key in normal credential admission.
+    /// An explicitly provider-bound session override still takes precedence.
+    pub fn set_recovery_cli_api_key(&mut self, key: Option<String>) {
+        let key = normalize_api_key_opt(key);
+        // ubs:ignore[rust.security.constant-time-compare] Local configuration change detection, not authentication.
+        if self.recovery_cli_api_key != key {
+            self.recovery_cli_api_key = key;
+            self.refresh_extension_completion_host_state();
+        }
+    }
+
     pub(crate) fn scope_auth_storage(&self, auth: &mut AuthStorage) {
         if let Some(previous) = &self.auth_storage {
             auth.inherit_command_working_directory(previous);
@@ -14730,20 +16421,143 @@ impl AgentSession {
         let key = entry.as_ref().map_or_else(
             || {
                 let provider = self.agent.provider();
-                normalize_api_key_opt(self.api_key_override.clone()).or_else(|| {
-                    self.auth_storage.as_ref().and_then(|auth| {
-                        normalize_api_key_opt(auth.resolve_api_key(provider.name(), None))
+                self.recovery_api_key_override(provider.name(), None)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        self.auth_storage.as_ref().and_then(|auth| {
+                            normalize_api_key_opt(auth.resolve_api_key(provider.name(), None))
+                        })
                     })
-                })
             },
-            |entry| self.resolve_stream_api_key_for_model(entry),
+            |entry| self.resolve_stream_api_key_for_model(entry).ok().flatten(),
         );
         self.agent.stream_options_mut().api_key = key;
         self.refresh_extension_completion_host_state();
     }
 
-    pub(crate) const fn model_registry(&self) -> Option<&ModelRegistry> {
+    /// Rotate a failed request's credential after its retry tail is durable.
+    /// The caller holds provider transition authority through this mutation.
+    pub(crate) fn rotate_rate_limited_credential(
+        &mut self,
+        provider: &str,
+        key: &str,
+        legacy_cli_api_key: Option<&str>,
+    ) -> Result<()> {
+        if self.agent.provider().name() != provider
+            // ubs:ignore-next-line Local request identity, not an authentication verifier.
+            || self.agent.stream_options().api_key.as_deref() != Some(key)
+            || self
+                .recovery_api_key_override(provider, legacy_cli_api_key)
+                .is_some_and(|key| !key.trim().is_empty())
+        {
+            return Ok(());
+        }
+        let Some(auth) = self.auth_storage.as_ref() else {
+            return Ok(());
+        };
+        crate::auth::report_provider_rate_limit(provider, key);
+        let entry = self.current_model_entry();
+        let fresh = entry.as_ref().map_or_else(
+            || {
+                auth.resolve_api_key_status(provider, None)
+                    .into_result(provider)
+            },
+            |entry| self.resolve_stream_api_key_for_model(entry),
+        );
+        let fresh = match fresh {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                // Do not leave a known-cooled key available to completion
+                // hosts while the next turn waits for fresh admission.
+                self.agent.stream_options_mut().api_key = None;
+                self.refresh_extension_completion_host_state();
+                return Err(error);
+            }
+        };
+        if let Some(fresh) = fresh
+            // ubs:ignore-next-line Compare local configuration to avoid an unnecessary key replacement.
+            && fresh != key
+        {
+            self.agent.stream_options_mut().api_key = Some(fresh);
+            self.refresh_extension_completion_host_state();
+        }
+        Ok(())
+    }
+
+    /// Print-mode recovery uses the same serialized credential transition as
+    /// SDK/RPC. A completed durable rewind is required before calling this.
+    pub async fn rotate_rate_limited_credential_after_retry(
+        &mut self,
+        provider: &str,
+        key: &str,
+        legacy_cli_api_key: Option<&str>,
+        abort: &AbortSignal,
+    ) -> Result<()> {
+        if abort.is_aborted() {
+            return Err(Error::Aborted);
+        }
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.provider_admission_gate();
+        let _authority = admission.acquire_transition_authority(cx.cx()).await?;
+        if abort.is_aborted() {
+            return Err(Error::Aborted);
+        }
+        self.rotate_rate_limited_credential(provider, key, legacy_cli_api_key)
+    }
+
+    /// Record a terminal provider failure only after its transcript save has
+    /// completed. Even when retry/fallback is disabled or exhausted, a later
+    /// prompt must not reuse the failed key while healthy siblings are present.
+    pub fn record_terminal_credential_failure(
+        &self,
+        outcome: crate::failover::TurnOutcome<'_>,
+    ) -> Option<Error> {
+        if !crate::failover::is_credential_rate_limit(outcome) {
+            return None;
+        }
+        let provider = self.agent.provider();
+        let key = self.agent.stream_options().api_key.as_deref()?;
+        self.record_terminal_rate_limited_credential(provider.name(), key)
+            .err()
+    }
+
+    pub(crate) fn record_terminal_rate_limited_credential(
+        &self,
+        provider: &str,
+        key: &str,
+    ) -> Result<()> {
+        if self.agent.provider().name() != provider
+            // ubs:ignore[rust.security.constant-time-compare] Captured request identity, not authentication.
+            || self.agent.stream_options().api_key.as_deref() != Some(key)
+            || self
+                .recovery_api_key_override(provider, None)
+                .is_some_and(|key| !key.trim().is_empty())
+        {
+            return Ok(());
+        }
+        self.ensure_provider_reentry_allowed()?;
+        let Some(auth) = &self.auth_storage else {
+            return Ok(());
+        };
+        crate::auth::report_provider_rate_limit(provider, key);
+        let _ = auth
+            .resolve_api_key_status(provider, None)
+            .into_result(provider)?;
+        Ok(())
+    }
+
+    /// The complete configured catalog, including models whose credentials are
+    /// not currently available. Use it to resolve identity before filtering
+    /// destinations for readiness or admission.
+    #[must_use]
+    pub const fn model_registry(&self) -> Option<&ModelRegistry> {
         self.model_registry.as_ref()
+    }
+
+    pub(crate) fn extension_model_catalog(&self) -> ExtensionModelCatalog {
+        ExtensionModelCatalog {
+            state: Arc::clone(&self.extension_ai_completion),
+        }
     }
 
     #[must_use]
@@ -14754,6 +16568,49 @@ impl AgentSession {
 
     pub fn set_api_key_override(&mut self, api_key: Option<String>) {
         self.api_key_override = normalize_api_key_opt(api_key);
+        self.api_key_override_provider = self
+            .api_key_override
+            .as_ref()
+            .map(|_| self.agent.provider().name().to_string());
+        self.refresh_extension_completion_host_state();
+    }
+
+    pub(crate) fn api_key_override_for_provider(&self, provider: &str) -> Option<&str> {
+        self.api_key_override_provider
+            .as_deref()
+            .filter(|bound| bound.eq_ignore_ascii_case(provider))
+            .and(self.api_key_override.as_deref())
+    }
+
+    /// Install the parent's admission snapshot once at native child startup.
+    /// Automatic role/prewalk/failover changes retain this ownership.
+    pub fn set_child_fallback_policy(
+        &mut self,
+        policy: Option<crate::failover::ChildFallbackPolicy>,
+    ) {
+        self.child_fallback_policy = policy;
+    }
+
+    /// All recovery drivers use the same role ownership. Unbound sessions
+    /// retain their existing default/exact-model chain behavior.
+    #[must_use]
+    pub fn resolve_fallback_chain(
+        &self,
+        ambient: &std::collections::HashMap<String, Vec<String>>,
+        provider: &str,
+        model_id: &str,
+        models: &[crate::models::ModelEntry],
+    ) -> Option<crate::failover::FailoverChain> {
+        self.child_fallback_policy.as_ref().map_or_else(
+            || crate::failover::chain_for(ambient, "default", provider, model_id, models),
+            |policy| policy.chain(provider, model_id, models),
+        )
+    }
+
+    fn fallback_provider_allowed(&self, provider: &str) -> bool {
+        self.child_fallback_policy
+            .as_ref()
+            .is_none_or(|policy| policy.allows_provider(provider))
     }
 
     pub fn refresh_extension_completion_host_state(&self) {
@@ -14763,12 +16620,35 @@ impl AgentSession {
         };
         state.provider = self.agent.provider();
         state.stream_options = self.agent.stream_options().clone();
+        state
+            .compaction_models
+            .api_key_override
+            .clone_from(&self.api_key_override);
+        state
+            .compaction_models
+            .api_key_override_provider
+            .clone_from(&self.api_key_override_provider);
+        state
+            .compaction_models
+            .recovery_cli_api_key
+            .clone_from(&self.recovery_cli_api_key);
     }
 
     fn refresh_extension_compaction_models(&self) {
+        // Only extensions read this state (`ctx.compact` with a `model`), and
+        // building it deep-copies the whole model registry and auth store.
+        // Startup sets both, so a session without extensions paid for two
+        // copies it could never use, several milliseconds of every start.
+        // Installing extensions calls this again, so they still get it.
+        if self.extensions.is_none() {
+            return;
+        }
         let models = ExtensionCompactionModelState {
             registry: self.model_registry.clone().map(Arc::new),
             auth: self.auth_storage.clone().map(Arc::new),
+            api_key_override: self.api_key_override.clone(),
+            api_key_override_provider: self.api_key_override_provider.clone(),
+            recovery_cli_api_key: self.recovery_cli_api_key.clone(),
             js_provider_ids: self.extensions.as_ref().map_or_else(Vec::new, |region| {
                 region
                     .manager()
@@ -14889,10 +16769,22 @@ impl AgentSession {
                     "Unable to switch provider/model to {provider_id}/{model_id}"
                 )));
             }
+            let resolved_key = if let Some(auth) = &self.auth_storage {
+                auth.resolve_api_key_status(
+                    provider_id,
+                    self.recovery_api_key_override(provider_id, None),
+                )
+                .into_result(provider_id)?
+                .or_else(|| self.agent.stream_options().api_key.clone())
+            } else {
+                self.recovery_api_key_override(provider_id, None)
+                    .map(str::to_string)
+                    .or_else(|| self.agent.stream_options().api_key.clone())
+            };
             return Ok(PreparedModelSelection {
                 entry: None,
                 provider: None,
-                resolved_key: self.agent.stream_options().api_key.clone(),
+                resolved_key,
                 provider_id: active_provider.name().to_string(),
                 model_id: active_provider.model_id().to_string(),
                 thinking_level: requested_thinking,
@@ -14904,7 +16796,7 @@ impl AgentSession {
         let already_active = active_provider.name().eq(&canonical_provider_id)
             && active_provider.model_id().eq(&canonical_model_id);
         let requires_credential = model_requires_configured_credential(&entry);
-        let resolved_key = self.resolve_stream_api_key_for_model(&entry).or_else(|| {
+        let resolved_key = self.resolve_stream_api_key_for_model(&entry)?.or_else(|| {
             (already_active && requires_credential)
                 .then(|| self.agent.stream_options().api_key.clone())
                 .flatten()
@@ -14986,7 +16878,9 @@ impl AgentSession {
                 entry.model.context_window
             });
         } else {
-            self.agent.stream_options_mut().thinking_level = Some(thinking_level);
+            let options = self.agent.stream_options_mut();
+            options.api_key = resolved_key;
+            options.thinking_level = Some(thinking_level);
         }
 
         if let Some(region) = &self.extensions {
@@ -14998,20 +16892,136 @@ impl AgentSession {
     }
 
     pub async fn set_provider_model(&mut self, provider_id: &str, model_id: &str) -> Result<()> {
-        self.ensure_provider_reentry_allowed()?;
         let current_thinking = self
             .agent
             .stream_options()
             .thinking_level
             .unwrap_or_default();
-        let prepared = self.prepare_model_selection(provider_id, model_id, current_thinking)?;
-        let target_provider_id = prepared.provider_id.clone();
-        let target_model_id = prepared.model_id.clone();
-        let next_thinking = prepared.thinking_level;
-        let active_provider = self.agent.provider();
-        let runtime_model_changed = active_provider.name() != target_provider_id
-            || active_provider.model_id() != target_model_id;
+        let admission = self.provider_admission.clone();
+        self.set_provider_model_selection(
+            provider_id,
+            model_id,
+            current_thinking,
+            ProviderSwapAdmission::Gate(&admission),
+            false,
+        )
+        .await?;
+        self.agent.disarm_prewalk();
+        if let Some(policy) = &mut self.child_fallback_policy {
+            policy.use_default_role();
+        }
+        Ok(())
+    }
 
+    /// Start the prewalk clock and capture session ownership for one logical
+    /// request. Native drivers retain this token through provider retries and
+    /// call `finish_prewalk_turn` after the final attempt. The SDK does this
+    /// automatically for its prompt/content/continuation entrypoints.
+    #[must_use]
+    pub fn begin_prewalk_turn(&mut self) -> crate::prewalk::PrewalkTurn {
+        let origin = self.session_action_admission.capture_origin();
+        self.agent.begin_prewalk_run();
+        crate::prewalk::PrewalkTurn { origin }
+    }
+
+    /// Whether a completed native attempt yielded after its first edit batch.
+    /// Only a successful, durably saved attempt may commit this handoff.
+    #[must_use]
+    pub fn prewalk_handoff_pending(&self) -> bool {
+        self.agent
+            .prewalk
+            .as_ref()
+            .is_some_and(crate::prewalk::PrewalkState::yielded)
+    }
+
+    /// Commit a yielded handoff before continuing the existing transcript.
+    /// `None` means a newer explicit selection won, or no handoff was pending.
+    /// A driver that observed `prewalk_handoff_pending` continues in either
+    /// case, without rerunning input hooks, user messages, or completed tools.
+    pub async fn complete_prewalk_handoff(
+        &mut self,
+        turn: &crate::prewalk::PrewalkTurn,
+        abort: Option<&AbortSignal>,
+    ) -> Result<Option<crate::prewalk::PrewalkTarget>> {
+        let Some(mut target) = self.agent.take_prewalk_handoff() else {
+            return Ok(None);
+        };
+        if abort.is_some_and(AbortSignal::is_aborted) {
+            return Err(Error::Aborted);
+        }
+        if !self.commit_prewalk_handoff(&target, &turn.origin).await? {
+            return Ok(None);
+        }
+        target.thinking = Some(
+            self.agent
+                .stream_options()
+                .thinking_level
+                .unwrap_or_default(),
+        );
+        Ok(Some(target))
+    }
+
+    /// Release the logical request's shared budgets. Errors and cancellation
+    /// disarm an unfinished prewalk; a read-only completed request keeps it.
+    pub fn finish_prewalk_turn(&mut self, interrupted: bool) {
+        self.agent.finish_prewalk_run(interrupted);
+    }
+
+    /// A prewalk keeps provider and session-action authority from provenance
+    /// validation through durable installation. A newer explicit selection
+    /// wins; navigation to a different session generation refuses continuation.
+    pub(crate) async fn commit_prewalk_handoff(
+        &mut self,
+        target: &crate::prewalk::PrewalkTarget,
+        origin: &SessionActionOrigin,
+    ) -> Result<bool> {
+        self.set_automatic_model_selection(
+            &target.provider,
+            &target.model,
+            target.thinking.unwrap_or_default(),
+            origin,
+        )
+        .await
+    }
+
+    /// Install a host-owned automatic selection without disarming a pending
+    /// prewalk. Model, reasoning, credentials and capabilities use the same
+    /// durable transition as explicit selection; session navigation or newer
+    /// persisted model intent wins before the destination is installed.
+    pub(crate) async fn set_automatic_model_selection(
+        &mut self,
+        provider: &str,
+        model: &str,
+        thinking: crate::model::ThinkingLevel,
+        origin: &SessionActionOrigin,
+    ) -> Result<bool> {
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.provider_admission.clone();
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = session_actions.acquire_origin(origin).await?;
+        self.set_provider_model_selection(
+            provider,
+            model,
+            thinking,
+            ProviderSwapAdmission::Held(&authority),
+            true,
+        )
+        .await
+    }
+
+    /// Install model and reasoning level in one durable transition. Automatic
+    /// selection checks provenance while holding the same lock used to save it.
+    #[allow(clippy::too_many_lines)]
+    async fn set_provider_model_selection(
+        &mut self,
+        provider_id: &str,
+        model_id: &str,
+        thinking: crate::model::ThinkingLevel,
+        admission: ProviderSwapAdmission<'_>,
+        automatic: bool,
+    ) -> Result<bool> {
+        self.ensure_provider_reentry_allowed()?;
         let cx = crate::agent_cx::AgentCx::for_request();
         let save_enabled = self.save_enabled;
         let session_store = Arc::clone(&self.session);
@@ -15024,6 +17034,41 @@ impl AgentSession {
             .effective_thinking_level_for_current_path()
             .as_deref()
             .and_then(|value| value.parse::<crate::model::ThinkingLevel>().ok());
+        if automatic {
+            let runtime = self.agent.provider();
+            let catalog = self
+                .model_registry
+                .as_ref()
+                .map_or(&[][..], ModelRegistry::models);
+            let model_matches = previous_model.as_ref().is_none_or(|(provider, model)| {
+                crate::models::model_identities_match(
+                    catalog,
+                    runtime.name(),
+                    runtime.model_id(),
+                    provider,
+                    model,
+                )
+            });
+            let thinking_matches = previous_thinking.is_none_or(|thinking| {
+                self.agent
+                    .stream_options()
+                    .thinking_level
+                    .unwrap_or_default()
+                    == thinking
+            });
+            if !model_matches || !thinking_matches {
+                return Ok(false);
+            }
+        }
+        // Respect a newer explicit selection before refreshing credentials for
+        // an automatic destination that will no longer be used.
+        let prepared = self.prepare_model_selection(provider_id, model_id, thinking)?;
+        let target_provider_id = prepared.provider_id.clone();
+        let target_model_id = prepared.model_id.clone();
+        let next_thinking = prepared.thinking_level;
+        let active_provider = self.agent.provider();
+        let runtime_model_changed = active_provider.name() != target_provider_id
+            || active_provider.model_id() != target_model_id;
         if previous_model
             .as_ref()
             .map(|(provider, model_id)| (provider.as_str(), model_id.as_str()))
@@ -15045,8 +17090,7 @@ impl AgentSession {
         if !previous_thinking.is_some_and(|previous| previous.eq(&next_thinking)) {
             candidate.append_thinking_level_change(next_thinking.to_string());
         }
-        let _provider_transition = self
-            .provider_admission
+        let _provider_transition = admission
             .begin_transition(
                 "model selection persistence was interrupted before live installation completed"
                     .to_string(),
@@ -15072,7 +17116,64 @@ impl AgentSession {
         drop(session);
         self.install_prepared_model_selection(prepared);
         self.clear_provider_reentry_quarantine();
-        Ok(())
+        Ok(true)
+    }
+
+    /// Arm a one-shot SDK-driven handoff. No provider request is made here.
+    /// Re-arming preserves an existing target. A target matching the current
+    /// model and reasoning level is a no-op, returned as `None`.
+    pub async fn arm_prewalk(
+        &mut self,
+        target: crate::prewalk::PrewalkTarget,
+    ) -> Result<Option<crate::prewalk::PrewalkTarget>> {
+        self.ensure_provider_reentry_allowed()?;
+        if let Some(current) = self.agent.prewalk_target() {
+            return Ok(Some(current.clone()));
+        }
+        let entry = self
+            .model_registry
+            .as_ref()
+            .and_then(|registry| registry.find(&target.provider, &target.model))
+            .ok_or_else(|| Error::validation("PREWALK_TARGET: select a registered model"))?;
+        let thinking = target.thinking.unwrap_or_else(|| {
+            self.agent
+                .stream_options()
+                .thinking_level
+                .unwrap_or_default()
+        });
+        let prepared =
+            self.prepare_model_selection(&entry.model.provider, &entry.model.id, thinking)?;
+        let target = crate::prewalk::PrewalkTarget {
+            provider: prepared.provider_id,
+            model: prepared.model_id,
+            thinking: Some(prepared.thinking_level),
+        };
+        let active = self.agent.provider();
+        if active.name() == target.provider
+            && active.model_id() == target.model
+            && self
+                .agent
+                .stream_options()
+                .thinking_level
+                .unwrap_or_default()
+                == prepared.thinking_level
+        {
+            return Ok(None);
+        }
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let session = self
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|error| Error::session(error.to_string()))?;
+        let todo_ready = self.agent.shared_tools().snapshot().get("todo").is_none()
+            || !crate::todo::latest_from_entries(session.entries_for_current_path()).is_empty();
+        drop(session);
+        self.agent.prewalk = Some(crate::prewalk::PrewalkState::new(
+            target.clone(),
+            todo_ready,
+        ));
+        Ok(Some(target))
     }
 
     /// Update the thinking/reasoning level for this session at runtime.
@@ -15137,6 +17238,7 @@ impl AgentSession {
         }
         *session = candidate;
         self.agent.stream_options_mut().thinking_level = Some(effective_level);
+        self.agent.disarm_prewalk();
         self.refresh_extension_completion_host_state();
         if changed {
             self.clear_provider_reentry_quarantine();
@@ -15170,21 +17272,25 @@ impl AgentSession {
             .map_or(level, |entry| entry.clamp_thinking_level(level))
     }
 
-    fn resolve_stream_api_key_for_model(&self, entry: &ModelEntry) -> Option<String> {
-        let normalize = |key_opt: Option<String>| {
-            key_opt.and_then(|key| {
-                let trimmed = key.trim();
-                (!trimmed.is_empty()).then(|| trimmed.to_string())
-            })
-        };
+    fn resolve_stream_api_key_for_model(&self, entry: &ModelEntry) -> Result<Option<String>> {
+        let override_key = self.recovery_api_key_override(&entry.model.provider, None);
+        if let Some(auth) = &self.auth_storage {
+            return crate::models::resolve_model_key(override_key, auth, entry);
+        }
+        Ok(normalize_api_key_opt(override_key.map(str::to_string))
+            .or_else(|| normalize_api_key_opt(entry.api_key.clone())))
+    }
 
-        normalize(self.api_key_override.clone())
-            .or_else(|| {
-                self.auth_storage
-                    .as_ref()
-                    .and_then(|auth| normalize(auth.resolve_api_key(&entry.model.provider, None)))
-            })
-            .or_else(|| normalize(entry.api_key.clone()))
+    fn refresh_compaction_credential(&self, options: &mut StreamOptions) -> Result<()> {
+        let provider = self.agent.provider();
+        let entry = self.current_model_entry();
+        ExtensionCompactionModelState::refresh_key_from_sources(
+            provider.as_ref(),
+            options,
+            entry.as_ref(),
+            self.auth_storage.as_ref(),
+            self.recovery_api_key_override(provider.name(), None),
+        )
     }
 
     pub(crate) async fn sync_runtime_selection_from_session_header(&mut self) -> Result<()> {
@@ -15216,8 +17322,18 @@ impl AgentSession {
             let provider = self.agent.provider();
             (provider.name().to_string(), provider.model_id().to_string())
         });
-        let prepared =
-            self.prepare_model_selection(&requested_provider_id, &requested_model_id, requested)?;
+        let prepared = self
+            .prepare_model_selection(&requested_provider_id, &requested_model_id, requested)
+            .map_err(|error| {
+                if crate::failover::marks_credential_pool_exhausted(&error.to_string()) {
+                    // This boundary precedes acceptance of a new user message.
+                    // An automatic continuation here would lose that input;
+                    // return a local admission refusal without dispatching.
+                    Error::validation(format!("Provider admission unavailable: {error}"))
+                } else {
+                    error
+                }
+            })?;
         let canonical_provider_id = prepared.provider_id.clone();
         let canonical_model_id = prepared.model_id.clone();
         let effective = prepared.thinking_level;
@@ -15282,6 +17398,12 @@ impl AgentSession {
         *session = candidate;
         drop(session);
         self.install_prepared_model_selection(prepared);
+        if runtime_model_changed && let Some(policy) = &mut self.child_fallback_policy {
+            policy.use_default_role();
+        }
+        if runtime_model_changed || current_thinking != effective {
+            self.agent.disarm_prewalk();
+        }
         self.clear_provider_reentry_quarantine();
         Ok(())
     }
@@ -15518,6 +17640,7 @@ impl AgentSession {
         .await
     }
 
+    #[allow(clippy::too_many_lines)] // one admitted swap; splitting would scatter the commit point
     async fn restore_primary_swap_admitted(
         &mut self,
         cx: &crate::agent_cx::AgentCx,
@@ -15526,14 +17649,20 @@ impl AgentSession {
     ) -> Result<Option<RestoredPrimary>> {
         let gate = admission.map(ProviderSwapAdmission::gate);
         let (active_provider, active_model) = request.active;
+        let catalog = self
+            .model_registry
+            .as_ref()
+            .map_or(request.available_models, ModelRegistry::models);
 
         // The runtime must still be on the fallback the caller recorded.
         let runtime_provider = self.agent.provider();
-        if !crate::provider_metadata::provider_ids_match(runtime_provider.name(), active_provider)
-            || !runtime_provider
-                .model_id()
-                .eq_ignore_ascii_case(active_model)
-        {
+        if !crate::models::model_identities_match(
+            catalog,
+            runtime_provider.name(),
+            runtime_provider.model_id(),
+            active_provider,
+            active_model,
+        ) {
             return Self::refuse_restore(
                 request,
                 gate,
@@ -15551,8 +17680,13 @@ impl AgentSession {
             .map_err(|err| Error::session(format!("primary restore inner lock failed: {err}")))?;
         let session_matches_active = inner.effective_model_for_current_path().is_some_and(
             |(session_provider, session_model)| {
-                crate::provider_metadata::provider_ids_match(&session_provider, active_provider)
-                    && session_model.eq_ignore_ascii_case(active_model)
+                crate::models::model_identities_match(
+                    catalog,
+                    &session_provider,
+                    &session_model,
+                    active_provider,
+                    active_model,
+                )
             },
         );
         if !session_matches_active {
@@ -15571,7 +17705,7 @@ impl AgentSession {
             return Ok(None);
         }
 
-        let Some((entry, key)) = Self::resolve_restore_target(request)? else {
+        let Some((entry, key)) = self.resolve_restore_target(request)? else {
             return Ok(None);
         };
         let provider_impl = match crate::providers::create_provider_with_auth(
@@ -15636,24 +17770,37 @@ impl AgentSession {
         }))
     }
 
+    /// Native CLI/API overrides retain their original provider binding across
+    /// automatic role changes and recovery. Standalone RPC/embedding recovery
+    /// requests without a session binding keep their explicit override contract.
+    pub(crate) fn recovery_api_key_override<'a>(
+        &'a self,
+        provider: &str,
+        external_override: Option<&'a str>,
+    ) -> Option<&'a str> {
+        if self.api_key_override_provider.is_some() {
+            self.api_key_override_for_provider(provider)
+        } else {
+            external_override.or(self.recovery_cli_api_key.as_deref())
+        }
+    }
+
     /// Resolve the primary to a model entry and a credential, or decline.
     ///
     /// `Ok(None)` is the lenient decline; the same conditions are hard errors
     /// under `strict_invariants`, with the error kinds RPC has always returned
     /// for them.
     fn resolve_restore_target(
+        &self,
         request: &PrimaryRestoreRequest<'_>,
     ) -> Result<Option<(crate::models::ModelEntry, Option<String>)>> {
         let primary = request.primary;
-        let Some(entry) = request
-            .available_models
-            .iter()
-            .find(|m| {
-                crate::provider_metadata::provider_ids_match(&m.model.provider, &primary.provider)
-                    && m.model.id.eq_ignore_ascii_case(&primary.model_id)
-            })
-            .cloned()
-            .or_else(|| crate::models::ad_hoc_model_entry(&primary.provider, &primary.model_id))
+        let catalog = self
+            .model_registry
+            .as_ref()
+            .map_or(request.available_models, ModelRegistry::models);
+        let Some(entry) =
+            crate::models::resolve_model_entry(catalog, &primary.provider, &primary.model_id)
         else {
             if request.strict_invariants {
                 return Err(Error::validation(format!(
@@ -15664,7 +17811,53 @@ impl AgentSession {
             return Ok(None);
         };
 
-        let key = crate::models::resolve_model_key(request.cli_api_key, request.auth, &entry);
+        if !self.fallback_provider_allowed(&entry.model.provider) {
+            if request.strict_invariants {
+                return Err(Error::validation(
+                    "Unable to restore primary: provider is excluded by the admitted child policy",
+                ));
+            }
+            return Ok(None);
+        }
+
+        let registered =
+            crate::models::find_model_entry(catalog, &primary.provider, &primary.model_id)
+                .is_some();
+        let admitted = request.available_models.iter().any(|candidate| {
+            candidate
+                .model
+                .provider
+                .trim()
+                .eq_ignore_ascii_case(entry.model.provider.trim())
+                && candidate.model.id.eq_ignore_ascii_case(&entry.model.id)
+        });
+        let cli_api_key =
+            self.recovery_api_key_override(&entry.model.provider, request.cli_api_key);
+        let explicit_key_recovers_unready = cli_api_key.is_some_and(|key| !key.trim().is_empty())
+            && !crate::models::model_entry_is_ready(&entry);
+        if registered && !admitted && !explicit_key_recovers_unready {
+            // Availability and disabled-provider filtering happen after the
+            // full catalog establishes identity. A ready alias's row cannot
+            // admit a separately configured primary that was filtered out.
+            if request.strict_invariants {
+                return Err(Error::validation(format!(
+                    "Unable to restore primary provider/model {}/{}: the requested destination is not in the admitted model catalog",
+                    primary.provider, primary.model_id
+                )));
+            }
+            return Ok(None);
+        }
+
+        let key = match crate::models::resolve_model_key(cli_api_key, request.auth, &entry) {
+            Ok(key) => key,
+            Err(error)
+                if !request.strict_invariants
+                    && crate::failover::marks_credential_pool_exhausted(&error.to_string()) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         if crate::models::model_requires_configured_credential(&entry) && key.is_none() {
             // Restoring into an auth error would be strictly worse than staying
             // on a working fallback.
@@ -15798,20 +17991,73 @@ impl AgentSession {
             let provider = self.agent.provider();
             (provider.name().to_string(), provider.model_id().to_string())
         };
+        let failed_key = (attempt.class == crate::failover::FailoverClass::Quota
+            && self
+                .recovery_api_key_override(&from_provider, attempt.cli_api_key)
+                .is_none_or(|key| key.trim().is_empty()))
+        .then(|| self.agent.stream_options().api_key.clone())
+        .flatten();
         let mut walk = crate::failover::FailoverWalk::new(
             attempt.chain,
             attempt.start_position,
             &from_provider,
             &from_model,
         );
-        while let Some((entry_index, spec)) = walk.next_spec() {
+        loop {
+            let catalog = self
+                .model_registry
+                .as_ref()
+                .map_or(attempt.available_models, ModelRegistry::models);
+            let Some((entry_index, spec)) = walk.next_spec(catalog) else {
+                break;
+            };
             let next_position = walk.position();
-            let Some(entry) = crate::failover::resolve_chain_spec(spec, attempt.available_models)
+            let Some((entry, thinking)) = crate::failover::resolve_chain_selection(spec, catalog)
             else {
                 continue;
             };
-            let api_key =
-                crate::models::resolve_model_key(attempt.cli_api_key, attempt.auth, &entry);
+            if !self.fallback_provider_allowed(&entry.model.provider) {
+                continue;
+            }
+            let registered =
+                crate::models::find_model_entry(catalog, &entry.model.provider, &entry.model.id)
+                    .is_some();
+            let admitted = attempt.available_models.iter().any(|candidate| {
+                candidate
+                    .model
+                    .provider
+                    .trim()
+                    .eq_ignore_ascii_case(entry.model.provider.trim())
+                    && candidate.model.id.eq_ignore_ascii_case(&entry.model.id)
+            });
+            let cli_api_key =
+                self.recovery_api_key_override(&entry.model.provider, attempt.cli_api_key);
+            let explicit_key_recovers_unready = cli_api_key
+                .is_some_and(|key| !key.trim().is_empty())
+                && !crate::models::model_entry_is_ready(&entry);
+            if registered && !admitted && !explicit_key_recovers_unready {
+                // Filtering cannot erase a declared provider's identity. Keep
+                // ready excluded routes out, while allowing an explicit key
+                // to make an otherwise unready configured route usable.
+                continue;
+            }
+            let key_result = failed_key.as_deref().map_or_else(
+                || crate::models::resolve_model_key(cli_api_key, attempt.auth, &entry),
+                |key| {
+                    crate::models::resolve_model_key_after_rate_limit(
+                        cli_api_key,
+                        attempt.auth,
+                        &entry,
+                        &from_provider,
+                        key,
+                    )
+                },
+            );
+            let Ok(api_key) = key_result else {
+                // A second model on the same exhausted credential pool cannot
+                // recover the turn. Keep walking to a usable provider.
+                continue;
+            };
             if crate::models::model_requires_configured_credential(&entry) && api_key.is_none() {
                 continue;
             }
@@ -15833,7 +18079,7 @@ impl AgentSession {
                 from_model: &from_model,
                 class: attempt.class,
                 chain_position: next_position,
-                thinking_level_to_clamp: attempt.thinking_level_to_clamp,
+                thinking_level_to_clamp: thinking.unwrap_or(attempt.thinking_level_to_clamp),
                 require_incomplete_tail: attempt.require_incomplete_tail,
                 primary: attempt.primary,
                 cooldown_secs: attempt.cooldown_secs,
@@ -15842,6 +18088,9 @@ impl AgentSession {
             let (_, source) = self
                 .commit_failover_swap_admitted(cx, &request, admission)
                 .await?;
+            if let Some(key) = failed_key.as_deref() {
+                crate::auth::report_provider_rate_limit(&from_provider, key);
+            }
             return Ok(FailoverSwapOutcome {
                 next_position,
                 committed: Some(CommittedFailover {
@@ -16099,23 +18348,163 @@ impl AgentSession {
         Ok((matches, current))
     }
 
-    /// Force-run compaction synchronously (used by `/compact` slash command).
+    /// Persist a private session candidate before installing its live context.
+    /// The caller must hold provider transition authority, Session-action
+    /// authority, and the live Session lock in that order.
+    pub(crate) async fn install_context_candidate(
+        &mut self,
+        live: &mut Session,
+        mut candidate: Session,
+        replace_context: bool,
+        admission: &ProviderAdmissionGate,
+        operation: &str,
+    ) -> Result<()> {
+        admission.ensure_allowed()?;
+        let save_enabled = self.save_enabled();
+        if let Some(budget) = self.agent.cost_budget() {
+            budget.checkpoint(&mut candidate)?;
+        }
+        if save_enabled {
+            admission.block(format!(
+                "Session {operation} persistence was interrupted before live installation completed"
+            ));
+            if let Err(first_error) = candidate.save().await
+                && let Err(retry_error) = candidate.save().await
+            {
+                let reason = format!(
+                    "Session {operation} persistence remained indeterminate after an idempotent retry: first failure: {first_error}; retry failure: {retry_error}"
+                );
+                admission.block(reason.clone());
+                return Err(Error::session_persistence(reason));
+            }
+        }
+        // Save reconciles IDs, navigation and the persisted header. Project
+        // from the accepted candidate, not the view prepared before that I/O.
+        let messages = replace_context.then(|| candidate.to_messages_for_current_path());
+        *live = candidate;
+        if let Some(messages) = messages {
+            self.invalidate_background_compaction();
+            self.agent.replace_messages(messages);
+        }
+        if save_enabled {
+            admission.clear();
+        }
+        Ok(())
+    }
+
+    /// Rewind the selected branch to the parent of its last retryable user
+    /// turn. The returned input preserves native content block order and bytes.
+    /// Re-send it as a new prompt to create a sibling of the abandoned turn.
+    /// A failed save preserves the live view and fences later provider calls.
+    pub async fn prepare_retry_content(&mut self) -> Result<UserContent> {
+        self.prepare_retry_input(false).await
+    }
+
+    pub(crate) async fn prepare_retry_input(&mut self, require_text: bool) -> Result<UserContent> {
+        let admission = self.provider_admission_gate();
+        admission.ensure_allowed()?;
+        let cx = crate::agent_cx::AgentCx::for_request();
+        // Provider callbacks may need Session actions and the store before
+        // releasing their provider permit. Match recovery's lock order and
+        // reserve authority without quarantining while validation is pending.
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission_gate();
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let store = Arc::clone(&self.session);
+        let mut guard = OwnedMutexGuard::lock(store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let plan = crate::checkpoint::plan_retry_content(&guard)
+            .ok_or_else(|| Error::session("No user turn to retry"))?;
+        if let UserContent::Blocks(blocks) = &plan.content {
+            if require_text {
+                return Err(Error::session(
+                    "The last user turn contains structured content; use prepare_retry_content to preserve its attachments",
+                ));
+            }
+            Self::validate_user_content_blocks(blocks)?;
+        }
+        let mut candidate = guard.clone();
+        crate::checkpoint::apply_retry_content_plan(&mut candidate, &plan)
+            .map_err(|error| Error::session(error.to_string()))?;
+        self.install_context_candidate(&mut guard, candidate, true, &admission, "retry rewind")
+            .await?;
+        Ok(plan.content)
+    }
+
+    /// Force-run compaction synchronously (used by `/compact` slash command),
+    /// below the automatic threshold and with auto-compaction off too.
+    /// `instructions` (`/compact <focus>`) steer the summary. Returns whether
+    /// the session changed: too little history is `false`, not an error.
     pub async fn compact_now(
         &mut self,
+        instructions: Option<&str>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.ensure_provider_reentry_allowed()?;
-        self.compact_synchronous(Arc::new(on_event), false).await
+        self.compact_synchronous(Arc::new(on_event), false, instructions, None, None)
+            .await
     }
 
     /// OMP `/shake` (bd-cv653.3.18): compact by dropping bulky tool output
     /// from the older span instead of asking the model for a summary.
-    /// Instant, and no provider request is made.
+    /// Instant, and no provider request is made. Returns whether the session
+    /// changed, as [`Self::compact_now`] does.
     pub async fn shake_now(
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<bool> {
+        self.compact_synchronous(Arc::new(on_event), true, None, None, None)
+            .await
+    }
+
+    /// Recover an overflowing request using the same durable compaction
+    /// transaction as manual maintenance. The caller first restores the failed
+    /// assistant tail and resumes only when this returns true. No-op cuts,
+    /// disabled compaction, cancellation, and summaries that do not shrink the
+    /// active context never authorize another provider request.
+    pub(crate) async fn compact_after_context_overflow(
+        &mut self,
+        abort: &AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<bool> {
+        self.ensure_provider_reentry_allowed()?;
+        self.compact_synchronous(Arc::new(on_event), false, None, Some(abort), None)
+            .await
+    }
+
+    /// Replace an older safe prefix with a model-generated continuation brief.
+    /// This explicit operation ignores automatic thresholds/enabling, retains
+    /// the latest authored turn verbatim, and never creates another session.
+    pub async fn handoff_now(
+        &mut self,
+        focus: &str,
+        abort: &AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<()> {
-        self.compact_synchronous(Arc::new(on_event), true).await
+        self.ensure_provider_reentry_allowed()?;
+        if focus.len() > 4096 || focus.contains('\0') {
+            return Err(Error::validation(
+                "Handoff focus must fit 4096 bytes and contain no NUL",
+            ));
+        }
+        // A set compacting flag here is a background compaction left running
+        // by the last turn (this borrow excludes a foreground one). The
+        // handoff's own compaction supersedes it, as an explicit compact does.
+        if self.extensions_turn_active.load(Ordering::SeqCst) {
+            return Err(Error::session(
+                "Wait for the current turn before handing off",
+            ));
+        }
+        let changed = self
+            .compact_synchronous(Arc::new(on_event), false, None, None, Some((focus, abort)))
+            .await?;
+        if !changed {
+            return Err(Error::session(
+                "Nothing safe to hand off: no older prefix remains outside the retained authored turn and keep-recent budget",
+            ));
+        }
+        Ok(())
     }
 
     pub async fn execute_extension_command(
@@ -16270,8 +18659,14 @@ impl AgentSession {
                         });
                         return Err(err);
                     }
-                    self.apply_compaction_result(result, Arc::clone(&on_event), provider_admission)
-                        .await?;
+                    self.apply_compaction_result(
+                        result,
+                        Arc::clone(&on_event),
+                        provider_admission,
+                        None,
+                        None,
+                    )
+                    .await?;
                     self.compaction_worker.mark_applied_success();
                 }
                 Err(e) => {
@@ -16394,6 +18789,8 @@ impl AgentSession {
                         compaction.details.clone(),
                         true,
                         provider_admission,
+                        false,
+                        None,
                     )
                     .await;
                 let tokens_after = match apply_result {
@@ -16425,7 +18822,7 @@ impl AgentSession {
             }
 
             let provider = self.agent.provider();
-            let stream_options = self.agent.stream_options().clone();
+            let mut stream_options = self.agent.stream_options().clone();
 
             let runtime_handle = match self.compaction_runtime_handle() {
                 Ok(runtime_handle) => runtime_handle,
@@ -16454,6 +18851,15 @@ impl AgentSession {
                 }
             };
             if let Err(err) = self.provider_admission.ensure_allowed() {
+                on_event(AgentEvent::AutoCompactionEnd {
+                    result: None,
+                    aborted: false,
+                    will_retry: false,
+                    error_message: Some(err.to_string()),
+                });
+                return Err(err);
+            }
+            if let Err(err) = self.refresh_compaction_credential(&mut stream_options) {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
                     aborted: false,
@@ -16555,8 +18961,14 @@ impl AgentSession {
             }
         };
 
-        self.apply_compaction_result(result, Arc::clone(&on_event), provider_admission)
-            .await
+        self.apply_compaction_result(
+            result,
+            Arc::clone(&on_event),
+            provider_admission,
+            None,
+            None,
+        )
+        .await
     }
 
     fn compaction_runtime_handle(&mut self) -> Result<RuntimeHandle> {
@@ -16596,9 +19008,10 @@ impl AgentSession {
 
     /// Append the compaction entry to the session and return the estimated
     /// token count of the context the next provider request will see (the
-    /// post-compaction current path). The estimate uses the char-based
-    /// heuristic and ignores retained assistant `usage`, so stale
+    /// post-compaction current path). The estimate ignores retained assistant
+    /// `usage`, so stale
     /// pre-compaction usage never inflates it.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one durable append transaction
     async fn apply_compaction_entry(
         &self,
         summary: String,
@@ -16607,12 +19020,49 @@ impl AgentSession {
         details: Option<Value>,
         from_extension: bool,
         provider_admission: OwnedMutexGuard<()>,
+        require_reduction: bool,
+        handoff_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
     ) -> Result<u64> {
         let cx = crate::agent_cx::AgentCx::for_request();
+        let session_action_permit = if handoff_source.is_some() {
+            Some(self.session_action_admission.acquire(cx.cx()).await?)
+        } else {
+            None
+        };
         let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
             .await
             .map_err(|e| Error::session(e.to_string()))?;
         self.provider_admission.ensure_allowed()?;
+        if let Some((source, abort)) = handoff_source {
+            if abort.is_aborted() {
+                return Err(Error::Aborted);
+            }
+            if SessionEditSnapshot::capture(&session)? != *source {
+                return Err(Error::session(
+                    "Handoff source changed during generation; the summary was not applied",
+                ));
+            }
+            if summary.trim().is_empty()
+                || !compaction::overflow_compaction_preserves_current_turn(
+                    &session.entries_for_current_path(),
+                    &first_kept_entry_id,
+                )
+            {
+                return Err(Error::session(
+                    "Handoff must preserve the current authored turn and have a nonempty summary",
+                ));
+            }
+        }
+        if require_reduction
+            && !compaction::overflow_compaction_preserves_current_turn(
+                &session.entries_for_current_path(),
+                &first_kept_entry_id,
+            )
+        {
+            return Err(Error::api(
+                "Context overflow compaction would discard the current user request or completed tool work; the cut was not applied",
+            ));
+        }
         let mut candidate = session.clone();
 
         let from_hook = if from_extension { Some(true) } else { None };
@@ -16624,6 +19074,25 @@ impl AgentSession {
             from_hook,
         );
 
+        // Count the context actually sent next, not the archived tree entries
+        // or pre-compaction usage. Refuse a no-progress overflow recovery
+        // before writing or installing its candidate.
+        let tokens_after =
+            compaction::estimate_model_context_tokens(&candidate.to_messages_for_current_path());
+        if require_reduction
+            && tokens_after
+                >= compaction::estimate_model_context_tokens(
+                    &session.to_messages_for_current_path(),
+                )
+        {
+            return Err(Error::api(
+                "Context overflow recovery made no progress; compaction did not reduce the active context",
+            ));
+        }
+
+        if let Some(budget) = self.agent.cost_budget() {
+            budget.checkpoint(&mut candidate)?;
+        }
         if self.save_enabled {
             self.provider_admission.block(
                 "compaction persistence was interrupted before live installation completed"
@@ -16640,12 +19109,6 @@ impl AgentSession {
             }
         }
 
-        // Estimate the context the *next* provider request will see now that the
-        // compacted history is written: the post-compaction current path via the
-        // shared char-based heuristic, ignoring any retained assistant `usage`.
-        let tokens_after =
-            compaction::estimate_entries_context_tokens(&candidate.entries_for_current_path());
-
         let compaction_entry = candidate.get_entry(&entry_id).and_then(|entry| {
             if let crate::session::SessionEntry::Compaction(compaction) = entry {
                 Some(compaction.clone())
@@ -16658,6 +19121,7 @@ impl AgentSession {
             self.provider_admission.clear();
         }
         drop(session);
+        drop(session_action_permit);
         // The Session transition is complete. Release provider admission
         // before dispatching the re-entrant post-install extension hook.
         drop(provider_admission);
@@ -16685,7 +19149,10 @@ impl AgentSession {
         result: compaction::CompactionResult,
         on_event: AgentEventHandler,
         provider_admission: OwnedMutexGuard<()>,
+        overflow_abort: Option<&AbortSignal>,
+        handoff_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
     ) -> Result<()> {
+        let overflow = overflow_abort.is_some();
         let details = match compaction::compaction_details_to_value(&result.details) {
             Ok(details) => Some(details),
             Err(err) => {
@@ -16706,6 +19173,8 @@ impl AgentSession {
                 details.clone(),
                 false,
                 provider_admission,
+                overflow,
+                handoff_source,
             )
             .await
         {
@@ -16729,10 +19198,11 @@ impl AgentSession {
             details,
         ));
 
+        self.agent.emit_cost_warning(&on_event);
         on_event(AgentEvent::AutoCompactionEnd {
             result: result_value,
             aborted: false,
-            will_retry: false,
+            will_retry: overflow && !overflow_abort.is_some_and(AbortSignal::is_aborted),
             error_message: None,
         });
 
@@ -16745,46 +19215,109 @@ impl AgentSession {
         &mut self,
         on_event: AgentEventHandler,
         shake: bool,
-    ) -> Result<()> {
-        if !self.compaction_settings.enabled {
-            return Ok(());
+        instructions: Option<&str>,
+        overflow_abort: Option<&AbortSignal>,
+        handoff: Option<(&str, &AbortSignal)>,
+    ) -> Result<bool> {
+        // `compaction.enabled` is the automatic switch, as in OMP: it stops
+        // overflow recovery, not a user's `/compact`, `/shake` or handoff.
+        if !self.compaction_settings.enabled && overflow_abort.is_some() {
+            return Ok(false);
         }
+        let abort = handoff.map(|(_, abort)| abort).or(overflow_abort);
+        if abort.is_some_and(AbortSignal::is_aborted) {
+            return Err(Error::Aborted);
+        }
+        let overflow = overflow_abort.is_some();
 
-        let (entries, preparation) = {
+        let (entries, preparation, handoff_snapshot) = {
             let cx = crate::agent_cx::AgentCx::for_request();
             let mut session = self
                 .session
                 .lock(cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
+            if handoff.is_some() {
+                session.ensure_full_v2_hydration_before_save()?;
+            }
             session.ensure_entry_ids();
+            let handoff_snapshot = handoff
+                .map(|_| SessionEditSnapshot::capture(&session))
+                .transpose()?;
             let entries = session
                 .entries_for_current_path()
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            let prep = compaction::prepare_compaction(&entries, self.compaction_settings.clone());
-            (entries, prep)
+            let mut settings = self.compaction_settings.clone();
+            let prep = if handoff.is_some() {
+                compaction::prepare_handoff_compaction(&entries, settings)
+            } else if overflow {
+                // A provider may reject a request smaller than the configured
+                // keep-recent budget. Aim to retain at most half the observed
+                // input while preserving the complete current authored turn,
+                // without inventing a different model capacity.
+                let tokens = compaction::estimate_model_context_tokens(
+                    &session.to_messages_for_current_path(),
+                );
+                settings.keep_recent_tokens = settings
+                    .keep_recent_tokens
+                    .min(u32::try_from(tokens / 2).unwrap_or(u32::MAX));
+                compaction::prepare_overflow_compaction(&entries, settings)
+            } else {
+                // `/compact` and `/shake`; automatic compaction does not run here.
+                compaction::prepare_manual_compaction(&entries, settings)
+            };
+            (entries, prep, handoff_snapshot)
         };
 
         if let Some(prep) = preparation {
             on_event(AgentEvent::AutoCompactionStart {
-                reason: "threshold".to_string(),
+                reason: if handoff.is_some() {
+                    "handoff"
+                } else if overflow {
+                    "overflow"
+                } else {
+                    "threshold"
+                }
+                .to_string(),
             });
             let _compacting_guard = AtomicBoolGuard::activate(&self.extensions_is_compacting);
 
-            let before_outcome = self.dispatch_before_compact(&prep, &entries, None).await;
-            if before_outcome.cancel {
+            let before_outcome = self
+                .dispatch_before_compact(
+                    &prep,
+                    &entries,
+                    handoff.map(|(focus, _)| focus).or(instructions),
+                )
+                .await;
+            if before_outcome.cancel || abort.is_some_and(AbortSignal::is_aborted) {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
                     aborted: true,
                     will_retry: false,
                     error_message: None,
                 });
-                return Err(Error::extension("Compaction cancelled".to_string()));
+                return Err(if abort.is_some_and(AbortSignal::is_aborted) {
+                    Error::Aborted
+                } else {
+                    Error::extension("Compaction cancelled".to_string())
+                });
             }
 
             if let Some(compaction) = before_outcome.compaction {
+                if handoff.is_some() {
+                    let error = Error::extension(
+                        "Native handoff does not accept extension replacement summaries; cancel the replacement or use /compact",
+                    );
+                    on_event(AgentEvent::AutoCompactionEnd {
+                        result: None,
+                        aborted: false,
+                        will_retry: false,
+                        error_message: Some(error.to_string()),
+                    });
+                    return Err(error);
+                }
                 let cx = crate::agent_cx::AgentCx::for_current_or_request();
                 let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
                     Ok(provider_admission) => provider_admission,
@@ -16806,6 +19339,8 @@ impl AgentSession {
                         compaction.details.clone(),
                         true,
                         provider_admission,
+                        overflow,
+                        None,
                     )
                     .await;
                 let tokens_after = match apply_result {
@@ -16830,14 +19365,14 @@ impl AgentSession {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: result_value,
                     aborted: false,
-                    will_retry: false,
+                    will_retry: overflow && !overflow_abort.is_some_and(AbortSignal::is_aborted),
                     error_message: None,
                 });
-                return Ok(());
+                return Ok(true);
             }
 
             let provider = self.agent.provider();
-            let stream_options = self.agent.stream_options().clone();
+            let mut stream_options = self.agent.stream_options().clone();
 
             self.invalidate_background_compaction();
             let cx = crate::agent_cx::AgentCx::for_current_or_request();
@@ -16862,39 +19397,57 @@ impl AgentSession {
                 });
                 return Err(err);
             }
-            let compaction_result = if shake {
-                Ok(compaction::compact_shake(
-                    prep,
-                    &self.agent.compaction_privacy(),
-                ))
+            let privacy = self.agent.compaction_privacy();
+            let compaction_result = if abort.is_some_and(AbortSignal::is_aborted) {
+                Err(Error::Aborted)
+            } else if !shake
+                && let Err(error) = self.refresh_compaction_credential(&mut stream_options)
+            {
+                Err(error)
+            } else if let Some((focus, abort)) = handoff {
+                compaction::compact_handoff(prep, provider, &stream_options, focus, abort, &privacy)
+                    .await
+            } else if shake {
+                Ok(compaction::compact_shake(prep, &privacy))
             } else {
-                compaction::compact(
-                    prep,
-                    provider,
-                    &stream_options,
-                    None,
-                    &self.agent.compaction_privacy(),
-                )
-                .await
+                let compact =
+                    compaction::compact(prep, provider, &stream_options, instructions, &privacy);
+                if let Some(abort) = overflow_abort {
+                    let cancelled = abort.wait();
+                    futures::pin_mut!(compact, cancelled);
+                    match futures::future::select(cancelled, compact).await {
+                        futures::future::Either::Left(_) => Err(Error::Aborted),
+                        futures::future::Either::Right((result, _)) => result,
+                    }
+                } else {
+                    compact.await
+                }
             };
 
             match compaction_result {
                 Ok(result) => {
-                    self.apply_compaction_result(result, Arc::clone(&on_event), provider_admission)
-                        .await?;
+                    self.apply_compaction_result(
+                        result,
+                        Arc::clone(&on_event),
+                        provider_admission,
+                        overflow_abort,
+                        handoff_snapshot.as_ref().zip(abort),
+                    )
+                    .await?;
                 }
                 Err(e) => {
                     on_event(AgentEvent::AutoCompactionEnd {
                         result: None,
-                        aborted: false,
+                        aborted: matches!(e, Error::Aborted),
                         will_retry: false,
                         error_message: Some(e.to_string()),
                     });
                     return Err(e);
                 }
             }
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn resolve_extension_policy_for_enable(
@@ -17135,8 +19688,19 @@ impl AgentSession {
             follow_up_mode,
         )));
         manager.set_session_action_origin_source(self.session_action_admission.origin_source());
+        {
+            let mut state = self
+                .extension_ai_completion
+                .lock()
+                .map_err(|_| Error::extension("Failed to initialize the live model catalog"))?;
+            // Startup hooks can select models before `self.extensions` is
+            // installed. Seed the same catalog that subsequent registry refreshes
+            // keep current for runtime model selection and compaction.
+            state.compaction_models.registry = self.model_registry.clone().map(Arc::new);
+        }
         manager.set_session(Arc::new(AgentExtensionSession {
             handle: SessionHandle(self.session.clone()),
+            model_catalog: self.extension_model_catalog(),
             session_action_admission: self.session_action_admission.clone(),
             is_streaming: Arc::clone(&self.extensions_is_streaming),
             is_compacting: Arc::clone(&self.extensions_is_compacting),
@@ -17237,6 +19801,21 @@ impl AgentSession {
         // host values in that narrow interval rather than after startup.
         crate::extensions::apply_cli_flags(&manager, &host.cli_flags).await?;
 
+        // A startup hook may select a provider registered by the extension
+        // that just loaded. Validate a private registration snapshot for those
+        // hooks; the caller still owns final credential refresh and selection.
+        let bindings = crate::models::extension_provider_bindings(&manager.extension_providers())?;
+        let mut hook_registry = self.model_registry.clone().unwrap_or_default();
+        hook_registry.merge_extension_registry(&bindings, manager.extension_model_entries())?;
+        manager.set_extension_models(pi_ai_model_registry_values(&hook_registry));
+        {
+            let mut state = self
+                .extension_ai_completion
+                .lock()
+                .map_err(|_| Error::extension("Failed to publish the startup model catalog"))?;
+            state.compaction_models.registry = Some(Arc::new(hook_registry));
+        }
+
         // Fire the `startup` lifecycle hook once extensions are loaded.
         // Fail-open: extension errors must not prevent the agent from running.
         let session_path = {
@@ -17284,6 +19863,9 @@ impl AgentSession {
             let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
+            if let Some(budget) = self.agent.cost_budget() {
+                budget.checkpoint(&mut session)?;
+            }
             let persist_result = flush_turn_autosave(
                 &mut session,
                 &self.provider_admission,
@@ -17303,6 +19885,9 @@ impl AgentSession {
         let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
             .await
             .map_err(|e| Error::session(e.to_string()))?;
+        if let Some(budget) = self.agent.cost_budget() {
+            budget.checkpoint(&mut session)?;
+        }
         let persist_result = flush_turn_autosave(
             &mut session,
             &self.provider_admission,
@@ -17322,32 +19907,38 @@ impl AgentSession {
 
     /// Advisor hook (bd-cv653.3.3): after a completed turn, if the advisor
     /// role resolved a model, review a compact digest and inject the verdict
-    /// into the next turn via the steering queue. Zero-overhead gate: no
-    /// advisor configured → no digest built. Failures are isolated inside
-    /// the runtime and never fail the run.
-    async fn maybe_advise_turn(&mut self, abort: Option<&AbortSignal>) {
-        if abort.is_some_and(AbortSignal::is_aborted) {
-            return;
+    /// through the native steering queue. Reserve any automatic continuation
+    /// durably before returning; optional provider failures remain isolated.
+    #[allow(clippy::too_many_lines)] // one ordered advise/reserve/inject sequence per turn
+    async fn maybe_advise_turn(
+        &mut self,
+        abort: Option<&AbortSignal>,
+        turn: &AdvisorTurn,
+        allow_continuation: bool,
+    ) -> Result<bool> {
+        if abort.is_some_and(AbortSignal::is_aborted) || turn.time_exhausted() {
+            return Ok(false);
         }
         let Some(runtime) = self.advisor.as_mut() else {
-            return;
+            return Ok(false);
         };
+        runtime.set_cost_budget(self.agent.cost_budget().cloned());
         let Ok(digest) = runtime.build_digest_with_agent(&self.agent) else {
             tracing::info!(
                 event = "pi.advisor.privacy_projection_refused",
                 "Advisor request omitted because the configured privacy policy refused its digest"
             );
-            return;
+            return Ok(false);
         };
         if digest.is_trivial() {
-            return;
+            return Ok(false);
         }
         let turn_index = self.agent.messages().len() as u64;
         let outcome = runtime
-            .review_turn_with_abort(&digest, turn_index, abort)
+            .review_turn_with_budget(&digest, turn_index, abort, turn.remaining_time())
             .await;
         if abort.is_some_and(AbortSignal::is_aborted) {
-            return;
+            return Ok(false);
         }
         if std::env::var_os("PI_DEBUG_ADVISOR").is_some() {
             eprintln!(
@@ -17364,7 +19955,7 @@ impl AgentSession {
         }
         let verdict = match outcome {
             crate::advisor::AdvisorOutcome::Inject(verdict) => verdict,
-            crate::advisor::AdvisorOutcome::Quiet => return,
+            crate::advisor::AdvisorOutcome::Quiet => return Ok(false),
             crate::advisor::AdvisorOutcome::Failed => {
                 // Surface the one-time disable notice if the watchdog fired.
                 if let Some(notice) = runtime.disabled_notice.clone() {
@@ -17376,51 +19967,161 @@ impl AgentSession {
                     });
                     self.agent.queue_generated_steering(msg);
                 }
-                return;
+                return Ok(false);
             }
         };
+        let severity_allows_continuation = runtime.should_continue(verdict.level);
         let level_str = verdict.level.as_str().to_string();
         let injection = crate::advisor::format_injection(&verdict);
         let message = crate::model::Message::User(crate::model::UserMessage {
-            content: crate::model::UserContent::Text(injection.clone()),
+            content: crate::model::UserContent::Text(injection),
             timestamp: chrono::Utc::now().timestamp_millis(),
         });
-        // Session audit entry (replayable advisor trail).
-        let cx = pi::agent_cx::AgentCx::for_request();
-        if let Ok(mut inner) = self.session.lock(cx.cx()).await {
-            if abort.is_some_and(AbortSignal::is_aborted) {
-                return;
-            }
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let mut inner = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
+            .await
+            .map_err(|error| Error::session(error.to_string()))?;
+        if abort.is_some_and(AbortSignal::is_aborted) {
+            return Ok(false);
+        }
+        // The latest authored input resets this counter. Recording each
+        // reservation before provider admission also bounds retry/reopen;
+        // an interrupted continuation cannot silently acquire a fresh budget.
+        let continuations = inner
+            .entries_for_current_path()
+            .into_iter()
+            .rev()
+            .find_map(|entry| match entry {
+                crate::session::SessionEntry::Custom(custom)
+                    if custom.custom_type == ADVISOR_CONTINUATION_ENTRY =>
+                {
+                    Some(
+                        custom
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get("count"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(MAX_ADVISOR_CONTINUATIONS),
+                    )
+                }
+                _ => None,
+            })
+            .unwrap_or(0);
+        let continue_turn = allow_continuation
+            && severity_allows_continuation
+            && continuations < MAX_ADVISOR_CONTINUATIONS
+            && turn.may_continue(&self.agent, abort);
+        inner.append_custom_entry(
+            "advisor_note".to_string(),
+            Some(serde_json::json!({
+                "level": level_str,
+                "rationale": verdict.rationale,
+                "continuationReserved": continue_turn,
+            })),
+        );
+        if continue_turn {
             inner.append_custom_entry(
-                "advisor_note".to_string(),
-                Some(serde_json::json!({
-                    "level": level_str,
-                    "rationale": verdict.rationale,
-                })),
+                ADVISOR_CONTINUATION_ENTRY.to_string(),
+                Some(serde_json::json!({"count": continuations + 1})),
             );
         }
-        if !abort.is_some_and(AbortSignal::is_aborted) {
-            self.agent.queue_generated_steering(message);
+        self.agent.queue_generated_steering(message);
+        if self.save_enabled {
+            persist_session_mutations(
+                &mut inner,
+                &self.provider_admission,
+                AutosaveFlushTrigger::Manual,
+            )
+            .await?;
         }
+        drop(inner);
+        (turn.on_event)(AgentEvent::AdvisorNote {
+            level: level_str.to_ascii_uppercase(),
+            rationale: verdict.rationale,
+        });
+        Ok(continue_turn)
     }
 
-    /// Every execution entrypoint reaches this boundary once, after its
-    /// transcript save. Pauses and failed turns retain their existing queue;
-    /// only a durable completion can admit a new advisory provider request.
+    /// Every execution entrypoint reaches this boundary after its transcript
+    /// save. Pauses and failed turns retain their existing queue; only a
+    /// durable completion can admit a new advisory provider request.
     async fn finish_turn_with_advice(
         &mut self,
         result: Result<AssistantMessage>,
-        persist_result: Result<()>,
         abort: Option<&AbortSignal>,
+        turn: AdvisorTurn,
     ) -> Result<AssistantMessage> {
-        let message = finish_turn_persistence(&self.provider_admission, result, persist_result)?;
-        if !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
-            && time_cap_marker(&message).is_none()
-            && !abort.is_some_and(AbortSignal::is_aborted)
-        {
-            self.maybe_advise_turn(abort).await;
+        let result = async {
+            let mut message = result?;
+            for continuation in 0..=MAX_ADVISOR_CONTINUATIONS {
+                if message.stop_reason != StopReason::Stop
+                    || self
+                        .agent
+                        .prewalk
+                        .as_ref()
+                        .is_some_and(crate::prewalk::PrewalkState::yielded)
+                    || time_cap_marker(&message).is_some()
+                    || abort.is_some_and(AbortSignal::is_aborted)
+                    || turn.time_exhausted()
+                {
+                    break;
+                }
+                let should_continue = self
+                    .maybe_advise_turn(abort, &turn, continuation < MAX_ADVISOR_CONTINUATIONS)
+                    .await?;
+                if !should_continue || !turn.may_continue(&self.agent, abort) {
+                    break;
+                }
+                message = self
+                    .run_continuation_attempt(
+                        false,
+                        abort.cloned(),
+                        || true,
+                        turn.event_handler(),
+                        Some(&turn),
+                    )
+                    .await?;
+            }
+            Ok(message)
         }
-        Ok(message)
+        .await;
+        if result.as_ref().is_ok_and(|message| {
+            message.stop_reason == StopReason::Stop && time_cap_marker(message).is_none()
+        }) && !self
+            .agent
+            .prewalk
+            .as_ref()
+            .is_some_and(crate::prewalk::PrewalkState::yielded)
+            && !abort.is_some_and(AbortSignal::is_aborted)
+            && !turn.time_exhausted()
+            && let Some(settings) = self
+                .memory_settings
+                .as_ref()
+                .filter(|settings| settings.auto_extract == Some(true))
+            && crate::memory::extraction::synchronize(
+                self,
+                settings,
+                true,
+                abort,
+                turn.remaining_time(),
+            )
+            .await
+            .is_err()
+        {
+            tracing::info!(
+                event = "pi.memory.extraction_deferred",
+                "Optional memory extraction did not complete; the completed turn is unchanged"
+            );
+        }
+        self.agent.emit_cost_warning(&turn.event_handler());
+        // Advisor/automatic memory requests finish after the primary turn's
+        // checkpoint. Save their shared account before returning to the host.
+        let result = if self.agent.cost_budget().is_some() {
+            self.save_and_index().await.and(result)
+        } else {
+            result
+        };
+        turn.finish(result)
     }
 
     pub async fn run_text_with_abort(
@@ -18090,7 +20791,8 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
         custom_messages: Vec<CustomMessage>,
     ) -> Result<AssistantMessage> {
-        let on_event: AgentEventHandler = Arc::new(on_event);
+        let turn = AdvisorTurn::new(self, Arc::new(on_event));
+        let on_event = turn.event_handler();
         self.sync_runtime_selection_from_session_header().await?;
 
         self.maybe_compact(Arc::clone(&on_event)).await?;
@@ -18115,6 +20817,7 @@ impl AgentSession {
             let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
+            // Extension custom messages do not start a new authored request.
             session.append_model_message(prompt_message.clone());
             if self.save_enabled {
                 let persist_result = flush_turn_autosave(
@@ -18143,6 +20846,7 @@ impl AgentSession {
             ));
         let on_event_for_run = Arc::clone(&on_event);
         prompts.extend(semantic_context_messages);
+        self.arm_turn_checkpoint(start_len + 1);
         let result = self
             .agent
             .run_with_messages_with_abort(prompts, abort.clone(), move |event| {
@@ -18159,7 +20863,8 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        self.finish_turn_with_advice(result, persist_result, abort.as_ref())
+        let result = finish_turn_persistence(&self.provider_admission, result, persist_result);
+        self.finish_turn_with_advice(result, abort.as_ref(), turn)
             .await
     }
 
@@ -18170,7 +20875,8 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
         custom_messages: Vec<CustomMessage>,
     ) -> Result<AssistantMessage> {
-        let on_event: AgentEventHandler = Arc::new(on_event);
+        let turn = AdvisorTurn::new(self, Arc::new(on_event));
+        let on_event = turn.event_handler();
         self.sync_runtime_selection_from_session_header().await?;
 
         self.maybe_compact(Arc::clone(&on_event)).await?;
@@ -18212,7 +20918,16 @@ impl AgentSession {
             let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            session.append_model_message(user_message.clone());
+            let input_id = session.append_model_message(user_message.clone());
+            if self.memory_settings.is_some() && self.input_source != InputSource::Extension {
+                crate::memory::extraction::record_authored_input(&mut session, &input_id)?;
+            }
+            if self.advisor.is_some() && self.input_source != InputSource::Extension {
+                session.append_custom_entry(
+                    ADVISOR_CONTINUATION_ENTRY.to_string(),
+                    Some(serde_json::json!({"count": 0})),
+                );
+            }
             if self.save_enabled {
                 let persist_result = flush_turn_autosave(
                     &mut session,
@@ -18232,6 +20947,7 @@ impl AgentSession {
                 semantic_context.as_ref(),
             ));
         let on_event_for_run = Arc::clone(&on_event);
+        self.arm_turn_checkpoint(start_len + 1);
         let result = self
             .agent
             .run_with_messages_with_abort(prompts, abort.clone(), move |event| {
@@ -18250,7 +20966,8 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        self.finish_turn_with_advice(result, persist_result, abort.as_ref())
+        let result = finish_turn_persistence(&self.provider_admission, result, persist_result);
+        self.finish_turn_with_advice(result, abort.as_ref(), turn)
             .await
     }
 
@@ -18261,7 +20978,8 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
         custom_messages: Vec<CustomMessage>,
     ) -> Result<AssistantMessage> {
-        let on_event: AgentEventHandler = Arc::new(on_event);
+        let turn = AdvisorTurn::new(self, Arc::new(on_event));
+        let on_event = turn.event_handler();
         self.sync_runtime_selection_from_session_header().await?;
 
         self.maybe_compact(Arc::clone(&on_event)).await?;
@@ -18303,7 +21021,16 @@ impl AgentSession {
             let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            session.append_model_message(user_message.clone());
+            let input_id = session.append_model_message(user_message.clone());
+            if self.memory_settings.is_some() && self.input_source != InputSource::Extension {
+                crate::memory::extraction::record_authored_input(&mut session, &input_id)?;
+            }
+            if self.advisor.is_some() && self.input_source != InputSource::Extension {
+                session.append_custom_entry(
+                    ADVISOR_CONTINUATION_ENTRY.to_string(),
+                    Some(serde_json::json!({"count": 0})),
+                );
+            }
             if self.save_enabled {
                 let persist_result = flush_turn_autosave(
                     &mut session,
@@ -18323,6 +21050,7 @@ impl AgentSession {
                 semantic_context.as_ref(),
             ));
         let on_event_for_run = Arc::clone(&on_event);
+        self.arm_turn_checkpoint(start_len + 1);
         let result = self
             .agent
             .run_with_messages_with_abort(prompts, abort.clone(), move |event| {
@@ -18341,7 +21069,74 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        self.finish_turn_with_advice(result, persist_result, abort.as_ref())
+        let result = finish_turn_persistence(&self.provider_admission, result, persist_result);
+        self.finish_turn_with_advice(result, abort.as_ref(), turn)
+            .await
+    }
+
+    /// Stage completed background jobs owned by this session without starting
+    /// a provider request. Unlike an ordinary follow-up poll, this does not
+    /// invoke extension or surface fetchers merely to decide whether an idle
+    /// print run has work to do. Staged notices keep their session ownership
+    /// until the existing durable follow-up boundary accepts them.
+    pub async fn stage_pending_job_follow_up(&mut self) -> bool {
+        if !self.agent.automatic_follow_up_dispatch {
+            return false;
+        }
+        self.agent.fetch_job_follow_up_messages().await;
+        self.agent.message_queue.has_job_follow_up()
+    }
+
+    /// Continue from a pending owned job result, with no synthetic authored
+    /// prompt. The normal continuation path persists the generated notice and
+    /// all resulting messages, and retains retry, advisor and extension hooks.
+    ///
+    /// `remaining_time` limits this wake to the caller's remaining run budget;
+    /// it never extends the configured cap. The owning surface must also bound
+    /// its idle waits and retry delays. A zero budget or cancellation leaves
+    /// the notice unconsumed and does not admit a provider request.
+    pub async fn run_pending_job_follow_up_with_abort(
+        &mut self,
+        remaining_time: Option<Duration>,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        self.ensure_provider_reentry_allowed()?;
+        let started = Instant::now();
+        let prewalk_remaining = self.agent.prewalk_budget.and_then(|budget| {
+            budget
+                .max_time
+                .map(|cap| cap.saturating_sub(started.saturating_duration_since(budget.started)))
+        });
+        let max_time = [
+            self.agent.config.max_time,
+            remaining_time,
+            prewalk_remaining,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        if abort.as_ref().is_some_and(AbortSignal::is_aborted)
+            || max_time.is_some_and(|remaining| remaining.is_zero())
+        {
+            return Err(Error::Aborted);
+        }
+        if !self.stage_pending_job_follow_up().await {
+            return Err(Error::session(
+                "no owned background completion is pending for this session",
+            ));
+        }
+        let system_prompt = self.agent.system_prompt().map(str::to_string);
+        let mut prompt_scope = SessionTurnPromptGuard::new(self, system_prompt);
+        prompt_scope.limit_max_time(started, max_time);
+        prompt_scope
+            .session
+            .run_continue_with_follow_up_with_abort(
+                true,
+                abort,
+                move || max_time.is_none_or(|cap| started.elapsed() < cap),
+                on_event,
+            )
             .await
     }
 
@@ -18414,7 +21209,32 @@ impl AgentSession {
     ) -> Result<AssistantMessage> {
         self.ensure_provider_reentry_allowed()?;
         let _turn_active = AtomicBoolGuard::activate(&self.extensions_turn_active);
-        let on_event: AgentEventHandler = Arc::new(on_event);
+        let turn = AdvisorTurn::new(self, Arc::new(on_event));
+        let result = self
+            .run_continuation_attempt(
+                follow_up_first,
+                abort.clone(),
+                on_ready,
+                turn.event_handler(),
+                None,
+            )
+            .await;
+        self.finish_turn_with_advice(result, abort.as_ref(), turn)
+            .await
+    }
+
+    /// One native continuation and its transcript save. Explicit retry,
+    /// late queued input, and advisor follow-up all use this same path.
+    /// Only automatic advisor follow-up overrides the remaining time budget.
+    async fn run_continuation_attempt(
+        &mut self,
+        follow_up_first: bool,
+        abort: Option<AbortSignal>,
+        on_ready: impl FnOnce() -> bool + Send + 'static,
+        on_event: AgentEventHandler,
+        advisor_turn: Option<&AdvisorTurn>,
+    ) -> Result<AssistantMessage> {
+        self.ensure_provider_reentry_allowed()?;
         self.sync_runtime_selection_from_session_header().await?;
 
         // Rehydrate the agent transcript from the (already reverted) session
@@ -18436,10 +21256,16 @@ impl AgentSession {
             semantic_context.as_ref(),
         );
         let prompt_scope = SessionTurnPromptGuard::new(self, system_prompt);
-
         let streaming_guard =
             AtomicBoolGuard::activate(&prompt_scope.session.extensions_is_streaming);
         let on_event_for_run = Arc::clone(&on_event);
+        if let Some(turn) = advisor_turn {
+            // Rehydration may have awaited a session lock. Sample the shared
+            // budget only after that preparation, immediately before dispatch.
+            // Some(ZERO) is the native stop boundary, never an unlimited run.
+            prompt_scope.session.agent.config.max_time = turn.remaining_time();
+        }
+        prompt_scope.session.arm_turn_checkpoint(start_len);
         let result = if follow_up_first {
             prompt_scope
                 .session
@@ -18474,8 +21300,7 @@ impl AgentSession {
             .persist_turn_artifacts(start_len, result.is_err(), run_incomplete)
             .await;
 
-        self.finish_turn_with_advice(result, persist_result, abort.as_ref())
-            .await
+        finish_turn_persistence(&self.provider_admission, result, persist_result)
     }
 
     /// Persist the turn transcript and both audit ledgers under one session
@@ -18483,18 +21308,101 @@ impl AgentSession {
     /// appended last, after audit and queued-steering entries, so
     /// `revert_incomplete_response` can remove it without discarding the
     /// durable audit trail or replaying completed tool effects.
+    /// Save each completed turn while the run goes on, as OMP saves at every
+    /// message end, instead of only when the run returns. Messages before
+    /// `cursor` are already in the session.
+    fn arm_turn_checkpoint(&mut self, cursor: usize) {
+        if !self.save_enabled {
+            return;
+        }
+        let session = Arc::clone(&self.session);
+        let admission = self.provider_admission.clone();
+        let cost_budget = self.agent.cost_budget().cloned();
+        let reset_advisor = self.advisor.is_some();
+        let track_memory_inputs = self.memory_settings.is_some();
+        let checkpoint: TurnCheckpoint = Arc::new(
+            move |messages: Vec<(Message, bool)>| -> BoxFuture<'static, bool> {
+                let session = Arc::clone(&session);
+                let admission = admission.clone();
+                let cost_budget = cost_budget.clone();
+                Box::pin(async move {
+                    let cx = crate::agent_cx::AgentCx::for_request();
+                    let Ok(mut session) = OwnedMutexGuard::lock(session, cx.cx()).await else {
+                        return false;
+                    };
+                    for (message, authored) in messages {
+                        let memory_input =
+                            track_memory_inputs && authored && matches!(&message, Message::User(_));
+                        let reset =
+                            reset_advisor && authored && matches!(&message, Message::User(_));
+                        let entry_id = session.append_model_message(message);
+                        if reset
+                            && let Err(err) = append_advisor_input_reset(&mut session, &entry_id)
+                        {
+                            tracing::warn!(error = %err, "mid-run advisor input reset failed");
+                        }
+                        if memory_input
+                            && crate::memory::extraction::record_authored_input(
+                                &mut session,
+                                &entry_id,
+                            )
+                            .is_err()
+                        {
+                            tracing::warn!("mid-run memory input provenance could not be recorded");
+                        }
+                    }
+                    if let Some(budget) = &cost_budget
+                        && let Err(error) = budget.checkpoint(&mut session)
+                    {
+                        // Transcript rows are already queued. Return success
+                        // to advance the cursor; the final save retries the
+                        // checkpoint and reports any persistent error.
+                        tracing::warn!(%error, "mid-run cost checkpoint failed");
+                    }
+                    if session.autosave_durability_mode()
+                        != crate::session::AutosaveDurabilityMode::Throughput
+                        && let Err(err) = flush_turn_autosave(
+                            &mut session,
+                            &admission,
+                            AutosaveFlushTrigger::Periodic,
+                        )
+                        .await
+                    {
+                        // The rows stay queued; the run's final save retries them
+                        // and reports a failure.
+                        tracing::warn!(error = %err, "mid-run session checkpoint failed");
+                    }
+                    true
+                })
+            },
+        );
+        self.agent.arm_turn_checkpoint(checkpoint, cursor);
+    }
+
     async fn persist_turn_artifacts(
         &mut self,
         start_len: usize,
         run_failed: bool,
         run_incomplete: bool,
     ) -> Result<()> {
-        let mut new_messages = self.agent.messages()[start_len..].to_vec();
+        // Turns a mid-run checkpoint saved are already in the session.
+        let start_len = self
+            .agent
+            .disarm_turn_checkpoint()
+            .map_or(start_len, |cursor| {
+                cursor.clamp(start_len, self.agent.messages().len().max(start_len))
+            });
+        let mut new_messages = self.agent.messages()[start_len..]
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, message)| (start_len + index, message))
+            .collect::<Vec<_>>();
         let incomplete_assistant = if run_incomplete {
             new_messages
                 .iter()
-                .rposition(is_incomplete_assistant_message)
-                .map(|index| new_messages.remove(index))
+                .rposition(|(_, message)| is_incomplete_assistant_message(message))
+                .map(|index| new_messages.remove(index).1)
         } else {
             None
         };
@@ -18505,18 +21413,34 @@ impl AgentSession {
                 .map_err(|e| Error::session(e.to_string()))?;
             let repairs = self.agent.drain_repair_ledger()?;
             let activations = self.agent.drain_keyword_ledger();
-            for message in new_messages {
+            for (message_index, message) in new_messages {
                 if run_failed && is_synthetic_empty_error_assistant(&message) {
                     continue;
                 }
-                session.append_model_message(message);
+                let reset_advisor = self.advisor.is_some()
+                    && self.agent.is_authored_queue_delivery(message_index)
+                    && matches!(&message, Message::User(_));
+                let memory_input = self.memory_settings.is_some()
+                    && self.agent.is_authored_queue_delivery(message_index)
+                    && matches!(&message, Message::User(_));
+                let entry_id = session.append_model_message(message);
+                if reset_advisor {
+                    append_advisor_input_reset(&mut session, &entry_id)?;
+                }
+                if memory_input {
+                    crate::memory::extraction::record_authored_input(&mut session, &entry_id)?;
+                }
             }
+            self.agent.authored_queue_delivery_indices.clear();
             append_dialect_repair_telemetry(&mut session, &repairs);
             crate::magic_keywords::append_session_telemetry(&mut session, &activations);
             if let Some(message) = incomplete_assistant
                 && !(run_failed && is_synthetic_empty_error_assistant(&message))
             {
                 session.append_model_message(message);
+            }
+            if let Some(budget) = self.agent.cost_budget() {
+                budget.checkpoint(&mut session)?;
             }
             if self.save_enabled {
                 flush_turn_autosave(
@@ -19133,21 +22057,6 @@ fn is_truncated_before_tool_call(
 }
 
 /// Extract tool calls from content blocks.
-/// Concatenated visible text of an assistant message, for stop
-/// classification (bd-cv653.3.15).
-fn assistant_text_content(content: &[ContentBlock]) -> String {
-    let mut text = String::new();
-    for block in content {
-        if let ContentBlock::Text(part) = block {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(&part.text);
-        }
-    }
-    text
-}
-
 fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolCall> {
     content
         .iter()
@@ -19166,7581 +22075,4 @@ fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolCall> {
 // ============================================================================
 
 #[cfg(test)]
-mod tests {
-    use super::extensions_integration_tests::PiAiCaptureProvider;
-    use super::*;
-    use crate::auth::AuthCredential;
-    use crate::provider::{InputType, Model, ModelCost};
-    use asupersync::runtime::RuntimeBuilder;
-    use async_trait::async_trait;
-    use futures::Stream;
-    use std::collections::BTreeSet;
-    use std::collections::HashMap;
-    use std::path::Path;
-    use std::pin::Pin;
-    use std::sync::{Arc as StdArc, Mutex as StdTestMutex};
-
-    fn user_message(text: &str) -> Message {
-        Message::User(UserMessage {
-            content: UserContent::Text(text.to_string()),
-            timestamp: 0,
-        })
-    }
-
-    fn queued_user_message(text: &str) -> QueuedAgentMessage {
-        QueuedAgentMessage::from_authored_message(user_message(text))
-    }
-
-    fn assert_user_text(message: &Message, expected: &str) {
-        assert!(
-            matches!(
-                message,
-                Message::User(UserMessage {
-                    content: UserContent::Text(_),
-                    ..
-                })
-            ),
-            "expected user text message, got {message:?}"
-        );
-        if let Message::User(UserMessage {
-            content: UserContent::Text(text),
-            ..
-        }) = message
-        {
-            assert_eq!(text, expected);
-        }
-    }
-
-    fn sample_image_block() -> ContentBlock {
-        ContentBlock::Image(ImageContent {
-            data: "aGVsbG8=".to_string(),
-            mime_type: "image/png".to_string(),
-        })
-    }
-
-    fn image_count_in_message(message: &Message) -> usize {
-        let count_images = |blocks: &[ContentBlock]| {
-            blocks
-                .iter()
-                .filter(|block| matches!(block, ContentBlock::Image(_)))
-                .count()
-        };
-        match message {
-            Message::User(UserMessage {
-                content: UserContent::Blocks(blocks),
-                ..
-            }) => count_images(blocks),
-            Message::Assistant(msg) => count_images(&msg.content),
-            Message::ToolResult(tool_result) => count_images(&tool_result.content),
-            Message::User(UserMessage {
-                content: UserContent::Text(_),
-                ..
-            })
-            | Message::Custom(_) => 0,
-        }
-    }
-
-    fn assistant_message(text: &str) -> AssistantMessage {
-        AssistantMessage {
-            content: vec![ContentBlock::Text(TextContent::new(text))],
-            api: "test-api".to_string(),
-            provider: "test-provider".to_string(),
-            model: "test-model".to_string(),
-            usage: Usage::default(),
-            stop_reason: StopReason::Stop,
-            stop_details: None,
-            error_message: None,
-            timestamp: 0,
-        }
-    }
-
-    #[derive(Debug)]
-    struct SilentProvider;
-
-    #[async_trait]
-    #[allow(clippy::unnecessary_literal_bound)]
-    impl Provider for SilentProvider {
-        fn name(&self) -> &str {
-            "silent-provider"
-        }
-
-        fn api(&self) -> &str {
-            "test-api"
-        }
-
-        fn model_id(&self) -> &str {
-            "test-model"
-        }
-
-        async fn stream(
-            &self,
-            _context: &Context<'_>,
-            _options: &StreamOptions,
-        ) -> crate::error::Result<
-            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
-        > {
-            Ok(Box::pin(futures::stream::empty()))
-        }
-    }
-
-    #[derive(Debug)]
-    struct CountingStopProvider {
-        stream_calls: StdArc<std::sync::atomic::AtomicUsize>,
-    }
-
-    #[async_trait]
-    #[allow(clippy::unnecessary_literal_bound)]
-    impl Provider for CountingStopProvider {
-        fn name(&self) -> &str {
-            "counting-stop-provider"
-        }
-
-        fn api(&self) -> &str {
-            "test-api"
-        }
-
-        fn model_id(&self) -> &str {
-            "test-model"
-        }
-
-        async fn stream(
-            &self,
-            _context: &Context<'_>,
-            _options: &StreamOptions,
-        ) -> crate::error::Result<
-            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
-        > {
-            self.stream_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::pin(futures::stream::iter([Ok(StreamEvent::Done {
-                reason: StopReason::Stop,
-                message: assistant_message("done"),
-            })])))
-        }
-    }
-
-    /// Reports token usage (and optionally a billed total) plus catalog
-    /// pricing, so a finished turn must carry a priced `usage.cost` (gh #221).
-    #[derive(Debug)]
-    struct PricedUsageProvider {
-        provider_reported_total: Option<f64>,
-    }
-
-    #[async_trait]
-    #[allow(clippy::unnecessary_literal_bound)]
-    impl Provider for PricedUsageProvider {
-        fn name(&self) -> &str {
-            "priced-provider"
-        }
-
-        fn api(&self) -> &str {
-            "test-api"
-        }
-
-        fn model_id(&self) -> &str {
-            "test-model"
-        }
-
-        fn model_cost(&self) -> Option<crate::provider::ModelCost> {
-            Some(crate::provider::ModelCost {
-                input: 2.0,
-                output: 10.0,
-                cache_read: 0.2,
-                cache_write: 2.5,
-            })
-        }
-
-        async fn stream(
-            &self,
-            _context: &Context<'_>,
-            _options: &StreamOptions,
-        ) -> crate::error::Result<
-            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
-        > {
-            let mut message = assistant_message("done");
-            message.usage = Usage {
-                input: 1_000_000,
-                output: 100_000,
-                cache_read: 500_000,
-                cache_write: 0,
-                total_tokens: 1_600_000,
-                cost: crate::model::Cost {
-                    total: self.provider_reported_total.unwrap_or(0.0),
-                    ..crate::model::Cost::default()
-                },
-            };
-            Ok(Box::pin(futures::stream::iter([Ok(StreamEvent::Done {
-                reason: StopReason::Stop,
-                message,
-            })])))
-        }
-    }
-
-    fn run_priced_turn(provider_reported_total: Option<f64>) -> crate::model::Usage {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        runtime.block_on(async {
-            let provider = StdArc::new(PricedUsageProvider {
-                provider_reported_total,
-            });
-            let mut agent = Agent::new(
-                provider,
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig::default(),
-            );
-            let ended = StdArc::new(std::sync::Mutex::new(None));
-            let ended_for_events = StdArc::clone(&ended);
-            agent
-                .run("price me", move |event| {
-                    if let AgentEvent::MessageEnd {
-                        message: Message::Assistant(message),
-                    } = event
-                    {
-                        *ended_for_events.lock().unwrap() = Some(message.usage.clone());
-                    }
-                })
-                .await
-                .expect("agent run");
-            let usage = ended.lock().unwrap().clone().expect("message_end usage");
-            let stored = match agent.messages().last() {
-                Some(Message::Assistant(message)) => message.usage.clone(),
-                other => panic!("expected assistant message, got {other:?}"),
-            };
-            assert!(
-                (stored.cost.total - usage.cost.total).abs() < 1e-12,
-                "history and message_end must agree"
-            );
-            usage
-        })
-    }
-
-    /// gh #221: `usage.cost` is priced from catalog rates on every finished
-    /// assistant message; previously it stayed 0.0 for every provider.
-    #[test]
-    fn finished_turn_prices_usage_from_catalog_rates() {
-        let usage = run_priced_turn(None);
-        assert!((usage.cost.input - 2.0).abs() < 1e-9);
-        assert!((usage.cost.output - 1.0).abs() < 1e-9);
-        assert!((usage.cost.cache_read - 0.1).abs() < 1e-9);
-        assert!(usage.cost.cache_write.abs() < 1e-12);
-        assert!((usage.cost.total - 3.1).abs() < 1e-9);
-    }
-
-    /// gh #221: a billed total reported by the provider (OpenRouter
-    /// `usage.cost`) survives pricing as the authoritative total.
-    #[test]
-    fn finished_turn_keeps_provider_reported_cost_total() {
-        let usage = run_priced_turn(Some(2.75));
-        assert!((usage.cost.total - 2.75).abs() < 1e-12);
-        assert!((usage.cost.input - 2.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn background_job_follow_ups_track_the_live_agent_session() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let first_session = Session::in_memory();
-            let first_id = first_session.header.id.clone();
-            let second_id = format!("session-b-{}", uuid::Uuid::new_v4().simple());
-            let session = Arc::new(Mutex::new(first_session));
-            let agent = Agent::new(
-                Arc::new(SilentProvider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig::default(),
-            );
-            let mut agent_session = AgentSession::new(
-                agent,
-                Arc::clone(&session),
-                false,
-                ResolvedCompactionSettings::default(),
-            );
-
-            crate::jobs::push_completion_notice(&first_id, "first-session-notice")
-                .expect("first notice");
-            crate::jobs::push_completion_notice(&second_id, "second-session-notice")
-                .expect("second notice");
-            agent_session
-                .agent
-                .fetch_additive_follow_up_messages()
-                .await;
-            assert!(
-                agent_session.agent.has_staged_follow_up(),
-                "the first owner's notice must be staged before the session switch"
-            );
-
-            {
-                let cx = crate::agent_cx::AgentCx::for_current_or_request();
-                let mut guard = session.lock(cx.cx()).await.expect("session lock");
-                guard.header.id.clone_from(&second_id);
-            }
-            let stale_delivery = agent_session
-                .agent
-                .pop_follow_up_for_current_session()
-                .await;
-            assert!(
-                stale_delivery.is_empty(),
-                "delivery-time owner validation must not expose the staged first-session notice"
-            );
-            agent_session
-                .agent
-                .fetch_additive_follow_up_messages()
-                .await;
-            let second_delivery = agent_session
-                .agent
-                .pop_follow_up_for_current_session()
-                .await;
-            assert_eq!(second_delivery.len(), 1);
-            assert_user_text(second_delivery[0].message(), "second-session-notice");
-            assert!(second_delivery.iter().all(|delivery| {
-                !matches!(
-                    delivery.message(),
-                    Message::User(UserMessage {
-                        content: UserContent::Text(text),
-                        ..
-                    }) if text == "first-session-notice"
-                )
-            }));
-
-            {
-                let cx = crate::agent_cx::AgentCx::for_current_or_request();
-                let mut guard = session.lock(cx.cx()).await.expect("session lock");
-                guard.header.id.clone_from(&first_id);
-            }
-            agent_session
-                .agent
-                .fetch_additive_follow_up_messages()
-                .await;
-            let restored_first_delivery = agent_session
-                .agent
-                .pop_follow_up_for_current_session()
-                .await;
-            assert_eq!(restored_first_delivery.len(), 1);
-            assert_user_text(restored_first_delivery[0].message(), "first-session-notice");
-            assert!(crate::jobs::take_completion_notices(&first_id).is_empty());
-            assert!(crate::jobs::take_completion_notices(&second_id).is_empty());
-        });
-    }
-
-    #[test]
-    fn stale_only_job_handoff_does_not_invoke_the_provider_empty() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let first_id = format!("stale-owner-a-{}", uuid::Uuid::new_v4().simple());
-            let second_id = format!("stale-owner-b-{}", uuid::Uuid::new_v4().simple());
-            let resolver_calls = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
-            let resolver_calls_for_scope = StdArc::clone(&resolver_calls);
-            let first_id_for_scope = first_id.clone();
-            let second_id_for_scope = second_id.clone();
-            let tools = ToolRegistry::from_tools(Vec::new());
-            tools.bind_job_session_resolver(StdArc::new(move || {
-                let resolved = if resolver_calls_for_scope.fetch_add(1, Ordering::SeqCst) == 0 {
-                    first_id_for_scope.clone()
-                } else {
-                    second_id_for_scope.clone()
-                };
-                Box::pin(async move { Some(resolved) })
-            }));
-            let stream_calls = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
-            let provider = StdArc::new(CountingStopProvider {
-                stream_calls: StdArc::clone(&stream_calls),
-            });
-            let mut agent = Agent::new(provider, tools, AgentConfig::default());
-            let turn_starts = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
-            let turn_starts_for_events = StdArc::clone(&turn_starts);
-
-            crate::jobs::push_completion_notice(&first_id, "stale-only-notice")
-                .expect("first owner notice");
-            agent
-                .run("initial prompt", move |event| {
-                    if matches!(event, AgentEvent::TurnStart { .. }) {
-                        turn_starts_for_events.fetch_add(1, Ordering::SeqCst);
-                    }
-                })
-                .await
-                .expect("agent run");
-
-            assert_eq!(
-                stream_calls.load(Ordering::SeqCst),
-                1,
-                "a stale-only staged batch must not create an empty provider turn"
-            );
-            assert_eq!(
-                turn_starts.load(Ordering::SeqCst),
-                1,
-                "a stale-only staged batch must not emit an unmatched turn start"
-            );
-            let restored = crate::jobs::take_completion_notices(&first_id);
-            assert_eq!(restored.len(), 1);
-            assert_user_text(&restored[0], "stale-only-notice");
-            assert!(crate::jobs::take_completion_notices(&second_id).is_empty());
-        });
-    }
-
-    #[test]
-    fn background_job_notice_survives_a_full_additive_handoff() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let session_state = Session::in_memory();
-            let session_id = session_state.header.id.clone();
-            let session = Arc::new(Mutex::new(session_state));
-            let mut agent = Agent::new(
-                Arc::new(SilentProvider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig::default(),
-            );
-            let ordinary_fetcher: MessageFetcher = Arc::new(|| {
-                Box::pin(async move {
-                    (0..=MAX_FOLLOW_UP_QUEUE_SIZE)
-                        .map(|index| {
-                            QueuedAgentMessage::generated(Message::User(UserMessage {
-                                content: UserContent::Text(format!("ordinary-{index}")),
-                                timestamp: 0,
-                            }))
-                        })
-                        .collect()
-                })
-            });
-            agent.register_message_fetchers(None, Some(ordinary_fetcher));
-            agent.set_queue_modes(QueueMode::OneAtATime, QueueMode::All);
-            let mut agent_session =
-                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
-
-            crate::jobs::push_completion_notice(&session_id, "bounded-job-notice")
-                .expect("job notice");
-            agent_session
-                .agent
-                .fetch_additive_follow_up_messages()
-                .await;
-            let deliveries = agent_session.agent.message_queue.pop_follow_up();
-            assert_eq!(deliveries.len(), MAX_FOLLOW_UP_QUEUE_SIZE + 1);
-            assert!(deliveries.iter().any(|delivery| matches!(
-                delivery.message(),
-                Message::User(UserMessage {
-                    content: UserContent::Text(text),
-                    ..
-                }) if text == "bounded-job-notice"
-            )));
-        });
-    }
-
-    #[test]
-    fn busy_owning_follow_up_source_does_not_starve_job_notices() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let session_state = Session::in_memory();
-            let session_id = session_state.header.id.clone();
-            let session = Arc::new(Mutex::new(session_state));
-            let mut agent = Agent::new(
-                Arc::new(SilentProvider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig::default(),
-            );
-            let owning_fetcher: MessageFetcher = Arc::new(|| {
-                Box::pin(async move {
-                    vec![QueuedAgentMessage::generated(Message::User(UserMessage {
-                        content: UserContent::Text("owning-follow-up".to_string()),
-                        timestamp: 0,
-                    }))]
-                })
-            });
-            agent.register_initial_follow_up_fetcher(owning_fetcher);
-            agent.set_queue_modes(QueueMode::OneAtATime, QueueMode::All);
-            let mut agent_session =
-                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
-
-            crate::jobs::push_completion_notice(&session_id, "non-starved-job-notice")
-                .expect("job notice");
-            assert!(agent_session.agent.stage_follow_up_messages().await);
-            let deliveries = agent_session.agent.message_queue.pop_follow_up();
-            assert_eq!(deliveries.len(), 2);
-            assert_user_text(deliveries[0].message(), "owning-follow-up");
-            assert_user_text(deliveries[1].message(), "non-starved-job-notice");
-            assert!(crate::jobs::take_completion_notices(&session_id).is_empty());
-        });
-    }
-
-    #[test]
-    fn one_at_a_time_job_handoff_keeps_only_one_registry_batch_staged() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let session_state = Session::in_memory();
-            let session_id = session_state.header.id.clone();
-            let session = Arc::new(Mutex::new(session_state));
-            let mut agent = Agent::new(
-                Arc::new(SilentProvider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig::default(),
-            );
-            agent.set_queue_modes(QueueMode::OneAtATime, QueueMode::OneAtATime);
-            let mut agent_session =
-                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
-
-            for round in 0..3 {
-                for index in 0..crate::jobs::MAX_COMPLETION_NOTICES_PER_SESSION {
-                    crate::jobs::push_completion_notice(
-                        &session_id,
-                        format!("job-notice-{round}-{index}"),
-                    )
-                    .expect("job notice");
-                }
-
-                assert!(agent_session.agent.stage_follow_up_messages().await);
-                let staged_jobs = agent_session
-                    .agent
-                    .message_queue
-                    .follow_up
-                    .iter()
-                    .filter(|entry| entry.job_owner_session_id.is_some())
-                    .count();
-                assert!(
-                    staged_jobs <= crate::jobs::MAX_COMPLETION_NOTICES_PER_SESSION,
-                    "the Agent queue must retain at most one bounded registry batch"
-                );
-                assert_eq!(
-                    agent_session.agent.message_queue.pop_follow_up().len(),
-                    1,
-                    "one-at-a-time mode must consume exactly one staged notice"
-                );
-            }
-
-            let retained_registry_batch = crate::jobs::take_completion_notices(&session_id);
-            assert_eq!(
-                retained_registry_batch.len(),
-                crate::jobs::MAX_COMPLETION_NOTICES_PER_SESSION,
-                "the registry must retain only its independent bounded batch"
-            );
-        });
-    }
-
-    #[derive(Debug)]
-    struct DeltaOnlyProvider;
-
-    #[async_trait]
-    #[allow(clippy::unnecessary_literal_bound)]
-    impl Provider for DeltaOnlyProvider {
-        fn name(&self) -> &str {
-            "test-provider"
-        }
-
-        fn api(&self) -> &str {
-            "test-api"
-        }
-
-        fn model_id(&self) -> &str {
-            "test-model"
-        }
-
-        async fn stream(
-            &self,
-            _context: &Context<'_>,
-            _options: &StreamOptions,
-        ) -> crate::error::Result<
-            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
-        > {
-            let final_message = assistant_message("hello");
-            let events = vec![
-                Ok(StreamEvent::TextDelta {
-                    content_index: 0,
-                    delta: "hello".to_string(),
-                }),
-                Ok(StreamEvent::Done {
-                    reason: StopReason::Stop,
-                    message: final_message,
-                }),
-            ];
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
-    }
-
-    #[derive(Debug, Clone, Default)]
-    struct CapturedProviderContext {
-        system_prompt: Option<String>,
-        messages: Vec<Message>,
-        thinking_level: Option<crate::model::ThinkingLevel>,
-    }
-
-    #[derive(Debug)]
-    struct CapturingProvider {
-        api: &'static str,
-        calls: StdArc<StdTestMutex<Vec<CapturedProviderContext>>>,
-    }
-
-    impl CapturingProvider {
-        fn new(api: &'static str) -> Self {
-            Self {
-                api,
-                calls: StdArc::new(StdTestMutex::new(Vec::new())),
-            }
-        }
-
-        fn calls(&self) -> StdArc<StdTestMutex<Vec<CapturedProviderContext>>> {
-            StdArc::clone(&self.calls)
-        }
-    }
-
-    #[async_trait]
-    #[allow(clippy::unnecessary_literal_bound)]
-    impl Provider for CapturingProvider {
-        fn name(&self) -> &str {
-            "capturing-provider"
-        }
-
-        fn api(&self) -> &str {
-            self.api
-        }
-
-        fn model_id(&self) -> &str {
-            "capture-model"
-        }
-
-        async fn stream(
-            &self,
-            context: &Context<'_>,
-            options: &StreamOptions,
-        ) -> crate::error::Result<
-            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
-        > {
-            self.calls
-                .lock()
-                .expect("capture context lock")
-                .push(CapturedProviderContext {
-                    system_prompt: context.system_prompt.as_ref().map(ToString::to_string),
-                    messages: context.messages.iter().cloned().collect(),
-                    thinking_level: options.thinking_level,
-                });
-            let final_message = assistant_message("captured");
-            Ok(Box::pin(futures::stream::iter(vec![Ok(
-                StreamEvent::Done {
-                    reason: StopReason::Stop,
-                    message: final_message,
-                },
-            )])))
-        }
-    }
-
-    fn sample_semantic_context_bundle() -> SemanticContextBundle {
-        use crate::semantic_workspace_graph::{
-            ContextBundleBudget, ContextBundleExclusion, ContextBundleInvalidationPolicy,
-            ContextRedactionSummary, EvidenceFreshnessStatus, RedactionStatus, SemanticNodeType,
-        };
-
-        SemanticContextBundle {
-            schema: crate::semantic_workspace_graph::SEMANTIC_CONTEXT_BUNDLE_SCHEMA.to_string(),
-            budget: ContextBundleBudget {
-                max_items: 8,
-                max_bytes: 4096,
-            },
-            selected_items: vec![
-                ContextBundleItem {
-                    node_id: "node-session".to_string(),
-                    node_type: SemanticNodeType::CodeSymbol,
-                    source_path: "src/agent.rs".to_string(),
-                    title: "AgentSession::run_agent_with_text".to_string(),
-                    reason: "query_match,related_to_bead_or_changed_path".to_string(),
-                    score: 420,
-                    estimated_bytes: 700,
-                    estimated_tokens: 175,
-                    freshness_status: None,
-                    redaction_status: RedactionStatus::None,
-                },
-                ContextBundleItem {
-                    node_id: "node-test".to_string(),
-                    node_type: SemanticNodeType::TestCase,
-                    source_path: "tests/agent_loop_reliability.rs".to_string(),
-                    title: "semantic context session coverage".to_string(),
-                    reason: "validation_context".to_string(),
-                    score: 300,
-                    estimated_bytes: 400,
-                    estimated_tokens: 100,
-                    freshness_status: Some(EvidenceFreshnessStatus::Current),
-                    redaction_status: RedactionStatus::Redacted,
-                },
-            ],
-            excluded_items: vec![ContextBundleExclusion {
-                node_id: "stale-doc".to_string(),
-                node_type: SemanticNodeType::DocSection,
-                source_path: "README.md".to_string(),
-                title: "obsolete drop-in claim".to_string(),
-                reason: "suppressed_stale_or_unsafe_evidence".to_string(),
-                score: 250,
-                estimated_bytes: 300,
-                freshness_status: Some(EvidenceFreshnessStatus::Uncertified),
-                redaction_status: RedactionStatus::SensitiveOmitted,
-            }],
-            stale_evidence_suppressions: Vec::new(),
-            redaction_summary: ContextRedactionSummary {
-                policy_version: "test-policy".to_string(),
-                overall_status: RedactionStatus::Redacted,
-                selected_redacted_nodes: 1,
-                selected_sensitive_omissions: 0,
-                suppressed_unsafe_nodes: 0,
-                redacted_metadata_keys: BTreeSet::from(["api_key".to_string()]),
-                sensitive_path_kinds: BTreeSet::new(),
-            },
-            invalidation_policy: ContextBundleInvalidationPolicy {
-                policy_version: "test-policy".to_string(),
-                workspace_id: "workspace:test".to_string(),
-                branch: Some("main".to_string()),
-                session_id: Some("session-123".to_string()),
-                input_fingerprint_sha256: "abc123".repeat(10),
-                cache_ttl_seconds: 900,
-                generated_at_utc: Some("2026-05-13T00:00:00Z".to_string()),
-                expires_at_utc: Some("2026-05-13T00:15:00Z".to_string()),
-                invalidates_on: vec!["input_fingerprint_change".to_string()],
-                cacheable: true,
-            },
-            path_normalization: Vec::new(),
-            suggested_validation_commands: vec![
-                "cargo test agent_semantic_context".to_string(),
-                "cargo check --all-targets".to_string(),
-            ],
-            estimated_bytes: 1100,
-            estimated_tokens: 275,
-        }
-    }
-
-    #[test]
-    fn semantic_context_exclusion_prompt_deduplicates_before_row_cap() {
-        let mut bundle = sample_semantic_context_bundle();
-        let duplicate = bundle.excluded_items[0].clone();
-        bundle.stale_evidence_suppressions.push(duplicate);
-
-        for index in 0..8 {
-            let mut exclusion = bundle.excluded_items[0].clone();
-            exclusion.node_id = format!("excluded-{index}");
-            exclusion.source_path = format!("docs/evidence/excluded-{index}.json");
-            exclusion.title = format!("excluded evidence {index}");
-            bundle.excluded_items.push(exclusion);
-        }
-
-        let mut prompt = String::new();
-        let mut stats = SemanticContextPromptStats::default();
-        push_semantic_context_exclusions(
-            &mut prompt,
-            &mut stats,
-            SemanticContextPromptBudget {
-                max_items: 16,
-                max_bytes: 64 * 1024,
-            },
-            &bundle,
-        );
-
-        assert_eq!(
-            prompt
-                .matches(
-                    "README.md :: obsolete drop-in claim reason=suppressed_stale_or_unsafe_evidence",
-                )
-                .count(),
-            1,
-            "the same exclusion from both bundle collections must render once"
-        );
-        assert_eq!(stats.exclusions_included, 8);
-        assert_eq!(
-            stats.exclusions_omitted, 1,
-            "the row cap must count omitted unique exclusions, not raw duplicate records"
-        );
-    }
-
-    #[test]
-    fn delta_without_start_does_not_mutate_previous_message() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = Arc::new(DeltaOnlyProvider);
-            let tools = ToolRegistry::from_tools(Vec::new());
-            let mut agent = Agent::new(provider, tools, AgentConfig::default());
-
-            agent.add_message(Message::Assistant(Arc::new(assistant_message("prev"))));
-
-            agent
-                .run_with_message_with_abort(user_message("hi"), None, |_| {})
-                .await
-                .expect("run");
-
-            let assistant_texts = agent
-                .messages()
-                .iter()
-                .filter_map(|message| match message {
-                    Message::Assistant(msg)
-                        if matches!(msg.content.as_slice(), [ContentBlock::Text(_)]) =>
-                    {
-                        if let [ContentBlock::Text(text)] = msg.content.as_slice() {
-                            Some(text.text.clone())
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-
-            assert_eq!(
-                assistant_texts.as_slice(),
-                ["prev".to_string(), "hello".to_string()]
-            );
-        });
-    }
-
-    /// Feed terminal protocol cases through the real Agent loop, then stop so
-    /// a pre-check regression fails on observable tool effects instead of looping.
-    struct TerminalBatchProvider {
-        events: Vec<StreamEvent>,
-        calls: std::sync::atomic::AtomicUsize,
-    }
-
-    #[async_trait]
-    #[allow(clippy::unnecessary_literal_bound)]
-    impl Provider for TerminalBatchProvider {
-        fn name(&self) -> &str {
-            "test-provider"
-        }
-
-        fn api(&self) -> &str {
-            "test-api"
-        }
-
-        fn model_id(&self) -> &str {
-            "test-model"
-        }
-
-        async fn stream(
-            &self,
-            _context: &Context<'_>,
-            _options: &StreamOptions,
-        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-            let events = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                self.events.clone()
-            } else {
-                vec![StreamEvent::Done {
-                    reason: StopReason::Stop,
-                    message: assistant_message("finished"),
-                }]
-            };
-            Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
-        }
-    }
-
-    fn batch_write_call(id: &str, path: &str, content: &str) -> ToolCall {
-        ToolCall {
-            id: id.to_string(),
-            name: "write".to_string(),
-            arguments: json!({"path": path, "content": content}),
-            thought_signature: Some("provider-call-signature".to_string()),
-        }
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
-    fn invalid_terminal_tool_peer_withholds_the_whole_batch_before_approval() {
-        let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().unwrap();
-            let target = temp.path().join("target.txt");
-            let valid = batch_write_call("valid-call", "target.txt", "changed");
-            let mut invalid = Vec::new();
-            for id in ["", " \t", "valid-call"] {
-                invalid.push(ToolCall {
-                    id: id.to_string(),
-                    ..valid.clone()
-                });
-            }
-            for name in ["", " \n"] {
-                invalid.push(ToolCall {
-                    id: "invalid-peer".to_string(),
-                    name: name.to_string(),
-                    ..valid.clone()
-                });
-            }
-            for arguments in [
-                Value::Null,
-                json!(true),
-                json!(42),
-                json!("private-argument"),
-                json!([]),
-            ] {
-                invalid.push(ToolCall {
-                    id: "invalid-peer".to_string(),
-                    arguments,
-                    ..valid.clone()
-                });
-            }
-
-            for bad in invalid {
-                for reason in [StopReason::Stop, StopReason::ToolUse, StopReason::Length] {
-                    std::fs::write(&target, "original").unwrap();
-                    let mut message = assistant_message("Retain the partial explanation");
-                    message.stop_reason = reason;
-                    message.usage.input = 17;
-                    message.usage.output = 5;
-                    message.usage.total_tokens = 22;
-                    message.content.extend([
-                        ContentBlock::ToolCall(valid.clone()),
-                        ContentBlock::ToolCall(bad.clone()),
-                    ]);
-                    let original_content = serde_json::to_value(&message.content).unwrap();
-                    let provider = Arc::new(TerminalBatchProvider {
-                        events: vec![
-                            StreamEvent::Start {
-                                partial: assistant_message(""),
-                            },
-                            StreamEvent::ToolCallEnd {
-                                content_index: 1,
-                                tool_call: valid.clone(),
-                            },
-                            StreamEvent::Done { reason, message },
-                        ],
-                        calls: std::sync::atomic::AtomicUsize::new(0),
-                    });
-                    let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                    let observed = Arc::clone(&approvals);
-                    let mut agent = Agent::new(
-                        provider.clone(),
-                        ToolRegistry::new(&["write"], temp.path(), None),
-                        AgentConfig {
-                            tool_approval: Some(Arc::new(move |_| {
-                                observed.fetch_add(1, Ordering::SeqCst);
-                                Box::pin(async { ToolApprovalDecision::Allow })
-                            })),
-                            ..AgentConfig::default()
-                        },
-                    );
-                    let events = Arc::new(StdMutex::new(Vec::new()));
-                    let captured = Arc::clone(&events);
-                    let result = agent
-                        .run("Apply the edits", move |event| {
-                            captured.lock().unwrap().push(event);
-                        })
-                        .await
-                        .unwrap();
-
-                    assert_eq!(result.stop_reason, StopReason::Error, "{reason:?}/{bad:?}");
-                    let error = result.error_message.as_deref().unwrap();
-                    assert!(error.contains("PI_TOOL_CALL_PROTOCOL"));
-                    assert!(!error.contains("private-argument"));
-                    assert_eq!(
-                        serde_json::to_value(&result.content).unwrap(),
-                        original_content
-                    );
-                    assert_eq!(
-                        (
-                            result.usage.input,
-                            result.usage.output,
-                            result.usage.total_tokens
-                        ),
-                        (17, 5, 22)
-                    );
-                    assert_eq!(approvals.load(Ordering::SeqCst), 0);
-                    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
-                    assert!(
-                        !agent
-                            .messages()
-                            .iter()
-                            .any(|m| matches!(m, Message::ToolResult(_)))
-                    );
-                    let events = events.lock().unwrap();
-                    assert!(
-                        !events
-                            .iter()
-                            .any(|event| matches!(event, AgentEvent::ToolExecutionStart { .. }))
-                    );
-                    let ended = events
-                        .iter()
-                        .find_map(|event| match event {
-                            AgentEvent::MessageEnd {
-                                message: Message::Assistant(message),
-                            } => Some(message),
-                            _ => None,
-                        })
-                        .unwrap();
-                    assert_eq!(
-                        serde_json::to_value(ended).unwrap(),
-                        serde_json::to_value(&result).unwrap()
-                    );
-                }
-            }
-        });
-    }
-
-    #[test]
-    fn valid_parallel_tool_batch_executes_with_stop_tool_use_and_length() {
-        let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(async {
-            for reason in [StopReason::Stop, StopReason::ToolUse, StopReason::Length] {
-                let temp = tempfile::tempdir().unwrap();
-                let mut message = assistant_message("Apply both edits");
-                message.stop_reason = reason;
-                message.content.extend([
-                    ContentBlock::ToolCall(batch_write_call("first", "first.txt", "one")),
-                    ContentBlock::ToolCall(batch_write_call("second", "second.txt", "two")),
-                ]);
-                let original = serde_json::to_value(&message).unwrap();
-                let provider = Arc::new(TerminalBatchProvider {
-                    events: vec![StreamEvent::Done { reason, message }],
-                    calls: std::sync::atomic::AtomicUsize::new(0),
-                });
-                let mut agent = Agent::new(
-                    provider.clone(),
-                    ToolRegistry::new(&["write"], temp.path(), None),
-                    AgentConfig::default(),
-                );
-                let result = agent.run("Apply the edits", |_| {}).await.unwrap();
-                assert_eq!(result.stop_reason, StopReason::Stop);
-                assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
-                assert_eq!(
-                    std::fs::read_to_string(temp.path().join("first.txt")).unwrap(),
-                    "one"
-                );
-                assert_eq!(
-                    std::fs::read_to_string(temp.path().join("second.txt")).unwrap(),
-                    "two"
-                );
-                let Message::Assistant(stored) = &agent.messages()[1] else {
-                    panic!("validated assistant batch stays in history");
-                };
-                assert_eq!(serde_json::to_value(stored).unwrap(), original);
-                let results: Vec<_> = agent
-                    .messages()
-                    .iter()
-                    .filter_map(|message| match message {
-                        Message::ToolResult(result) => {
-                            Some((result.tool_call_id.as_str(), result.is_error))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                assert_eq!(results, [("first", false), ("second", false)]);
-            }
-        });
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn length_tool_batch_withholds_completed_peer_when_another_call_disappears() {
-        let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(async {
-            for omit_started_peer in [false, true] {
-                let temp = tempfile::tempdir().unwrap();
-                let target = temp.path().join("target.txt");
-                std::fs::write(&target, "original").unwrap();
-                let completed = batch_write_call("complete", "target.txt", "changed");
-                let mut message = assistant_message("Apply the edits");
-                message.stop_reason = StopReason::Length;
-                message
-                    .content
-                    .push(ContentBlock::ToolCall(completed.clone()));
-                let mut events = vec![StreamEvent::Start {
-                    partial: assistant_message(""),
-                }];
-                // Start, delta, and repeated end updates at the same index
-                // represent one call, not four separate batch members.
-                events.extend([
-                    StreamEvent::ToolCallStart {
-                        content_index: 1,
-                        id: completed.id.clone(),
-                        name: completed.name.clone(),
-                    },
-                    StreamEvent::ToolCallDelta {
-                        content_index: 1,
-                        delta: serde_json::to_string(&completed.arguments).unwrap(),
-                    },
-                    StreamEvent::ToolCallEnd {
-                        content_index: 1,
-                        tool_call: completed.clone(),
-                    },
-                    StreamEvent::ToolCallEnd {
-                        content_index: 1,
-                        tool_call: completed,
-                    },
-                ]);
-                if omit_started_peer {
-                    events.extend([
-                        StreamEvent::ToolCallStart {
-                            content_index: 2,
-                            id: "unfinished".to_string(),
-                            name: "write".to_string(),
-                        },
-                        StreamEvent::ToolCallDelta {
-                            content_index: 2,
-                            delta: "{\"path\":\"other.txt\",\"content\":\"".to_string(),
-                        },
-                    ]);
-                }
-                events.push(StreamEvent::Done {
-                    reason: StopReason::Length,
-                    message,
-                });
-                let provider = Arc::new(TerminalBatchProvider {
-                    events,
-                    calls: std::sync::atomic::AtomicUsize::new(0),
-                });
-                let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let observed = Arc::clone(&approvals);
-                let mut agent = Agent::new(
-                    provider.clone(),
-                    ToolRegistry::new(&["write"], temp.path(), None),
-                    AgentConfig {
-                        tool_approval: Some(Arc::new(move |_| {
-                            observed.fetch_add(1, Ordering::SeqCst);
-                            Box::pin(async { ToolApprovalDecision::Allow })
-                        })),
-                        ..AgentConfig::default()
-                    },
-                );
-                let result = agent.run("Apply the edits", |_| {}).await.unwrap();
-                if omit_started_peer {
-                    assert_eq!(result.stop_reason, StopReason::Error);
-                    assert_eq!(
-                        result.error_message.as_deref(),
-                        Some(TRUNCATED_TOOL_CALL_ERROR)
-                    );
-                    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-                    assert_eq!(approvals.load(Ordering::SeqCst), 0);
-                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
-                    assert!(
-                        !agent
-                            .messages()
-                            .iter()
-                            .any(|m| matches!(m, Message::ToolResult(_)))
-                    );
-                } else {
-                    assert_eq!(result.stop_reason, StopReason::Stop);
-                    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
-                    assert_eq!(approvals.load(Ordering::SeqCst), 1);
-                    assert_eq!(std::fs::read_to_string(&target).unwrap(), "changed");
-                }
-                assert!(!temp.path().join("other.txt").exists());
-            }
-        });
-    }
-
-    #[test]
-    fn terminal_failure_envelopes_never_execute_stale_success_snapshots() {
-        let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().unwrap();
-            let target = temp.path().join("target.txt");
-            for reason in [StopReason::Error, StopReason::Aborted] {
-                for error_envelope in [false, true] {
-                    let mut message = assistant_message("Partial provider answer");
-                    message.error_message = Some("original provider diagnostic".to_string());
-                    message
-                        .content
-                        .push(ContentBlock::ToolCall(batch_write_call(
-                            "call",
-                            "target.txt",
-                            "must not execute",
-                        )));
-                    let event = if error_envelope {
-                        StreamEvent::Error {
-                            reason,
-                            error: message,
-                        }
-                    } else {
-                        StreamEvent::Done { reason, message }
-                    };
-                    let provider = Arc::new(TerminalBatchProvider {
-                        events: vec![event],
-                        calls: std::sync::atomic::AtomicUsize::new(0),
-                    });
-                    let mut agent = Agent::new(
-                        provider,
-                        ToolRegistry::new(&["write"], temp.path(), None),
-                        AgentConfig::default(),
-                    );
-                    let result = agent.run("Apply the edit", |_| {}).await.unwrap();
-                    assert_eq!(result.stop_reason, reason);
-                    assert_eq!(
-                        result.error_message.as_deref(),
-                        Some("original provider diagnostic")
-                    );
-                    assert!(!target.exists(), "a terminal failure cannot create a file");
-                    assert!(
-                        !agent
-                            .messages()
-                            .iter()
-                            .any(|m| matches!(m, Message::ToolResult(_)))
-                    );
-                }
-            }
-        });
-    }
-
-    #[test]
-    fn terminal_length_envelope_rejects_a_dropped_incomplete_call() {
-        let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(async {
-            for snapshot_reason in [StopReason::Stop, StopReason::ToolUse] {
-                let mut message = assistant_message("Retain the partial explanation");
-                message.stop_reason = snapshot_reason;
-                message.usage.input = 9;
-                message.usage.output = 2;
-                message.usage.total_tokens = 11;
-                let original_content = serde_json::to_value(&message.content).unwrap();
-                let provider = Arc::new(TerminalBatchProvider {
-                    events: vec![
-                        StreamEvent::Start {
-                            partial: assistant_message(""),
-                        },
-                        StreamEvent::ToolCallStart {
-                            content_index: 1,
-                            id: "partial-call".to_string(),
-                            name: "write".to_string(),
-                        },
-                        StreamEvent::ToolCallDelta {
-                            content_index: 1,
-                            delta: "{\"path\":\"target.txt\",\"content\":\"".to_string(),
-                        },
-                        // The provider omits the unfinished call from its
-                        // snapshot while the envelope still reports Length.
-                        StreamEvent::Done {
-                            reason: StopReason::Length,
-                            message,
-                        },
-                    ],
-                    calls: std::sync::atomic::AtomicUsize::new(0),
-                });
-                let temp = tempfile::tempdir().unwrap();
-                let mut agent = Agent::new(
-                    provider.clone(),
-                    ToolRegistry::new(&["write"], temp.path(), None),
-                    AgentConfig::default(),
-                );
-                let result = agent.run("Apply the edit", |_| {}).await.unwrap();
-                assert_eq!(result.stop_reason, StopReason::Error);
-                assert_eq!(
-                    result.error_message.as_deref(),
-                    Some(TRUNCATED_TOOL_CALL_ERROR)
-                );
-                assert_eq!(
-                    serde_json::to_value(&result.content).unwrap(),
-                    original_content
-                );
-                assert_eq!(result.usage.total_tokens, 11);
-                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-                assert!(!temp.path().join("target.txt").exists());
-            }
-        });
-    }
-
-    #[test]
-    fn terminal_pause_envelope_continues_signed_calls_without_local_execution() {
-        let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().unwrap();
-            let target = temp.path().join("target.txt");
-            let mut message = assistant_message("The server tool is still working");
-            message
-                .content
-                .push(ContentBlock::ToolCall(batch_write_call(
-                    "server-call",
-                    "target.txt",
-                    "must not execute",
-                )));
-            let original_content = serde_json::to_value(&message.content).unwrap();
-            let provider = Arc::new(TerminalBatchProvider {
-                events: vec![StreamEvent::Done {
-                    reason: StopReason::PauseTurn,
-                    message,
-                }],
-                calls: std::sync::atomic::AtomicUsize::new(0),
-            });
-            let mut agent = Agent::new(
-                provider.clone(),
-                ToolRegistry::new(&["write"], temp.path(), None),
-                AgentConfig::default(),
-            );
-            let result = agent.run("Apply the edit", |_| {}).await.unwrap();
-            assert_eq!(result.stop_reason, StopReason::Stop);
-            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
-            assert!(
-                !target.exists(),
-                "server tool pauses cannot execute locally"
-            );
-            assert!(
-                !agent
-                    .messages()
-                    .iter()
-                    .any(|m| matches!(m, Message::ToolResult(_)))
-            );
-            let Message::Assistant(stored) = &agent.messages()[1] else {
-                panic!("paused assistant stays in history for continuation");
-            };
-            assert_eq!(stored.stop_reason, StopReason::PauseTurn);
-            assert_eq!(
-                serde_json::to_value(&stored.content).unwrap(),
-                original_content
-            );
-        });
-    }
-
-    #[test]
-    fn terminal_refusal_preserves_provider_details_without_local_execution() {
-        let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().unwrap();
-            let target = temp.path().join("target.txt");
-            for (snapshot_reason, reason) in [
-                (StopReason::Refusal, StopReason::Refusal),
-                (StopReason::Stop, StopReason::Refusal),
-                (StopReason::Refusal, StopReason::Stop),
-                (StopReason::Refusal, StopReason::PauseTurn),
-            ] {
-                let mut message = assistant_message("Provider declined the request");
-                message.stop_reason = snapshot_reason;
-                message.stop_details = Some(crate::model::StopDetails {
-                    kind: "refusal".to_string(),
-                    category: Some("provider-policy".to_string()),
-                    explanation: Some("original provider explanation".to_string()),
-                });
-                message
-                    .content
-                    .push(ContentBlock::ToolCall(batch_write_call(
-                        "refused-call",
-                        "target.txt",
-                        "must not execute",
-                    )));
-                let mut expected = message.clone();
-                expected.stop_reason = StopReason::Refusal;
-                let provider = Arc::new(TerminalBatchProvider {
-                    events: vec![StreamEvent::Done { reason, message }],
-                    calls: std::sync::atomic::AtomicUsize::new(0),
-                });
-                let mut agent = Agent::new(
-                    provider.clone(),
-                    ToolRegistry::new(&["write"], temp.path(), None),
-                    AgentConfig::default(),
-                );
-                let result = agent.run("Apply the edit", |_| {}).await.unwrap();
-                assert_eq!(
-                    serde_json::to_value(&result).unwrap(),
-                    serde_json::to_value(expected).unwrap()
-                );
-                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-                assert!(!target.exists(), "refused requests cannot execute locally");
-                assert!(
-                    !agent
-                        .messages()
-                        .iter()
-                        .any(|m| matches!(m, Message::ToolResult(_)))
-                );
-            }
-        });
-    }
-
-    #[test]
-    fn terminal_validation_preserves_failed_aborted_and_signed_pause_payloads() {
-        for reason in [
-            StopReason::Error,
-            StopReason::Aborted,
-            StopReason::PauseTurn,
-            StopReason::Refusal,
-        ] {
-            let mut message = assistant_message("provider explanation");
-            message.stop_reason = reason;
-            message.error_message = Some("original diagnostic".to_string());
-            message.content.extend([
-                ContentBlock::Thinking(ThinkingContent {
-                    thinking: "signed reasoning".to_string(),
-                    thinking_signature: Some("opaque-signature".to_string()),
-                }),
-                ContentBlock::ToolCall(ToolCall {
-                    id: String::new(),
-                    name: String::new(),
-                    arguments: Value::Null,
-                    thought_signature: Some("opaque-call".to_string()),
-                }),
-            ]);
-            let original = serde_json::to_value(&message).unwrap();
-            let mut agent = Agent::new(
-                Arc::new(SilentProvider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig::default(),
-            );
-            let on_event: AgentEventHandler = Arc::new(|_| {});
-            let result = agent.finalize_assistant_message(message, &on_event, false);
-            assert_eq!(serde_json::to_value(result).unwrap(), original);
-        }
-    }
-
-    /// #148: first turn is cut off by the token cap while a tool call is still
-    /// streaming, exactly as OpenAI (`finish_reason: "length"`) and Anthropic
-    /// (`stop_reason: "max_tokens"`) report it — the tool call keeps its name
-    /// but its argument fragment fails to parse, so the provider stores
-    /// `arguments: null`. A second turn is scripted so the pre-fix behaviour
-    /// (continue as if nothing went wrong) is observable rather than hanging.
-    #[derive(Debug)]
-    struct TruncatedToolCallProvider {
-        stream_calls: StdArc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl TruncatedToolCallProvider {
-        fn new() -> Self {
-            Self {
-                stream_calls: StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
-            }
-        }
-
-        /// Shared handle to the stream-call counter, taken before the provider
-        /// is moved into the agent.
-        fn calls(&self) -> StdArc<std::sync::atomic::AtomicUsize> {
-            StdArc::clone(&self.stream_calls)
-        }
-    }
-
-    #[async_trait]
-    #[allow(clippy::unnecessary_literal_bound)]
-    impl Provider for TruncatedToolCallProvider {
-        fn name(&self) -> &str {
-            "test-provider"
-        }
-
-        fn api(&self) -> &str {
-            "test-api"
-        }
-
-        fn model_id(&self) -> &str {
-            "test-model"
-        }
-
-        async fn stream(
-            &self,
-            _context: &Context<'_>,
-            _options: &StreamOptions,
-        ) -> crate::error::Result<
-            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
-        > {
-            let call_index = self.stream_calls.fetch_add(1, Ordering::SeqCst);
-            if call_index > 0 {
-                let events = vec![Ok(StreamEvent::Done {
-                    reason: StopReason::Stop,
-                    message: assistant_message("recovered"),
-                })];
-                return Ok(Box::pin(futures::stream::iter(events)));
-            }
-
-            let mut truncated = assistant_message("Let me read that file");
-            truncated.stop_reason = StopReason::Length;
-            truncated.content.push(ContentBlock::ToolCall(ToolCall {
-                id: "call-1".to_string(),
-                name: "read_file".to_string(),
-                // `{"path": "/etc/ho` does not parse; both providers fall back
-                // to null after logging a parse warning.
-                arguments: Value::Null,
-                thought_signature: None,
-            }));
-
-            let events = vec![
-                Ok(StreamEvent::Start {
-                    partial: assistant_message(""),
-                }),
-                Ok(StreamEvent::TextDelta {
-                    content_index: 0,
-                    delta: "Let me read that file".to_string(),
-                }),
-                Ok(StreamEvent::ToolCallStart {
-                    content_index: 1,
-                    id: "call-1".to_string(),
-                    name: "read_file".to_string(),
-                }),
-                Ok(StreamEvent::ToolCallDelta {
-                    content_index: 1,
-                    delta: "{\"path\": \"/etc/ho".to_string(),
-                }),
-                Ok(StreamEvent::Done {
-                    reason: StopReason::Length,
-                    message: truncated,
-                }),
-            ];
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
-    }
-
-    /// #148 negative case: the same token cap, but the model was writing prose.
-    /// No tool call was ever started, so this is an ordinary `Length` stop and
-    /// must not be rewritten into an error.
-    #[derive(Debug)]
-    struct TruncatedTextProvider;
-
-    #[async_trait]
-    #[allow(clippy::unnecessary_literal_bound)]
-    impl Provider for TruncatedTextProvider {
-        fn name(&self) -> &str {
-            "test-provider"
-        }
-
-        fn api(&self) -> &str {
-            "test-api"
-        }
-
-        fn model_id(&self) -> &str {
-            "test-model"
-        }
-
-        async fn stream(
-            &self,
-            _context: &Context<'_>,
-            _options: &StreamOptions,
-        ) -> crate::error::Result<
-            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
-        > {
-            let mut truncated = assistant_message("The answer is fourty-tw");
-            truncated.stop_reason = StopReason::Length;
-
-            let events = vec![
-                Ok(StreamEvent::Start {
-                    partial: assistant_message(""),
-                }),
-                Ok(StreamEvent::TextDelta {
-                    content_index: 0,
-                    delta: "The answer is fourty-tw".to_string(),
-                }),
-                Ok(StreamEvent::Done {
-                    reason: StopReason::Length,
-                    message: truncated,
-                }),
-            ];
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
-    }
-
-    #[test]
-    fn truncated_tool_call_finalizes_as_error() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = TruncatedToolCallProvider::new();
-            let stream_calls = provider.calls();
-            let tools = ToolRegistry::from_tools(Vec::new());
-            let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
-
-            let result = agent
-                .run_with_message_with_abort(user_message("read /etc/hosts"), None, |_| {})
-                .await
-                .expect("run");
-
-            assert_eq!(
-                result.stop_reason,
-                StopReason::Error,
-                "truncated tool call must not finalize as a normal turn"
-            );
-            let error_message = result
-                .error_message
-                .as_deref()
-                .expect("truncated turn carries an error message");
-            assert!(
-                error_message.contains("truncated before tool call completed"),
-                "unexpected error message: {error_message}"
-            );
-
-            // The turn must stop here: continuing would either execute a tool
-            // call whose arguments were cut off, or silently drop it.
-            assert_eq!(
-                stream_calls.load(Ordering::SeqCst),
-                1,
-                "agent kept running past the truncated tool call"
-            );
-
-            // The partial text is retained so the caller can show what arrived.
-            let last = agent
-                .messages()
-                .iter()
-                .rev()
-                .find_map(|message| match message {
-                    Message::Assistant(assistant) => Some(Arc::clone(assistant)),
-                    _ => None,
-                })
-                .expect("assistant message in history");
-            assert_eq!(last.stop_reason, StopReason::Error);
-            assert!(
-                last.content
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::Text(text)
-                        if text.text == "Let me read that file")),
-                "partial text was dropped: {:?}",
-                last.content
-            );
-        });
-    }
-
-    #[test]
-    fn truncated_text_without_tool_call_stays_a_length_stop() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = Arc::new(TruncatedTextProvider);
-            let tools = ToolRegistry::from_tools(Vec::new());
-            let mut agent = Agent::new(provider, tools, AgentConfig::default());
-
-            let result = agent
-                .run_with_message_with_abort(user_message("what is the answer"), None, |_| {})
-                .await
-                .expect("run");
-
-            assert_eq!(
-                result.stop_reason,
-                StopReason::Length,
-                "a plain length stop must not be rewritten into an error"
-            );
-            assert_eq!(result.error_message, None);
-            assert!(
-                result
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::Text(text)
-                        if text.text == "The answer is fourty-tw")),
-                "partial text was dropped: {:?}",
-                result.content
-            );
-        });
-    }
-
-    #[test]
-    fn semantic_context_bundle_injection_is_disabled_by_default() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = CapturingProvider::new("openai-responses");
-            let calls = provider.calls();
-            let agent = Agent::new(
-                Arc::new(provider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig::default(),
-            );
-            let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session =
-                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
-
-            agent_session
-                .run_text("hello".to_string(), |_| {})
-                .await
-                .expect("run with default context settings");
-
-            let recorded_calls = {
-                let guard = match calls.lock() {
-                    Ok(calls) => calls,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                guard.clone()
-            };
-            assert_eq!(recorded_calls.len(), 1);
-            assert_eq!(recorded_calls[0].messages.len(), 1);
-            assert_user_text(&recorded_calls[0].messages[0], "hello");
-            assert!(recorded_calls[0].system_prompt.is_none());
-        });
-    }
-
-    #[test]
-    fn queued_steering_and_follow_up_messages_apply_magic_keywords_on_delivery() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = CapturingProvider::new("openai-responses");
-            let calls = provider.calls();
-            let mut agent = Agent::new(
-                Arc::new(provider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig {
-                    stream_options: StreamOptions {
-                        thinking_level: Some(crate::model::ThinkingLevel::Low),
-                        ..StreamOptions::default()
-                    },
-                    ..AgentConfig::default()
-                },
-            );
-            agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
-            agent.queue_steering(user_message("ultrathink before continuing"));
-            agent.queue_follow_up(user_message("orchestrate the follow-up"));
-
-            agent
-                .run_with_message_with_abort(user_message("start normally"), None, |_| {})
-                .await
-                .expect("queued messages complete");
-
-            let recorded_calls = {
-                let guard = match calls.lock() {
-                    Ok(calls) => calls,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                guard.clone()
-            };
-            assert_eq!(
-                recorded_calls.len(),
-                2,
-                "follow-up must trigger a second provider turn"
-            );
-            assert_eq!(
-                recorded_calls[0].thinking_level,
-                Some(crate::model::ThinkingLevel::High),
-                "queued steering ultrathink must affect its first outbound request"
-            );
-            assert!(
-                recorded_calls[0]
-                    .system_prompt
-                    .as_deref()
-                    .is_none_or(|prompt| !prompt.contains("invoked `orchestrate`")),
-                "the later follow-up directive must not leak into the first request"
-            );
-            assert!(
-                recorded_calls[1]
-                    .system_prompt
-                    .as_deref()
-                    .is_some_and(|prompt| prompt.contains("invoked `orchestrate`")),
-                "queued follow-up orchestrate must affect its outbound request"
-            );
-
-            let activations = agent.drain_keyword_ledger();
-            assert_eq!(activations.len(), 2);
-            assert_eq!(activations[0].word, "ultrathink");
-            assert_eq!(activations[1].word, "orchestrate");
-        });
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn continuation_follow_up_first_precedes_provider_and_later_steering() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = CapturingProvider::new("openai-responses");
-            let calls = provider.calls();
-            let mut agent = Agent::new(
-                Arc::new(provider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig {
-                    stream_options: StreamOptions {
-                        thinking_level: Some(crate::model::ThinkingLevel::Low),
-                        ..StreamOptions::default()
-                    },
-                    ..AgentConfig::default()
-                },
-            );
-            agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
-            agent.set_queue_modes(QueueMode::All, QueueMode::All);
-
-            let queued_steering = Arc::new(StdTestMutex::new(Some(
-                QueuedAgentMessage::from_authored_message(user_message("steer after handoff")),
-            )));
-            let steering_fetcher_state = Arc::clone(&queued_steering);
-            let steering_fetcher =
-                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
-                    let steering_fetcher_state = Arc::clone(&steering_fetcher_state);
-                    Box::pin(async move {
-                        steering_fetcher_state
-                            .lock()
-                            .ok()
-                            .and_then(|mut queued| queued.take())
-                            .into_iter()
-                            .collect()
-                    })
-                };
-
-            let first_visible = "expanded payload without a magic word";
-            let second_visible = "generated ultrathink payload";
-            let queued_follow_up = Arc::new(StdTestMutex::new(Some(vec![
-                QueuedAgentMessage::authored(
-                    user_message(first_visible),
-                    "please orchestrate this follow-up",
-                ),
-                QueuedAgentMessage::generated(user_message(second_visible)),
-            ])));
-            let follow_up_fetcher_state = Arc::clone(&queued_follow_up);
-            let follow_up_fetcher =
-                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
-                    let follow_up_fetcher_state = Arc::clone(&follow_up_fetcher_state);
-                    Box::pin(async move {
-                        follow_up_fetcher_state
-                            .lock()
-                            .ok()
-                            .and_then(|mut queued| queued.take())
-                            .unwrap_or_default()
-                    })
-                };
-            agent.register_message_fetchers(Some(Arc::new(steering_fetcher)), None);
-            agent.register_initial_follow_up_fetcher(Arc::new(follow_up_fetcher));
-            agent
-                .run_continue_with_follow_up_with_abort(None, |_| {})
-                .await
-                .expect("follow-up-first continuation");
-
-            let recorded_calls = {
-                let guard = match calls.lock() {
-                    Ok(calls) => calls,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                guard.clone()
-            };
-            assert_eq!(
-                recorded_calls.len(),
-                2,
-                "initial follow-up and later steering must each drive one provider request"
-            );
-            assert_eq!(recorded_calls[0].messages.len(), 2);
-            assert_user_text(&recorded_calls[0].messages[0], first_visible);
-            assert_user_text(&recorded_calls[0].messages[1], second_visible);
-            assert!(
-                recorded_calls[0].messages.iter().all(|message| {
-                    !matches!(
-                        message,
-                        Message::User(UserMessage { content: UserContent::Text(text), .. })
-                            if text == "steer after handoff"
-                    )
-                }),
-                "steering admitted for the resumed turn must not precede its initial follow-up"
-            );
-            assert!(recorded_calls[1].messages.iter().any(|message| {
-                matches!(
-                    message,
-                    Message::User(UserMessage { content: UserContent::Text(text), .. })
-                        if text == "steer after handoff"
-                )
-            }));
-            assert_eq!(
-                recorded_calls[0].thinking_level,
-                Some(crate::model::ThinkingLevel::Low),
-                "generated ultrathink bytes must remain inert"
-            );
-            assert!(
-                recorded_calls[0]
-                    .system_prompt
-                    .as_deref()
-                    .is_some_and(|prompt| prompt.contains("invoked `orchestrate`")),
-                "the exact authored source must activate its directive"
-            );
-        });
-    }
-
-    #[test]
-    fn continuation_preflights_owning_source_before_consuming_staged_follow_up() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = CapturingProvider::new("openai-responses");
-            let calls = provider.calls();
-            let mut agent = Agent::new(
-                Arc::new(provider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig::default(),
-            );
-            agent.set_queue_modes(QueueMode::All, QueueMode::All);
-            agent.queue_follow_up(user_message("older staged follow-up"));
-
-            let owning_source_fetched = StdArc::new(AtomicBool::new(false));
-            let fetched_for_source = StdArc::clone(&owning_source_fetched);
-            let queued_owning = StdArc::new(StdTestMutex::new(Some(queued_user_message(
-                "new owning follow-up",
-            ))));
-            let queued_for_source = StdArc::clone(&queued_owning);
-            let follow_up_fetcher =
-                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
-                    fetched_for_source.store(true, Ordering::SeqCst);
-                    let queued_for_source = StdArc::clone(&queued_for_source);
-                    Box::pin(async move {
-                        queued_for_source
-                            .lock()
-                            .ok()
-                            .and_then(|mut queued| queued.take())
-                            .into_iter()
-                            .collect()
-                    })
-                };
-            agent.register_initial_follow_up_fetcher(Arc::new(follow_up_fetcher));
-
-            let events = StdArc::new(StdTestMutex::new(Vec::new()));
-            let events_for_failed_preflight = StdArc::clone(&events);
-            let result = agent
-                .run_continue_with_follow_up_on_ready_with_abort(
-                    None,
-                    || false,
-                    move |event| {
-                        events_for_failed_preflight
-                            .lock()
-                            .expect("event capture")
-                            .push(event);
-                    },
-                )
-                .await;
-            assert!(result.is_err(), "failed source preflight must stop the run");
-            assert!(
-                owning_source_fetched.load(Ordering::SeqCst),
-                "an older staged batch must not bypass the owning fetcher"
-            );
-            assert!(events.lock().expect("event capture").is_empty());
-            assert!(calls.lock().expect("provider calls").is_empty());
-            assert_eq!(agent.message_queue.follow_up.len(), 2);
-            assert_user_text(
-                &agent.message_queue.follow_up[0].delivery.message,
-                "older staged follow-up",
-            );
-            assert_user_text(
-                &agent.message_queue.follow_up[1].delivery.message,
-                "new owning follow-up",
-            );
-
-            agent
-                .run_continue_with_follow_up_with_abort(None, |_| {})
-                .await
-                .expect("resume retained follow-ups after successful preflight");
-            let recorded_calls = calls.lock().expect("provider calls").clone();
-            assert_eq!(recorded_calls.len(), 1);
-            assert_eq!(recorded_calls[0].messages.len(), 2);
-            assert_user_text(&recorded_calls[0].messages[0], "older staged follow-up");
-            assert_user_text(&recorded_calls[0].messages[1], "new owning follow-up");
-        });
-    }
-
-    #[test]
-    fn max_time_restores_undelivered_steering_for_next_production_run() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = CapturingProvider::new("openai-responses");
-            let calls = provider.calls();
-            let mut agent = Agent::new(
-                Arc::new(provider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig {
-                    max_time: Some(std::time::Duration::ZERO),
-                    ..AgentConfig::default()
-                },
-            );
-            agent.set_queue_modes(QueueMode::OneAtATime, QueueMode::All);
-            agent.queue_steering(user_message("accepted steering one"));
-            agent.queue_steering(user_message("accepted steering two"));
-            agent.queue_steering(user_message("accepted steering three"));
-
-            let events = StdArc::new(StdTestMutex::new(Vec::new()));
-            let events_for_capped_run = StdArc::clone(&events);
-            let capped = agent
-                .run_with_message_with_abort(user_message("initial prompt"), None, move |event| {
-                    events_for_capped_run
-                        .lock()
-                        .expect("event capture")
-                        .push(event);
-                })
-                .await
-                .expect("time-capped run");
-            assert!(assistant_text_content(&capped.content).contains("time cap reached"));
-            assert!(calls.lock().expect("provider calls").is_empty());
-            assert_eq!(agent.message_queue.steering.len(), 3);
-            assert_user_text(
-                &agent.message_queue.steering[0].delivery.message,
-                "accepted steering one",
-            );
-            assert_user_text(
-                &agent.message_queue.steering[1].delivery.message,
-                "accepted steering two",
-            );
-            assert_user_text(
-                &agent.message_queue.steering[2].delivery.message,
-                "accepted steering three",
-            );
-            let captured_events = { events.lock().expect("event capture").clone() };
-            assert_eq!(
-                captured_events
-                    .iter()
-                    .filter(|event| matches!(event, AgentEvent::AgentStart { .. }))
-                    .count(),
-                1
-            );
-            assert_eq!(
-                captured_events
-                    .iter()
-                    .filter(|event| matches!(event, AgentEvent::AgentEnd { .. }))
-                    .count(),
-                1
-            );
-            assert!(captured_events.iter().all(|event| !matches!(
-                event,
-                AgentEvent::TurnStart { .. } | AgentEvent::TurnEnd { .. }
-            )));
-
-            agent.config.max_time = None;
-            agent.set_queue_modes(QueueMode::All, QueueMode::All);
-            agent
-                .run_with_message_with_abort(user_message("resume prompt"), None, |_| {})
-                .await
-                .expect("next production run");
-            assert!(agent.message_queue.steering.is_empty());
-            let recorded_calls = calls.lock().expect("provider calls").clone();
-            assert_eq!(recorded_calls.len(), 1);
-            let user_texts = recorded_calls[0]
-                .messages
-                .iter()
-                .filter_map(|message| match message {
-                    Message::User(UserMessage {
-                        content: UserContent::Text(text),
-                        ..
-                    }) => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                user_texts,
-                vec![
-                    "initial prompt",
-                    "resume prompt",
-                    "accepted steering one",
-                    "accepted steering two",
-                    "accepted steering three"
-                ]
-            );
-        });
-    }
-
-    #[test]
-    fn continuation_follow_up_first_preserves_full_admitted_batch() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = CapturingProvider::new("openai-responses");
-            let calls = provider.calls();
-            let mut agent = Agent::new(
-                Arc::new(provider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig::default(),
-            );
-            agent.set_queue_modes(QueueMode::All, QueueMode::All);
-
-            let expected = (0..128)
-                .map(|index| format!("admitted follow-up {index}"))
-                .collect::<Vec<_>>();
-            let queued_follow_up = Arc::new(StdTestMutex::new(Some(
-                expected
-                    .iter()
-                    .map(|text| {
-                        QueuedAgentMessage::from_authored_message(user_message(text.as_str()))
-                    })
-                    .collect::<Vec<_>>(),
-            )));
-            let follow_up_fetcher_state = Arc::clone(&queued_follow_up);
-            let follow_up_fetcher =
-                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
-                    let follow_up_fetcher_state = Arc::clone(&follow_up_fetcher_state);
-                    Box::pin(async move {
-                        follow_up_fetcher_state
-                            .lock()
-                            .ok()
-                            .and_then(|mut queued| queued.take())
-                            .unwrap_or_default()
-                    })
-                };
-            agent.register_initial_follow_up_fetcher(Arc::new(follow_up_fetcher));
-
-            agent
-                .run_continue_with_follow_up_with_abort(None, |_| {})
-                .await
-                .expect("full admitted follow-up batch");
-
-            let recorded_calls = {
-                let guard = match calls.lock() {
-                    Ok(calls) => calls,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                guard.clone()
-            };
-            assert_eq!(recorded_calls.len(), 1);
-            assert_eq!(recorded_calls[0].messages.len(), expected.len());
-            for (message, expected_text) in recorded_calls[0].messages.iter().zip(&expected) {
-                assert_user_text(message, expected_text);
-            }
-        });
-    }
-
-    #[test]
-    fn owning_steering_fetcher_preserves_full_admitted_batch() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = CapturingProvider::new("openai-responses");
-            let calls = provider.calls();
-            let mut agent = Agent::new(
-                Arc::new(provider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig::default(),
-            );
-            agent.set_queue_modes(QueueMode::All, QueueMode::All);
-
-            let expected = (0..128)
-                .map(|index| format!("admitted steering {index}"))
-                .collect::<Vec<_>>();
-            let queued = Arc::new(StdTestMutex::new(Some(
-                expected
-                    .iter()
-                    .map(|text| {
-                        QueuedAgentMessage::from_authored_message(user_message(text.as_str()))
-                    })
-                    .collect::<Vec<_>>(),
-            )));
-            let fetcher_state = Arc::clone(&queued);
-            let fetcher =
-                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
-                    let fetcher_state = Arc::clone(&fetcher_state);
-                    Box::pin(async move {
-                        fetcher_state
-                            .lock()
-                            .ok()
-                            .and_then(|mut queued| queued.take())
-                            .unwrap_or_default()
-                    })
-                };
-            agent.register_message_fetchers(Some(Arc::new(fetcher)), None);
-
-            agent
-                .run_with_message_with_abort(user_message("initial turn"), None, |_| {})
-                .await
-                .expect("full admitted steering batch");
-
-            let recorded_calls = match calls.lock() {
-                Ok(calls) => calls.clone(),
-                Err(poisoned) => poisoned.into_inner().clone(),
-            };
-            assert_eq!(recorded_calls.len(), 1);
-            assert_eq!(recorded_calls[0].messages.len(), expected.len() + 1);
-            assert_user_text(&recorded_calls[0].messages[0], "initial turn");
-            for (message, expected_text) in recorded_calls[0].messages[1..].iter().zip(&expected) {
-                assert_user_text(message, expected_text);
-            }
-        });
-    }
-
-    #[test]
-    fn ordinary_idle_boundary_preserves_full_primary_follow_up_batch() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = CapturingProvider::new("openai-responses");
-            let calls = provider.calls();
-            let mut agent = Agent::new(
-                Arc::new(provider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig::default(),
-            );
-            agent.set_queue_modes(QueueMode::All, QueueMode::All);
-
-            let expected = (0..128)
-                .map(|index| format!("ordinary follow-up {index}"))
-                .collect::<Vec<_>>();
-            let queued_follow_up = Arc::new(StdTestMutex::new(Some(
-                expected
-                    .iter()
-                    .map(|text| {
-                        QueuedAgentMessage::from_authored_message(user_message(text.as_str()))
-                    })
-                    .collect::<Vec<_>>(),
-            )));
-            let follow_up_fetcher_state = Arc::clone(&queued_follow_up);
-            let follow_up_fetcher =
-                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
-                    let follow_up_fetcher_state = Arc::clone(&follow_up_fetcher_state);
-                    Box::pin(async move {
-                        follow_up_fetcher_state
-                            .lock()
-                            .ok()
-                            .and_then(|mut queued| queued.take())
-                            .unwrap_or_default()
-                    })
-                };
-            agent.register_initial_follow_up_fetcher(Arc::new(follow_up_fetcher));
-
-            agent
-                .run_with_message_with_abort(user_message("initial turn"), None, |_| {})
-                .await
-                .expect("ordinary follow-up delivery");
-
-            let recorded_calls = {
-                let guard = match calls.lock() {
-                    Ok(calls) => calls,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                guard.clone()
-            };
-            assert_eq!(recorded_calls.len(), 2);
-            let second_call = &recorded_calls[1].messages;
-            assert!(second_call.len() >= expected.len());
-            let delivered = &second_call[second_call.len() - expected.len()..];
-            for (message, expected_text) in delivered.iter().zip(&expected) {
-                assert_user_text(message, expected_text);
-            }
-        });
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn ordinary_follow_up_batch_remains_staged_and_resumes_after_max_time() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = CapturingProvider::new("openai-responses");
-            let calls = provider.calls();
-            let mut agent = Agent::new(
-                Arc::new(provider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig {
-                    max_time: Some(std::time::Duration::from_millis(100)),
-                    ..AgentConfig::default()
-                },
-            );
-            agent.set_queue_modes(QueueMode::All, QueueMode::All);
-
-            let expected = (0..128)
-                .map(|index| format!("staged follow-up {index}"))
-                .collect::<Vec<_>>();
-            let queued_follow_up = Arc::new(StdTestMutex::new(Some(
-                expected
-                    .iter()
-                    .map(|text| {
-                        QueuedAgentMessage::from_authored_message(user_message(text.as_str()))
-                    })
-                    .collect::<Vec<_>>(),
-            )));
-            let follow_up_fetcher_state = Arc::clone(&queued_follow_up);
-            let follow_up_fetcher =
-                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
-                    let follow_up_fetcher_state = Arc::clone(&follow_up_fetcher_state);
-                    Box::pin(async move {
-                        std::thread::sleep(std::time::Duration::from_millis(150));
-                        follow_up_fetcher_state
-                            .lock()
-                            .ok()
-                            .and_then(|mut queued| queued.take())
-                            .unwrap_or_default()
-                    })
-                };
-            agent.register_initial_follow_up_fetcher(Arc::new(follow_up_fetcher));
-
-            let events = StdArc::new(StdTestMutex::new(Vec::new()));
-            let events_for_run = StdArc::clone(&events);
-            let result = agent
-                .run_with_message_with_abort(user_message("initial turn"), None, move |event| {
-                    events_for_run.lock().expect("event capture").push(event);
-                })
-                .await
-                .expect("max-time stop");
-            assert!(
-                assistant_text_content(&result.content).contains("time cap reached"),
-                "the returned terminal message must report the cap"
-            );
-
-            let calls_len = match calls.lock() {
-                Ok(calls) => calls.len(),
-                Err(poisoned) => poisoned.into_inner().len(),
-            };
-            assert_eq!(
-                calls_len, 1,
-                "the expired time cap must prevent a follow-up provider turn"
-            );
-            assert_eq!(
-                agent.message_queue.follow_up.len(),
-                128,
-                "the accepted batch must remain staged for a later run"
-            );
-            for (entry, expected_text) in agent.message_queue.follow_up.iter().zip(&expected) {
-                assert_user_text(&entry.delivery.message, expected_text);
-            }
-
-            let captured_events = { events.lock().expect("event capture").clone() };
-            assert_eq!(
-                captured_events
-                    .iter()
-                    .filter(|event| matches!(event, AgentEvent::AgentStart { .. }))
-                    .count(),
-                1
-            );
-            let agent_ends = captured_events
-                .iter()
-                .filter_map(|event| match event {
-                    AgentEvent::AgentEnd {
-                        messages, error, ..
-                    } => Some((messages, error)),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                agent_ends.len(),
-                1,
-                "AgentStart must have one matching AgentEnd"
-            );
-            assert!(agent_ends[0].1.is_none());
-            assert!(agent_ends[0].0.iter().any(|message| {
-                matches!(
-                    message,
-                    Message::Assistant(assistant)
-                        if assistant_text_content(&assistant.content).contains("time cap reached")
-                )
-            }));
-
-            agent
-                .run_continue_with_follow_up_with_abort(None, |_| {})
-                .await
-                .expect("resume staged follow-up batch");
-            assert!(agent.message_queue.follow_up.is_empty());
-            let recorded_calls = match calls.lock() {
-                Ok(calls) => calls.clone(),
-                Err(poisoned) => poisoned.into_inner().clone(),
-            };
-            assert_eq!(recorded_calls.len(), 2);
-            let resumed = &recorded_calls[1].messages;
-            assert!(resumed.len() >= expected.len());
-            for (message, expected_text) in resumed[resumed.len() - expected.len()..]
-                .iter()
-                .zip(&expected)
-            {
-                assert_user_text(message, expected_text);
-            }
-        });
-    }
-
-    #[test]
-    fn fetched_message_scans_only_explicit_authored_source() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = CapturingProvider::new("openai-responses");
-            let calls = provider.calls();
-            let mut agent = Agent::new(
-                Arc::new(provider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig {
-                    stream_options: StreamOptions {
-                        thinking_level: Some(crate::model::ThinkingLevel::Low),
-                        ..StreamOptions::default()
-                    },
-                    ..AgentConfig::default()
-                },
-            );
-            agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
-
-            let expanded = "generated ultrathink and workflowz bytes".to_string();
-            let queued = Arc::new(StdTestMutex::new(Some(QueuedAgentMessage::authored(
-                user_message(&expanded),
-                "please orchestrate this queued turn",
-            ))));
-            let fetch_queue = Arc::clone(&queued);
-            let fetcher =
-                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
-                    let fetch_queue = Arc::clone(&fetch_queue);
-                    Box::pin(async move {
-                        fetch_queue
-                            .lock()
-                            .ok()
-                            .and_then(|mut queued| queued.take())
-                            .into_iter()
-                            .collect()
-                    })
-                };
-            agent.register_message_fetchers(Some(Arc::new(fetcher)), None);
-
-            agent
-                .run_with_message_with_abort(user_message("start normally"), None, |_| {})
-                .await
-                .expect("source-aware queued message completes");
-
-            let recorded_calls = {
-                let guard = match calls.lock() {
-                    Ok(calls) => calls,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                guard.clone()
-            };
-            assert_eq!(recorded_calls.len(), 1);
-            assert_eq!(
-                recorded_calls[0].thinking_level,
-                Some(crate::model::ThinkingLevel::Low),
-                "generated ultrathink must not raise effort"
-            );
-            let system_prompt = recorded_calls[0]
-                .system_prompt
-                .as_deref()
-                .expect("directive");
-            assert!(system_prompt.contains("invoked `orchestrate`"));
-            assert!(!system_prompt.contains("invoked `workflowz`"));
-            assert!(recorded_calls[0].messages.iter().any(|message| {
-                matches!(
-                    message,
-                    Message::User(UserMessage {
-                        content: UserContent::Text(text),
-                        ..
-                    }) if text == &expanded
-                )
-            }));
-
-            let activations = agent.drain_keyword_ledger();
-            assert_eq!(activations.len(), 1);
-            assert_eq!(activations[0].word, "orchestrate");
-        });
-    }
-
-    #[test]
-    fn fetched_generated_message_reaches_provider_without_keyword_effects() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = CapturingProvider::new("openai-responses");
-            let calls = provider.calls();
-            let mut agent = Agent::new(
-                Arc::new(provider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig {
-                    stream_options: StreamOptions {
-                        thinking_level: Some(crate::model::ThinkingLevel::Low),
-                        ..StreamOptions::default()
-                    },
-                    ..AgentConfig::default()
-                },
-            );
-            agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
-
-            let generated_text = "generated ultrathink orchestrate workflowz bytes".to_string();
-            let queued = Arc::new(StdTestMutex::new(Some(QueuedAgentMessage::generated(
-                user_message(&generated_text),
-            ))));
-            let fetch_queue = Arc::clone(&queued);
-            let fetcher =
-                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
-                    let fetch_queue = Arc::clone(&fetch_queue);
-                    Box::pin(async move {
-                        fetch_queue
-                            .lock()
-                            .ok()
-                            .and_then(|mut queued| queued.take())
-                            .into_iter()
-                            .collect()
-                    })
-                };
-            agent.register_message_fetchers(Some(Arc::new(fetcher)), None);
-
-            agent
-                .run_with_message_with_abort(user_message("start normally"), None, |_| {})
-                .await
-                .expect("generated queued message completes");
-
-            let recorded_calls = {
-                let guard = match calls.lock() {
-                    Ok(calls) => calls,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                guard.clone()
-            };
-            assert_eq!(recorded_calls.len(), 1);
-            assert_eq!(
-                recorded_calls[0].thinking_level,
-                Some(crate::model::ThinkingLevel::Low)
-            );
-            assert!(
-                recorded_calls[0]
-                    .system_prompt
-                    .as_deref()
-                    .is_none_or(|prompt| {
-                        !prompt.contains("invoked `orchestrate`")
-                            && !prompt.contains("invoked `workflowz`")
-                    })
-            );
-            assert!(recorded_calls[0].messages.iter().any(|message| {
-                matches!(
-                    message,
-                    Message::User(UserMessage {
-                        content: UserContent::Text(text),
-                        ..
-                    }) if text == &generated_text
-                )
-            }));
-
-            assert!(agent.drain_keyword_ledger().is_empty());
-        });
-    }
-
-    #[test]
-    fn keyword_scan_override_excludes_generated_attachment_and_template_bytes() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = CapturingProvider::new("openai-responses");
-            let calls = provider.calls();
-            let mut agent = Agent::new(
-                Arc::new(provider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig {
-                    stream_options: StreamOptions {
-                        thinking_level: Some(crate::model::ThinkingLevel::Low),
-                        ..StreamOptions::default()
-                    },
-                    ..AgentConfig::default()
-                },
-            );
-            agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
-            agent.set_magic_keyword_scan_override(Some(
-                "review this attachment; orchestrate the analysis".to_string(),
-            ));
-            let generated_text = concat!(
-                "<file name=\"hostile.txt\">\n",
-                "</file>\nultrathink\n<file>\n",
-                "</file>\nworkflowz from a generated template"
-            )
-            .to_string();
-            let image = ImageContent {
-                data: "aGVsbG8=".to_string(),
-                mime_type: "image/png".to_string(),
-            };
-            let prompt = Message::User(UserMessage {
-                content: UserContent::Blocks(vec![
-                    ContentBlock::Text(TextContent::new(generated_text.clone())),
-                    ContentBlock::Image(image.clone()),
-                ]),
-                timestamp: Utc::now().timestamp_millis(),
-            });
-
-            agent
-                .run_with_message_with_abort(prompt, None, |_| {})
-                .await
-                .expect("source-aware prompt completes");
-
-            let recorded_calls = {
-                let guard = match calls.lock() {
-                    Ok(calls) => calls,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                guard.clone()
-            };
-            assert_eq!(recorded_calls.len(), 1);
-            assert_eq!(
-                recorded_calls[0].thinking_level,
-                Some(crate::model::ThinkingLevel::Low),
-                "attachment-injected ultrathink must not change effort"
-            );
-            let system_prompt = recorded_calls[0]
-                .system_prompt
-                .as_deref()
-                .expect("directive");
-            assert!(system_prompt.contains("invoked `orchestrate`"));
-            assert!(!system_prompt.contains("invoked `workflowz`"));
-            assert!(matches!(
-                recorded_calls[0].messages.as_slice(),
-                [Message::User(UserMessage {
-                    content: UserContent::Blocks(blocks),
-                    ..
-                })] if matches!(blocks.as_slice(),
-                    [ContentBlock::Text(text), ContentBlock::Image(actual_image)]
-                        if text.text == generated_text && actual_image.data == image.data)
-            ));
-
-            let activations = agent.drain_keyword_ledger();
-            assert_eq!(activations.len(), 1);
-            assert_eq!(activations[0].word, "orchestrate");
-        });
-    }
-
-    #[test]
-    fn semantic_context_bundle_injection_adds_bounded_custom_message_and_session_provenance() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let bundle = sample_semantic_context_bundle();
-            let revision = semantic_context_bundle_revision(&bundle);
-            let provider = CapturingProvider::new("openai-responses");
-            let calls = provider.calls();
-            let agent = Agent::new(
-                Arc::new(provider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig::default(),
-            );
-            let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session = AgentSession::new(
-                agent,
-                Arc::clone(&session),
-                false,
-                ResolvedCompactionSettings::default(),
-            );
-            agent_session.set_semantic_context_bundle(Some(
-                SemanticContextBundleInjection::enabled(bundle).with_prompt_budget(4, 2048),
-            ));
-
-            agent_session
-                .run_text("use context".to_string(), |_| {})
-                .await
-                .expect("run with context bundle");
-
-            {
-                let calls = match calls.lock() {
-                    Ok(calls) => calls,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                assert_eq!(calls.len(), 1);
-                assert_eq!(calls[0].messages.len(), 2);
-                assert_user_text(&calls[0].messages[0], "use context");
-                let custom = match &calls[0].messages[1] {
-                    Message::Custom(custom) => custom,
-                    other => {
-                        assert!(
-                            matches!(other, Message::Custom(_)),
-                            "expected custom semantic context message"
-                        );
-                        return;
-                    }
-                };
-                assert_eq!(custom.custom_type, SEMANTIC_CONTEXT_CUSTOM_TYPE);
-                assert!(custom.display);
-                assert!(custom.content.len() <= 2048);
-                assert!(custom.content.contains("Semantic Context Bundle"));
-                assert!(custom.content.contains("src/agent.rs"));
-                let details = custom.details.as_ref().expect("context provenance");
-                assert_eq!(
-                    details.get("bundleRevision").and_then(Value::as_str),
-                    Some(revision.as_str())
-                );
-                assert_eq!(
-                    details
-                        .pointer("/provider/promptShape")
-                        .and_then(Value::as_str),
-                    Some("custom_user_message")
-                );
-                drop(calls);
-            }
-
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let stored = session
-                .lock(cx.cx())
-                .await
-                .expect("session lock")
-                .to_messages_for_current_path();
-            assert!(
-                stored.iter().any(|message| matches!(
-                    message,
-                    Message::Custom(CustomMessage { custom_type, details, display: true, .. })
-                        if custom_type == SEMANTIC_CONTEXT_CUSTOM_TYPE
-                            && details
-                                .as_ref()
-                                .and_then(|value| value.get("bundleRevision"))
-                                .and_then(Value::as_str)
-                                == Some(revision.as_str())
-                )),
-                "semantic context provenance was not persisted in session messages: {stored:?}"
-            );
-        });
-    }
-
-    #[test]
-    fn semantic_context_bundle_uses_system_prompt_append_for_providers_without_custom_context() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let bundle = sample_semantic_context_bundle();
-            let revision = semantic_context_bundle_revision(&bundle);
-            let provider = CapturingProvider::new("gitlab-chat");
-            let calls = provider.calls();
-            let agent = Agent::new(
-                Arc::new(provider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig {
-                    system_prompt: Some("base prompt".to_string()),
-                    ..AgentConfig::default()
-                },
-            );
-            let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session = AgentSession::new(
-                agent,
-                Arc::clone(&session),
-                false,
-                ResolvedCompactionSettings::default(),
-            );
-            agent_session.set_semantic_context_bundle(Some(
-                SemanticContextBundleInjection::enabled(bundle).with_prompt_budget(4, 2048),
-            ));
-
-            agent_session
-                .run_text("gitlab turn".to_string(), |_| {})
-                .await
-                .expect("run with system prompt context");
-
-            {
-                let calls = match calls.lock() {
-                    Ok(calls) => calls,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                assert_eq!(calls.len(), 1);
-                assert_eq!(calls[0].messages.len(), 1);
-                assert_user_text(&calls[0].messages[0], "gitlab turn");
-                let system_prompt = calls[0].system_prompt.as_deref().expect("system prompt");
-                assert!(system_prompt.contains("base prompt"));
-                assert!(system_prompt.contains("Semantic Context Bundle"));
-                assert!(system_prompt.contains("src/agent.rs"));
-                drop(calls);
-            }
-
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let stored = session
-                .lock(cx.cx())
-                .await
-                .expect("session lock")
-                .to_messages_for_current_path();
-            assert!(
-                stored.iter().any(|message| matches!(
-                    message,
-                    Message::Custom(CustomMessage { custom_type, details, display: false, .. })
-                        if custom_type == SEMANTIC_CONTEXT_CUSTOM_TYPE
-                            && details
-                                .as_ref()
-                                .and_then(|value| value.get("bundleRevision"))
-                                .and_then(Value::as_str)
-                                == Some(revision.as_str())
-                )),
-                "hidden semantic context provenance was not persisted in session messages: {stored:?}"
-            );
-            assert_eq!(agent_session.agent.system_prompt(), Some("base prompt"));
-        });
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
-    fn semantic_context_continuation_preserves_bundle_across_provider_shapes_without_duplicate_entries()
-     {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        runtime.block_on(Box::pin(async {
-            for initial_api in ["gitlab-chat", "test-api"] {
-                let bundle = sample_semantic_context_bundle();
-                let agent = Agent::new(
-                    Arc::new(CapturingProvider::new(initial_api)),
-                    ToolRegistry::from_tools(Vec::new()),
-                    AgentConfig {
-                        system_prompt: Some("base prompt".to_string()),
-                        ..AgentConfig::default()
-                    },
-                );
-                let session = Arc::new(Mutex::new(Session::in_memory()));
-                let mut agent_session = AgentSession::new(
-                    agent,
-                    Arc::clone(&session),
-                    false,
-                    ResolvedCompactionSettings::default(),
-                );
-                agent_session.set_semantic_context_bundle(Some(
-                    SemanticContextBundleInjection::enabled(bundle).with_prompt_budget(4, 2048),
-                ));
-                agent_session
-                    .run_text("first turn".to_string(), |_| {})
-                    .await
-                    .unwrap();
-
-                let semantic_entries = |stored: &Session| {
-                    stored
-                        .to_messages_for_current_path()
-                        .into_iter()
-                        .filter(|message| {
-                            matches!(
-                                message,
-                                Message::Custom(custom)
-                                    if custom.custom_type == SEMANTIC_CONTEXT_CUSTOM_TYPE
-                            )
-                        })
-                        .map(|message| serde_json::to_value(message).unwrap())
-                        .collect::<Vec<_>>()
-                };
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let original = {
-                    let stored = session.lock(cx.cx()).await.unwrap();
-                    semantic_entries(&stored)
-                };
-                assert_eq!(original.len(), 1);
-
-                for target_api in ["bedrock-converse-stream", "test-api", "gitlab-chat"] {
-                    let provider = CapturingProvider::new(target_api);
-                    let calls = provider.calls();
-                    agent_session.agent.set_provider(Arc::new(provider));
-                    agent_session
-                        .run_continue_with_abort_and_system_prompt(
-                            None,
-                            Some("hook-system"),
-                            |_| {},
-                        )
-                        .await
-                        .unwrap();
-                    {
-                        let calls = calls.lock().unwrap();
-                        assert_eq!(calls.len(), 1);
-                        let request = &calls[0];
-                        let system = request.system_prompt.as_deref().unwrap();
-                        assert!(system.starts_with("hook-system"));
-                        let semantic_messages = request
-                            .messages
-                            .iter()
-                            .filter_map(|message| match message {
-                                Message::Custom(custom)
-                                    if custom.custom_type == SEMANTIC_CONTEXT_CUSTOM_TYPE =>
-                                {
-                                    Some(custom)
-                                }
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>();
-                        if target_api == "test-api" {
-                            assert_eq!(system, "hook-system");
-                            assert_eq!(semantic_messages.len(), 1);
-                            assert!(semantic_messages[0].content.contains("src/agent.rs"));
-                        } else {
-                            assert!(semantic_messages.is_empty());
-                            assert_eq!(system.matches("# Semantic Context Bundle").count(), 1);
-                            assert!(system.contains("src/agent.rs"));
-                        }
-                    }
-                    assert_eq!(agent_session.agent.system_prompt(), Some("base prompt"));
-                    let stored = session.lock(cx.cx()).await.unwrap();
-                    assert_eq!(semantic_entries(&stored), original);
-                }
-            }
-        }));
-    }
-
-    #[test]
-    fn enable_extensions_policy_resolution_defaults_to_permissive() {
-        let policy = AgentSession::resolve_extension_policy_for_enable(None, None);
-        assert_eq!(
-            policy.mode,
-            crate::extensions::ExtensionPolicyMode::Permissive
-        );
-    }
-
-    #[test]
-    fn enable_extensions_policy_resolution_respects_config_default_toggle() {
-        let config = crate::config::Config {
-            extension_policy: Some(crate::config::ExtensionPolicyConfig {
-                profile: None,
-                default_permissive: Some(false),
-                allow_dangerous: None,
-            }),
-            ..Default::default()
-        };
-        let policy = AgentSession::resolve_extension_policy_for_enable(Some(&config), None);
-        assert_eq!(policy.mode, crate::extensions::ExtensionPolicyMode::Strict);
-    }
-
-    #[test]
-    fn enable_extensions_policy_resolution_prefers_explicit_policy() {
-        let config = crate::config::Config {
-            extension_policy: Some(crate::config::ExtensionPolicyConfig {
-                profile: None,
-                default_permissive: Some(false),
-                allow_dangerous: None,
-            }),
-            ..Default::default()
-        };
-        let explicit = crate::extensions::PolicyProfile::Permissive.to_policy();
-        let policy =
-            AgentSession::resolve_extension_policy_for_enable(Some(&config), Some(explicit));
-        assert_eq!(
-            policy.mode,
-            crate::extensions::ExtensionPolicyMode::Permissive
-        );
-    }
-
-    #[test]
-    fn test_extract_tool_calls() {
-        let content = vec![
-            ContentBlock::Text(TextContent::new("Hello")),
-            ContentBlock::ToolCall(ToolCall {
-                id: "tc1".to_string(),
-                name: "read".to_string(),
-                arguments: serde_json::json!({"path": "file.txt"}),
-                thought_signature: None,
-            }),
-            ContentBlock::Text(TextContent::new("World")),
-            ContentBlock::ToolCall(ToolCall {
-                id: "tc2".to_string(),
-                name: "bash".to_string(),
-                arguments: serde_json::json!({"command": "ls"}),
-                thought_signature: None,
-            }),
-        ];
-
-        let tool_calls = extract_tool_calls(&content);
-        assert_eq!(tool_calls.len(), 2);
-        assert_eq!(tool_calls[0].name, "read");
-        assert_eq!(tool_calls[1].name, "bash");
-    }
-
-    #[test]
-    fn test_agent_config_default() {
-        // Tests don't mutate env (the crate forbids unsafe code, and
-        // `std::env::set_var` is unsafe in 2024 edition); under typical
-        // `cargo test` invocation `PI_MAX_TOOL_ITERATIONS` is unset, so
-        // this assertion holds. If a developer's shell happens to export
-        // that var, this test will reflect their effective default — which
-        // is the correct behavior, not a bug.
-        let config = AgentConfig::default();
-        let expected = resolved_max_tool_iterations_default();
-        assert_eq!(config.max_tool_iterations, expected);
-        assert!(config.system_prompt.is_none());
-        assert!(!config.block_images);
-    }
-
-    #[test]
-    fn resolve_max_tool_iterations_handles_unset_empty_and_whitespace() {
-        assert_eq!(
-            resolve_max_tool_iterations(None),
-            MAX_TOOL_ITERATIONS_DEFAULT
-        );
-        assert_eq!(
-            resolve_max_tool_iterations(Some("")),
-            MAX_TOOL_ITERATIONS_DEFAULT
-        );
-        assert_eq!(
-            resolve_max_tool_iterations(Some("    ")),
-            MAX_TOOL_ITERATIONS_DEFAULT
-        );
-    }
-
-    #[test]
-    fn resolve_max_tool_iterations_rejects_zero_and_invalid() {
-        assert_eq!(
-            resolve_max_tool_iterations(Some("0")),
-            MAX_TOOL_ITERATIONS_DEFAULT
-        );
-        assert_eq!(
-            resolve_max_tool_iterations(Some("not-a-number")),
-            MAX_TOOL_ITERATIONS_DEFAULT
-        );
-        assert_eq!(
-            resolve_max_tool_iterations(Some("-5")),
-            MAX_TOOL_ITERATIONS_DEFAULT
-        );
-        assert_eq!(
-            resolve_max_tool_iterations(Some("3.14")),
-            MAX_TOOL_ITERATIONS_DEFAULT
-        );
-    }
-
-    #[test]
-    fn resolve_max_tool_iterations_accepts_valid_overrides_and_trims_whitespace() {
-        assert_eq!(resolve_max_tool_iterations(Some("1")), 1);
-        assert_eq!(resolve_max_tool_iterations(Some("100")), 100);
-        assert_eq!(resolve_max_tool_iterations(Some("  200  ")), 200);
-        assert_eq!(resolve_max_tool_iterations(Some("999")), 999);
-    }
-
-    #[test]
-    fn resolve_max_tool_iterations_clamps_above_ceiling() {
-        assert_eq!(
-            resolve_max_tool_iterations(Some("99999")),
-            MAX_TOOL_ITERATIONS_CEILING
-        );
-        // The ceiling itself should pass through unchanged.
-        assert_eq!(
-            resolve_max_tool_iterations(Some("1000")),
-            MAX_TOOL_ITERATIONS_CEILING
-        );
-    }
-
-    #[test]
-    fn clamp_max_tool_iterations_matches_resolve_semantics() {
-        // None -> default, 0 -> default (with warning), >ceiling -> ceiling.
-        assert_eq!(clamp_max_tool_iterations(None), MAX_TOOL_ITERATIONS_DEFAULT);
-        assert_eq!(
-            clamp_max_tool_iterations(Some(0)),
-            MAX_TOOL_ITERATIONS_DEFAULT
-        );
-        assert_eq!(clamp_max_tool_iterations(Some(7)), 7);
-        assert_eq!(
-            clamp_max_tool_iterations(Some(usize::MAX)),
-            MAX_TOOL_ITERATIONS_CEILING
-        );
-    }
-
-    #[test]
-    fn iteration_warning_fires_at_80_percent_for_default_cap() {
-        // Default cap = 50; (50 * 4) / 5 = 40 → warn at 40+.
-        assert!(!should_warn_at_iteration_threshold(39, 50));
-        assert!(should_warn_at_iteration_threshold(40, 50));
-        assert!(should_warn_at_iteration_threshold(50, 50));
-        // Off-by-one regression guard: not at 39 even with default cap.
-        assert!(!should_warn_at_iteration_threshold(0, 50));
-    }
-
-    #[test]
-    fn iteration_warning_fires_at_80_percent_for_custom_caps() {
-        for (cap, threshold) in [(100usize, 80usize), (200, 160), (1000, 800)] {
-            assert!(
-                !should_warn_at_iteration_threshold(threshold - 1, cap),
-                "expected no warning below threshold (current=cap={cap}, threshold={threshold})"
-            );
-            assert!(
-                should_warn_at_iteration_threshold(threshold, cap),
-                "expected warning at threshold (cap={cap}, threshold={threshold})"
-            );
-        }
-    }
-
-    #[test]
-    fn iteration_warning_skipped_for_caps_below_minimum() {
-        // For caps under ITERATION_WARN_MIN_CAP (5), the warning never
-        // fires regardless of `current`. This avoids noise on tiny ceilings
-        // where the warning would land on iteration 0 or 1.
-        for cap in 0..ITERATION_WARN_MIN_CAP {
-            for current in 0..=cap.saturating_add(2) {
-                assert!(
-                    !should_warn_at_iteration_threshold(current, cap),
-                    "should not warn at current={current} cap={cap}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn iteration_warning_handles_minimum_warnable_cap_boundary() {
-        // Cap == ITERATION_WARN_MIN_CAP (5): (5 * 4) / 5 = 4 → warn at 4+.
-        assert!(!should_warn_at_iteration_threshold(3, 5));
-        assert!(should_warn_at_iteration_threshold(4, 5));
-        assert!(should_warn_at_iteration_threshold(5, 5));
-    }
-
-    #[test]
-    fn iteration_warning_handles_overflow_resistant_caps() {
-        // SDK callers that write `AgentConfig::max_tool_iterations = usize::MAX`
-        // directly bypass the resolvers' clamp. Without `saturating_mul`,
-        // `max * 4` would wrap to a tiny number and the warning would fire
-        // on iteration ~0. The saturating multiply pins the threshold at
-        // (saturated) usize::MAX / 5, so the warning effectively never
-        // fires for absurd caps — which is the safer default.
-        assert!(!should_warn_at_iteration_threshold(1_000_000, usize::MAX));
-        assert!(!should_warn_at_iteration_threshold(
-            usize::MAX / 6,
-            usize::MAX
-        ));
-        // Conversely, a current at the saturated threshold should fire.
-        assert!(should_warn_at_iteration_threshold(
-            usize::MAX / 5,
-            usize::MAX
-        ));
-    }
-
-    #[test]
-    fn iteration_handoff_steering_text_is_self_describing() {
-        // Pinning the wording is intentional: this string is the load-bearing
-        // contract between the runtime and the agent's iteration-aware-handoff
-        // protocol. If it changes, downstream spec templates may need an
-        // update, so the test forces a deliberate review on edits.
-        let text = iteration_handoff_steering_text(42, 50);
-        assert!(text.contains("[runtime]"));
-        assert!(text.contains("Tool-iteration budget at >=80%"));
-        assert!(text.contains("used 42 of 50"));
-        assert!(text.contains("graceful handoff"));
-        assert!(text.contains("incomplete-handoff"));
-        assert!(text.contains("Do NOT compress"));
-    }
-
-    #[test]
-    fn filter_image_blocks_replaces_images_with_deduped_placeholder_text() {
-        let mut blocks = vec![
-            sample_image_block(),
-            sample_image_block(),
-            ContentBlock::Text(TextContent::new("tail")),
-            sample_image_block(),
-        ];
-
-        let removed = filter_image_blocks(&mut blocks, BLOCK_IMAGES_PLACEHOLDER);
-
-        assert_eq!(removed, 3);
-        assert!(
-            !blocks
-                .iter()
-                .any(|block| matches!(block, ContentBlock::Image(_)))
-        );
-        assert!(matches!(
-            blocks.first(),
-            Some(ContentBlock::Text(TextContent { text, .. }))
-                if text.as_str().eq(BLOCK_IMAGES_PLACEHOLDER)
-        ));
-        assert!(matches!(
-            blocks.get(1),
-            Some(ContentBlock::Text(TextContent { text, .. })) if text.as_str().eq("tail")
-        ));
-        assert!(matches!(
-            blocks.get(2),
-            Some(ContentBlock::Text(TextContent { text, .. }))
-                if text.as_str().eq(BLOCK_IMAGES_PLACEHOLDER)
-        ));
-    }
-
-    #[test]
-    fn filter_images_for_provider_filters_images_from_all_block_message_types() {
-        let mut messages = vec![
-            Message::User(UserMessage {
-                content: UserContent::Blocks(vec![
-                    ContentBlock::Text(TextContent::new("hello")),
-                    sample_image_block(),
-                ]),
-                timestamp: 0,
-            }),
-            Message::Assistant(Arc::new(AssistantMessage {
-                content: vec![sample_image_block()],
-                api: "test".to_string(),
-                provider: "test".to_string(),
-                model: "test".to_string(),
-                usage: Usage::default(),
-                stop_reason: StopReason::Stop,
-                stop_details: None,
-                error_message: None,
-                timestamp: 0,
-            })),
-            Message::tool_result(ToolResultMessage {
-                tool_call_id: "tc1".to_string(),
-                tool_name: "read".to_string(),
-                content: vec![
-                    sample_image_block(),
-                    ContentBlock::Text(TextContent::new("ok")),
-                ],
-                details: None,
-                is_error: false,
-                timestamp: 0,
-            }),
-        ];
-
-        let stats = filter_images_for_provider(&mut messages, BLOCK_IMAGES_PLACEHOLDER);
-
-        assert_eq!(stats.removed_images, 3);
-        assert_eq!(stats.affected_messages, 3);
-        assert_eq!(
-            messages.iter().map(image_count_in_message).sum::<usize>(),
-            0,
-            "no images should remain in provider-bound context"
-        );
-    }
-
-    #[test]
-    fn build_context_strips_images_when_block_images_enabled() {
-        let mut agent = Agent::new(
-            Arc::new(SilentProvider),
-            ToolRegistry::new(&[], Path::new("."), None),
-            AgentConfig {
-                system_prompt: None,
-                max_tool_iterations: 50,
-                stream_options: StreamOptions::default(),
-                block_images: true,
-                model_accepts_images: true,
-                fail_closed_hooks: false,
-                tool_approval: None,
-                keyword_settings: None,
-                max_time: None,
-                turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
-                approval_state: None,
-                bash_settings: None,
-                secrets: None,
-            },
-        );
-        agent.add_message(Message::User(UserMessage {
-            content: UserContent::Blocks(vec![sample_image_block()]),
-            timestamp: 0,
-        }));
-
-        let context = agent.build_context();
-        assert_eq!(context.messages.len(), 1);
-        assert_eq!(image_count_in_message(&context.messages[0]), 0);
-        assert!(matches!(
-            &context.messages[0],
-            Message::User(UserMessage {
-                content: UserContent::Blocks(blocks),
-                ..
-            }) if blocks
-                .iter()
-                .any(|block| matches!(block, ContentBlock::Text(TextContent { text, .. }) if text.as_str().eq(BLOCK_IMAGES_PLACEHOLDER)))
-        ));
-    }
-
-    #[test]
-    fn build_context_keeps_images_when_block_images_disabled() {
-        let mut agent = Agent::new(
-            Arc::new(SilentProvider),
-            ToolRegistry::new(&[], Path::new("."), None),
-            AgentConfig {
-                system_prompt: None,
-                max_tool_iterations: 50,
-                stream_options: StreamOptions::default(),
-                block_images: false,
-                model_accepts_images: true,
-                fail_closed_hooks: false,
-                tool_approval: None,
-                keyword_settings: None,
-                max_time: None,
-                turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
-                approval_state: None,
-                bash_settings: None,
-                secrets: None,
-            },
-        );
-        agent.add_message(Message::User(UserMessage {
-            content: UserContent::Blocks(vec![sample_image_block()]),
-            timestamp: 0,
-        }));
-
-        let context = agent.build_context();
-        assert_eq!(context.messages.len(), 1);
-        assert_eq!(image_count_in_message(&context.messages[0]), 1);
-    }
-
-    #[test]
-    fn model_image_capability_filters_requests_without_losing_history() {
-        let mut assistant = assistant_message("assistant text");
-        assistant.content = vec![
-            ContentBlock::Text(TextContent {
-                text: "signed text".to_string(),
-                text_signature: Some("preserved-signature".to_string()),
-            }),
-            sample_image_block(),
-        ];
-        let media = ContentBlock::Media(crate::model::MediaContent {
-            data: "YXVkaW8=".to_string(),
-            mime_type: "audio/wav".to_string(),
-            name: Some("recording.wav".to_string()),
-        });
-        let original = vec![
-            Message::User(UserMessage {
-                content: UserContent::Blocks(vec![
-                    ContentBlock::Text(TextContent::new("before")),
-                    sample_image_block(),
-                    sample_image_block(),
-                    ContentBlock::Text(TextContent::new("after")),
-                ]),
-                timestamp: 7,
-            }),
-            Message::assistant(assistant),
-            Message::tool_result(ToolResultMessage {
-                tool_call_id: "read-image".to_string(),
-                tool_name: "read".to_string(),
-                content: vec![sample_image_block(), media.clone()],
-                details: Some(json!({"type": "image", "data": "opaque tool metadata"})),
-                is_error: false,
-                timestamp: 11,
-            }),
-            Message::Custom(crate::model::CustomMessage {
-                content: "custom text".to_string(),
-                custom_type: "image-test".to_string(),
-                display: true,
-                details: Some(json!({"type": "image", "data": "opaque custom metadata"})),
-                timestamp: 13,
-            }),
-        ];
-        let original_json = serde_json::to_value(&original).unwrap();
-        let mut agent = Agent::new(
-            Arc::new(SilentProvider),
-            ToolRegistry::from_tools(Vec::new()),
-            AgentConfig::default(),
-        );
-        agent.replace_messages(original);
-        assert_eq!(
-            serde_json::to_value(&agent.build_context().messages).unwrap(),
-            original_json,
-        );
-
-        agent.set_model_accepts_images(false);
-        let context = agent.build_context();
-        assert_eq!(context.messages.len(), 4);
-        assert!(!context.messages.iter().any(message_has_images));
-        let projected = serde_json::to_value(&context.messages).unwrap();
-        assert_eq!(
-            projected[0]["content"],
-            json!([
-                {"type": "text", "text": "before"},
-                {"type": "text", "text": UNSUPPORTED_IMAGES_PLACEHOLDER},
-                {"type": "text", "text": "after"}
-            ]),
-        );
-        assert_eq!(projected[1]["content"][0], original_json[1]["content"][0]);
-        assert_eq!(projected[1]["usage"], original_json[1]["usage"]);
-        assert_eq!(projected[2]["toolCallId"], "read-image");
-        assert_eq!(
-            projected[2]["content"][1],
-            serde_json::to_value(media).unwrap()
-        );
-        assert_eq!(projected[2]["details"], original_json[2]["details"]);
-        assert_eq!(projected[3], original_json[3]);
-        drop(context);
-        assert_eq!(
-            serde_json::to_value(agent.messages()).unwrap(),
-            original_json
-        );
-
-        agent.set_model_accepts_images(true);
-        assert_eq!(
-            serde_json::to_value(&agent.build_context().messages).unwrap(),
-            original_json,
-            "returning to a vision model must restore the original image bytes",
-        );
-    }
-
-    #[test]
-    fn image_policy_keeps_image_free_history_shared() {
-        let assistant = Arc::new(assistant_message("unchanged assistant"));
-        let tool = Arc::new(ToolResultMessage {
-            tool_call_id: "text-tool".to_string(),
-            tool_name: "read".to_string(),
-            content: vec![ContentBlock::Text(TextContent::new(
-                "unchanged tool result",
-            ))],
-            details: None,
-            is_error: false,
-            timestamp: 0,
-        });
-        let mut agent = Agent::new(
-            Arc::new(SilentProvider),
-            ToolRegistry::from_tools(Vec::new()),
-            AgentConfig {
-                model_accepts_images: false,
-                ..AgentConfig::default()
-            },
-        );
-        agent.replace_messages(vec![
-            Message::Assistant(Arc::clone(&assistant)),
-            Message::ToolResult(Arc::clone(&tool)),
-        ]);
-        assert!(matches!(agent.build_context().messages, Cow::Borrowed(_)));
-
-        agent.add_message(Message::User(UserMessage {
-            content: UserContent::Blocks(vec![sample_image_block()]),
-            timestamp: 0,
-        }));
-        let context = agent.build_context();
-        assert!(
-            matches!(&context.messages[0], Message::Assistant(value) if Arc::ptr_eq(value, &assistant))
-        );
-        assert!(
-            matches!(&context.messages[1], Message::ToolResult(value) if Arc::ptr_eq(value, &tool))
-        );
-        assert!(!context.messages.iter().any(message_has_images));
-    }
-
-    #[test]
-    fn bare_provider_switch_does_not_inherit_image_capability() {
-        let mut agent = Agent::new(
-            Arc::new(SilentProvider),
-            ToolRegistry::from_tools(Vec::new()),
-            AgentConfig::default(),
-        );
-        agent.add_message(Message::User(UserMessage {
-            content: UserContent::Blocks(vec![sample_image_block()]),
-            timestamp: 0,
-        }));
-        assert!(
-            agent
-                .build_context()
-                .messages
-                .iter()
-                .any(message_has_images)
-        );
-        agent.set_provider(Arc::new(SilentProvider));
-        assert!(
-            !agent
-                .build_context()
-                .messages
-                .iter()
-                .any(message_has_images)
-        );
-        assert!(agent.messages().iter().any(message_has_images));
-        agent.set_model_accepts_images(true);
-        assert!(
-            agent
-                .build_context()
-                .messages
-                .iter()
-                .any(message_has_images)
-        );
-    }
-
-    #[test]
-    #[allow(clippy::significant_drop_tightening)]
-    fn context_hook_images_obey_the_final_provider_image_policy() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        runtime.block_on(async {
-            let temp_dir = tempfile::tempdir().expect("tempdir");
-            let entry_path = temp_dir.path().join("context-image.mjs");
-            std::fs::write(
-                &entry_path,
-                r#"
-                export default function init(pi) {
-                  pi.on("context", async (event) => ({
-                    messages: [...event.messages, {
-                      role: "user",
-                      content: [
-                        { type: "text", text: "context hook reached provider" },
-                        { type: "image", mimeType: "image/png", data: "aGVsbG8=" }
-                      ],
-                      timestamp: 17
-                    }]
-                  }));
-                }
-                "#,
-            )
-            .expect("write extension");
-
-            for (block_images, model_accepts_images, expected_images, placeholder) in [
-                (false, false, 0, Some(UNSUPPORTED_IMAGES_PLACEHOLDER)),
-                (true, true, 0, Some(BLOCK_IMAGES_PLACEHOLDER)),
-                (false, true, 1, None),
-            ] {
-                let provider = CapturingProvider::new("test-api");
-                let calls = provider.calls();
-                let agent = Agent::new(
-                    Arc::new(provider),
-                    ToolRegistry::from_tools(Vec::new()),
-                    AgentConfig {
-                        model_accepts_images,
-                        block_images,
-                        ..AgentConfig::default()
-                    },
-                );
-                let mut session = AgentSession::new(
-                    agent,
-                    Arc::new(Mutex::new(Session::in_memory())),
-                    false,
-                    ResolvedCompactionSettings::default(),
-                );
-                session
-                    .enable_extensions(
-                        &[],
-                        temp_dir.path(),
-                        None,
-                        std::slice::from_ref(&entry_path),
-                    )
-                    .await
-                    .expect("enable context extension");
-                session
-                    .run_text("hello".to_string(), |_| {})
-                    .await
-                    .expect("complete provider turn");
-
-                let recorded = calls.lock().expect("captured requests");
-                assert_eq!(recorded.len(), 1);
-                let messages = &recorded[0].messages;
-                assert_eq!(
-                    messages.iter().map(image_count_in_message).sum::<usize>(),
-                    expected_images,
-                );
-                let projected = serde_json::to_value(messages).unwrap();
-                let injected = projected.as_array().unwrap().last().unwrap();
-                assert_eq!(
-                    injected["content"][0]["text"], "context hook reached provider",
-                    "the extension must actually rewrite the provider context",
-                );
-                if let Some(placeholder) = placeholder {
-                    assert_eq!(injected["content"][1]["text"], placeholder);
-                }
-            }
-        });
-    }
-
-    #[test]
-    fn auto_compaction_start_serializes_with_pi_mono_compatible_type_tag() {
-        let event = AgentEvent::AutoCompactionStart {
-            reason: "threshold".to_string(),
-        };
-        let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "auto_compaction_start");
-        assert_eq!(json["reason"], "threshold");
-    }
-
-    #[test]
-    fn auto_compaction_end_serializes_with_pi_mono_compatible_fields() {
-        let event = AgentEvent::AutoCompactionEnd {
-            result: Some(serde_json::json!({"tokens_before": 5000, "tokens_after": 2000})),
-            aborted: false,
-            will_retry: false,
-            error_message: None,
-        };
-        let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "auto_compaction_end");
-        assert_eq!(json["aborted"], false);
-        assert_eq!(json["willRetry"], false);
-        assert!(json.get("errorMessage").is_none()); // skipped when None
-        assert!(json["result"].is_object());
-    }
-
-    #[test]
-    fn auto_compaction_end_includes_error_message_when_present() {
-        let event = AgentEvent::AutoCompactionEnd {
-            result: None,
-            aborted: true,
-            will_retry: false,
-            error_message: Some("Compaction failed".to_string()),
-        };
-        let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "auto_compaction_end");
-        assert_eq!(json["aborted"], true);
-        assert_eq!(json["errorMessage"], "Compaction failed");
-    }
-
-    #[test]
-    fn auto_retry_start_serializes_with_camel_case_fields() {
-        let event = AgentEvent::AutoRetryStart {
-            attempt: 1,
-            max_attempts: 3,
-            delay_ms: 2000,
-            error_message: "Rate limited".to_string(),
-        };
-        let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "auto_retry_start");
-        assert_eq!(json["attempt"], 1);
-        assert_eq!(json["maxAttempts"], 3);
-        assert_eq!(json["delayMs"], 2000);
-        assert_eq!(json["errorMessage"], "Rate limited");
-    }
-
-    #[test]
-    fn auto_retry_end_serializes_success_and_omits_null_final_error() {
-        let event = AgentEvent::AutoRetryEnd {
-            success: true,
-            attempt: 2,
-            final_error: None,
-        };
-        let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "auto_retry_end");
-        assert_eq!(json["success"], true);
-        assert_eq!(json["attempt"], 2);
-        assert!(json.get("finalError").is_none());
-    }
-
-    #[test]
-    fn auto_retry_end_includes_final_error_on_failure() {
-        let event = AgentEvent::AutoRetryEnd {
-            success: false,
-            attempt: 3,
-            final_error: Some("Max retries exceeded".to_string()),
-        };
-        let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "auto_retry_end");
-        assert_eq!(json["success"], false);
-        assert_eq!(json["attempt"], 3);
-        assert_eq!(json["finalError"], "Max retries exceeded");
-    }
-
-    #[test]
-    fn message_queue_push_increments_seq_and_counts_both_queues() {
-        let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
-        assert_eq!(queue.pending_count(), 0);
-
-        assert_eq!(queue.push_steering(queued_user_message("s1")), 0);
-        assert_eq!(queue.push_follow_up(queued_user_message("f1")), 1);
-        assert_eq!(queue.push_steering(queued_user_message("s2")), 2);
-
-        assert_eq!(queue.pending_count(), 3);
-    }
-
-    #[test]
-    fn message_queue_pop_steering_one_at_a_time_preserves_order() {
-        let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
-        queue.push_steering(queued_user_message("s1"));
-        queue.push_steering(queued_user_message("s2"));
-
-        let first = queue.pop_steering();
-        assert_eq!(first.len(), 1);
-        assert_user_text(first[0].message(), "s1");
-        assert_eq!(queue.pending_count(), 1);
-
-        let second = queue.pop_steering();
-        assert_eq!(second.len(), 1);
-        assert_user_text(second[0].message(), "s2");
-        assert_eq!(queue.pending_count(), 0);
-
-        let empty = queue.pop_steering();
-        assert!(empty.is_empty());
-    }
-
-    #[test]
-    fn message_queue_pop_respects_queue_modes_per_kind() {
-        let mut queue = MessageQueue::new(QueueMode::All, QueueMode::OneAtATime);
-        queue.push_steering(queued_user_message("s1"));
-        queue.push_steering(queued_user_message("s2"));
-        queue.push_follow_up(queued_user_message("f1"));
-        queue.push_follow_up(queued_user_message("f2"));
-
-        let steering = queue.pop_steering();
-        assert_eq!(steering.len(), 2);
-        assert_user_text(steering[0].message(), "s1");
-        assert_user_text(steering[1].message(), "s2");
-        assert_eq!(queue.pending_count(), 2);
-
-        let follow_up = queue.pop_follow_up();
-        assert_eq!(follow_up.len(), 1);
-        assert_user_text(follow_up[0].message(), "f1");
-        assert_eq!(queue.pending_count(), 1);
-
-        let follow_up = queue.pop_follow_up();
-        assert_eq!(follow_up.len(), 1);
-        assert_user_text(follow_up[0].message(), "f2");
-        assert_eq!(queue.pending_count(), 0);
-    }
-
-    #[test]
-    fn message_queue_set_modes_applies_to_existing_messages() {
-        let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
-        queue.push_steering(queued_user_message("s1"));
-        queue.push_steering(queued_user_message("s2"));
-
-        let first = queue.pop_steering();
-        assert_eq!(first.len(), 1);
-        assert_user_text(first[0].message(), "s1");
-
-        queue.set_modes(QueueMode::All, QueueMode::OneAtATime);
-        let remaining = queue.pop_steering();
-        assert_eq!(remaining.len(), 1);
-        assert_user_text(remaining[0].message(), "s2");
-    }
-
-    fn build_switch_test_session(auth: &AuthStorage) -> AgentSession {
-        let registry = ModelRegistry::load(auth, None);
-        let current_entry = registry
-            .find("anthropic", "claude-sonnet-4-5")
-            .expect("anthropic model in registry");
-        let provider = crate::providers::create_provider(&current_entry, None)
-            .expect("create anthropic provider");
-        let tools = ToolRegistry::new(&[], Path::new("."), None);
-        let mut stream_options = StreamOptions {
-            api_key: Some("stale-key".to_string()),
-            ..Default::default()
-        };
-        let _ = stream_options
-            .headers
-            .insert("x-stale-header".to_string(), "stale-value".to_string());
-        let agent = Agent::new(
-            provider,
-            tools,
-            AgentConfig {
-                system_prompt: None,
-                max_tool_iterations: 50,
-                stream_options,
-                block_images: false,
-                model_accepts_images: true,
-                fail_closed_hooks: false,
-                tool_approval: None,
-                keyword_settings: None,
-                max_time: None,
-                turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
-                approval_state: None,
-                bash_settings: None,
-                secrets: None,
-            },
-        );
-
-        let mut session = Session::in_memory();
-        session.header.provider = Some("anthropic".to_string());
-        session.header.model_id = Some("claude-sonnet-4-5".to_string());
-
-        let mut agent_session = AgentSession::new(
-            agent,
-            Arc::new(Mutex::new(session)),
-            false,
-            ResolvedCompactionSettings::default(),
-        );
-        agent_session.set_model_registry(registry);
-        agent_session.set_auth_storage(auth.clone());
-        agent_session
-    }
-
-    #[test]
-    fn compaction_runtime_handle_creates_fallback_runtime() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let auth_path = dir.path().join("auth.json");
-        let auth = AuthStorage::load(auth_path).expect("load auth");
-        let mut agent_session = build_switch_test_session(&auth);
-
-        assert!(agent_session.compaction_runtime.is_none());
-        assert!(agent_session.runtime_handle.is_none());
-
-        let runtime_handle = agent_session
-            .compaction_runtime_handle()
-            .expect("create fallback compaction runtime");
-        let join = runtime_handle.spawn(async { 7_u8 });
-        assert_eq!(futures::executor::block_on(join), 7);
-
-        assert!(agent_session.compaction_runtime.is_some());
-        assert!(agent_session.runtime_handle.is_some());
-    }
-
-    #[test]
-    fn provider_transition_waits_for_active_provider_permit() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-        let runtime_handle = runtime.handle();
-
-        runtime.block_on(async move {
-            let gate = ProviderAdmissionGate::default();
-            let active_cx = crate::agent_cx::AgentCx::for_request();
-            let active_provider = gate
-                .acquire(active_cx.cx())
-                .await
-                .expect("acquire active provider permit");
-
-            let transition_gate = gate.clone();
-            let transition = runtime_handle.spawn(async move {
-                let transition_cx = crate::agent_cx::AgentCx::for_request();
-                let permit = transition_gate
-                    .begin_transition(
-                        "test transition interrupted".to_string(),
-                        transition_cx.cx(),
-                    )
-                    .await
-                    .expect("begin transition");
-                drop(permit);
-            });
-
-            asupersync::time::sleep(
-                asupersync::time::wall_now(),
-                std::time::Duration::from_millis(10),
-            )
-            .await;
-            assert!(
-                !transition.is_finished(),
-                "transition must not pass an active provider future"
-            );
-
-            drop(active_provider);
-            transition.await;
-            assert_eq!(
-                gate.reason().as_deref(),
-                Some("test transition interrupted")
-            );
-            gate.clear();
-            assert!(gate.reason().is_none());
-        });
-    }
-
-    #[test]
-    fn prepared_model_selection_updates_stream_credentials_and_headers() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let auth_path = dir.path().join("auth.json");
-        let mut auth = AuthStorage::load(auth_path).expect("load auth");
-        auth.set(
-            "anthropic",
-            AuthCredential::ApiKey {
-                key: "anthropic-key".to_string(),
-            },
-        );
-        auth.set(
-            "openai",
-            AuthCredential::ApiKey {
-                key: "openai-key".to_string(),
-            },
-        );
-
-        let mut agent_session = build_switch_test_session(&auth);
-        let prepared = agent_session
-            .prepare_model_selection("openai", "gpt-4o", crate::model::ThinkingLevel::Off)
-            .expect("prepare switch");
-        agent_session.install_prepared_model_selection(prepared);
-
-        assert_eq!(agent_session.agent.provider().name(), "openai");
-        assert_eq!(agent_session.agent.provider().model_id(), "gpt-4o");
-        assert_eq!(
-            agent_session.agent.stream_options().api_key.as_deref(),
-            Some("openai-key")
-        );
-        assert!(
-            agent_session.agent.stream_options().headers.is_empty(),
-            "stream headers should be refreshed from selected model entry"
-        );
-    }
-
-    #[test]
-    fn prepared_model_selection_clears_stale_key_for_keyless_target() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let auth_path = dir.path().join("auth.json");
-        let mut auth = AuthStorage::load(auth_path).expect("load auth");
-        auth.set(
-            "anthropic",
-            AuthCredential::ApiKey {
-                key: "anthropic-key".to_string(),
-            },
-        );
-
-        let mut registry = ModelRegistry::load(&auth, None);
-        registry.merge_entries(vec![ModelEntry {
-            model: Model {
-                id: "local-model".to_string(),
-                name: "Local Model".to_string(),
-                api: "openai-completions".to_string(),
-                provider: "acme-local".to_string(),
-                base_url: "https://example.invalid/v1".to_string(),
-                reasoning: true,
-                input: vec![InputType::Text],
-                cost: ModelCost {
-                    input: 0.0,
-                    output: 0.0,
-                    cache_read: 0.0,
-                    cache_write: 0.0,
-                },
-                context_window: 128_000,
-                max_tokens: 8_192,
-                headers: HashMap::new(),
-            },
-            api_key: None,
-            headers: HashMap::new(),
-            auth_header: false,
-            compat: None,
-            oauth_config: None,
-        }]);
-
-        let mut agent_session = build_switch_test_session(&auth);
-        agent_session.set_model_registry(registry);
-        let prepared = agent_session
-            .prepare_model_selection(
-                "acme-local",
-                "local-model",
-                crate::model::ThinkingLevel::Off,
-            )
-            .expect("prepare keyless local model");
-        agent_session.install_prepared_model_selection(prepared);
-
-        assert_eq!(agent_session.agent.provider().name(), "acme-local");
-        assert_eq!(
-            agent_session.agent.stream_options().api_key,
-            None,
-            "stale key must be cleared when target model has no configured key"
-        );
-
-        agent_session.agent.stream_options_mut().api_key = Some("stale-again".to_string());
-        let prepared = agent_session
-            .prepare_model_selection(
-                "acme-local",
-                "local-model",
-                crate::model::ThinkingLevel::Off,
-            )
-            .expect("prepare already-active keyless model");
-        agent_session.install_prepared_model_selection(prepared);
-        assert_eq!(
-            agent_session.agent.stream_options().api_key,
-            None,
-            "an already-active keyless model must not retain a stale credential"
-        );
-    }
-
-    #[test]
-    fn prepared_model_selection_treats_blank_model_key_as_missing_credential() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let auth_path = dir.path().join("auth.json");
-        let auth = AuthStorage::load(auth_path).expect("load auth");
-
-        let mut registry = ModelRegistry::load(&auth, None);
-        registry.merge_entries(vec![ModelEntry {
-            model: Model {
-                id: "blank-model".to_string(),
-                name: "Blank Model".to_string(),
-                api: "openai-completions".to_string(),
-                provider: "acme".to_string(),
-                base_url: "https://example.invalid/v1".to_string(),
-                reasoning: true,
-                input: vec![InputType::Text],
-                cost: ModelCost {
-                    input: 0.0,
-                    output: 0.0,
-                    cache_read: 0.0,
-                    cache_write: 0.0,
-                },
-                context_window: 128_000,
-                max_tokens: 8_192,
-                headers: HashMap::new(),
-            },
-            api_key: Some("   ".to_string()),
-            headers: HashMap::new(),
-            auth_header: true,
-            compat: None,
-            oauth_config: None,
-        }]);
-
-        let mut agent_session = build_switch_test_session(&auth);
-        agent_session.set_model_registry(registry);
-        let err = agent_session
-            .prepare_model_selection("acme", "blank-model", crate::model::ThinkingLevel::Off)
-            .err()
-            .expect("blank keys must not satisfy credential requirements");
-
-        assert!(
-            err.to_string()
-                .contains("Missing credentials for acme/blank-model"),
-            "unexpected error: {err}"
-        );
-        assert_eq!(agent_session.agent.provider().name(), "anthropic");
-        assert_eq!(
-            agent_session.agent.stream_options().api_key,
-            Some("stale-key".to_string()),
-            "failed switches must preserve the prior runtime credentials"
-        );
-    }
-
-    #[test]
-    fn set_provider_model_preserves_session_header_when_switch_fails() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-
-        runtime.block_on(async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let auth_path = dir.path().join("auth.json");
-            let auth = AuthStorage::load(auth_path).expect("load auth");
-            let mut agent_session = build_switch_test_session(&auth);
-
-            {
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let mut session = agent_session
-                    .session
-                    .lock(cx.cx())
-                    .await
-                    .expect("session lock");
-                session.header.provider = Some("anthropic".to_string());
-                session.header.model_id = Some("claude-sonnet-4-5".to_string());
-            }
-
-            let err = agent_session
-                .set_provider_model("missing-provider", "missing-model")
-                .await
-                .expect_err("missing model should not switch");
-            assert!(
-                err.to_string()
-                    .contains("Unable to switch provider/model to missing-provider/missing-model"),
-                "unexpected error: {err}"
-            );
-            assert_eq!(agent_session.agent.provider().name(), "anthropic");
-            assert_eq!(
-                agent_session.agent.provider().model_id(),
-                "claude-sonnet-4-5"
-            );
-
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = agent_session
-                .session
-                .lock(cx.cx())
-                .await
-                .expect("session lock");
-            assert_eq!(session.header.provider.as_deref(), Some("anthropic"));
-            assert_eq!(
-                session.header.model_id.as_deref(),
-                Some("claude-sonnet-4-5")
-            );
-        });
-    }
-
-    #[test]
-    fn set_provider_model_rejects_missing_credentials_without_switching() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-
-        runtime.block_on(async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let auth_path = dir.path().join("auth.json");
-            let auth = AuthStorage::load(auth_path).expect("load auth");
-            let mut agent_session = build_switch_test_session(&auth);
-            let model_scope = agent_session.agent.shared_tools().snapshot().model_scope();
-            let original_model = model_scope.current();
-
-            {
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let mut session = agent_session
-                    .session
-                    .lock(cx.cx())
-                    .await
-                    .expect("session lock");
-                session.header.provider = Some("anthropic".to_string());
-                session.header.model_id = Some("claude-sonnet-4-5".to_string());
-            }
-
-            let err = agent_session
-                .set_provider_model("openai", "gpt-4o")
-                .await
-                .expect_err("missing credentials should abort model switch");
-            assert!(
-                err.to_string()
-                    .contains("Missing credentials for openai/gpt-4o"),
-                "unexpected error: {err}"
-            );
-            assert_eq!(model_scope.current(), original_model);
-            assert_eq!(agent_session.agent.provider().name(), "anthropic");
-            assert_eq!(
-                agent_session.agent.provider().model_id(),
-                "claude-sonnet-4-5"
-            );
-
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = agent_session
-                .session
-                .lock(cx.cx())
-                .await
-                .expect("session lock");
-            assert_eq!(session.header.provider.as_deref(), Some("anthropic"));
-            assert_eq!(
-                session.header.model_id.as_deref(),
-                Some("claude-sonnet-4-5")
-            );
-        });
-    }
-
-    #[test]
-    fn set_provider_model_quarantines_failed_persistence_without_runtime_mutation() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-        let handle = runtime.handle();
-
-        runtime.block_on(async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let auth_path = dir.path().join("auth.json");
-            let mut auth = AuthStorage::load(auth_path).expect("load auth");
-            auth.set(
-                "anthropic",
-                AuthCredential::ApiKey {
-                    key: "anthropic-key".to_string(),
-                },
-            );
-            auth.set(
-                "openai",
-                AuthCredential::ApiKey {
-                    key: "openai-key".to_string(),
-                },
-            );
-            let mut agent_session = build_switch_test_session(&auth);
-            let model_scope = agent_session.agent.shared_tools().snapshot().model_scope();
-            let original_model = model_scope.current();
-            let blocked_path = dir.path().join("blocked.jsonl");
-            std::fs::create_dir_all(&blocked_path).expect("create blocking directory");
-            {
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let mut session = agent_session
-                    .session
-                    .lock(cx.cx())
-                    .await
-                    .expect("session lock");
-                session.path = Some(blocked_path);
-            }
-            agent_session.save_enabled = true;
-            let original_compaction_window =
-                agent_session.compaction_settings().context_window_tokens;
-            agent_session.park_pending_compaction_for_test(&handle, None);
-
-            let err = agent_session
-                .set_provider_model("openai", "gpt-4o")
-                .await
-                .expect_err("unwritable model-selection candidate must fail closed");
-            assert!(err.is_session_persistence(), "unexpected error: {err}");
-            assert_eq!(
-                model_scope.current(),
-                original_model,
-                "a failed model commit must not retarget delegated work"
-            );
-            assert!(
-                agent_session.has_pending_background_compaction(),
-                "a switch that never became durable must not retire the live model's compaction"
-            );
-            assert_eq!(agent_session.agent.provider().name(), "anthropic");
-            assert_eq!(
-                agent_session.agent.provider().model_id(),
-                "claude-sonnet-4-5"
-            );
-            assert_eq!(
-                agent_session.agent.stream_options().api_key.as_deref(),
-                Some("stale-key")
-            );
-            assert_eq!(
-                agent_session.compaction_settings().context_window_tokens,
-                original_compaction_window
-            );
-            assert!(agent_session.provider_admission.reason().is_some());
-
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = agent_session
-                .session
-                .lock(cx.cx())
-                .await
-                .expect("session lock");
-            assert_eq!(session.header.provider.as_deref(), Some("anthropic"));
-            assert_eq!(
-                session.header.model_id.as_deref(),
-                Some("claude-sonnet-4-5")
-            );
-            assert!(
-                session
-                    .entries_for_current_path()
-                    .iter()
-                    .all(|entry| !matches!(entry, crate::session::SessionEntry::ModelChange(_)))
-            );
-            drop(session);
-
-            let blocked = agent_session
-                .sync_runtime_selection_from_session_header()
-                .await
-                .expect_err("quarantine must block later provider re-entry");
-            assert!(blocked.is_session_persistence());
-        });
-    }
-
-    #[test]
-    fn set_thinking_level_quarantines_failed_persistence_without_live_mutation() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-
-        runtime.block_on(async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let auth_path = dir.path().join("auth.json");
-            let auth = AuthStorage::load(auth_path).expect("load auth");
-            let mut agent_session = build_switch_test_session(&auth);
-            let blocked_path = dir.path().join("blocked.jsonl");
-            std::fs::create_dir_all(&blocked_path).expect("create blocking directory");
-            {
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let mut session = agent_session
-                    .session
-                    .lock(cx.cx())
-                    .await
-                    .expect("session lock");
-                session.path = Some(blocked_path);
-            }
-            agent_session.save_enabled = true;
-            let original_thinking = agent_session.agent.stream_options().thinking_level;
-
-            let err = agent_session
-                .set_thinking_level(crate::model::ThinkingLevel::High)
-                .await
-                .expect_err("unwritable thinking candidate must fail closed");
-            assert!(err.is_session_persistence(), "unexpected error: {err}");
-            assert_eq!(
-                agent_session.agent.stream_options().thinking_level,
-                original_thinking
-            );
-            assert!(agent_session.provider_admission.reason().is_some());
-
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = agent_session
-                .session
-                .lock(cx.cx())
-                .await
-                .expect("session lock");
-            assert!(session.header.thinking_level.is_none());
-            assert!(
-                session
-                    .entries_for_current_path()
-                    .iter()
-                    .all(|entry| !matches!(
-                        entry,
-                        crate::session::SessionEntry::ThinkingLevelChange(_)
-                    ))
-            );
-        });
-    }
-
-    /// bd-5jfkl: a setter cancelled while its save is in flight. The write may
-    /// still land on the blocking thread, so the durable outcome is unknown;
-    /// the live runtime and live Session must stay as they were and provider
-    /// re-entry must be quarantined rather than silently resumed.
-    #[test]
-    fn set_thinking_level_cancelled_mid_save_quarantines_without_live_mutation() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .blocking_threads(1, 1)
-            .build()
-            .expect("build runtime");
-
-        runtime.block_on(async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let auth = AuthStorage::load(dir.path().join("auth.json")).expect("load auth");
-            let mut agent_session = build_switch_test_session(&auth);
-            {
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let mut session = agent_session
-                    .session
-                    .lock(cx.cx())
-                    .await
-                    .expect("session lock");
-                session.session_dir = Some(dir.path().to_path_buf());
-                session.path = Some(dir.path().join("cancelled.jsonl"));
-            }
-            agent_session.save_enabled = true;
-            let original_thinking = agent_session.agent.stream_options().thinking_level;
-
-            {
-                let setter = agent_session.set_thinking_level(crate::model::ThinkingLevel::High);
-                futures::pin_mut!(setter);
-                assert!(
-                    futures::poll!(setter.as_mut()).is_pending(),
-                    "the first poll must park on the blocking save"
-                );
-            }
-
-            assert_eq!(
-                agent_session.agent.stream_options().thinking_level,
-                original_thinking
-            );
-            assert!(
-                agent_session.ensure_provider_reentry_allowed().is_err(),
-                "a cancelled transition must leave provider re-entry quarantined"
-            );
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = agent_session
-                .session
-                .lock(cx.cx())
-                .await
-                .expect("session lock after cancellation");
-            assert!(session.header.thinking_level.is_none());
-        });
-    }
-
-    #[test]
-    fn set_provider_model_clamps_thinking_for_non_reasoning_targets() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-
-        runtime.block_on(async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let auth_path = dir.path().join("auth.json");
-            let auth = AuthStorage::load(auth_path).expect("load auth");
-
-            let mut registry = ModelRegistry::load(&auth, None);
-            registry.merge_entries(vec![ModelEntry {
-                model: Model {
-                    id: "plain-model".to_string(),
-                    name: "Plain Model".to_string(),
-                    api: "openai-completions".to_string(),
-                    provider: "acme".to_string(),
-                    base_url: "https://example.invalid/v1".to_string(),
-                    reasoning: false,
-                    input: vec![InputType::Text],
-                    cost: ModelCost {
-                        input: 0.0,
-                        output: 0.0,
-                        cache_read: 0.0,
-                        cache_write: 0.0,
-                    },
-                    context_window: 128_000,
-                    max_tokens: 8_192,
-                    headers: HashMap::new(),
-                },
-                api_key: None,
-                headers: HashMap::new(),
-                auth_header: false,
-                compat: None,
-                oauth_config: None,
-            }]);
-
-            let mut agent_session = build_switch_test_session(&auth);
-            agent_session.set_model_registry(registry);
-            agent_session.agent.stream_options_mut().thinking_level =
-                Some(crate::model::ThinkingLevel::High);
-
-            {
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let mut session = agent_session
-                    .session
-                    .lock(cx.cx())
-                    .await
-                    .expect("session lock");
-                session.header.thinking_level = Some("high".to_string());
-            }
-
-            agent_session
-                .set_provider_model("acme", "plain-model")
-                .await
-                .expect("switch should clamp unsupported thinking");
-
-            assert_eq!(agent_session.agent.provider().name(), "acme");
-            assert_eq!(agent_session.agent.provider().model_id(), "plain-model");
-            assert_eq!(
-                agent_session.agent.stream_options().thinking_level,
-                Some(crate::model::ThinkingLevel::Off)
-            );
-            assert_eq!(
-                agent_session.agent.keyword_max_thinking_level,
-                crate::model::ThinkingLevel::Off,
-                "ultrathink must use the target model's clamped maximum"
-            );
-            assert!(
-                !agent_session.agent.model_accepts_images(),
-                "runtime model switches must install the target image policy"
-            );
-            assert_eq!(
-                agent_session.compaction_settings().context_window_tokens,
-                128_000,
-                "runtime model switches must install the target compaction window"
-            );
-
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = agent_session
-                .session
-                .lock(cx.cx())
-                .await
-                .expect("session lock");
-            assert_eq!(session.header.provider.as_deref(), Some("acme"));
-            assert_eq!(session.header.model_id.as_deref(), Some("plain-model"));
-            assert_eq!(session.header.thinking_level.as_deref(), Some("off"));
-        });
-    }
-
-    #[test]
-    fn bare_provider_replacement_resets_catalog_controls_fail_closed() {
-        let tools = ToolRegistry::new(&[], Path::new("."), None);
-        let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
-        agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
-        agent.set_tool_call_dialect(crate::dialects::Dialect::Xmlish);
-
-        agent.set_provider(Arc::new(SilentProvider));
-
-        assert_eq!(
-            agent.keyword_max_thinking_level,
-            crate::model::ThinkingLevel::Off,
-            "provider replacement without registry metadata must not inherit the prior cap"
-        );
-        assert_eq!(
-            agent.tool_call_dialect,
-            crate::dialects::Dialect::Native,
-            "provider replacement without registry metadata must not inherit repair opt-in"
-        );
-    }
-
-    #[test]
-    fn tool_model_scope_tracks_provider_swaps_without_changing_captured_selections() {
-        let tools = ToolRegistry::new(&[], Path::new("."), None);
-        let standalone_scope = tools.model_scope();
-        assert!(standalone_scope.current().is_none());
-        let shared = crate::tools::SharedToolRegistry::new(tools);
-        let old_snapshot = shared.snapshot();
-        let mut agent = Agent::with_shared_tools(
-            Arc::new(SilentProvider),
-            shared.clone(),
-            AgentConfig {
-                stream_options: StreamOptions {
-                    api_key: Some("private-parent-credential".to_string()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
-        let captured = standalone_scope.current().expect("initial model affinity");
-        assert_eq!(captured.provider, "silent-provider");
-        assert_eq!(captured.model, "test-model");
-
-        let other = Agent::new(
-            Arc::new(SilentProvider),
-            ToolRegistry::from_tools(Vec::new()),
-            AgentConfig::default(),
-        );
-        let fallback = crate::models::ad_hoc_model_entry("openrouter", "vendor/fallback-model")
-            .expect("fallback entry");
-        agent.set_provider(
-            crate::providers::create_provider(&fallback, None).expect("fallback provider"),
-        );
-        let expected = crate::tools::ToolModelSelection {
-            provider: "openrouter".to_string(),
-            model: "vendor/fallback-model".to_string(),
-        };
-        assert_eq!(standalone_scope.current(), Some(expected.clone()));
-        assert_eq!(old_snapshot.model_scope().current(), Some(expected.clone()));
-        assert_eq!(shared.snapshot().model_scope().current(), Some(expected));
-        assert_eq!(captured.provider, "silent-provider");
-        assert_eq!(captured.model, "test-model");
-        assert_eq!(
-            other.shared_tools().snapshot().model_scope().current(),
-            Some(captured.clone()),
-            "another registry must retain its own parent model"
-        );
-
-        agent.set_provider(Arc::new(SilentProvider));
-        assert_eq!(standalone_scope.current(), Some(captured));
-    }
-
-    struct ModelScopeProbeTool {
-        name: &'static str,
-        bindings: StdArc<StdTestMutex<Vec<crate::tools::ToolModelScope>>>,
-    }
-
-    #[async_trait]
-    impl crate::tools::Tool for ModelScopeProbeTool {
-        fn name(&self) -> &str {
-            self.name
-        }
-
-        fn label(&self) -> &str {
-            self.name
-        }
-
-        fn description(&self) -> &str {
-            self.name
-        }
-
-        fn parameters(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
-        }
-
-        fn bind_model_scope(&mut self, scope: crate::tools::ToolModelScope) {
-            self.bindings.lock().unwrap().push(scope);
-        }
-
-        async fn execute(
-            &self,
-            _tool_call_id: &str,
-            _input: serde_json::Value,
-            _on_update: Option<Box<dyn Fn(crate::tools::ToolUpdate) + Send + Sync>>,
-        ) -> Result<crate::tools::ToolOutput> {
-            panic!("model affinity binding must not execute a tool");
-        }
-    }
-
-    #[test]
-    fn newly_mounted_and_replaced_tools_share_the_live_model_scope() {
-        let bindings = StdArc::new(StdTestMutex::new(Vec::new()));
-        let probe = |name| -> Box<dyn crate::tools::Tool> {
-            Box::new(ModelScopeProbeTool {
-                name,
-                bindings: StdArc::clone(&bindings),
-            })
-        };
-        let tools = ToolRegistry::from_tools(vec![probe("initial")]);
-        let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
-        let shared = agent.shared_tools();
-        let old_snapshot = shared.snapshot();
-        shared.update(|registry| {
-            registry.push(probe("pushed"));
-            registry.extend(vec![probe("extended")]);
-        });
-
-        let target = crate::models::ad_hoc_model_entry("openai", "next-model").unwrap();
-        agent.set_provider(crate::providers::create_provider(&target, None).unwrap());
-        shared.update(|registry| {
-            registry.push(probe("pushed"));
-            registry.extend(vec![probe("extended"), probe("late")]);
-        });
-
-        assert_eq!(old_snapshot.tools().len(), 1);
-        assert_eq!(shared.snapshot().tools().len(), 4);
-        let bindings = bindings.lock().unwrap();
-        assert_eq!(bindings.len(), 6, "initial, mounted, and replacement tools");
-        for scope in bindings.iter() {
-            assert_eq!(
-                scope.current(),
-                Some(crate::tools::ToolModelSelection {
-                    provider: "openai".to_string(),
-                    model: "next-model".to_string(),
-                })
-            );
-        }
-        agent.set_provider(Arc::new(SilentProvider));
-        for scope in bindings.iter() {
-            assert_eq!(scope.current().unwrap().provider, "silent-provider");
-        }
-    }
-
-    #[test]
-    fn set_provider_model_records_model_change_once() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-
-        runtime.block_on(async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let auth_path = dir.path().join("auth.json");
-            let mut auth = AuthStorage::load(auth_path).expect("load auth");
-            auth.set(
-                "anthropic",
-                AuthCredential::ApiKey {
-                    key: "anthropic-key".to_string(),
-                },
-            );
-            auth.set(
-                "openai",
-                AuthCredential::ApiKey {
-                    key: "openai-key".to_string(),
-                },
-            );
-
-            let mut agent_session = build_switch_test_session(&auth);
-            let model_scope = agent_session.agent.shared_tools().snapshot().model_scope();
-            agent_session
-                .set_provider_model("openai", "gpt-4o")
-                .await
-                .expect("switch model");
-            agent_session
-                .set_provider_model("openai", "gpt-4o")
-                .await
-                .expect("repeat same model");
-            assert_eq!(
-                model_scope.current(),
-                Some(crate::tools::ToolModelSelection {
-                    provider: "openai".to_string(),
-                    model: "gpt-4o".to_string(),
-                })
-            );
-
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = agent_session
-                .session
-                .lock(cx.cx())
-                .await
-                .expect("session lock");
-            let model_changes = session
-                .entries_for_current_path()
-                .iter()
-                .filter(|entry| matches!(entry, crate::session::SessionEntry::ModelChange(_)))
-                .count();
-            assert_eq!(model_changes, 1);
-        });
-    }
-
-    #[test]
-    fn set_provider_model_persists_canonical_registry_identity() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-
-        runtime.block_on(async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let auth_path = dir.path().join("auth.json");
-            let mut auth = AuthStorage::load(auth_path).expect("load auth");
-            auth.set(
-                "openai",
-                AuthCredential::ApiKey {
-                    key: "openai-key".to_string(),
-                },
-            );
-
-            let mut agent_session = build_switch_test_session(&auth);
-            agent_session
-                .set_provider_model(" OpenAI ", "GPT-4O")
-                .await
-                .expect("mixed-case alias should resolve");
-
-            assert_eq!(agent_session.agent.provider().name(), "openai");
-            assert_eq!(agent_session.agent.provider().model_id(), "gpt-4o");
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = agent_session
-                .session
-                .lock(cx.cx())
-                .await
-                .expect("session lock");
-            assert_eq!(session.header.provider.as_deref(), Some("openai"));
-            assert_eq!(session.header.model_id.as_deref(), Some("gpt-4o"));
-            assert_eq!(
-                session.effective_model_for_current_path(),
-                Some(("openai".to_string(), "gpt-4o".to_string()))
-            );
-        });
-    }
-
-    #[test]
-    fn model_and_thinking_transitions_reopen_with_complete_state() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-
-        runtime.block_on(async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let auth_path = dir.path().join("auth.json");
-            let mut auth = AuthStorage::load(auth_path).expect("load auth");
-            auth.set(
-                "openai",
-                AuthCredential::ApiKey {
-                    key: "openai-key".to_string(),
-                },
-            );
-            let mut agent_session = build_switch_test_session(&auth);
-            {
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let mut session = agent_session
-                    .session
-                    .lock(cx.cx())
-                    .await
-                    .expect("session lock");
-                let mut persistent = Session::create_with_dir(Some(dir.path().join("sessions")));
-                persistent.header.provider = Some("anthropic".to_string());
-                persistent.header.model_id = Some("claude-sonnet-4-5".to_string());
-                *session = persistent;
-            }
-            agent_session.save_enabled = true;
-
-            agent_session
-                .set_provider_model("openai", "gpt-5.5")
-                .await
-                .expect("persist model transition");
-            agent_session
-                .set_thinking_level(crate::model::ThinkingLevel::High)
-                .await
-                .expect("persist thinking transition");
-
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = agent_session
-                .session
-                .lock(cx.cx())
-                .await
-                .expect("session lock");
-            let path = session.path.clone().expect("persisted session path");
-            drop(session);
-            let reopened = Session::open(path.to_string_lossy().as_ref())
-                .await
-                .expect("reopen persisted transitions");
-            assert_eq!(reopened.header.provider.as_deref(), Some("openai"));
-            assert_eq!(reopened.header.model_id.as_deref(), Some("gpt-5.5"));
-            assert_eq!(reopened.header.thinking_level.as_deref(), Some("high"));
-            assert_eq!(
-                reopened.effective_model_for_current_path(),
-                Some(("openai".to_string(), "gpt-5.5".to_string()))
-            );
-            assert_eq!(
-                reopened
-                    .effective_thinking_level_for_current_path()
-                    .as_deref(),
-                Some("high")
-            );
-        });
-    }
-
-    #[test]
-    fn sync_runtime_selection_from_session_header_clamps_and_normalizes_thinking() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-
-        runtime.block_on(async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let auth_path = dir.path().join("auth.json");
-            let auth = AuthStorage::load(auth_path).expect("load auth");
-
-            let mut registry = ModelRegistry::load(&auth, None);
-            registry.merge_entries(vec![ModelEntry {
-                model: Model {
-                    id: "plain-model".to_string(),
-                    name: "Plain Model".to_string(),
-                    api: "openai-completions".to_string(),
-                    provider: "acme".to_string(),
-                    base_url: "https://example.invalid/v1".to_string(),
-                    reasoning: false,
-                    input: vec![InputType::Text],
-                    cost: ModelCost {
-                        input: 0.0,
-                        output: 0.0,
-                        cache_read: 0.0,
-                        cache_write: 0.0,
-                    },
-                    context_window: 128_000,
-                    max_tokens: 8_192,
-                    headers: HashMap::new(),
-                },
-                api_key: None,
-                headers: HashMap::new(),
-                auth_header: false,
-                compat: None,
-                oauth_config: None,
-            }]);
-
-            let mut agent_session = build_switch_test_session(&auth);
-            agent_session.set_model_registry(registry);
-            agent_session.agent.stream_options_mut().thinking_level =
-                Some(crate::model::ThinkingLevel::High);
-
-            {
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let mut session = agent_session
-                    .session
-                    .lock(cx.cx())
-                    .await
-                    .expect("session lock");
-                session.header.provider = Some("acme".to_string());
-                session.header.model_id = Some("plain-model".to_string());
-                session.header.thinking_level = Some("high".to_string());
-            }
-
-            agent_session
-                .sync_runtime_selection_from_session_header()
-                .await
-                .expect("sync runtime selection");
-
-            assert_eq!(agent_session.agent.provider().name(), "acme");
-            assert_eq!(agent_session.agent.provider().model_id(), "plain-model");
-            assert_eq!(
-                agent_session.agent.stream_options().thinking_level,
-                Some(crate::model::ThinkingLevel::Off)
-            );
-
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = agent_session
-                .session
-                .lock(cx.cx())
-                .await
-                .expect("session lock");
-            assert_eq!(session.header.thinking_level.as_deref(), Some("off"));
-            let thinking_changes = session
-                .entries_for_current_path()
-                .iter()
-                .filter(|entry| {
-                    matches!(entry, crate::session::SessionEntry::ThinkingLevelChange(_))
-                })
-                .count();
-            assert_eq!(thinking_changes, 1);
-        });
-    }
-
-    #[test]
-    fn sync_runtime_selection_from_session_header_clamps_current_thinking_when_header_omits_it() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-
-        runtime.block_on(async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let auth_path = dir.path().join("auth.json");
-            let auth = AuthStorage::load(auth_path).expect("load auth");
-
-            let mut registry = ModelRegistry::load(&auth, None);
-            registry.merge_entries(vec![ModelEntry {
-                model: Model {
-                    id: "plain-model".to_string(),
-                    name: "Plain Model".to_string(),
-                    api: "openai-completions".to_string(),
-                    provider: "acme".to_string(),
-                    base_url: "https://example.invalid/v1".to_string(),
-                    reasoning: false,
-                    input: vec![InputType::Text],
-                    cost: ModelCost {
-                        input: 0.0,
-                        output: 0.0,
-                        cache_read: 0.0,
-                        cache_write: 0.0,
-                    },
-                    context_window: 128_000,
-                    max_tokens: 8_192,
-                    headers: HashMap::new(),
-                },
-                api_key: None,
-                headers: HashMap::new(),
-                auth_header: false,
-                compat: None,
-                oauth_config: None,
-            }]);
-
-            let mut agent_session = build_switch_test_session(&auth);
-            agent_session.set_model_registry(registry);
-            agent_session.agent.stream_options_mut().thinking_level =
-                Some(crate::model::ThinkingLevel::High);
-
-            {
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let mut session = agent_session
-                    .session
-                    .lock(cx.cx())
-                    .await
-                    .expect("session lock");
-                session.header.provider = Some("acme".to_string());
-                session.header.model_id = Some("plain-model".to_string());
-                session.header.thinking_level = None;
-            }
-
-            agent_session
-                .sync_runtime_selection_from_session_header()
-                .await
-                .expect("sync runtime selection");
-
-            assert_eq!(agent_session.agent.provider().name(), "acme");
-            assert_eq!(agent_session.agent.provider().model_id(), "plain-model");
-            assert_eq!(
-                agent_session.agent.stream_options().thinking_level,
-                Some(crate::model::ThinkingLevel::Off)
-            );
-
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = agent_session
-                .session
-                .lock(cx.cx())
-                .await
-                .expect("session lock");
-            assert_eq!(session.header.thinking_level.as_deref(), Some("off"));
-            let thinking_changes = session
-                .entries_for_current_path()
-                .iter()
-                .filter(|entry| {
-                    matches!(entry, crate::session::SessionEntry::ThinkingLevelChange(_))
-                })
-                .count();
-            assert_eq!(thinking_changes, 1);
-        });
-    }
-
-    #[test]
-    fn sync_runtime_selection_from_session_header_rejects_missing_credentials() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-
-        runtime.block_on(async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let auth_path = dir.path().join("auth.json");
-            let auth = AuthStorage::load(auth_path).expect("load auth");
-            let mut agent_session = build_switch_test_session(&auth);
-
-            {
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let mut session = agent_session
-                    .session
-                    .lock(cx.cx())
-                    .await
-                    .expect("session lock");
-                session.header.provider = Some("openai".to_string());
-                session.header.model_id = Some("gpt-4o".to_string());
-            }
-
-            let err = agent_session
-                .sync_runtime_selection_from_session_header()
-                .await
-                .expect_err("sync should reject switching to a credentialed target without a key");
-            assert!(
-                err.to_string()
-                    .contains("Missing credentials for openai/gpt-4o"),
-                "unexpected error: {err}"
-            );
-            assert_eq!(agent_session.agent.provider().name(), "anthropic");
-            assert_eq!(
-                agent_session.agent.provider().model_id(),
-                "claude-sonnet-4-5"
-            );
-
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = agent_session
-                .session
-                .lock(cx.cx())
-                .await
-                .expect("session lock");
-            assert_eq!(session.header.provider.as_deref(), Some("openai"));
-            assert_eq!(session.header.model_id.as_deref(), Some("gpt-4o"));
-        });
-    }
-
-    #[test]
-    fn sync_runtime_selection_quarantines_failed_normalization_without_live_mutation() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-
-        runtime.block_on(async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let auth_path = dir.path().join("auth.json");
-            let mut auth = AuthStorage::load(auth_path).expect("load auth");
-            auth.set(
-                "openai",
-                AuthCredential::ApiKey {
-                    key: "openai-key".to_string(),
-                },
-            );
-            let mut agent_session = build_switch_test_session(&auth);
-            let blocked_path = dir.path().join("blocked.jsonl");
-            std::fs::create_dir_all(&blocked_path).expect("create blocking directory");
-            {
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let mut session = agent_session
-                    .session
-                    .lock(cx.cx())
-                    .await
-                    .expect("session lock");
-                session.path = Some(blocked_path);
-                session.header.provider = Some("openai".to_string());
-                session.header.model_id = Some("GPT-4O".to_string());
-                session.header.thinking_level = Some("high".to_string());
-            }
-            agent_session.save_enabled = true;
-            let original_provider = agent_session.agent.provider();
-            let original_options = agent_session.agent.stream_options().clone();
-
-            let err = agent_session
-                .sync_runtime_selection_from_session_header()
-                .await
-                .expect_err("unwritable normalization must fail closed");
-            assert!(err.is_session_persistence(), "unexpected error: {err}");
-            assert_eq!(
-                agent_session.agent.provider().name(),
-                original_provider.name()
-            );
-            assert_eq!(
-                agent_session.agent.provider().model_id(),
-                original_provider.model_id()
-            );
-            assert_eq!(
-                agent_session.agent.stream_options().api_key,
-                original_options.api_key
-            );
-            assert_eq!(
-                agent_session.agent.stream_options().thinking_level,
-                original_options.thinking_level
-            );
-            assert!(agent_session.provider_admission.reason().is_some());
-
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = agent_session
-                .session
-                .lock(cx.cx())
-                .await
-                .expect("session lock");
-            assert_eq!(session.header.provider.as_deref(), Some("openai"));
-            assert_eq!(session.header.model_id.as_deref(), Some("GPT-4O"));
-            assert_eq!(session.header.thinking_level.as_deref(), Some("high"));
-            drop(session);
-
-            let compact_err = agent_session
-                .compact_now(|_| {})
-                .await
-                .expect_err("compaction must honor transition quarantine");
-            assert!(compact_err.is_session_persistence());
-            let extension_err = agent_session
-                .execute_extension_command("unused", "", 1, |_| {})
-                .await
-                .expect_err("extension execution must honor transition quarantine");
-            assert!(extension_err.is_session_persistence());
-        });
-    }
-
-    #[test]
-    fn set_provider_model_allows_current_model_without_registry() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build runtime");
-
-        runtime.block_on(async {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let auth_path = dir.path().join("auth.json");
-            let auth = AuthStorage::load(auth_path).expect("load auth");
-            let mut agent_session = build_switch_test_session(&auth);
-            agent_session.model_registry = None;
-            agent_session.agent.stream_options_mut().thinking_level =
-                Some(crate::model::ThinkingLevel::High);
-
-            agent_session
-                .set_provider_model("anthropic", "claude-sonnet-4-5")
-                .await
-                .expect("re-persisting the current model should succeed without a registry");
-
-            assert_eq!(agent_session.agent.provider().name(), "anthropic");
-            assert_eq!(
-                agent_session.agent.provider().model_id(),
-                "claude-sonnet-4-5"
-            );
-            assert_eq!(
-                agent_session.agent.stream_options().thinking_level,
-                Some(crate::model::ThinkingLevel::High)
-            );
-
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = agent_session
-                .session
-                .lock(cx.cx())
-                .await
-                .expect("session lock");
-            assert_eq!(session.header.provider.as_deref(), Some("anthropic"));
-            assert_eq!(
-                session.header.model_id.as_deref(),
-                Some("claude-sonnet-4-5")
-            );
-            assert_eq!(session.header.thinking_level.as_deref(), Some("high"));
-        });
-    }
-
-    #[test]
-    fn auto_compaction_start_serializes_to_pi_mono_format() {
-        let event = AgentEvent::AutoCompactionStart {
-            reason: "threshold".to_string(),
-        };
-        let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "auto_compaction_start");
-        assert_eq!(json["reason"], "threshold");
-    }
-
-    #[test]
-    fn auto_compaction_end_serializes_to_pi_mono_format() {
-        let event = AgentEvent::AutoCompactionEnd {
-            result: Some(serde_json::json!({
-                "summary": "Compacted",
-                "firstKeptEntryId": "abc123",
-                "tokensBefore": 50000,
-                "details": { "readFiles": [], "modifiedFiles": [] }
-            })),
-            aborted: false,
-            will_retry: true,
-            error_message: None,
-        };
-        let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "auto_compaction_end");
-        assert!(json["result"].is_object());
-        assert_eq!(json["aborted"], false);
-        assert_eq!(json["willRetry"], true);
-        assert!(json.get("errorMessage").is_none());
-    }
-
-    #[test]
-    fn auto_compaction_end_with_error_serializes_error_message() {
-        let event = AgentEvent::AutoCompactionEnd {
-            result: None,
-            aborted: false,
-            will_retry: false,
-            error_message: Some("compaction failed".to_string()),
-        };
-        let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "auto_compaction_end");
-        assert!(json.get("result").is_none());
-        assert_eq!(json["errorMessage"], "compaction failed");
-    }
-
-    #[test]
-    fn apply_compaction_result_emits_structured_result_payload() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = Arc::new(SilentProvider);
-            let tools = ToolRegistry::new(&[], Path::new("."), None);
-            let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Arc::new(Mutex::new(Session::in_memory()));
-            let agent_session =
-                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
-
-            let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> =
-                Arc::new(std::sync::Mutex::new(Vec::new()));
-            let sink = Arc::clone(&events);
-            let on_event: AgentEventHandler = Arc::new(move |event| {
-                sink.lock().expect("lock compaction events").push(event);
-            });
-
-            let result = compaction::CompactionResult {
-                summary: "Compacted 10 messages into 2".to_string(),
-                first_kept_entry_id: "entry-5".to_string(),
-                tokens_before: 12_000,
-                details: compaction::CompactionDetails {
-                    read_files: vec!["src/main.rs".to_string()],
-                    modified_files: vec!["src/agent.rs".to_string()],
-                    mode: None,
-                },
-                snap_payload: None,
-            };
-            let provider_admission = agent_session
-                .provider_admission
-                .acquire(&asupersync::Cx::for_testing())
-                .await
-                .expect("provider admission");
-
-            agent_session
-                .apply_compaction_result(result, on_event, provider_admission)
-                .await
-                .expect("apply compaction result");
-
-            let payload = {
-                let guard = events.lock().expect("lock captured events");
-                guard
-                    .iter()
-                    .find_map(|event| match event {
-                        AgentEvent::AutoCompactionEnd {
-                            result: Some(result),
-                            ..
-                        } => Some(result.clone()),
-                        _ => None,
-                    })
-                    .expect("auto compaction end payload")
-            };
-
-            assert_eq!(payload["summary"], "Compacted 10 messages into 2");
-            assert_eq!(payload["firstKeptEntryId"], "entry-5");
-            assert_eq!(payload["tokensBefore"], 12_000);
-            // tokensAfter is the estimated post-compaction context: additive,
-            // present, positive, and strictly smaller than tokensBefore (the
-            // whole point of compaction — it shrinks the context). It is the
-            // char-based heuristic over the post-compaction current path, not
-            // the hand-set tokens_before.
-            let tokens_after = payload["tokensAfter"]
-                .as_u64()
-                .expect("tokensAfter present and integer");
-            assert!(tokens_after > 0, "tokensAfter must be positive");
-            assert!(
-                tokens_after < 12_000,
-                "tokensAfter ({tokens_after}) must be < tokensBefore"
-            );
-            assert_eq!(payload["details"]["readFiles"], json!(["src/main.rs"]));
-            assert_eq!(payload["details"]["modifiedFiles"], json!(["src/agent.rs"]));
-        });
-    }
-
-    #[test]
-    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
-    #[allow(clippy::significant_drop_tightening)]
-    fn session_compact_hook_can_reenter_provider_after_transition_install() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let temp_dir = tempfile::tempdir().expect("tempdir");
-            let entry_path = temp_dir.path().join("compaction-reentry.mjs");
-            std::fs::write(
-                &entry_path,
-                r#"
-                import { complete } from "@mariozechner/pi-ai";
-
-                export default function init(pi) {
-                  pi.on("session_compact", async () => {
-                    await complete(
-                      { id: "capture-model" },
-                      [{ role: "user", content: "after compaction" }],
-                      { maxTokens: 16 }
-                    );
-                  });
-                }
-                "#,
-            )
-            .expect("write compaction extension");
-
-            let calls = Arc::new(StdMutex::new(Vec::new()));
-            let provider = Arc::new(PiAiCaptureProvider {
-                calls: Arc::clone(&calls),
-            });
-            let tools = ToolRegistry::new(&[], temp_dir.path(), None);
-            let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session =
-                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
-            agent_session
-                .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
-                .await
-                .expect("enable compaction extension");
-
-            let result = compaction::CompactionResult {
-                summary: "Compacted before provider re-entry".to_string(),
-                first_kept_entry_id: "entry-5".to_string(),
-                tokens_before: 12_000,
-                details: compaction::CompactionDetails {
-                    read_files: Vec::new(),
-                    modified_files: Vec::new(),
-                    mode: None,
-                },
-                snap_payload: None,
-            };
-            let provider_admission = agent_session
-                .provider_admission
-                .acquire(&asupersync::Cx::for_testing())
-                .await
-                .expect("provider admission");
-            let on_event: AgentEventHandler = Arc::new(|_| {});
-
-            let outcome = asupersync::time::timeout(
-                asupersync::time::wall_now(),
-                Duration::from_secs(5),
-                agent_session.apply_compaction_result(result, on_event, provider_admission),
-            )
-            .await
-            .expect("session_compact hook must not deadlock on provider admission");
-            outcome.expect("apply compaction result");
-
-            let captured = calls
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(
-                captured.len(),
-                1,
-                "post-install session_compact hook must reach the provider exactly once"
-            );
-            assert!(matches!(
-                captured[0].messages.as_slice(),
-                [Message::User(UserMessage {
-                    content: UserContent::Text(text),
-                    ..
-                })] if text == "after compaction"
-            ));
-        });
-    }
-
-    #[test]
-    // Guard scope is deliberate; tightening drops would change lock-hold semantics.
-    #[allow(clippy::significant_drop_tightening)]
-    fn compaction_persistence_failure_preserves_live_session_and_quarantines_provider() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let blocked_root = tempfile::tempdir().expect("tempdir");
-            let blocked_session_dir = blocked_root.path().join("not-a-directory");
-            std::fs::write(&blocked_session_dir, b"blocked").expect("write path blocker");
-
-            let provider = Arc::new(SilentProvider);
-            let tools = ToolRegistry::new(&[], Path::new("."), None);
-            let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
-                blocked_session_dir,
-            ))));
-            let agent_session = AgentSession::new(
-                agent,
-                Arc::clone(&session),
-                true,
-                ResolvedCompactionSettings::default(),
-            );
-            let metrics_before = {
-                let cx = asupersync::Cx::for_testing();
-                session
-                    .lock(&cx)
-                    .await
-                    .expect("session lock")
-                    .autosave_metrics()
-            };
-
-            let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> =
-                Arc::new(std::sync::Mutex::new(Vec::new()));
-            let sink = Arc::clone(&events);
-            let on_event: AgentEventHandler = Arc::new(move |event| {
-                sink.lock().expect("lock compaction events").push(event);
-            });
-            let result = compaction::CompactionResult {
-                summary: "private candidate must not leak".to_string(),
-                first_kept_entry_id: "entry-5".to_string(),
-                tokens_before: 12_000,
-                details: compaction::CompactionDetails {
-                    read_files: Vec::new(),
-                    modified_files: Vec::new(),
-                    mode: None,
-                },
-                snap_payload: None,
-            };
-            let provider_admission = agent_session
-                .provider_admission
-                .acquire(&asupersync::Cx::for_testing())
-                .await
-                .expect("provider admission");
-
-            let err = agent_session
-                .apply_compaction_result(result, on_event, provider_admission)
-                .await
-                .expect_err("blocked persistence must fail");
-            assert!(
-                err.to_string()
-                    .contains("compaction persistence remained indeterminate"),
-                "unexpected persistence error: {err}"
-            );
-            assert!(
-                agent_session.provider_admission.reason().is_some_and(
-                    |reason| reason.contains("compaction persistence remained indeterminate")
-                ),
-                "indeterminate persistence must quarantine provider re-entry"
-            );
-
-            let cx = asupersync::Cx::for_testing();
-            let session = session.lock(&cx).await.expect("session lock after failure");
-            assert!(
-                session
-                    .entries_for_current_path()
-                    .iter()
-                    .all(|entry| !matches!(
-                        entry,
-                        crate::session::SessionEntry::Compaction(compaction)
-                            if compaction.summary == "private candidate must not leak"
-                    )),
-                "failed private candidate must not be installed into the live session"
-            );
-            let metrics_after = session.autosave_metrics();
-            assert_eq!(
-                metrics_after.pending_mutations, metrics_before.pending_mutations,
-                "failed private candidate must not alter the live autosave queue"
-            );
-            assert_eq!(
-                metrics_after.flush_started, metrics_before.flush_started,
-                "candidate flush attempts must remain private"
-            );
-
-            let events = events.lock().expect("lock compaction events");
-            assert_eq!(events.len(), 1, "failure must emit one terminal event");
-            assert!(matches!(
-                &events[0],
-                AgentEvent::AutoCompactionEnd {
-                    result: None,
-                    aborted: false,
-                    will_retry: false,
-                    error_message: Some(message),
-                } if message.contains("compaction persistence remained indeterminate")
-            ));
-        });
-    }
-
-    #[test]
-    fn maybe_compact_forces_local_compaction_when_quota_blocked_and_oversized() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = Arc::new(SilentProvider);
-            let tools = ToolRegistry::new(&[], Path::new("."), None);
-            let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Arc::new(Mutex::new(Session::in_memory()));
-
-            // Small window so a handful of messages is "catastrophically"
-            // oversized (>= 2x window) by heuristic estimation (chars / 3).
-            let settings = ResolvedCompactionSettings {
-                enabled: true,
-                context_window_tokens: 100,
-                reserve_tokens: 10,
-                keep_recent_tokens: 30,
-                mode: compaction::AutoCompactionMode::default(),
-                render_mode: compaction::CompactionRenderMode::default(),
-            };
-
-            {
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let mut guard = session.lock(cx.cx()).await.expect("session lock");
-                for i in 0..6 {
-                    guard.append_message(crate::session::SessionMessage::User {
-                        content: UserContent::Text(format!(
-                            "oversized turn {i}: {}",
-                            "x".repeat(300)
-                        )),
-                        timestamp: Some(0),
-                    });
-                }
-            }
-
-            let mut agent_session = AgentSession::new(agent, session, false, settings);
-            // Exhaust the per-session attempt quota so the background worker is
-            // permanently blocked (the deadlock reported for oversized sessions).
-            agent_session
-                .compaction_worker
-                .set_attempt_count_for_test(u32::MAX);
-            assert!(!agent_session.compaction_worker.can_start());
-
-            let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> =
-                Arc::new(std::sync::Mutex::new(Vec::new()));
-            let sink = Arc::clone(&events);
-            let on_event: AgentEventHandler = Arc::new(move |event| {
-                sink.lock().expect("lock compaction events").push(event);
-            });
-
-            agent_session
-                .maybe_compact(on_event)
-                .await
-                .expect("maybe_compact");
-
-            let (start_reason, end_payload) = {
-                let captured = events.lock().expect("lock captured events");
-                let start_reason = captured.iter().find_map(|event| match event {
-                    AgentEvent::AutoCompactionStart { reason } => Some(reason.clone()),
-                    _ => None,
-                });
-                let end_payload = captured.iter().find_map(|event| match event {
-                    AgentEvent::AutoCompactionEnd {
-                        result: Some(result),
-                        ..
-                    } => Some(result.clone()),
-                    _ => None,
-                });
-                drop(captured);
-                (start_reason, end_payload)
-            };
-            let start_reason = start_reason.expect("forced local compaction should start");
-            assert!(
-                start_reason.starts_with("forced_local"),
-                "unexpected start reason: {start_reason}"
-            );
-            let end_payload = end_payload.expect("forced local compaction should complete");
-            assert!(
-                end_payload["summary"]
-                    .as_str()
-                    .expect("summary string")
-                    .contains("deterministic fallback")
-            );
-
-            // The session must now contain a compaction entry.
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let guard = agent_session
-                .session
-                .lock(cx.cx())
-                .await
-                .expect("session lock");
-            assert!(
-                guard
-                    .entries_for_current_path()
-                    .iter()
-                    .any(|entry| matches!(entry, crate::session::SessionEntry::Compaction(_))),
-                "forced local compaction should append a compaction entry"
-            );
-        });
-    }
-
-    #[test]
-    fn maybe_compact_quota_blocked_is_noop_below_forced_threshold() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async {
-            let provider = Arc::new(SilentProvider);
-            let tools = ToolRegistry::new(&[], Path::new("."), None);
-            let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Arc::new(Mutex::new(Session::in_memory()));
-
-            // Over the compaction threshold (window - reserve) but below the
-            // forced-local threshold (2x window): ~600 chars => ~200 tokens.
-            let settings = ResolvedCompactionSettings {
-                enabled: true,
-                context_window_tokens: 150,
-                reserve_tokens: 10,
-                keep_recent_tokens: 30,
-                mode: compaction::AutoCompactionMode::default(),
-                render_mode: compaction::CompactionRenderMode::default(),
-            };
-
-            {
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let mut guard = session.lock(cx.cx()).await.expect("session lock");
-                for i in 0..2 {
-                    guard.append_message(crate::session::SessionMessage::User {
-                        content: UserContent::Text(format!("turn {i}: {}", "x".repeat(300))),
-                        timestamp: Some(0),
-                    });
-                }
-            }
-
-            let mut agent_session = AgentSession::new(agent, session, false, settings);
-            agent_session
-                .compaction_worker
-                .set_attempt_count_for_test(u32::MAX);
-
-            let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> =
-                Arc::new(std::sync::Mutex::new(Vec::new()));
-            let sink = Arc::clone(&events);
-            let on_event: AgentEventHandler = Arc::new(move |event| {
-                sink.lock().expect("lock compaction events").push(event);
-            });
-
-            agent_session
-                .maybe_compact(on_event)
-                .await
-                .expect("maybe_compact");
-
-            assert!(
-                events.lock().expect("lock captured events").is_empty(),
-                "quota-blocked compaction below the forced threshold must stay a no-op"
-            );
-
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let guard = agent_session
-                .session
-                .lock(cx.cx())
-                .await
-                .expect("session lock");
-            assert!(
-                !guard
-                    .entries_for_current_path()
-                    .iter()
-                    .any(|entry| matches!(entry, crate::session::SessionEntry::Compaction(_))),
-            );
-        });
-    }
-
-    #[test]
-    fn auto_retry_start_serializes_to_pi_mono_format() {
-        let event = AgentEvent::AutoRetryStart {
-            attempt: 2,
-            max_attempts: 3,
-            delay_ms: 4000,
-            error_message: "rate limited".to_string(),
-        };
-        let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "auto_retry_start");
-        assert_eq!(json["attempt"], 2);
-        assert_eq!(json["maxAttempts"], 3);
-        assert_eq!(json["delayMs"], 4000);
-        assert_eq!(json["errorMessage"], "rate limited");
-    }
-
-    #[test]
-    fn auto_retry_end_success_serializes_to_pi_mono_format() {
-        let event = AgentEvent::AutoRetryEnd {
-            success: true,
-            attempt: 2,
-            final_error: None,
-        };
-        let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "auto_retry_end");
-        assert_eq!(json["success"], true);
-        assert_eq!(json["attempt"], 2);
-        assert!(json.get("finalError").is_none());
-    }
-
-    #[test]
-    fn auto_retry_end_failure_serializes_final_error() {
-        let event = AgentEvent::AutoRetryEnd {
-            success: false,
-            attempt: 3,
-            final_error: Some("max retries exceeded".to_string()),
-        };
-        let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "auto_retry_end");
-        assert_eq!(json["success"], false);
-        assert_eq!(json["attempt"], 3);
-        assert_eq!(json["finalError"], "max retries exceeded");
-    }
-
-    // === Tool load modes / xdev dispatcher (bd-cv653.1.6) ===
-
-    fn xdev_test_agent(enabled: &[&str], cwd: &Path) -> Agent {
-        let provider = Arc::new(SilentProvider);
-        let tools = ToolRegistry::new(enabled, cwd, None);
-        Agent::new(provider, tools, AgentConfig::default())
-    }
-
-    fn xdev_call(action: &str, name: Option<&str>, args: Option<Value>) -> ToolCall {
-        let mut arguments = json!({ "action": action });
-        if let Some(name) = name {
-            arguments["name"] = json!(name);
-        }
-        if let Some(inner) = args {
-            arguments["args"] = inner;
-        }
-        ToolCall {
-            id: "call-xdev-1".to_string(),
-            name: "xdev".to_string(),
-            arguments,
-            thought_signature: None,
-        }
-    }
-
-    #[test]
-    fn xdev_list_and_describe_via_tool_execute() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let agent = xdev_test_agent(&["read", "ast_grep"], temp.path());
-            let registry = agent.tools.snapshot();
-            let xdev = registry.get("xdev").expect("xdev registered");
-
-            let list = xdev
-                .execute("c1", json!({"action": "list"}), None)
-                .await
-                .expect("list");
-            let list_text = match &list.content[0] {
-                ContentBlock::Text(t) => t.text.clone(),
-                other => panic!("expected text, got {other:?}"),
-            };
-            assert!(
-                list_text.contains("ast_grep"),
-                "list shows discoverable ast_grep"
-            );
-            assert!(!list.is_error);
-
-            let describe = xdev
-                .execute(
-                    "c2",
-                    json!({"action": "describe", "name": "ast_grep"}),
-                    None,
-                )
-                .await
-                .expect("describe");
-            let describe_text = match &describe.content[0] {
-                ContentBlock::Text(t) => t.text.clone(),
-                other => panic!("expected text, got {other:?}"),
-            };
-            let parsed: Value = serde_json::from_str(&describe_text).expect("describe JSON");
-            assert_eq!(parsed["name"], "ast_grep");
-            assert!(parsed["parameters"]["properties"]["pattern"].is_object());
-        });
-    }
-
-    #[test]
-    fn xdev_run_executes_discoverable_tool_through_agent() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().expect("tempdir");
-            std::fs::write(
-                temp.path().join("main.rs"),
-                "fn main() { let _ = compute().unwrap(); }\nfn compute() -> i32 { 1 }\n",
-            )
-            .expect("write fixture");
-            let agent = xdev_test_agent(&["read", "ast_grep"], temp.path());
-            let call = xdev_call(
-                "run",
-                Some("ast_grep"),
-                Some(json!({"pattern": "$EXPR.unwrap()", "path": "."})),
-            );
-            let (output, is_error) = agent
-                .execute_tool_without_hooks(&call, Arc::new(|_| {}))
-                .await;
-            assert!(!is_error, "run must succeed: {:?}", output.content);
-            let text = match &output.content[0] {
-                ContentBlock::Text(t) => t.text.clone(),
-                other => panic!("expected text, got {other:?}"),
-            };
-            assert!(
-                text.contains("main.rs"),
-                "run output names the fixture file: {text}"
-            );
-            assert_eq!(
-                output
-                    .details
-                    .as_ref()
-                    .and_then(|d| d.get("dispatchedVia"))
-                    .and_then(Value::as_str),
-                Some("xdev")
-            );
-        });
-    }
-
-    #[test]
-    fn xdev_promote_moves_tool_into_live_schema() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let mut agent = xdev_test_agent(&["read", "ast_grep"], temp.path());
-
-            // Before promotion: ast_grep is discoverable, so the schema omits it.
-            let defs_before = agent
-                .build_context()
-                .tools
-                .iter()
-                .map(|def| def.name.clone())
-                .collect::<Vec<_>>();
-            assert!(defs_before.contains(&"read".to_string()));
-            assert!(defs_before.contains(&"xdev".to_string()));
-            assert!(
-                !defs_before.contains(&"ast_grep".to_string()),
-                "discoverable tool must be hidden pre-promotion"
-            );
-
-            let call = xdev_call("promote", Some("ast_grep"), None);
-            let (output, is_error) = agent
-                .execute_tool_without_hooks(&call, Arc::new(|_| {}))
-                .await;
-            assert!(!is_error);
-
-            let has_promoted_tool = agent
-                .build_context()
-                .tools
-                .iter()
-                .any(|def| def.name == "ast_grep");
-            assert!(
-                has_promoted_tool,
-                "promoted tool enters the schema mid-session"
-            );
-        });
-    }
-
-    #[test]
-    fn xdev_run_unknown_tool_named_error() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let agent = xdev_test_agent(&["read", "ast_grep"], temp.path());
-            let call = xdev_call("run", Some("nosuch_tool"), Some(json!({})));
-            let (output, is_error) = agent
-                .execute_tool_without_hooks(&call, Arc::new(|_| {}))
-                .await;
-            assert!(is_error, "unknown discoverable tool must error");
-            let text = match &output.content[0] {
-                ContentBlock::Text(t) => t.text.clone(),
-                other => panic!("expected text, got {other:?}"),
-            };
-            assert!(text.contains("nosuch_tool"), "error names the tool: {text}");
-        });
-    }
-
-    #[test]
-    fn xdev_schema_token_accounting() {
-        // Bead evidence: schema-token delta essential-only vs all-tools.
-        let temp = tempfile::tempdir().expect("tempdir");
-        let full_registry = ToolRegistry::new(
-            &[
-                "read",
-                "bash",
-                "edit",
-                "write",
-                "grep",
-                "find",
-                "ls",
-                "hashline_edit",
-                "ast_grep",
-                "ast_edit",
-            ],
-            temp.path(),
-            None,
-        );
-        let all_defs: usize = full_registry
-            .tools()
-            .iter()
-            .map(|t| serde_json::to_string(&json!({"name": t.name(), "description": t.description(), "parameters": t.parameters()})).unwrap().len())
-            .sum();
-        let essential_defs: usize = full_registry
-            .tools()
-            .iter()
-            .filter(|t| !full_registry.is_discoverable(t.name()))
-            .map(|t| serde_json::to_string(&json!({"name": t.name(), "description": t.description(), "parameters": t.parameters()})).unwrap().len())
-            .sum();
-        println!(
-            "xdev token accounting: all={all_defs} bytes, essential={essential_defs} bytes, saved={}",
-            all_defs - essential_defs
-        );
-        assert!(
-            essential_defs < all_defs,
-            "essential schema must be strictly smaller ({essential_defs} < {all_defs})"
-        );
-        assert!(full_registry.is_discoverable("ast_grep"));
-        assert!(!full_registry.is_discoverable("read"));
-        assert!(full_registry.get("xdev").is_some(), "xdev auto-registered");
-    }
-
-    #[test]
-    fn xdev_dispatch_preserves_result_details_without_routing_key_collisions() {
-        let original = json!({
-            "schema": "pi.memory.v1",
-            "memories": [{"id": 7}],
-            "history": {"status": "unavailable", "diagnostic": "CASS_NOT_INSTALLED"},
-            "resultDetails": {"existing": true}
-        });
-        let details = Agent::xdev_dispatch_details("recall", Some(original.clone()));
-        for (key, value) in original.as_object().unwrap() {
-            assert_eq!(details.get(key), Some(value));
-        }
-        assert_eq!(details["dispatchedVia"], "xdev");
-        assert_eq!(details["tool"], "recall");
-
-        for original in [
-            Value::Null,
-            json!(42),
-            json!(["evidence"]),
-            json!("plain metadata"),
-            json!({"tool": "inner-tool", "resultDetails": {"existing": true}}),
-            json!({"dispatchedVia": "original-route", "history": {"status": "completed"}}),
-        ] {
-            let details = Agent::xdev_dispatch_details("recall", Some(original.clone()));
-            assert_eq!(details["resultDetails"], original);
-            assert_eq!(details["dispatchedVia"], "xdev");
-            assert_eq!(details["tool"], "recall");
-        }
-        assert_eq!(
-            Agent::xdev_dispatch_details("recall", None),
-            json!({"dispatchedVia": "xdev", "tool": "recall"})
-        );
-    }
-
-    // === Plan mode (bd-cv653.3.5) ===
-
-    fn cass_recall_plan_test_agent(cwd: &Path, through_xdev: bool) -> Agent {
-        let config: crate::config::Config =
-            serde_json::from_value(json!({"memory": {"backend": "cass"}})).unwrap();
-        let mut tools = ToolRegistry::new(&[], cwd, Some(&config));
-        assert!(tools.is_discoverable("recall"));
-        if !through_xdev {
-            tools.mark_promoted("recall");
-        }
-        tools.bind_job_session_resolver(Arc::new(|| {
-            Box::pin(async { Some("cass-plan-owner".to_string()) })
-        }));
-        let store = Arc::new(crate::memory::MemoryStore::open(cwd).unwrap());
-        store
-            .retain(
-                crate::memory::MemoryKind::Fact,
-                "parser fact available while planning",
-                &[],
-                None,
-            )
-            .unwrap();
-        crate::memory::shared::SharedMemoryStore::new(store, "cass-plan-owner")
-            .unwrap()
-            .write("handoff", "exact planning handoff", None)
-            .unwrap();
-        let agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
-        agent.plan_state().enter_planning();
-        agent
-    }
-
-    #[test]
-    fn plan_gate_cass_recall_keeps_history_and_malformed_inputs_behind_process_barrier() {
-        let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(async {
-            for through_xdev in [false, true] {
-                let root = tempfile::tempdir().unwrap();
-                let agent = cass_recall_plan_test_agent(root.path(), through_xdev);
-                for input in [
-                    None,
-                    Some(json!({"query": "parser"})),
-                    Some(json!({"query": "parser", "includeHistory": true})),
-                    Some(json!({"query": "parser", "includeHistory": null})),
-                    Some(json!({"query": "parser", "includeHistory": "false"})),
-                    Some(Value::Null),
-                    Some(json!([{"includeHistory": false}])),
-                ] {
-                    let call = if through_xdev {
-                        let mut call = xdev_call("run", Some("recall"), input);
-                        // Outer dispatcher fields cannot suppress the inner
-                        // invocation's process effect or impersonate its scope.
-                        call.arguments["includeHistory"] = json!(false);
-                        call.arguments["scope"] = json!("session");
-                        call
-                    } else {
-                        ToolCall {
-                            id: "cass-blocked".to_string(),
-                            name: "recall".to_string(),
-                            arguments: input.unwrap_or_else(|| json!({})),
-                            thought_signature: None,
-                        }
-                    };
-                    let effects = agent.effects_for_call(&call);
-                    assert!(effects.processes(), "history input: {:?}", call.arguments);
-                    assert!(!agent.plan_state().allows_effects(effects));
-                    // Verify the real gate only after the effect assertions;
-                    // this test never dispatches a CASS search.
-                    let (output, is_error) = agent
-                        .execute_tool_without_hooks(&call, Arc::new(|_| {}))
-                        .await;
-                    assert!(is_error);
-                    let ContentBlock::Text(text) = &output.content[0] else {
-                        panic!("plan gate must return an explanation");
-                    };
-                    assert!(text.text.contains("PLAN_MODE_BLOCKED"));
-                }
-            }
-        });
-    }
-
-    #[test]
-    fn plan_gate_allows_local_and_shared_recall_directly_and_through_xdev() {
-        let runtime = RuntimeBuilder::current_thread().build().unwrap();
-        runtime.block_on(async {
-            for through_xdev in [false, true] {
-                let root = tempfile::tempdir().unwrap();
-                let agent = cass_recall_plan_test_agent(root.path(), through_xdev);
-                for (input, expected_text, details_key) in [
-                    (
-                        json!({"query": "parser", "includeHistory": false}),
-                        "parser fact available while planning",
-                        "memories",
-                    ),
-                    (
-                        json!({"scope": "session", "key": "handoff"}),
-                        "exact planning handoff",
-                        "value",
-                    ),
-                    (
-                        json!({"scope": "session", "limit": 1}),
-                        "handoff",
-                        "entries",
-                    ),
-                ] {
-                    let call = if through_xdev {
-                        xdev_call("run", Some("recall"), Some(input))
-                    } else {
-                        ToolCall {
-                            id: "cass-read-only".to_string(),
-                            name: "recall".to_string(),
-                            arguments: input,
-                            thought_signature: None,
-                        }
-                    };
-                    assert_eq!(agent.effects_for_call(&call), ToolEffects::read());
-                    let (output, is_error) = agent
-                        .execute_tool_without_hooks(&call, Arc::new(|_| {}))
-                        .await;
-                    assert!(!is_error, "read-only recall failed: {:?}", output.content);
-                    let ContentBlock::Text(text) = &output.content[0] else {
-                        panic!("recall must return readable results");
-                    };
-                    assert!(text.text.contains(expected_text));
-                    let details = output.details.unwrap();
-                    assert!(details.get(details_key).is_some());
-                    assert!(details.get("history").is_none());
-                    if through_xdev {
-                        assert_eq!(details["dispatchedVia"], "xdev");
-                        assert_eq!(details["tool"], "recall");
-                    }
-                }
-            }
-        });
-    }
-
-    #[test]
-    fn plan_gate_blocks_mutation_and_allows_reads() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let target = temp.path().join("scratch.txt");
-            std::fs::write(&target, "original").expect("write fixture");
-
-            let provider = Arc::new(SilentProvider);
-            let tools = ToolRegistry::new(
-                &["read", "write", "bash", "grep", "ls", "ast_grep"],
-                temp.path(),
-                None,
-            );
-            let agent = Agent::new(provider, tools, AgentConfig::default());
-            agent.plan_state().enter_planning();
-
-            // Mutation is blocked with the structured, model-readable error…
-            let write_call = ToolCall {
-                id: "w1".to_string(),
-                name: "write".to_string(),
-                arguments: json!({"path": "scratch.txt", "content": "changed"}),
-                thought_signature: None,
-            };
-            let (output, is_error) = agent
-                .execute_tool_without_hooks(&write_call, Arc::new(|_| {}))
-                .await;
-            assert!(is_error, "write must be blocked while planning");
-            let text = match &output.content[0] {
-                ContentBlock::Text(t) => t.text.clone(),
-                other => panic!("expected text, got {other:?}"),
-            };
-            assert!(text.contains("PLAN_MODE_BLOCKED"), "gate error: {text}");
-            // …and the file is untouched (zero bytes changed).
-            assert_eq!(
-                std::fs::read_to_string(&target).expect("read back"),
-                "original"
-            );
-
-            // Reads flow freely.
-            let read_call = ToolCall {
-                id: "r1".to_string(),
-                name: "read".to_string(),
-                arguments: json!({"path": "scratch.txt"}),
-                thought_signature: None,
-            };
-            let (output, is_error) = agent
-                .execute_tool_without_hooks(&read_call, Arc::new(|_| {}))
-                .await;
-            assert!(!is_error, "read must pass the gate");
-            let text = match &output.content[0] {
-                ContentBlock::Text(t) => t.text.clone(),
-                other => panic!("expected text, got {other:?}"),
-            };
-            assert!(text.contains("original"), "read returns content: {text}");
-
-            // Bash (process effect) is blocked in plan mode.
-            let bash_call = ToolCall {
-                id: "b1".to_string(),
-                name: "bash".to_string(),
-                arguments: json!({"command": "echo hi"}),
-                thought_signature: None,
-            };
-            let (_output, is_error) = agent
-                .execute_tool_without_hooks(&bash_call, Arc::new(|_| {}))
-                .await;
-            assert!(is_error, "bash is blocked while planning");
-
-            // Approval re-opens mutation.
-            agent
-                .plan_state()
-                .submit_plan("goal: test; steps: 1) write".to_string());
-            assert!(agent.plan_state().approve().is_some());
-            let write_call = ToolCall {
-                id: "w2".to_string(),
-                name: "write".to_string(),
-                arguments: json!({"path": "scratch.txt", "content": "changed"}),
-                thought_signature: None,
-            };
-            let (_output, is_error) = agent
-                .execute_tool_without_hooks(&write_call, Arc::new(|_| {}))
-                .await;
-            assert!(!is_error, "write allowed after approval");
-            assert_eq!(
-                std::fs::read_to_string(&target).expect("read back"),
-                "changed"
-            );
-        });
-    }
-
-    /// bd-wfcu7: the github tool declares a process effect, so plan mode must
-    /// refuse it through the real dispatch path before any `gh` is spawned.
-    #[cfg(unix)]
-    #[test]
-    fn plan_gate_refuses_github_before_spawning_gh() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let spawned = temp.path().join("gh-was-spawned");
-            let stub = temp.path().join("gh");
-            std::fs::write(
-                &stub,
-                format!("#!/bin/sh\ntouch '{}'\nprintf '[]'\n", spawned.display()),
-            )
-            .expect("write gh stub");
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod gh stub");
-            let tools = ToolRegistry::from_tools(vec![Box::new(crate::github::GithubTool::new(
-                temp.path(),
-                Some(stub.to_str().expect("utf-8 path")),
-            ))]);
-            let agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
-            agent.plan_state().enter_planning();
-
-            let call = ToolCall {
-                id: "gh1".to_string(),
-                name: "github".to_string(),
-                arguments: json!({"op": "run_list", "repo": "o/r"}),
-                thought_signature: None,
-            };
-            let (output, is_error) = agent
-                .execute_tool_without_hooks(&call, Arc::new(|_| {}))
-                .await;
-            assert!(is_error, "github must be blocked while planning");
-            let text = match &output.content[0] {
-                ContentBlock::Text(t) => t.text.clone(),
-                other => panic!("expected text, got {other:?}"),
-            };
-            assert!(text.contains("PLAN_MODE_BLOCKED"), "gate error: {text}");
-            assert!(
-                !spawned.exists(),
-                "plan mode must refuse before gh is spawned"
-            );
-        });
-    }
-
-    #[test]
-    fn plan_gate_xdev_run_uses_inner_tool_effects() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().expect("tempdir");
-            std::fs::write(temp.path().join("main.rs"), "fn main() {}\n").expect("fixture");
-            let provider = Arc::new(SilentProvider);
-            let tools = ToolRegistry::new(
-                &["read", "write", "ast_grep", "ast_edit"],
-                temp.path(),
-                None,
-            );
-            let agent = Agent::new(provider, tools, AgentConfig::default());
-            agent.plan_state().enter_planning();
-
-            // xdev run on a read-only tool (ast_grep) passes the gate.
-            let run_read = ToolCall {
-                id: "x1".to_string(),
-                name: "xdev".to_string(),
-                arguments: json!({
-                    "action": "run",
-                    "name": "ast_grep",
-                    "args": {"pattern": "fn $NAME($$$)", "path": "."}
-                }),
-                thought_signature: None,
-            };
-            let (_output, is_error) = agent
-                .execute_tool_without_hooks(&run_read, Arc::new(|_| {}))
-                .await;
-            assert!(
-                !is_error,
-                "xdev run on a read-only tool passes while planning"
-            );
-
-            // xdev run on a mutating tool (ast_edit) is blocked.
-            let run_write = ToolCall {
-                id: "x2".to_string(),
-                name: "xdev".to_string(),
-                arguments: json!({
-                    "action": "run",
-                    "name": "ast_edit",
-                    "args": {"ops": [{"pat": "fn main() {}", "out": ""}], "path": "."}
-                }),
-                thought_signature: None,
-            };
-            let (output, is_error) = agent
-                .execute_tool_without_hooks(&run_write, Arc::new(|_| {}))
-                .await;
-            assert!(
-                is_error,
-                "xdev run on a mutating tool is blocked while planning"
-            );
-            let text = match &output.content[0] {
-                ContentBlock::Text(t) => t.text.clone(),
-                other => panic!("expected text, got {other:?}"),
-            };
-            assert!(text.contains("PLAN_MODE_BLOCKED"), "gate error: {text}");
-        });
-    }
-
-    #[test]
-    fn plan_mode_session_entries_round_trip() {
-        let mut session = Session::in_memory();
-        session.append_custom_entry("plan_mode".to_string(), Some(json!({"mode": "planning"})));
-        session.append_custom_entry("plan_mode".to_string(), Some(json!({"mode": "approved"})));
-        let json = serde_json::to_string(session.entries_for_current_path()[1]).expect("ser");
-        let parsed: crate::session::SessionEntry = serde_json::from_str(&json).expect("reparse");
-        let crate::session::SessionEntry::Custom(custom) = &parsed else {
-            panic!("expected custom entry");
-        };
-        assert_eq!(custom.custom_type, "plan_mode");
-        assert_eq!(
-            custom
-                .data
-                .as_ref()
-                .and_then(|d| d.get("mode"))
-                .and_then(Value::as_str),
-            Some("approved")
-        );
-    }
-
-    #[test]
-    fn colliding_restored_tool_keys_are_refused_before_approval_and_execution() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let target = temp.path().join("credential.txt");
-            std::fs::write(&target, "original").expect("existing file");
-            let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let observed_approvals = Arc::clone(&approvals);
-            let config = AgentConfig {
-                tool_approval: Some(Arc::new(move |_| {
-                    observed_approvals.fetch_add(1, Ordering::SeqCst);
-                    Box::pin(async { ToolApprovalDecision::Allow })
-                })),
-                ..AgentConfig::default()
-            };
-            let tools = ToolRegistry::new(&["write"], temp.path(), None);
-            let mut agent = Agent::new(Arc::new(SilentProvider), tools, config);
-            let secret = "sk-abcdefghijklmnopqrstuvwxyz123456";
-            let placeholder = agent
-                .secrets_transform_outbound_text(secret)
-                .expect("establish credential mapping");
-            let mut fields = serde_json::Map::new();
-            fields.insert(secret.to_string(), json!("first field"));
-            fields.insert(placeholder.clone(), json!("second field"));
-            let call = ToolCall {
-                id: "ambiguous-write".to_string(),
-                name: "write".to_string(),
-                arguments: json!({
-                    "path": "credential.txt",
-                    "content": placeholder,
-                    "metadata": [Value::Object(fields)],
-                }),
-                thought_signature: None,
-            };
-            let (output, is_error) = agent
-                .execute_tool(
-                    call,
-                    Arc::new(|_| panic!("refused arguments must not reach approval or tools")),
-                    Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
-                )
-                .await;
-            assert!(is_error && output.is_error);
-            let report = serde_json::to_string(&output).expect("error output");
-            assert!(report.contains("PI_SECRET_JSON_RESTORE_KEY_COLLISION"));
-            assert!(!report.contains(secret));
-            assert_eq!(approvals.load(Ordering::SeqCst), 0);
-            assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
-
-            // The same real tool and vault remain usable after a rejected call.
-            let (output, is_error) = agent
-                .execute_tool(
-                    ToolCall {
-                        id: "valid-write".to_string(),
-                        name: "write".to_string(),
-                        arguments: json!({
-                            "path": "credential.txt",
-                            "content": placeholder,
-                        }),
-                        thought_signature: None,
-                    },
-                    Arc::new(|_| {}),
-                    Arc::new(StdMutex::new(TurnLatencyAccumulator::started())),
-                )
-                .await;
-            assert!(!is_error && !output.is_error);
-            assert_eq!(approvals.load(Ordering::SeqCst), 1);
-            assert_eq!(std::fs::read_to_string(&target).unwrap(), secret);
-        });
-    }
-
-    #[test]
-    fn session_state_reset_drops_secret_placeholders_and_plan_gate() {
-        let provider = Arc::new(SilentProvider);
-        let tools = ToolRegistry::new(&[], Path::new("."), None);
-        let mut agent = Agent::new(provider, tools, AgentConfig::default());
-        let raw_secret = "sk-abcdefghijklmnopqrstuvwxyz123456";
-        let placeholder = agent
-            .secrets_transform_outbound_text(raw_secret)
-            .expect("obfuscate secret");
-        assert_ne!(placeholder, raw_secret);
-        agent.plan_state().enter_planning();
-
-        let before_reset = agent
-            .restore_secrets_inbound(ToolCall {
-                id: "before".to_string(),
-                name: "read".to_string(),
-                arguments: json!({"token": placeholder}),
-                thought_signature: None,
-            })
-            .expect("restore source session credential");
-        assert_eq!(before_reset.arguments["token"], raw_secret);
-
-        agent.reset_session_scoped_state(crate::plan::PlanMode::Off);
-
-        assert_eq!(agent.plan_state().mode(), crate::plan::PlanMode::Off);
-        let after_reset = agent
-            .restore_secrets_inbound(ToolCall {
-                id: "after".to_string(),
-                name: "read".to_string(),
-                arguments: json!({"token": placeholder}),
-                thought_signature: None,
-            })
-            .expect("unknown placeholder remains literal");
-        assert_eq!(after_reset.arguments["token"], placeholder);
-        assert_eq!(agent.mask_secrets_text(raw_secret), raw_secret);
-    }
-
-    // === Dialect repair turn (bd-cv653.7.8) ===
-
-    /// Emits a text-embedded tool call on stream 1, plain text on stream 2.
-    struct TextCallProvider {
-        calls: std::sync::atomic::AtomicUsize,
-        model_id: &'static str,
-        /// When true, the request after the repaired tool result drops
-        /// mid-stream once so retry cleanup can be exercised.
-        fail_after_tool_once: bool,
-        /// Optional mutation-sensitive assertion for the resumed request.
-        expected_retry_thinking: Option<crate::model::ThinkingLevel>,
-    }
-
-    #[async_trait]
-    #[allow(clippy::unnecessary_literal_bound)]
-    impl Provider for TextCallProvider {
-        fn name(&self) -> &str {
-            "test-provider"
-        }
-        fn api(&self) -> &str {
-            "test-api"
-        }
-        fn model_id(&self) -> &str {
-            self.model_id
-        }
-
-        async fn stream(
-            &self,
-            context: &Context<'_>,
-            options: &StreamOptions,
-        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-            let call_number = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if call_number >= 2
-                && let Some(expected) = self.expected_retry_thinking
-            {
-                assert_eq!(
-                    options.thinking_level,
-                    Some(expected),
-                    "retry must preserve the original turn's magic-keyword effort"
-                );
-            }
-            let make = |content: Vec<ContentBlock>, reason: StopReason| AssistantMessage {
-                content,
-                api: "test-api".to_string(),
-                provider: "test-provider".to_string(),
-                model: "qwen3-mock".to_string(),
-                usage: Usage::default(),
-                stop_reason: reason,
-                stop_details: None,
-                error_message: None,
-                timestamp: chrono::Utc::now().timestamp_millis(),
-            };
-            let events: Vec<Result<StreamEvent>> = if call_number == 0 {
-                vec![
-                    Ok(StreamEvent::TextDelta {
-                        content_index: 0,
-                        delta: "Checking the file. <tool_call>{\"name\": \"read\", \"arguments\": {\"path\": \"fixture.txt\"}}</tool_call>".to_string(),
-                    }),
-                    Ok(StreamEvent::Done {
-                        reason: StopReason::Stop,
-                        message: make(
-                            vec![ContentBlock::Text(TextContent::new(
-                                "Checking the file. <tool_call>{\"name\": \"read\", \"arguments\": {\"path\": \"fixture.txt\"}}</tool_call>",
-                            ))],
-                            StopReason::Stop,
-                        ),
-                    }),
-                ]
-            } else if self.fail_after_tool_once && call_number == 1 {
-                vec![
-                    Ok(StreamEvent::Start {
-                        partial: make(Vec::new(), StopReason::Stop),
-                    }),
-                    Err(Error::api(
-                        "SSE error: connection reset by peer (transient connection drop)",
-                    )),
-                ]
-            } else {
-                assert!(
-                    !context.messages.iter().any(|message| {
-                        matches!(
-                            message,
-                            Message::Assistant(assistant)
-                                if matches!(
-                                    assistant.stop_reason,
-                                    StopReason::Error | StopReason::Aborted
-                                )
-                        )
-                    }),
-                    "retry context must not retain the incomplete assistant"
-                );
-                vec![
-                    Ok(StreamEvent::TextDelta {
-                        content_index: 0,
-                        delta: "The file says hello-fixture.".to_string(),
-                    }),
-                    Ok(StreamEvent::Done {
-                        reason: StopReason::Stop,
-                        message: make(
-                            vec![ContentBlock::Text(TextContent::new(
-                                "The file says hello-fixture.",
-                            ))],
-                            StopReason::Stop,
-                        ),
-                    }),
-                ]
-            };
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
-    }
-
-    #[test]
-    fn dialect_repair_preserves_other_blocks_and_uses_unique_ids() {
-        let provider = Arc::new(TextCallProvider {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-            model_id: "qwen3-mock",
-            fail_after_tool_once: false,
-            expected_retry_thinking: None,
-        });
-        let tools = ToolRegistry::new(&["read"], std::path::Path::new("."), None);
-        let mut agent = Agent::new(provider, tools, AgentConfig::default());
-        agent.set_tool_call_dialect(crate::dialects::Dialect::Xmlish);
-        let original = AssistantMessage {
-            content: vec![
-                ContentBlock::Thinking(ThinkingContent {
-                    thinking: "reasoning".to_string(),
-                    thinking_signature: Some("thinking-sig".to_string()),
-                }),
-                ContentBlock::Text(TextContent {
-                    text: "preface".to_string(),
-                    text_signature: Some("preface-sig".to_string()),
-                }),
-                ContentBlock::Image(ImageContent {
-                    data: "aGVsbG8=".to_string(),
-                    mime_type: "image/png".to_string(),
-                }),
-                ContentBlock::Text(TextContent {
-                    text: r#"<tool_call>{"name":"read","arguments":{"path":"fixture.txt"}}</tool_call>"#
-                        .to_string(),
-                    text_signature: Some("candidate-sig".to_string()),
-                }),
-                ContentBlock::Text(TextContent {
-                    text: "tail".to_string(),
-                    text_signature: Some("tail-sig".to_string()),
-                }),
-            ],
-            api: "test-api".to_string(),
-            provider: "test-provider".to_string(),
-            model: "qwen3-mock".to_string(),
-            usage: Usage::default(),
-            stop_reason: StopReason::Stop,
-            stop_details: None,
-            error_message: None,
-            timestamp: chrono::Utc::now().timestamp_millis(),
-        };
-
-        let first = agent.maybe_repair_dialect_tool_calls(original.clone());
-        let second = agent.maybe_repair_dialect_tool_calls(original);
-        assert!(matches!(
-            &first.content[0],
-            ContentBlock::Thinking(thinking)
-                if thinking.thinking_signature.as_deref() == Some("thinking-sig")
-        ));
-        assert!(matches!(
-            &first.content[1],
-            ContentBlock::Text(text)
-                if text.text == "preface"
-                    && text.text_signature.as_deref() == Some("preface-sig")
-        ));
-        assert!(matches!(&first.content[2], ContentBlock::Image(_)));
-        assert!(matches!(
-            &first.content[4],
-            ContentBlock::Text(text)
-                if text.text == "tail" && text.text_signature.as_deref() == Some("tail-sig")
-        ));
-        let first_id = extract_tool_calls(&first.content)[0].id.clone();
-        let second_id = extract_tool_calls(&second.content)[0].id.clone();
-        assert_ne!(
-            first_id, second_id,
-            "repaired call IDs must be session-unique"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn dialect_repair_continues_turn_and_executes_tool() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        runtime.block_on(async {
-            // CONTROL: Native dialect (no repair path) — a plain-text turn
-            // must complete without hitting the iteration cap. If this
-            // loops, the test provider is the artifact, not the repair.
-            for model_id in ["gpt-4o", "gpt-5.5"] {
-                let control = Arc::new(TextCallProvider {
-                    calls: std::sync::atomic::AtomicUsize::new(0),
-                    model_id,
-                    fail_after_tool_once: false,
-                    expected_retry_thinking: None,
-                });
-                let control_tools = ToolRegistry::new(&["read"], std::path::Path::new("."), None);
-                let mut control_agent = Agent::new(
-                    Arc::clone(&control) as Arc<dyn Provider>,
-                    control_tools,
-                    AgentConfig::default(),
-                );
-                control_agent.config.max_tool_iterations = 5;
-                let session = Arc::new(Mutex::new(Session::in_memory()));
-                let mut control_session = AgentSession::new(
-                    control_agent,
-                    Arc::clone(&session),
-                    false,
-                    ResolvedCompactionSettings::default(),
-                );
-                let tool_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let tool_starts_for_events = Arc::clone(&tool_starts);
-                let control_result = control_session
-                    .run_text_with_abort("hello".to_string(), None, move |event| {
-                        if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
-                            tool_starts_for_events.fetch_add(1, Ordering::SeqCst);
-                        }
-                    })
-                    .await
-                    .expect("non-repairable control completes");
-                assert_eq!(control_result.stop_reason, StopReason::Stop);
-                assert_eq!(control.calls.load(Ordering::SeqCst), 1, "{model_id}");
-                assert_eq!(tool_starts.load(Ordering::SeqCst), 0, "{model_id}");
-                let cx = asupersync::Cx::for_request();
-                let inner = session.lock(&cx).await.expect("control session lock");
-                assert!(
-                    inner
-                        .entries_for_current_path()
-                        .iter()
-                        .all(|entry| !matches!(
-                            entry,
-                            crate::session::SessionEntry::Custom(custom)
-                                if custom.custom_type == "dialect_repair"
-                        )),
-                    "{model_id} must not persist repair telemetry"
-                );
-            }
-        });
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().expect("tempdir");
-            std::fs::write(temp.path().join("fixture.txt"), "hello-fixture")
-                .expect("write fixture");
-            let provider = Arc::new(TextCallProvider {
-                calls: std::sync::atomic::AtomicUsize::new(0),
-                model_id: "qwen3-mock",
-                fail_after_tool_once: false,
-                expected_retry_thinking: None,
-            });
-            let tools = ToolRegistry::new(&["read"], temp.path(), None);
-            let mut agent = Agent::new(provider, tools, AgentConfig::default());
-            agent.set_tool_call_dialect(crate::dialects::Dialect::Xmlish);
-            let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
-                temp.path().join("sessions"),
-            ))));
-            let mut agent_session =
-                AgentSession::new(agent, session, true, ResolvedCompactionSettings::default());
-
-            let final_message = agent_session
-                .run_text_with_abort("check the fixture".to_string(), None, |_| {})
-                .await
-                .expect("run completes");
-
-            let texts: Vec<String> = agent_session
-                .agent
-                .messages()
-                .iter()
-                .flat_map(|m| match m {
-                    crate::model::Message::Assistant(msg) => msg.content.clone(),
-                    crate::model::Message::User(u) => match &u.content {
-                        crate::model::UserContent::Text(t) => {
-                            vec![ContentBlock::Text(TextContent::new(t))]
-                        }
-                        crate::model::UserContent::Blocks(blocks) => blocks.clone(),
-                    },
-                    crate::model::Message::ToolResult(r) => r.content.clone(),
-                    crate::model::Message::Custom(_) => Vec::new(),
-                })
-                .filter_map(|b| match b {
-                    ContentBlock::Text(t) => Some(t.text),
-                    _ => None,
-                })
-                .collect();
-            assert!(
-                texts.iter().any(|t| t.contains("hello-fixture")),
-                "tool result with fixture content present: {texts:?}"
-            );
-            assert_eq!(
-                final_message.stop_reason,
-                StopReason::Stop,
-                "turn ends cleanly after the repair"
-            );
-            // The session layer drained the ledger into a dialect_repair
-            // Custom entry at run completion (bd-cv653.7.8).
-            let entries = {
-                let cx = asupersync::Cx::for_request();
-                let inner = agent_session.session.lock(&cx).await.expect("session lock");
-                let found: Vec<_> = inner
-                    .entries_for_current_path()
-                    .iter()
-                    .filter_map(|e| match e {
-                        crate::session::SessionEntry::Custom(c)
-                            if c.custom_type == "dialect_repair" =>
-                        {
-                            Some(c.data.clone())
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                found
-            };
-            assert_eq!(entries.len(), 1, "one repair entry in the session");
-            assert_eq!(
-                entries[0]
-                    .as_ref()
-                    .and_then(|d| d.get("tool"))
-                    .and_then(Value::as_str),
-                Some("read")
-            );
-
-            let persisted_path = {
-                let cx = asupersync::Cx::for_request();
-                let inner = agent_session.session.lock(&cx).await.expect("session lock");
-                inner.path.clone().expect("autosave created session file")
-            };
-            let reopened = Session::open(persisted_path.to_string_lossy().as_ref())
-                .await
-                .expect("reopen autosaved session");
-            let persisted_repairs = reopened
-                .entries_for_current_path()
-                .iter()
-                .filter(|entry| {
-                    matches!(
-                        entry,
-                        crate::session::SessionEntry::Custom(custom)
-                            if custom.custom_type == "dialect_repair"
-                    )
-                })
-                .count();
-            assert_eq!(persisted_repairs, 1, "repair audit entry survives reopen");
-        });
-    }
-
-    #[test]
-    fn dialect_repair_on_resume_persists_before_exit() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().expect("tempdir");
-            std::fs::write(temp.path().join("fixture.txt"), "hello-fixture")
-                .expect("write fixture");
-            let provider = Arc::new(TextCallProvider {
-                calls: std::sync::atomic::AtomicUsize::new(0),
-                model_id: "qwen3-mock",
-                fail_after_tool_once: false,
-                expected_retry_thinking: None,
-            });
-            let tools = ToolRegistry::new(&["read"], temp.path(), None);
-            let mut agent = Agent::new(provider, tools, AgentConfig::default());
-            agent.set_tool_call_dialect(crate::dialects::Dialect::Xmlish);
-            let mut durable_session =
-                Session::create_with_dir(Some(temp.path().join("resume-sessions")));
-            durable_session.append_model_message(Message::User(UserMessage {
-                content: UserContent::Text("check the fixture".to_string()),
-                timestamp: Utc::now().timestamp_millis(),
-            }));
-            let session = Arc::new(Mutex::new(durable_session));
-            let mut agent_session = AgentSession::new(
-                agent,
-                Arc::clone(&session),
-                true,
-                ResolvedCompactionSettings::default(),
-            );
-
-            let final_message = agent_session
-                .run_continue_with_abort(None, |_| {})
-                .await
-                .expect("resume completes");
-            assert_eq!(final_message.stop_reason, StopReason::Stop);
-
-            let persisted_path = {
-                let cx = asupersync::Cx::for_request();
-                let inner = session.lock(&cx).await.expect("session lock");
-                inner.path.clone().expect("autosave created session file")
-            };
-            let reopened = Session::open(persisted_path.to_string_lossy().as_ref())
-                .await
-                .expect("reopen autosaved resume session");
-            let persisted_repairs = reopened
-                .entries_for_current_path()
-                .iter()
-                .filter(|entry| {
-                    matches!(
-                        entry,
-                        crate::session::SessionEntry::Custom(custom)
-                            if custom.custom_type == "dialect_repair"
-                                && custom.data.as_ref().is_some_and(|data| {
-                                    data["tool"] == json!("read")
-                                })
-                    )
-                })
-                .count();
-            assert_eq!(
-                persisted_repairs, 1,
-                "resume repair audit entry survives an immediate reopen"
-            );
-        });
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn failed_keyword_repair_turn_keeps_audits_and_reverts_incomplete_tail() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().expect("tempdir");
-            std::fs::write(temp.path().join("fixture.txt"), "hello-fixture")
-                .expect("write fixture");
-            let provider = Arc::new(TextCallProvider {
-                calls: std::sync::atomic::AtomicUsize::new(0),
-                model_id: "qwen3-mock",
-                fail_after_tool_once: true,
-                expected_retry_thinking: Some(crate::model::ThinkingLevel::High),
-            });
-            let tools = ToolRegistry::new(&["read"], temp.path(), None);
-            let mut agent = Agent::new(
-                Arc::clone(&provider) as Arc<dyn Provider>,
-                tools,
-                AgentConfig::default(),
-            );
-            agent.set_tool_call_dialect(crate::dialects::Dialect::Xmlish);
-            agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
-            let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
-                temp.path().join("retry-sessions"),
-            ))));
-            let mut agent_session = AgentSession::new(
-                agent,
-                Arc::clone(&session),
-                true,
-                ResolvedCompactionSettings::default(),
-            );
-            let tool_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let tool_starts_for_events = Arc::clone(&tool_starts);
-
-            let failed = agent_session
-                .run_text_with_abort(
-                    "ultrathink check the fixture".to_string(),
-                    None,
-                    move |event| {
-                        if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
-                            tool_starts_for_events.fetch_add(1, Ordering::SeqCst);
-                        }
-                    },
-                )
-                .await
-                .expect("mid-stream failure is represented by an assistant message");
-            assert_eq!(failed.stop_reason, StopReason::Error);
-
-            {
-                let cx = asupersync::Cx::for_request();
-                let inner = session.lock(&cx).await.expect("failed session lock");
-                let entries = inner.entries_for_current_path();
-                assert!(matches!(
-                    entries.last(),
-                    Some(crate::session::SessionEntry::Message(message))
-                        if matches!(
-                            &message.message,
-                            crate::session::SessionMessage::Assistant { message }
-                                if message.stop_reason == StopReason::Error
-                        )
-                ));
-                assert_eq!(
-                    entries
-                        .iter()
-                        .filter(|entry| matches!(
-                            entry,
-                            crate::session::SessionEntry::Custom(custom)
-                                if custom.custom_type == "dialect_repair"
-                        ))
-                        .count(),
-                    1
-                );
-                assert_eq!(
-                    entries
-                        .iter()
-                        .filter(|entry| matches!(
-                            entry,
-                            crate::session::SessionEntry::Custom(custom)
-                                if custom.custom_type == "magic_keyword"
-                        ))
-                        .count(),
-                    1
-                );
-            }
-
-            assert!(
-                agent_session
-                    .revert_incomplete_response()
-                    .await
-                    .expect("revert succeeds"),
-                "the failed assistant must remain the removable session tail"
-            );
-            let resumed = agent_session
-                .run_continue_with_abort(None, |_| {})
-                .await
-                .expect("retry resumes after the completed tool cycle");
-            assert_eq!(resumed.stop_reason, StopReason::Stop);
-            assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
-            assert_eq!(tool_starts.load(Ordering::SeqCst), 1);
-
-            let persisted_path = {
-                let cx = asupersync::Cx::for_request();
-                let inner = session.lock(&cx).await.expect("resumed session lock");
-                inner.path.clone().expect("autosave created session file")
-            };
-            let reopened = Session::open(persisted_path.to_string_lossy().as_ref())
-                .await
-                .expect("reopen autosaved retry session");
-            let entries = reopened.entries_for_current_path();
-            assert!(entries.iter().all(|entry| !matches!(
-                entry,
-                crate::session::SessionEntry::Message(message)
-                    if matches!(
-                        &message.message,
-                        crate::session::SessionMessage::Assistant { message }
-                            if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
-                    )
-            )));
-            let repair_data = entries.iter().find_map(|entry| match entry {
-                crate::session::SessionEntry::Custom(custom)
-                    if custom.custom_type == "dialect_repair" =>
-                {
-                    custom.data.as_ref()
-                }
-                _ => None,
-            });
-            assert_eq!(
-                repair_data
-                    .and_then(|data| data.get("tool"))
-                    .and_then(Value::as_str),
-                Some("read")
-            );
-            assert!(
-                repair_data
-                    .and_then(|data| data.get("strippedBytes"))
-                    .and_then(Value::as_u64)
-                    .is_some_and(|bytes| bytes > 0),
-                "repair telemetry must prove that text was actually stripped"
-            );
-            assert_eq!(
-                entries
-                    .iter()
-                    .filter(|entry| matches!(
-                        entry,
-                        crate::session::SessionEntry::Custom(custom)
-                            if custom.custom_type == "dialect_repair"
-                    ))
-                    .count(),
-                1
-            );
-            assert_eq!(
-                entries
-                    .iter()
-                    .filter(|entry| matches!(
-                        entry,
-                        crate::session::SessionEntry::Custom(custom)
-                            if custom.custom_type == "magic_keyword"
-                    ))
-                    .count(),
-                1
-            );
-        });
-    }
-
-    // === Advisor turn review (bd-cv653.3.3) ===
-
-    /// Doer: issues one structured read call, then finishes with text.
-    struct ScriptedDoerProvider {
-        calls: std::sync::atomic::AtomicUsize,
-    }
-
-    #[async_trait]
-    #[allow(clippy::unnecessary_literal_bound)]
-    impl Provider for ScriptedDoerProvider {
-        fn name(&self) -> &str {
-            "doer"
-        }
-        fn api(&self) -> &str {
-            "test-api"
-        }
-        fn model_id(&self) -> &str {
-            "doer-model"
-        }
-
-        async fn stream(
-            &self,
-            _context: &Context<'_>,
-            _options: &StreamOptions,
-        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-            let call_number = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let make = |content: Vec<ContentBlock>| AssistantMessage {
-                content,
-                api: "test-api".to_string(),
-                provider: "doer".to_string(),
-                model: "doer-model".to_string(),
-                usage: Usage::default(),
-                stop_reason: StopReason::Stop,
-                stop_details: None,
-                error_message: None,
-                timestamp: chrono::Utc::now().timestamp_millis(),
-            };
-            let events: Vec<Result<StreamEvent>> = if call_number == 0 {
-                vec![Ok(StreamEvent::Done {
-                    reason: StopReason::Stop,
-                    message: make(vec![ContentBlock::ToolCall(ToolCall {
-                        id: "call-1".to_string(),
-                        name: "read".to_string(),
-                        arguments: json!({"path": "fixture.txt"}),
-                        thought_signature: None,
-                    })]),
-                })]
-            } else {
-                vec![Ok(StreamEvent::Done {
-                    reason: StopReason::Stop,
-                    message: make(vec![ContentBlock::Text(TextContent::new("all fixed"))]),
-                })]
-            };
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
-    }
-
-    /// Advisor: returns a CONCERN verdict.
-    struct ScriptedAdvisorProvider;
-
-    #[async_trait]
-    #[allow(clippy::unnecessary_literal_bound)]
-    impl Provider for ScriptedAdvisorProvider {
-        fn name(&self) -> &str {
-            "advisor"
-        }
-        fn api(&self) -> &str {
-            "test-api"
-        }
-        fn model_id(&self) -> &str {
-            "advisor-model"
-        }
-
-        async fn stream(
-            &self,
-            _context: &Context<'_>,
-            _options: &StreamOptions,
-        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-            let events: Vec<Result<StreamEvent>> = vec![
-                Ok(StreamEvent::TextDelta {
-                    content_index: 0,
-                    delta: "CONCERN: the read covers the whole tree".to_string(),
-                }),
-                Ok(StreamEvent::Done {
-                    reason: StopReason::Stop,
-                    message: AssistantMessage {
-                        content: vec![ContentBlock::Text(TextContent::new(
-                            "CONCERN: the read covers the whole tree",
-                        ))],
-                        api: "test-api".to_string(),
-                        provider: "advisor".to_string(),
-                        model: "advisor-model".to_string(),
-                        usage: Usage::default(),
-                        stop_reason: StopReason::Stop,
-                        stop_details: None,
-                        error_message: None,
-                        timestamp: chrono::Utc::now().timestamp_millis(),
-                    },
-                }),
-            ];
-            Ok(Box::pin(futures::stream::iter(events)))
-        }
-    }
-
-    struct AdvisorLifecycleDoer {
-        replies: StdMutex<VecDeque<Result<AssistantMessage>>>,
-        calls: std::sync::atomic::AtomicUsize,
-        session: Arc<Mutex<Session>>,
-        fail_save_at_completion: StdMutex<Option<PathBuf>>,
-    }
-
-    #[async_trait]
-    #[allow(clippy::unnecessary_literal_bound)]
-    impl Provider for AdvisorLifecycleDoer {
-        fn name(&self) -> &str {
-            "doer"
-        }
-
-        fn api(&self) -> &str {
-            "test-api"
-        }
-
-        fn model_id(&self) -> &str {
-            "doer-model"
-        }
-
-        async fn stream(
-            &self,
-            _context: &Context<'_>,
-            _options: &StreamOptions,
-        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let reply = self
-                .replies
-                .lock()
-                .expect("scripted doer replies") // ubs:ignore[rust.panic.expect] -- Fixture synchronization failure invalidates the regression.
-                .pop_front()
-                .expect("unexpected doer request")?; // ubs:ignore[rust.panic.expect] -- An extra request is the regression under test.
-            let blocked_path = self
-                .fail_save_at_completion
-                .lock()
-                .expect("save failure injection") // ubs:ignore[rust.panic.expect] -- The fixture must retain its one explicit fault.
-                .clone();
-            if reply.stop_reason == StopReason::Stop
-                && let Some(path) = blocked_path
-            {
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
-                    .await
-                    .map_err(|error| Error::session(error.to_string()))?;
-                session.path = Some(path);
-            }
-            Ok(Box::pin(futures::stream::iter([Ok(StreamEvent::Done {
-                reason: reply.stop_reason,
-                message: reply,
-            })])))
-        }
-    }
-
-    struct AdvisorLifecycleReview {
-        calls: std::sync::atomic::AtomicUsize,
-        session: Arc<Mutex<Session>>,
-        observed_durable_completion: AtomicBool,
-        abort_on_call: Option<AbortHandle>,
-    }
-
-    #[async_trait]
-    #[allow(clippy::unnecessary_literal_bound)]
-    impl Provider for AdvisorLifecycleReview {
-        fn name(&self) -> &str {
-            "advisor"
-        }
-
-        fn api(&self) -> &str {
-            "test-api"
-        }
-
-        fn model_id(&self) -> &str {
-            "advisor-model"
-        }
-
-        async fn stream(
-            &self,
-            context: &Context<'_>,
-            options: &StreamOptions,
-        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let path = {
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let session = self
-                    .session
-                    .lock(cx.cx())
-                    .await
-                    .map_err(|error| Error::session(error.to_string()))?;
-                session
-                    .path
-                    .clone()
-                    .ok_or_else(|| Error::session("advisor ran before the first save"))?
-            };
-            let reopened = Session::open(path.to_string_lossy().as_ref()).await?;
-            self.observed_durable_completion.store(
-                reopened
-                    .to_messages_for_current_path()
-                    .iter()
-                    .any(|message| {
-                        matches!(
-                            message,
-                            Message::Assistant(assistant)
-                                if assistant.stop_reason == StopReason::Stop
-                                    && assistant_text_content(&assistant.content)
-                                        == "durable doer completion"
-                        )
-                    }),
-                Ordering::SeqCst,
-            );
-            if let Some(handle) = &self.abort_on_call {
-                handle.abort();
-            }
-            ScriptedAdvisorProvider.stream(context, options).await
-        }
-    }
-
-    fn advisor_lifecycle_reply(stop_reason: StopReason) -> AssistantMessage {
-        AssistantMessage {
-            content: vec![ContentBlock::Text(TextContent::new(
-                "durable doer completion",
-            ))],
-            api: "test-api".to_string(),
-            provider: "doer".to_string(),
-            model: "doer-model".to_string(),
-            stop_reason,
-            error_message: (stop_reason == StopReason::Error)
-                .then(|| "temporary provider failure".to_string()),
-            ..AssistantMessage::default()
-        }
-    }
-
-    fn advisor_lifecycle_tool_call() -> AssistantMessage {
-        AssistantMessage {
-            content: vec![ContentBlock::ToolCall(ToolCall {
-                id: "advisor-read".to_string(),
-                name: "read".to_string(),
-                arguments: json!({"path": "fixture.txt"}),
-                thought_signature: None,
-            })],
-            ..advisor_lifecycle_reply(StopReason::ToolUse)
-        }
-    }
-
-    fn advisor_lifecycle_session(
-        root: &Path,
-        replies: Vec<Result<AssistantMessage>>,
-        abort_on_review: Option<AbortHandle>,
-    ) -> (
-        AgentSession,
-        Arc<AdvisorLifecycleDoer>,
-        Arc<AdvisorLifecycleReview>,
-    ) {
-        std::fs::write(root.join("fixture.txt"), "fixture content").expect("write read fixture"); // ubs:ignore[rust.panic.expect] -- Real read-tool execution establishes a substantial turn.
-        let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
-            root.join("sessions"),
-        ))));
-        let doer = Arc::new(AdvisorLifecycleDoer {
-            replies: StdMutex::new(replies.into()),
-            calls: std::sync::atomic::AtomicUsize::new(0),
-            session: Arc::clone(&session),
-            fail_save_at_completion: StdMutex::new(None),
-        });
-        let advisor = Arc::new(AdvisorLifecycleReview {
-            calls: std::sync::atomic::AtomicUsize::new(0),
-            session: Arc::clone(&session),
-            observed_durable_completion: AtomicBool::new(false),
-            abort_on_call: abort_on_review,
-        });
-        let mut agent_session = AgentSession::new(
-            Agent::new(
-                doer.clone(),
-                ToolRegistry::new(&["read"], root, None),
-                AgentConfig::default(),
-            ),
-            session,
-            true,
-            ResolvedCompactionSettings {
-                enabled: false,
-                ..ResolvedCompactionSettings::default()
-            },
-        );
-        agent_session.advisor = Some(crate::advisor::AdvisorRuntime::new(
-            advisor.clone(),
-            "advisor/advisor-model".to_string(),
-        ));
-        (agent_session, doer, advisor)
-    }
-
-    #[test]
-    fn every_session_entrypoint_reviews_once_after_the_completed_turn_is_durable() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build"); // ubs:ignore[rust.panic.expect] -- Each path exercises real AgentSession execution and persistence.
-        runtime.block_on(async {
-            for entrypoint in ["text", "content", "custom", "continue"] {
-                let temp = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.panic.expect] -- Isolated durable session and read-tool fixture.
-                let (mut session, doer, advisor) = advisor_lifecycle_session(
-                    temp.path(),
-                    vec![
-                        Ok(advisor_lifecycle_tool_call()),
-                        Ok(advisor_lifecycle_reply(StopReason::Stop)),
-                    ],
-                    None,
-                );
-                if entrypoint == "continue" {
-                    let cx = crate::agent_cx::AgentCx::for_request();
-                    session
-                        .session
-                        .lock(cx.cx())
-                        .await
-                        .expect("seed continuation") // ubs:ignore[rust.panic.expect] -- A continuation must start from an authored persisted-path input.
-                        .append_model_message(user_message("check the fixture"));
-                }
-                let ends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let captured_ends = Arc::clone(&ends);
-                let on_event = move |event| {
-                    if matches!(event, AgentEvent::AgentEnd { .. }) {
-                        captured_ends.fetch_add(1, Ordering::SeqCst);
-                    }
-                };
-                let result = match entrypoint {
-                    "text" => {
-                        session
-                            .run_text("check the fixture".to_string(), on_event)
-                            .await
-                    }
-                    "content" => {
-                        session
-                            .run_with_content(
-                                vec![ContentBlock::Text(TextContent::new("check the fixture"))],
-                                on_event,
-                            )
-                            .await
-                    }
-                    "custom" => {
-                        session
-                            .run_custom_message_with_abort(
-                                Message::Custom(CustomMessage {
-                                    content: "check the fixture".to_string(),
-                                    custom_type: "extension-task".to_string(),
-                                    display: true,
-                                    details: None,
-                                    timestamp: Utc::now().timestamp_millis(),
-                                }),
-                                None,
-                                on_event,
-                            )
-                            .await
-                    }
-                    _ => session.run_continue_with_abort(None, on_event).await,
-                }
-                .expect("completed session turn"); // ubs:ignore[rust.panic.expect] -- All four actual execution entrypoints must complete.
-                assert_eq!(result.stop_reason, StopReason::Stop, "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- The primary result remains unchanged by optional review.
-                assert_eq!(doer.calls.load(Ordering::SeqCst), 2, "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- Advice is queued for a later explicit turn.
-                assert_eq!(advisor.calls.load(Ordering::SeqCst), 1, "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- Nested wrappers must neither omit nor duplicate review.
-                assert!(
-                    advisor.observed_durable_completion.load(Ordering::SeqCst),
-                    "{entrypoint}"
-                ); // ubs:ignore[rust.panic.assert-macros] -- Independent disk reopen at provider admission sees the completed doer reply.
-                assert_eq!(ends.load(Ordering::SeqCst), 1, "{entrypoint}"); // ubs:ignore[rust.panic.assert-macros] -- Advisory work adds no extra agent terminal.
-                assert_eq!(
-                    session.agent.message_queue.steering.len(),
-                    1,
-                    "{entrypoint}"
-                ); // ubs:ignore[rust.panic.assert-macros] -- Exactly one generated concern awaits the next turn.
-                assert!(
-                    !session.extensions_turn_active.load(Ordering::SeqCst),
-                    "{entrypoint}"
-                ); // ubs:ignore[rust.panic.assert-macros] -- Completion releases turn ownership on every path.
-            }
-        });
-    }
-
-    #[test]
-    fn advisor_reviews_recovered_tool_work_once_without_reexecuting_it() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build"); // ubs:ignore[rust.panic.expect] -- Exercise the same continuation path used by provider retry.
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.panic.expect] -- Durable retry fixture.
-            let (mut session, doer, advisor) = advisor_lifecycle_session(
-                temp.path(),
-                vec![
-                    Ok(advisor_lifecycle_tool_call()),
-                    Ok(advisor_lifecycle_reply(StopReason::Error)),
-                    Ok(advisor_lifecycle_reply(StopReason::Stop)),
-                ],
-                None,
-            );
-            let tool_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let observed_tools = Arc::clone(&tool_starts);
-            let failed = session
-                .run_text("check the fixture".to_string(), move |event| {
-                    if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
-                        observed_tools.fetch_add(1, Ordering::SeqCst);
-                    }
-                })
-                .await
-                .expect("provider terminal is returned"); // ubs:ignore[rust.panic.expect] -- The scripted failure is a completed Error terminal.
-            assert_eq!(failed.stop_reason, StopReason::Error); // ubs:ignore[rust.panic.assert-macros] -- Review must be withheld for the failed first attempt.
-            assert_eq!(advisor.calls.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- Substantial but failed work never starts review.
-            assert!(
-                session
-                    .revert_incomplete_response()
-                    .await
-                    .expect("revert failed tail")
-            ); // ubs:ignore[rust.panic.assert-macros,rust.panic.expect] -- Retry restores the real incomplete assistant tail.
-            let observed_tools = Arc::clone(&tool_starts);
-            let recovered = session
-                .run_continue_with_abort(None, move |event| {
-                    if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
-                        observed_tools.fetch_add(1, Ordering::SeqCst);
-                    }
-                })
-                .await
-                .expect("retry completion"); // ubs:ignore[rust.panic.expect] -- The successful retry must reach the shared review boundary.
-            assert_eq!(recovered.stop_reason, StopReason::Stop); // ubs:ignore[rust.panic.assert-macros] -- Recovery returns the durable final reply.
-            assert_eq!(doer.calls.load(Ordering::SeqCst), 3); // ubs:ignore[rust.panic.assert-macros] -- One tool request, one failed request, and one resumed request.
-            assert_eq!(tool_starts.load(Ordering::SeqCst), 1); // ubs:ignore[rust.panic.assert-macros] -- Completed tool effects are never replayed for review.
-            assert_eq!(advisor.calls.load(Ordering::SeqCst), 1); // ubs:ignore[rust.panic.assert-macros] -- Only the recovered completion is reviewed.
-            assert!(advisor.observed_durable_completion.load(Ordering::SeqCst)); // ubs:ignore[rust.panic.assert-macros] -- Recovered reply is durable before the advisor sees it.
-            assert_eq!(session.agent.message_queue.steering.len(), 1); // ubs:ignore[rust.panic.assert-macros] -- Recovery publishes one concern.
-        });
-    }
-
-    #[test]
-    fn durable_time_cap_skips_nontrivial_advice_until_explicit_continuation() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build"); // ubs:ignore[rust.panic.expect] -- Exercise the actual zero-budget core boundary.
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.panic.expect] -- The capped conversation must survive an independent reopen.
-            let (mut session, doer, advisor) = advisor_lifecycle_session(
-                temp.path(),
-                vec![Ok(advisor_lifecycle_reply(StopReason::Stop))],
-                None,
-            );
-            {
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let mut inner = session.session.lock(cx.cx()).await.expect("seed tool work"); // ubs:ignore[rust.panic.expect] -- A completed tool cycle makes this digest nontrivial even at a zero cap.
-                inner.append_model_message(user_message("check the fixture"));
-                inner.append_model_message(Message::assistant(advisor_lifecycle_tool_call()));
-                inner.append_model_message(Message::tool_result(ToolResultMessage {
-                    tool_call_id: "advisor-read".to_string(),
-                    tool_name: "read".to_string(),
-                    content: vec![ContentBlock::Text(TextContent::new("fixture content"))],
-                    details: None,
-                    is_error: false,
-                    timestamp: Utc::now().timestamp_millis(),
-                }));
-            }
-            session.agent.config.max_time = Some(Duration::ZERO);
-            let capped = session
-                .run_continue_with_abort(None, |_| {})
-                .await
-                .expect("durable capped turn"); // ubs:ignore[rust.panic.expect] -- The real cap is a successful bounded terminal.
-            assert!(time_cap_marker(&capped).is_some()); // ubs:ignore[rust.panic.assert-macros] -- The test must reach the exact synthetic time-cap path.
-            assert!(!crate::advisor::build_digest(session.agent.messages()).is_trivial()); // ubs:ignore[rust.panic.assert-macros] -- Zero calls must result from the cap gate rather than trivial-digest suppression.
-            assert_eq!(doer.calls.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- Exhausted budget admits no primary provider request.
-            assert_eq!(advisor.calls.load(Ordering::SeqCst), 0); // ubs:ignore[rust.panic.assert-macros] -- Exhausted budget also admits no optional review.
-            assert!(session.agent.message_queue.steering.is_empty()); // ubs:ignore[rust.panic.assert-macros] -- A pause cannot create new generated work.
-            let path = {
-                let cx = crate::agent_cx::AgentCx::for_request();
-                session
-                    .session
-                    .lock(cx.cx())
-                    .await
-                    .expect("saved cap path") // ubs:ignore[rust.panic.expect] -- Capture the authoritative file after completed persistence.
-                    .path
-                    .clone()
-                    .expect("durable session path") // ubs:ignore[rust.panic.expect] -- Saving the cap must materialize a session file.
-            };
-            let reopened = Session::open(path.to_string_lossy().as_ref())
-                .await
-                .expect("reopen capped session"); // ubs:ignore[rust.panic.expect] -- Assert durable output rather than only the in-memory result.
-            assert!(reopened.to_messages_for_current_path().iter().any(
-                |message| matches!( // ubs:ignore[rust.panic.assert-macros] -- The exact bounded terminal must survive reopen.
-                    message, Message::Assistant(assistant) if time_cap_marker(assistant).is_some()
-                )
-            ));
-            session.agent.config.max_time = None;
-            session
-                .run_continue_with_abort(None, |_| {})
-                .await
-                .expect("explicit continuation"); // ubs:ignore[rust.panic.expect] -- A subsequent authorized turn may complete the paused work.
-            assert_eq!(doer.calls.load(Ordering::SeqCst), 1); // ubs:ignore[rust.panic.assert-macros] -- Only explicit continuation enters the primary provider.
-            assert_eq!(advisor.calls.load(Ordering::SeqCst), 1); // ubs:ignore[rust.panic.assert-macros] -- Review resumes after a fresh durable completion.
-            assert!(advisor.observed_durable_completion.load(Ordering::SeqCst)); // ubs:ignore[rust.panic.assert-macros] -- The new completed reply is saved before review.
-        });
-    }
-
-    #[test]
-    fn advisor_omits_aborted_unsaved_and_cancelled_completions() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build"); // ubs:ignore[rust.panic.expect] -- All cases use the real session completion boundary.
-        runtime.block_on(async {
-            for case in ["aborted", "save_failed", "late_abort", "advisor_abort"] {
-                let temp = tempfile::tempdir().expect("tempdir"); // ubs:ignore[rust.panic.expect] -- Each fault owns a separate durable session.
-                let (handle, signal) = AbortHandle::new();
-                let (mut session, doer, advisor) = advisor_lifecycle_session(
-                    temp.path(),
-                    vec![
-                        Ok(advisor_lifecycle_tool_call()),
-                        Ok(advisor_lifecycle_reply(if case == "aborted" {
-                            StopReason::Aborted
-                        } else {
-                            StopReason::Stop
-                        })),
-                    ],
-                    (case == "advisor_abort").then(|| handle.clone()),
-                );
-                if case == "save_failed" {
-                    let blocked_path = temp.path().join("blocked.jsonl");
-                    std::fs::create_dir(&blocked_path).expect("block terminal save"); // ubs:ignore[rust.panic.expect] -- A directory at the final file path creates a real save failure.
-                    *doer
-                        .fail_save_at_completion
-                        .lock()
-                        .expect("inject save failure") // ubs:ignore[rust.panic.expect] -- Install the failure after the initial authored input is saved.
-                        = Some(blocked_path);
-                }
-                let result = session
-                    .run_text_with_abort(
-                        "check the fixture".to_string(),
-                        Some(signal),
-                        move |event| {
-                            if case == "late_abort"
-                                && matches!(event, AgentEvent::AgentEnd { .. })
-                            {
-                                handle.abort();
-                            }
-                        },
-                    )
-                    .await;
-                if case == "save_failed" {
-                    assert!(result.is_err()); // ubs:ignore[rust.panic.assert-macros] -- A failed durable completion cannot report success.
-                    assert!(session.ensure_provider_reentry_allowed().is_err()); // ubs:ignore[rust.panic.assert-macros] -- The existing persistence fence remains installed.
-                } else {
-                    let reply = result.expect("primary terminal remains available"); // ubs:ignore[rust.panic.expect] -- Optional review cancellation does not rewrite a completed main turn.
-                    assert_eq!(reply.stop_reason, if case == "aborted" { StopReason::Aborted } else { StopReason::Stop }); // ubs:ignore[rust.panic.assert-macros] -- Main-turn outcomes retain their original meaning.
-                }
-                assert_eq!(doer.calls.load(Ordering::SeqCst), 2, "{case}"); // ubs:ignore[rust.panic.assert-macros] -- Every fault occurs after substantive tool work.
-                assert_eq!(advisor.calls.load(Ordering::SeqCst), usize::from(case == "advisor_abort"), "{case}"); // ubs:ignore[rust.panic.assert-macros] -- Only the deliberate in-review cancellation case enters the advisor.
-                assert!(session.agent.message_queue.steering.is_empty(), "{case}"); // ubs:ignore[rust.panic.assert-macros] -- No cancelled or failed completion injects a late concern.
-                let cx = crate::agent_cx::AgentCx::for_request();
-                let inner = session
-                    .session
-                    .lock(cx.cx())
-                    .await
-                    .expect("inspect advisor trail"); // ubs:ignore[rust.panic.expect] -- Publication is checked through the authoritative session path.
-                assert!(inner.entries_for_current_path().iter().all(|entry| !matches!( // ubs:ignore[rust.panic.assert-macros] -- Cancelled or withheld review creates no audit verdict.
-                    entry, crate::session::SessionEntry::Custom(custom) if custom.custom_type == "advisor_note"
-                )), "{case}");
-            }
-        });
-    }
-
-    #[test]
-    fn advisor_review_injects_concern_into_steering_queue() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().expect("tempdir");
-            std::fs::write(temp.path().join("fixture.txt"), "x").expect("fixture");
-            let tools = ToolRegistry::new(&["read"], temp.path(), None);
-            let agent = Agent::new(
-                Arc::new(ScriptedDoerProvider {
-                    calls: std::sync::atomic::AtomicUsize::new(0),
-                }),
-                tools,
-                AgentConfig::default(),
-            );
-            let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session =
-                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
-            agent_session.advisor = Some(crate::advisor::AdvisorRuntime::new(
-                Arc::new(ScriptedAdvisorProvider),
-                "advisor/advisor-model".to_string(),
-            ));
-
-            let _ = agent_session
-                .run_text_with_abort("check the fixture".to_string(), None, |_| {})
-                .await
-                .expect("turn 1 completes");
-
-            // Turn 2 delivers the queued advisor note into the session
-            // context (the next-turn injection is the acceptance behavior).
-            let _ = agent_session
-                .run_text_with_abort("continue".to_string(), None, |_| {})
-                .await
-                .expect("turn 2 completes");
-
-            let steered = agent_session
-                .agent
-                .messages()
-                .iter()
-                .filter_map(|m| match m {
-                    crate::model::Message::User(u) => match &u.content {
-                        crate::model::UserContent::Text(t) => Some(t.clone()),
-                        crate::model::UserContent::Blocks(_) => None,
-                    },
-                    _ => None,
-                })
-                .any(|text| text.contains("ADVISOR:CONCERN"));
-            assert!(
-                steered,
-                "advisor concern must be delivered into the next turn"
-            );
-            let has_entry = {
-                let cx = asupersync::Cx::for_request();
-                let inner = agent_session.session.lock(&cx).await.expect("session lock");
-                inner.entries_for_current_path().iter().any(|e| {
-                    matches!(
-                        e,
-                        crate::session::SessionEntry::Custom(c) if c.custom_type == "advisor_note"
-                    )
-                })
-            };
-            assert!(has_entry, "advisor_note session entry recorded");
-        });
-    }
-
-    #[test]
-    fn advisor_hook_blocks_configured_and_remembered_secrets_before_provider_admission() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        runtime.block_on(async {
-            let advisor = Arc::new(ScriptedDoerProvider {
-                calls: std::sync::atomic::AtomicUsize::new(0),
-            });
-            let mut agent = Agent::new(
-                Arc::new(SilentProvider),
-                ToolRegistry::from_tools(Vec::new()),
-                AgentConfig::default(),
-            );
-            let known = "rememberedCredentialValue123456";
-            agent
-                .secrets_transform_outbound_text(&format!("API_KEY={known}"))
-                .unwrap();
-            let mut session = AgentSession::new(
-                agent,
-                Arc::new(Mutex::new(Session::in_memory())),
-                false,
-                ResolvedCompactionSettings::default(),
-            );
-            session.advisor = Some(
-                crate::advisor::AdvisorRuntime::new(advisor.clone(), "privacy-test".to_string())
-                    .with_secrets_settings(Some(&crate::secrets::SecretsSettings {
-                        mode: Some("block".to_string()),
-                        extra_patterns: Some(vec![r"ACME-\d{6}".to_string()]),
-                    })),
-            );
-            for command in [
-                format!("{} ACME-123456", "x".repeat(300)),
-                "API_KEY=r4nd0mCredentialValue123456".to_string(),
-                format!("echo {known}"),
-            ] {
-                session
-                    .agent
-                    .replace_messages(vec![Message::Assistant(Arc::new(AssistantMessage {
-                        content: vec![ContentBlock::ToolCall(ToolCall {
-                            id: "privacy-call".to_string(),
-                            name: "bash".to_string(),
-                            arguments: json!({"command": command}),
-                            thought_signature: None,
-                        })],
-                        ..Default::default()
-                    }))]);
-                let original = serde_json::to_value(session.agent.messages()).unwrap();
-                session.maybe_advise_turn(None).await;
-                assert_eq!(advisor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-                assert_eq!(
-                    serde_json::to_value(session.agent.messages()).unwrap(),
-                    original
-                );
-                assert!(!session.advisor.as_ref().unwrap().is_disabled());
-            }
-            // The zero-call assertions must not pass just because the hook is
-            // disabled or globally paused: a clean substantial turn is admitted.
-            session
-                .agent
-                .replace_messages(vec![Message::Assistant(Arc::new(AssistantMessage {
-                    content: vec![ContentBlock::Text(TextContent::new("x".repeat(500)))],
-                    ..Default::default()
-                }))]);
-            session.maybe_advise_turn(None).await;
-            assert_eq!(advisor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        });
-    }
-
-    #[test]
-    fn advisor_absent_means_zero_overhead() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        runtime.block_on(async {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let tools = ToolRegistry::new(&["read"], temp.path(), None);
-            let agent = Agent::new(
-                Arc::new(ScriptedDoerProvider {
-                    calls: std::sync::atomic::AtomicUsize::new(0),
-                }),
-                tools,
-                AgentConfig::default(),
-            );
-            let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session =
-                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
-            assert!(agent_session.advisor.is_none());
-            let result = agent_session
-                .run_text_with_abort("work".to_string(), None, |_| {})
-                .await;
-            assert!(result.is_ok(), "no advisor → turn unaffected");
-        });
-    }
-}
+include!("agent_tests.rs");

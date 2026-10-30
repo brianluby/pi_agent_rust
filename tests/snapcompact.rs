@@ -58,15 +58,18 @@ fn rendering_is_deterministic_byte_for_byte() {
 }
 
 // Golden hash pins the exact renderer output (font table + palette +
-// geometry + flate2 output), captured from the first verified build of this
-// module. Any intentional visual change requires updating this constant in
-// the same commit, with a reviewer-visible diff of the rendered output.
-const GOLDEN_SHA256: &str = "22a1e7ee20b254d1a4859f1b08c3c45244ba7412b218c08c1b504d2639e68473";
+// geometry + flate2 output). Any intentional visual change requires updating
+// this constant in the same commit, with a reviewer-visible diff of the
+// rendered output. Last change: e40fe1b76 pads short frames to 64px, so this
+// one-line frame grew from 960x32 to 960x64; the extra 32 rows are
+// background and the raster above them is unchanged.
+const GOLDEN_SHA256: &str = "3713201a8b60e8471c8d644a56ecf969ad856a1239bc7acc17e614a2b9d6b6b7";
 
 #[test]
 fn golden_hash_matches_committed_renderer_output() {
     let small = render_frames("[User]: golden\n");
     assert_eq!(small.len(), 1);
+    assert_eq!((small[0].width, small[0].height), (FRAME_WIDTH, 64));
     let mut h = Sha256::new();
     h.update(small[0].png.as_bytes());
     let digest: String = h
@@ -188,17 +191,17 @@ fn base_summary_message() -> Message {
     })
 }
 
-fn frame_stub(data: &str) -> SnapFrame {
-    SnapFrame {
-        png: data.to_string(),
-        width: 10,
-        height: 10,
-    }
+/// A frame from the production renderer. Attachment validates each frame's
+/// PNG integrity and geometry, so placeholder bytes are rejected.
+fn rendered_frame(text: &str) -> SnapFrame {
+    render_frames(text).remove(0)
 }
 
 #[test]
 fn attach_frames_places_images_after_text_block() {
-    let payload = SnapPayload::new(vec![frame_stub("QUFB"), frame_stub("QkJC")]);
+    let first = rendered_frame("[User]: first frame");
+    let expected = first.png.clone();
+    let payload = SnapPayload::new(vec![first, rendered_frame("[User]: second frame")]);
     let attached = attach_frames(base_summary_message(), Some(&payload));
 
     let Message::User(user) = attached else {
@@ -211,7 +214,7 @@ fn attach_frames_places_images_after_text_block() {
     assert!(matches!(&blocks[0], ContentBlock::Text(t) if t.text.contains("<summary>")));
     assert!(
         matches!(&blocks[1], ContentBlock::Image(ImageContent { data, mime_type })
-        if data == "QUFB" && mime_type == "image/png")
+        if *data == expected && mime_type == "image/png")
     );
     assert_eq!(user.timestamp, 7, "timestamp preserved from source entry");
 

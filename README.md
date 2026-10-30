@@ -355,8 +355,18 @@ Each standalone CLI invocation starts a new process, so its in-memory cache is
 fresh. The five-minute cache only avoids repeat discovery calls made within one
 long-lived process by SDK/library users; `--refresh-models` bypasses that cache.
 
+Discovery also reads usable `supported_reasoning_levels` advertisements, including
+`metadata.supported_reasoning_levels` and entries shaped as `{"effort":"high"}`.
+Nested metadata takes precedence. Pi preserves the advertised tiers through the
+cache and persisted catalog, constrains the model's thinking choices to those
+tiers, and sends the selected effort through the provider's request format.
+The recognized tiers are `off` (also advertised as `none`), `minimal`, `low`,
+`medium`, `high`, `xhigh`, and `max`. Missing, empty, or unusable advertisements
+leave existing model capabilities intact. Your configured thinking level remains
+authoritative; discovery does not select a server-advertised default effort.
+
 Persistence is opt-in. The v2 `~/.pi/agent/models.fetched.json` schema stores
-provider/model IDs, the fetch timestamp, and a non-secret SHA-256 identity
+provider/model IDs, optional bounded reasoning tiers, the fetch timestamp, and a non-secret SHA-256 identity
 binding membership to the provider, API, query-free endpoint, auth-header
 mode, recognized credential-query ordered name/presence shape, and
 request-header name/presence shape that produced it. Pi never persists a static fallback, API
@@ -447,6 +457,44 @@ remains reachable. The tier table lives in `src/xdev.rs`; the default
 | `read_media` | Attaches a local video/audio file (mp4, webm, mov, mp3, wav, m4a, ogg, flac) as an inline media block. Gemini, Gemini CLI, and Vertex Gemini models receive it natively as `inline_data`; every other provider sees `[media omitted: <name>, <mime>, <size>]`. Hard cap 5 MiB per file (`media.maxBytes`); settings-gated |
 | `subagent` | Delegate isolated work to named Rust Pi child agents |
 
+### Project memory learning
+
+The local memory bank can extract reusable facts, lessons, preferences and
+decisions from completed saved sessions, and consolidate facts learned earlier.
+Enable the bank in settings, then run `/memory sync` in the default interactive
+UI to learn from the current completed branch:
+
+```json
+{
+  "memory": {
+    "backend": "local",
+    "autoExtract": true,
+    "extractEveryTurns": 3
+  }
+}
+```
+
+`autoExtract` is off unless explicitly enabled. When enabled, one bounded,
+tool-free request runs after every three newly authored turns by default; the
+cadence accepts 1–100. The request uses the session's current model and provider
+credentials, has a 30-second deadline, and shares any remaining foreground time
+budget. Extraction failure leaves the completed foreground answer intact and
+can be retried with `/memory sync`. Explicit synchronization works with
+`autoExtract` off. Ephemeral sessions and delegated child agents do not extract
+project memories. The `cass` backend uses the same local learning pipeline.
+
+Extraction resolves the session's current attached workdir, screens complete
+bounded text evidence before selecting a recent request window, and redacts
+both request and stored results. Oversized evidence is refused rather than
+partially screened. Each successful extraction commits facts, search indexes,
+audit records and a durable branch checkpoint together, so reopening or revisiting
+an already synchronized branch does not repeat the provider request. Automatic
+consolidation can supersede only unchanged generated memories supplied to the
+request; manually retained or edited facts keep their ownership. Historical
+versions remain auditable. Learned facts become available through `recall`,
+`reflect` and the existing startup memory block. `/memory view`, `list`, `search`
+and `forget` remain available for inspection and management.
+
 All tools include automatic truncation for large outputs (2000 lines /
 1MB), detailed metadata in responses, and process-tree cleanup for bash.
 Background-job logs live in a dedicated directory with a 256 MiB / 4096-entry
@@ -456,6 +504,23 @@ least eight recent ones. Set `PI_JOBS_ARTIFACT_RETENTION=preserve` to keep
 every log instead; Pi then refuses new background jobs once the budget is
 full. Job snapshots report the applied policy, removed-file count, and
 reclaimed bytes in `artifactCleanup`.
+
+Print mode can keep working after a background job finishes. Add `--wait-async`
+or set `"async": {"printWake": true}` to wait for the current session's jobs,
+deliver their completion notices to the agent, and run follow-up turns in the
+same session. A follow-up may start further jobs. The process exits when all
+owned work has settled and its notices have been delivered. Text continues
+streaming each answer; JSON mode emits the corresponding agent lifecycles.
+
+```bash
+pi -p --wait-async --max-time 3600 \
+  "Run the integration suite in the background and fix any failures."
+```
+
+The flag is opt-in; ordinary print mode exits after its prompts and cancels
+unfinished jobs. With async waiting, `--max-time` covers the original run,
+idle waits, follow-up turns and retry delays. Reaching it fails the run and
+cancels owned jobs. Ctrl+C also interrupts idle waits and retry delays.
 
 Hub service logs retain the first 16 MiB of raw output per run. Pi continues
 draining the service after that limit or an artifact write failure, so live
@@ -475,6 +540,73 @@ wins:
 pi --tools read,bash,edit,write,grep,find,ls,hashline_edit,subagent \
   "Use the scout agent to inspect the provider implementation."
 ```
+
+### Model Spend Limits
+
+Use `--warn-cost` to show a one-time notice and `--max-cost` to stop admitting
+model requests once known spend reaches a USD threshold:
+
+```bash
+pi --warn-cost 2 --max-cost 5 "Implement and test the change."
+pi -p --wait-async --max-cost 10 "Delegate the investigation and report the findings."
+```
+
+The corresponding settings are `session.warnCost` and `session.maxCost`;
+CLI values override them. Values must be positive finite numbers. The limits
+cover the active session tree: foreground turns, retries, native subagents,
+advisor reviews, compaction, titles, memory extraction and side questions
+share the same account. Child requests consult the parent's live balance;
+missing or ambiguous accounting acknowledgements block further child requests.
+
+Known partial usage from an in-flight request counts toward the next admission.
+The provider's final bill replaces that request's provisional estimate exactly
+once, including when the final bill is lower. Cancelling or reaping a native
+child retains partial usage already acknowledged by its parent, so siblings
+cannot spend that allowance again. An already-admitted request may settle its
+bill during cancellation; this does not permit new model requests.
+
+```json
+{
+  "session": { "warnCost": 2, "maxCost": 5 }
+}
+```
+
+Resuming includes recorded assistant usage from all retained branches and
+saved auxiliary-spend checkpoints. Forking, rewinding, retrying, changing
+models and reloading resources preserve the live balance. A new session gets
+a fresh balance; switching to another saved session restores that session's
+recorded spend. A resumed session already above its warning threshold does
+not repeat the warning. Change launch flags or settings before reopening to
+use different thresholds.
+
+The Rust SDK exposes `SessionOptions.warn_cost`, `max_cost` and an optional
+shared `cost_budget`; `CostBudget` clones share one account. Warnings arrive
+as `AgentEvent::CostWarning` (`type: "cost_warning"` in JSON). A refused request
+returns `Error::CostCap`; print mode exits with status **3**. Native RPC marks
+the terminal failure with `errorCode: "cost_cap"`, `retryable: false`, and
+`costCap: { "spent": ..., "cap": ... }`.
+
+These are request-boundary limits based on known provider costs or catalog
+token pricing. Requests already in flight may finish above the cap, and
+unreported/unpriced usage cannot be estimated. Spend is checkpointed with
+session saves, including normal turn completion, replacement and SDK shutdown.
+Only settled charges enter saved cost checkpoints; an in-flight estimate
+cannot permanently inflate the restored balance if its final bill is lower.
+When a saved session is replaced or shuts down, captured background requests
+retain a durable billing destination for that original session. Their final
+charges go to a separate cost journal beside the session file, without
+rewriting its transcript or racing a newly reopened session's saves. Resume
+combines those charges with saved checkpoints exactly once; a reopened live
+account also imports newly arrived charges before admitting another request.
+This applies to JSONL and SQLite sessions, including the first charge arriving
+after a zero-spend checkpoint. Failed replacements and same-file reloads keep
+the foreground account live. Cost journals are not created for `--no-session`.
+
+Keep the adjacent `.pi-cost-*.json` files with their session files when backing
+up or moving a session directory. Failure to acknowledge a journal write blocks
+further requests on the affected account. A crash before a normal checkpoint or
+before a final charge receives its durable acknowledgement can still lose
+uncheckpointed spend; these limits do not replace the provider's billing records.
 
 ### Native Subagents and Orchestration
 
@@ -616,6 +748,63 @@ Pi runs in four modes, each suited to different workflows:
 | **Print** | `pi -p "..."` | Single response to stdout, no TUI, scriptable |
 | **RPC** | `pi --mode rpc` | Headless JSON protocol over stdin/stdout for IDE integrations |
 | **ACP** | `pi --acp` | JSON-RPC 2.0 Agent Client Protocol over stdin/stdout (e.g. the Zed editor) |
+
+**ACP attachments.** `session/prompt` accepts ordered text, images, native
+`audio` blocks, and embedded audio/video resource blobs. Audio-only prompts
+work. Gemini-family providers receive native media; other transports show an
+explicit omission label while the complete attachment stays in session history
+and editor replay. Audio/video admission honors `media.maxBytes` (5 MiB by
+default), with a 10 MiB transport ceiling per attachment and at most 32 media
+attachments per prompt. See [ACP audio and video prompts](docs/tools/media_tools.md#acp-audio-and-video-prompts)
+for the editor wire format and aggregate limits.
+
+**ACP live steering.** The initialize response advertises
+`_meta.steering.supported: true`. Editors can send `_session/steering` with
+`sessionId` and the same `prompt` content blocks as `session/prompt` while a
+turn is running. Text, images, audio/video, and embedded references retain
+their native form and the same media limits. Set `_meta.steering.queue` to
+`"followUp"` to request delivery after the current model turn; the default
+`"steering"` lane delivers at the next native
+steering boundary. Steering cancels that session's open permission dialog via
+`$/cancel_request`; a follow-up leaves the dialog open.
+
+The response is `{"outcome":"injected","queue":"steering"}` (or
+`"followUp"`) when the native agent claims the input. This acknowledges
+handoff, not completed execution or durable storage. Idle input, and input
+still unclaimed when its owning turn ends or is cancelled, returns
+`"promptRequired"` so the editor can submit it as a new `session/prompt`.
+Unclaimed responses follow the original prompt's terminal response and cleanup;
+unclaimed input is never carried into a different prompt. The per-turn queue
+holds at most 100 requests and 8 MiB; each request is limited to 128 blocks,
+4 MiB for serialized content and request ID together, and 256 KiB of authored prose.
+An overflowing queue returns `"failed"` without accepting the input.
+
+**ACP editor files.** Clients can advertise `clientCapabilities.fs.readTextFile`
+and `writeTextFile` in `initialize`. Pi then sends standard outbound
+`fs/read_text_file` and `fs/write_text_file` requests, scoped to the owning
+`sessionId` and an absolute workspace path. Native `read`, `write`, `edit`, and
+`hashline_edit` work with unsaved editor buffers, including new files that do
+not yet exist on disk. Tool approval and workspace/symlink checks run before
+any editor request. Text buffers are limited to 10 MiB; read pagination and
+hashline tags are derived from the editor text. Rendered documents, notebooks,
+binary media, internal artifacts, and non-file URLs keep their native routes.
+
+Capabilities are independent: without an advertised capability the corresponding
+operation remains local. A failed advertised editor read never falls back to
+stale disk content. With a read-only client, an edit can write locally only if
+disk still matches the exact editor preimage. Edits re-read their source before
+writing to catch intervening changes; ACP does not provide atomic versioned
+compare-and-swap. After an acknowledged editor write, Pi reads back when
+possible and reports formatter changes from the resulting buffer. If read-back
+is unavailable, Pi reports an acknowledged, unverified write and does not claim
+a verified diff or a disk undo record.
+
+Cancellation discards pending reads and ignores their late responses. A write
+already published to the editor may still complete: cancellation or timeout
+stops the current prompt and holds further prompts or reloads for that session
+until its matching valid acknowledgment or error arrives. Pi explicitly reports
+that the write was not rolled back. Malformed or unrelated responses cannot
+clear this hold, and other sessions can continue normally.
 
 **Interactive mode** provides the full experience: a multi-line text editor with history, scrollable conversation viewport, model selector (`Ctrl+L`), scoped model cycling (`Ctrl+P`/`Ctrl+Shift+P`), session branch navigator (`/tree`), and real-time token/cost tracking. Since v0.4.0 the default interactive stack is the FrankenTUI (`ftui`) runtime; `pi --inline` keeps your shell scrollback by drawing the UI at the bottom of the screen instead of on the alternate screen, and `pi --classic` (aliases `--classic-tui`, `--charmed`, `--bubbletea`) selects the previous charmed_rust stack until it is removed.
 
@@ -1014,7 +1203,7 @@ pi migrate ~/.pi/agent/sessions
 
 - `update-index` refreshes extension index metadata used by `search` and `info`.
 - `search` and `info` let you discover and inspect extension metadata without leaving the CLI.
-- `doctor` checks config, directories, auth, shell setup, sessions, swarm coordination readiness, and extension compatibility. `pi doctor --only swarm --format json` also reports cgroup CPU quota, cpuset size, NUMA topology, cgroup memory limits, target/tmp headroom, and recommended concurrency budgets before large multi-agent runs.
+- `pi doctor` checks ordinary installation health: config, directories, auth, shell setup, and sessions. Swarm coordination diagnostics are opt-in with `--only swarm` (or a comma-separated selection including `swarm`); they require development infrastructure such as Beads, Agent Mail, RCH, and build scratch space. `pi doctor --only swarm --format json` reports cgroup CPU quota, cpuset size, NUMA topology, cgroup memory limits, target/tmp headroom, and recommended concurrency budgets before large multi-agent runs. These explicit checks remain strict and fail closed on operational hazards. Text, JSON, and markdown reports use the same selected findings and exit with status 1 when any selected check fails; warnings and informational findings exit 0. Supplying an extension path checks extension compatibility by default.
 - `swarm-progress` evaluates a normalized progress SLO snapshot and emits advisory JSON/text only; it does not mutate Beads, git, Agent Mail, RCH, validation broker slots, runpacks, or source files. Operator workflow, privacy boundaries, degraded Agent Mail/RCH interpretation, stale-Beads handling, and no-open-work convergence guidance lives in [docs/swarm-operations-runbook.md#progress-slo-operator-workflow](docs/swarm-operations-runbook.md#progress-slo-operator-workflow).
 - `migrate` validates or creates the v2 session sidecar format for faster resume on larger histories.
 
@@ -1149,7 +1338,7 @@ When multiple resources share the same name, the first occurrence wins. Collisio
 
 Project context files are a separate switch. By default pi appends `AGENTS.md` / `CLAUDE.md` from `~/.pi/agent/`, the working directory, and every ancestor directory to the system prompt (plus imported foreign-format workspace rules). `--no-context-files` (or `PI_NO_CONTEXT_FILES=1`) disables that discovery entirely; `--no-skills` does not cover it. Hosts that compose the whole prompt with `--system-prompt` typically pass `--no-context-files --no-skills` together.
 
-**Prompt template expansion** supports positional arguments: `$1`, `$2`, `$@` (all args), and slice syntax `${@:start}`, `${@:start:length}`. For example, a template invoked as `/review src/main.rs --strict` receives `src/main.rs` as `$1` and `--strict` as `$2`.
+**Prompt template expansion** supports positional arguments: `$1`, `$2`, `$@` (all args), and slice syntax `${@:start}`, `${@:start:length}` (or OMP's `$@[start:length]`). For example, a template invoked as `/review src/main.rs --strict` receives `src/main.rs` as `$1` and `--strict` as `$2`. A template with no placeholder gets its arguments appended after a blank line.
 
 ### Environment Variables
 
@@ -1923,6 +2112,58 @@ The previous stack, built on the `charmed_rust` library family (a Rust port of G
 | `/reload` | Reload skills/prompts/themes/extensions from disk |
 | `/exit` (`/quit`, `/q`) or `Ctrl+C` | Exit Pi |
 
+**Live stream rules:** `/rules` manages corrections enforced during generation
+on every native agent surface. Matching assistant text or thinking interrupts
+the response before its tool calls execute, adds the rule's directive, and
+retries within a three-correction turn budget. Project rules require workspace
+trust; triggered corrections survive compaction on their active branch. See
+[Stream rules](docs/stream-rules.md) for configuration and examples.
+
+### MCP server authentication and project configuration
+
+Use `/mcp list` to inspect each server's selected source, trust decision, and
+connection health. `/mcp trust <name>` acknowledges that exact definition;
+HTTP servers that need OAuth can then sign in with `/mcp reauth <name>`.
+Follow the authorization URL and complete the browser callback. A successful
+reauthentication replaces the live connection and reloads its tools, including
+in RPC and ACP sessions.
+
+Reauthentication also repairs an expired configured `Authorization` header.
+After login succeeds, Pi removes that header from the file that supplied the
+winning definition and preserves its existing trust acknowledgement for that
+specific repair. Explicit `--mcp-config` files take precedence over `.pi`,
+`.agents`, global Pi, and imported tool configurations. Shadowed files,
+unrelated settings, and authored variable or secret references remain intact.
+If the selected file changes while the browser is open, Pi preserves the edit
+and refuses the repair. ACP and extension definitions remain owned by their
+clients: their explicit login takes over only the exact supplied definition
+without creating a replacement configuration file.
+
+`/mcp unauth <name>` removes the managed login and retires the connection and
+tools. Logout suppresses the old configured bearer as well, and a late browser
+callback cannot restore a logged-out session. Cancelling the browser wait
+preserves the previous credentials, source, and trust. If login succeeds
+but source persistence or reconnection fails, Pi reports that the login was
+saved so the remaining problem can be repaired without mistaking it for a
+failed authorization.
+
+Native settings support the OMP project-configuration switch:
+
+```json
+{
+  "mcp": {
+    "enableProjectConfig": false
+  }
+}
+```
+
+The default is `true`. When the merged setting is `false`, automatic discovery
+skips project `.pi` and `.agents` MCP files and imported project configurations.
+Global Pi configuration and explicit `--mcp-config` arguments remain eligible.
+Project configuration also requires workspace trust when the setting is
+enabled. Client-supplied ACP servers remain explicit session definitions, and
+each server still requires its own trust acknowledgement.
+
 ### RPC Protocol
 
 The RPC mode (`pi --mode rpc`) exposes a line-delimited JSON protocol over stdin/stdout for programmatic integration. Each line is a self-contained JSON object.
@@ -2105,15 +2346,24 @@ Input: { "path": "src/lib.rs", "old": "fn foo()", "new": "fn bar()" }
 
 ### grep
 
-Search file contents:
+Search files, internal documents, or a web page:
 
-```
-Input: { "pattern": "TODO", "path": "src/", "context": 2, "limit": 100 }
+```json
+{ "pattern": "TODO", "path": "src/", "context": 2, "limit": 100 }
+{ "pattern": "FEATURE_X", "path": ".;!vendor;!gen" }
+{ "pattern": "track\\(", "path": "src;!*.test.ts;!src/legacy" }
+{ "pattern": "critical|warning", "path": "agent://reviewer/findings;local://review-notes", "ignoreCase": true }
+{ "pattern": "migration", "path": "skill://release/references/checklist.md" }
+{ "pattern": "deprecated", "path": "https://example.com/changelog" }
+{ "pattern": "data-version", "path": "https://example.com/changelog:raw", "literal": true }
 ```
 
-- Regex patterns supported
-- Context lines before/after matches
-- Respects .gitignore
+- Regex and literal matching, case folding, and merged context lines work across all sources. Each result identifies its source and line number.
+- Filesystem searches respect `.gitignore` and workspace boundaries. `hashline: true` provides edit anchors for filesystem results.
+- Exclude files or entire directory trees with `path: "root;!glob;!glob"` (up to 64 entries and 64 KiB). A bare name such as `!vendor` matches at any depth below the root; a slash-containing pattern such as `!src/legacy` or `!./gen` is anchored to the working directory. Use `!**/generated` to match a directory at any depth. Exclusions alone default to the working directory, and explicitly named roots remain searchable. Existing filenames containing `!` or semicolons retain their literal meaning. Both search backends prune exclusions before counting matches, while included paths retain normal permission checks. Use separate calls for multiple filesystem roots or resource URLs.
+- Internal documents use the same resolver as `read`, including accepted `agent://` results and JSON fields, skills, prompts, scratch notes, merge conflicts, PRs, issues, and SSH documents. Pending or rejected child output retains its normal access restrictions. Separate up to 16 internal URLs with semicolons; filesystem paths and HTTP URLs use separate calls.
+- HTTP(S) searches use reader text by default; append `:raw` to search the fetched source. Semicolons inside an HTTP URL remain part of that URL. The existing `read.urlAllowPrivateTargets` setting governs private-network access, with the same redirect checks as `read`. PR, issue, SSH, and conflict lookups retain their process effects for execution approval.
+- The match limit applies across the entire resource list. Resource searches accept up to 10,000 matches and 10 MiB per document; output still truncates at 1 MiB and 500 characters per line. Results report skipped resources and partial source documents. `glob` and `hashline` apply to filesystem searches; virtual document line numbers are search locations.
 
 ### find
 

@@ -169,8 +169,10 @@ const fn event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
         AgentEvent::FailoverStart { .. } => "failover_start",
         AgentEvent::FailoverEnd { .. } => "failover_end",
+        AgentEvent::PrewalkSwitched { .. } => "prewalk_switched",
         AgentEvent::ExtensionError { .. } => "extension_error",
         AgentEvent::AdvisorNote { .. } => "advisor_note",
+        AgentEvent::CostWarning { .. } => "cost_warning",
         AgentEvent::ProviderError { .. } => "provider_error",
     }
 }

@@ -34,12 +34,15 @@ impl Report {
 /// `/rules [list|remove <id>|toggle <id>]`: the project's TTSR stream rules.
 pub fn rules(cwd: &Path, args: &str) -> Report {
     let args = args.trim();
-    let mut store = crate::stream_rules::StreamRuleStore::load_for_project(cwd);
+    let mut store = match crate::stream_rules::StreamRuleStore::load_for_project(cwd) {
+        Ok(store) => store,
+        Err(error) => return Report::status(format!("Cannot load stream rules: {error}")),
+    };
     if args.is_empty() || args == "list" {
         let rules = store.list_all_rules();
         let mut text = format!("### 🛡️ Active Stream Rules ({})\n\n", rules.len());
         if rules.is_empty() {
-            text.push_str("No stream rules configured. Use `/rules add <id> <pattern> <body>` or `/omfg <complaint>` to create one.\n");
+            text.push_str("No stream rules configured. Use `pi rules add --id ID --name NAME --pattern REGEX --body DIRECTIVE` or `/omfg <complaint>` to create one.\n");
         } else {
             for r in &rules {
                 let status = if r.enabled {
@@ -92,8 +95,21 @@ pub fn omfg(cwd: &Path, args: &str) -> Report {
     match crate::stream_rules::GrievancesLedger::record_complaint(cwd, args, None) {
         Ok(g) => {
             let candidate = crate::stream_rules::GrievancesLedger::forge_candidate_rule(&g);
-            let mut store = crate::stream_rules::StreamRuleStore::load_for_project(cwd);
-            let _ = store.add_rule(candidate.clone(), false);
+            let mut store = match crate::stream_rules::StreamRuleStore::load_for_project(cwd) {
+                Ok(store) => store,
+                Err(error) => {
+                    return Report::status(format!(
+                        "Grievance {} saved, but its stream rule could not be loaded: {error}",
+                        g.id
+                    ));
+                }
+            };
+            if let Err(error) = store.add_rule(candidate.clone(), false) {
+                return Report::status(format!(
+                    "Grievance {} saved, but its stream rule could not be saved: {error}",
+                    g.id
+                ));
+            }
             let card = format!(
                 "### 📝 Grievance Logged & Stream Rule Forged\n\n\
                  - **Grievance ID:** `{gid}`\n\
@@ -119,25 +135,50 @@ pub fn omfg(cwd: &Path, args: &str) -> Report {
     }
 }
 
-/// Paths from `git status --porcelain` output. Each line is `XY <path>` (or
-/// `XY <old> -> <new>` for a rename); X is a space for an unstaged change,
-/// so the line must not be trimmed before the path is sliced off.
-fn porcelain_paths(status: &str) -> Vec<String> {
-    status
-        .lines()
-        .filter_map(|line| line.get(3..))
-        .map(|path| {
-            path.split_once(" -> ")
-                .map_or(path, |(_, new)| new)
-                .trim()
-                .to_string()
-        })
-        .filter(|path| !path.is_empty())
-        .collect()
+/// Parse NUL-delimited porcelain v1 paths without losing whitespace, quoted
+/// characters, or rename destinations. Git emits the destination first for
+/// renames/copies under -z, then a second NUL-terminated source name.
+fn porcelain_paths_zero(status: &[u8]) -> Result<Vec<String>, String> {
+    if status.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !status.ends_with(&[0]) {
+        return Err("truncated git porcelain status".into());
+    }
+    let mut fields = status.split(|byte| *byte == 0).peekable();
+    let mut paths = Vec::new();
+    while let Some(record) = fields.next() {
+        if record.is_empty() {
+            if fields.peek().is_none() {
+                break;
+            }
+            return Err("empty git porcelain record".into());
+        }
+        if record.len() < 4 || record[2] != b' ' {
+            return Err("invalid git porcelain status record".into());
+        }
+        let path = std::str::from_utf8(&record[3..])
+            .map_err(|_| "non-UTF-8 filenames cannot be safely committed through /commit")?;
+        if path.is_empty() {
+            return Err("empty path in git porcelain status".into());
+        }
+        let renamed = matches!(record[0], b'R' | b'C') || matches!(record[1], b'R' | b'C');
+        if renamed {
+            let Some(original) = fields.next() else {
+                return Err("missing source path for git rename/copy".into());
+            };
+            if original.is_empty() {
+                return Err("empty rename/copy source path".into());
+            }
+        }
+        paths.push(path.to_string());
+    }
+    Ok(paths)
 }
 
 /// `/commit [--dry-run|-n|plan] [--include-lockfiles]`: split the working
 /// tree's changes into atomic commits, or only show the plan.
+#[allow(clippy::too_many_lines)] // one git inspect/plan/apply flow rendered into a single report
 pub fn commit(cwd: &Path, args: &str) -> Report {
     let args = args.trim();
     let dry_run = args == "dry-run"
@@ -150,30 +191,69 @@ pub fn commit(cwd: &Path, args: &str) -> Report {
         .any(|arg| arg == "--include-lockfiles");
 
     let status_out = match std::process::Command::new("git")
-        .args(["status", "--porcelain"])
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ])
         .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
     {
-        Ok(o) => o,
-        Err(e) => return Report::status(format!("Failed to run git status: {e}")),
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            return Report::status(format!(
+                "Git status failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Err(error) => return Report::status(format!("Failed to run git status: {error}")),
     };
-    let changed_files = porcelain_paths(&String::from_utf8_lossy(&status_out.stdout));
+    let changed_files = match porcelain_paths_zero(&status_out.stdout) {
+        Ok(paths) => paths,
+        Err(error) => return Report::status(format!("Cannot plan commits: {error}")),
+    };
     if changed_files.is_empty() {
         return Report::status("Working tree clean; nothing to commit.");
     }
 
-    let hunks = std::process::Command::new("git")
-        .args(["diff", "HEAD"])
+    // A failed Git invocation or malformed diff is not an empty diff: falling
+    // back to an empty hunk list could silently produce a misleading plan.
+    let diff_out = match std::process::Command::new("git")
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+        ])
         .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
-        .ok()
-        .and_then(|out| {
-            crate::commit_split::DiffParser::parse_unified_diff(&String::from_utf8_lossy(
-                &out.stdout,
-            ))
-            .ok()
-        })
-        .unwrap_or_default();
+    {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            return Report::status(format!(
+                "Git diff failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Err(error) => return Report::status(format!("Failed to run git diff: {error}")),
+    };
+    let Ok(diff) = std::str::from_utf8(&diff_out.stdout) else {
+        return Report::status("Git diff is not UTF-8; refusing to plan an incomplete commit.");
+    };
+    let hunks = match crate::commit_split::DiffParser::parse_unified_diff(diff) {
+        Ok(hunks) => hunks,
+        Err(error) => return Report::status(format!("Cannot parse Git diff: {error}")),
+    };
 
     let options = crate::commit_split::CommitOptions {
         dry_run,
@@ -224,27 +304,137 @@ pub fn commit(cwd: &Path, args: &str) -> Report {
     Report::card(card, format!("Generated commit plan with {units} units"))
 }
 
-/// `/review [target]`: heuristic code review of the working tree (or target).
-pub fn review(cwd: &Path, args: &str) -> Report {
+/// A review owns its screened input and provider while the UI remains responsive.
+pub enum PreparedWorkspaceReview {
+    Offline(Report),
+    Model(
+        Box<crate::review::ModelReviewer>,
+        crate::review::PreparedReview,
+    ),
+}
+
+impl PreparedWorkspaceReview {
+    pub async fn run(self, abort: Option<&crate::agent::AbortSignal>) -> Report {
+        match self {
+            Self::Offline(report) => report,
+            Self::Model(client, request) => match client.review_prepared(request, abort).await {
+                Ok(report) => review_report(&report),
+                Err(error) => Report::status(format!("Review failed: {error}")),
+            },
+        }
+    }
+}
+
+fn review_report(report: &crate::review::ReviewReport) -> Report {
+    Report::card(
+        report.format_markdown(),
+        format!("{}: {}", report.verdict.badge(), report.summary),
+    )
+}
+
+/// `/review [--offline] [target]`: prepare a model review, or explicitly request
+/// the local heuristic scan. No provider call happens before preparation succeeds.
+pub fn prepare_review(
+    cwd: &Path,
+    args: &str,
+    agent: &crate::agent::Agent,
+) -> crate::error::Result<PreparedWorkspaceReview> {
     let args = args.trim();
+    let (first, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+    let offline = first == "--offline";
+    let target = if offline { rest.trim() } else { args };
+    if target.starts_with('-') {
+        return Err(crate::error::Error::validation(
+            "Usage: /review [--offline] [uncommitted|staged|commit:REF|branch:REF|RANGE]",
+        ));
+    }
     let options = crate::review::ReviewOptions {
-        target: (!args.is_empty()).then(|| args.to_string()),
+        target: (!target.is_empty()).then(|| target.to_string()),
         fail_on: None,
         confidence_threshold: 0.70,
         format: "markdown".to_string(),
         max_findings: 15,
         out_file: None,
     };
-    match crate::review::CodeReviewer::review(cwd, &options) {
-        Ok(report) => Report::card(
-            report.format_markdown(),
-            format!("{}: {}", report.verdict.badge(), report.summary),
-        ),
-        Err(e) => Report::status(format!("Review failed: {e}")),
+    if offline {
+        return crate::review::CodeReviewer::review(cwd, &options)
+            .map(|report| review_report(&report))
+            .map(PreparedWorkspaceReview::Offline);
+    }
+    let client = crate::review::ModelReviewer::for_agent(agent);
+    let request = client.prepare_with_agent(cwd, &options, agent)?;
+    Ok(PreparedWorkspaceReview::Model(Box::new(client), request))
+}
+
+/// Explicit report and preview modes never turn an unrecognized option into
+/// a delivery target. All other authored text is the in-place handoff focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffMode<'a> {
+    InPlace(&'a str),
+    Report(&'a str),
+    ModelPreview(&'a str),
+    Import(&'a str),
+}
+
+pub fn handoff_mode(args: &str) -> crate::error::Result<HandoffMode<'_>> {
+    let args = args.trim();
+    let (first, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+    match first {
+        "--report" => Ok(HandoffMode::Report(rest.trim())),
+        "--model" => Ok(HandoffMode::ModelPreview(args)),
+        "--import" => Ok(HandoffMode::Import(args)),
+        option if option.starts_with('-') && option != "--" => {
+            Err(crate::error::Error::validation(
+                "Usage: /handoff [focus] | /handoff --report [human|agent|target] [path] | /handoff --model [preview options] | /handoff --import <absolute-bundle.json> [import options]. Use /handoff -- <focus> when the focus starts with '-'.",
+            ))
+        }
+        _ => {
+            let focus = if first == "--" { rest.trim() } else { args };
+            if focus.len() > 4096 || focus.contains('\0') {
+                return Err(crate::error::Error::validation(
+                    "Handoff focus must contain at most 4096 UTF-8 bytes and no NUL characters",
+                ));
+            }
+            Ok(HandoffMode::InPlace(focus))
+        }
     }
 }
 
-/// `/handoff [human|agent|<target>] [path]`: a handoff brief of the session.
+/// Both terminal stacks share the native durable transaction. Keep polling it
+/// after cancellation so persistence retains its normal ownership and fence.
+pub async fn run_in_place_handoff(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    focus: &str,
+    abort: &crate::agent::AbortSignal,
+) -> super::PiMsg {
+    match handle.handoff(focus, abort, |_| {}).await {
+        Ok(()) => match handle
+            .with_session(|session| {
+                let (messages, usage) = super::conversation_from_session(session);
+                (session.header.id.clone(), messages, usage)
+            })
+            .await
+        {
+            Ok((session_id, messages, usage)) => super::PiMsg::ConversationReset {
+                session_id,
+                messages,
+                usage,
+                status: Some(
+                    "Handoff saved; continuing in this session with compacted context".to_string(),
+                ),
+            },
+            // The durable transaction succeeded. A display snapshot failure
+            // must not invite a second paid request by claiming it did not.
+            Err(error) => super::PiMsg::System(format!(
+                "Handoff saved; conversation display could not be refreshed: {error}"
+            )),
+        },
+        Err(crate::error::Error::Aborted) => super::PiMsg::System("Handoff cancelled".to_string()),
+        Err(error) => super::PiMsg::AgentError(format!("Handoff failed: {error}")),
+    }
+}
+
+/// `/handoff --report [human|agent|<target>] [path]`: a local session report.
 pub fn handoff(session: &crate::session::Session, args: &str) -> Report {
     let args = args.trim();
     let (to_target, out_path) = if args.is_empty() {
@@ -539,8 +729,87 @@ pub fn approval(
 mod tests {
     use super::*;
 
+    #[test]
+    fn handoff_modes_require_explicit_report_or_preview_options() {
+        assert_eq!(handoff_mode("").unwrap(), HandoffMode::InPlace(""));
+        assert_eq!(
+            handoff_mode(" human migration decisions ").unwrap(),
+            HandoffMode::InPlace("human migration decisions")
+        );
+        assert_eq!(
+            handoff_mode("--report agent destination.md").unwrap(),
+            HandoffMode::Report("agent destination.md")
+        );
+        assert_eq!(
+            handoff_mode("--model -- focus").unwrap(),
+            HandoffMode::ModelPreview("--model -- focus")
+        );
+        assert_eq!(
+            handoff_mode(
+                "--import /tmp/brief.json --session-output /tmp/new.jsonl --workspace /tmp/project"
+            )
+            .unwrap(),
+            HandoffMode::Import(
+                "--import /tmp/brief.json --session-output /tmp/new.jsonl --workspace /tmp/project"
+            )
+        );
+        assert_eq!(
+            handoff_mode("-- --model is part of the focus").unwrap(),
+            HandoffMode::InPlace("--model is part of the focus")
+        );
+        assert_eq!(
+            handoff_mode("preserve @notes.md and 日本語").unwrap(),
+            HandoffMode::InPlace("preserve @notes.md and 日本語")
+        );
+        for invalid in [
+            "--reporting agent",
+            "--modelx",
+            "--importx /tmp/brief.json",
+            "--export /tmp/handoff.json",
+            "-target",
+            "focus\0text",
+        ] {
+            assert!(handoff_mode(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(handoff_mode(&"é".repeat(2048)).is_ok());
+        assert!(handoff_mode(&"é".repeat(2049)).is_err());
+        eprintln!(
+            "{}",
+            serde_json::json!({"schema":"pi.handoff.ui.test.v1","case":"explicit_modes"})
+        );
+    }
+
     /// `/memory` over a real (per-test) project bank: retained facts are
     /// listed and searchable, and `forget` removes one.
+    #[test]
+    fn nul_porcelain_preserves_paths_and_rename_destinations() {
+        let bytes = b" M leading space.txt\0?? weird -> literal.txt\0R  new name.rs\0old name.rs\0 C other.rs\0old copy.rs\0";
+        assert_eq!(
+            porcelain_paths_zero(bytes).unwrap(),
+            [
+                "leading space.txt",
+                "weird -> literal.txt",
+                "new name.rs",
+                "other.rs"
+            ]
+        );
+        assert_eq!(
+            porcelain_paths_zero(b"??  leading.txt\0").unwrap(),
+            [" leading.txt"]
+        );
+        assert!(porcelain_paths_zero(b" M unfinished").is_err());
+        assert!(porcelain_paths_zero(b"R  moved\0").is_err());
+        assert!(porcelain_paths_zero(b"?? \xff\0").is_err());
+        assert!(porcelain_paths_zero(b"").unwrap().is_empty());
+    }
+
+    #[test]
+    fn commit_reports_git_failure_instead_of_an_empty_plan() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let report = commit(dir.path(), "--dry-run");
+        assert!(report.status.starts_with("Git status failed"), "{report:?}");
+    }
+
     #[test]
     fn memory_lists_searches_and_forgets() {
         let root = std::env::temp_dir().join(format!(
@@ -747,9 +1016,10 @@ mod tests {
 
     #[test]
     fn porcelain_paths_keep_the_first_character_of_unstaged_paths() {
-        let status = " M src/a.rs\nM  src/b.rs\n?? new.txt\nR  old.rs -> src/renamed.rs\n";
+        // `git status --porcelain -z`: a rename lists its destination first.
+        let status = b" M src/a.rs\0M  src/b.rs\0?? new.txt\0R  src/renamed.rs\0old.rs\0";
         assert_eq!(
-            porcelain_paths(status),
+            porcelain_paths_zero(status).unwrap(),
             vec!["src/a.rs", "src/b.rs", "new.txt", "src/renamed.rs"]
         );
     }

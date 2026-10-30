@@ -88,6 +88,7 @@ be breaking for Rust consumers.
 | `session.setModel(provider, model)` | `AgentSessionHandle::set_model(provider, model)` |
 | `session.setThinkingLevel(level)` | `AgentSessionHandle::set_thinking_level(level)` |
 | `session.compact()` | `AgentSessionHandle::compact(on_event)` |
+| In-place context handoff | `AgentSessionHandle::handoff(focus, abort, on_event)` / `RpcTransportClient::handoff(focus)` |
 | `session.abort()` | `AgentSessionHandle::new_abort_handle()` + `prompt_with_abort(...)` |
 | `session.steer(...)`, `session.followUp(...)` | `RpcTransportClient::steer(...)`, `RpcTransportClient::follow_up(...)` |
 | RPC bridge client | `RpcTransportClient` / `SessionTransport::RpcSubprocess` |
@@ -156,6 +157,17 @@ the media again or repeating input hooks. Media-only prompts are supported;
 an empty block list or an assistant-only block is rejected before appending
 the user message.
 
+In-process turns can also recover once from a provider context-window overflow
+when session compaction is enabled. The SDK removes the failed response, compacts
+and saves the active context, then continues with the accepted input and completed
+tool results. It only summarizes older history: the current request's native media
+and all completed tool pairs remain intact even when they exceed the usual
+keep-recent budget. With no safely older prefix, recovery stops. This maintenance
+path remains enabled when transient retries are disabled. It emits
+`auto_compaction_start` with reason `overflow` and a successful
+`auto_compaction_end` with `willRetry: true`. Cancellation, failed persistence,
+an ineffective summary, or a second overflow ends recovery without replaying tools.
+
 `SessionTransport::prompt_with_content(content, on_event)` provides this input
 over either backend. `RpcTransportClient::prompt_with_content(content)` and
 `prompt_with_content_streaming(content, streaming_behavior, on_event)` send
@@ -182,10 +194,62 @@ end. Audio/video blocks remain in the prompt. Providers use their existing
 native media transport where supported; unsupported media becomes a visible
 omission placeholder. The local transcript retains the native content.
 
+Gemini-family providers accept native audio/video. OpenAI Chat Completions
+models that declare audio input and explicit audio pricing accept WAV/MP3 and
+return text; the bundled `openai/gpt-audio-1.5` is configured for this path.
+The same behavior applies to saved history and media returned by tools.
+Text and audio charges contribute to the shared spend limit separately;
+missing or ambiguous audio billing prevents further requests and remains
+recorded across session restoration. See
+[native audio model configuration](models.md#native-audio-with-openai-chat-completions)
+for pricing and transport bounds.
+
 Media names respect the configured secret-screening policy. A MIME type that
 contains secret material is refused when screening is enabled because replacing
 part of that identifier could change how the provider handles the attachment.
 Encoded payload bytes remain opaque to the text secret detector.
+
+### In-place handoff
+
+`AgentSessionHandle::handoff(focus, &abort_signal, on_event).await` generates a
+continuation brief and replaces an older safe prefix in the current session.
+It uses the native handoff transaction: configured privacy screening, extension
+hooks, exact-source validation, and persistence before installation. Session ID,
+path, and the latest complete authored turn remain intact, including native
+image/media blocks and completed tool work. The configured keep-recent budget
+still applies. Automatic compaction enablement, thresholds, and modes do not
+disable or change this explicit operation.
+
+The focus is literal text with a limit of 4096 UTF-8 bytes and no NUL. Empty
+focus is valid. If there is no older safe prefix, synthesis fails, an extension
+cancels, or the source changes during generation, the method returns an error.
+It never installs an empty or local fallback summary. A failed save preserves
+the live context and retains the native persistence fence.
+
+Session subscribers and `on_event` receive `AutoCompactionStart` with reason
+`handoff`, followed by `AutoCompactionEnd`. This operation has no user prompt
+and emits no `AgentEnd`. On successful return, both the durable Session and the
+handle's live Agent messages contain the installed projection.
+
+Create an `AbortHandle`/`AbortSignal` pair before admitting the operation.
+`abort_handle.signal()` can derive another signal later without losing an
+earlier abort. Signal cancellation through the handle and keep polling the
+handoff future until it returns; dropping a future cannot promise asynchronous
+persistence cleanup.
+
+For a subprocess, `RpcTransportClient::handoff(Some(focus)).await` returns a
+`RpcCompactionResult`. `handoff(None)` uses empty focus, and
+`handoff_with_events(focus, callback)` forwards live native lifecycle and
+extension UI frames. A cloned `control_handle()` can send `abort` or extension
+UI replies while the client is borrowed by the pending handoff. Keep awaiting
+the terminal `handoff` response after cancellation. The server rejects a
+handoff during another turn, maintenance operation, or foreground bash command.
+
+`RpcSessionState::context_tokens` estimates the selected branch's active model
+context, excluding archived and sibling history. `context_window` is the
+resolved model capacity or `None` when unknown. Read these values at an idle
+boundary for scheduling; they are estimates, not cumulative provider usage.
+The fields default to zero/`None` when connecting to an older server.
 
 ### Checkpoints and branch rewinds
 
@@ -209,6 +273,19 @@ Checkpoint summarization respects provider admission and the configured secret
 policy. A summary error or privacy refusal leaves the span intact. If an
 extension changes the session during summarization, the stale report is
 rejected without overwriting that change.
+
+### Stream rules
+
+SDK sessions load global stream rules from the configured agent directory and
+project rules when `SessionOptions.workspace_trusted` is true. Ambient rules
+are omitted when context-file loading is disabled. The shared agent enforces
+the rules across provider streams, cancels a matching draft before its tools
+execute, and records a bounded corrective retry in the transcript. The newest
+active-branch correction per rule survives compaction.
+
+Hosts constructing `Agent` directly can use `set_stream_rules` for an explicit
+validated set, or `set_stream_rule_source` for refreshable project/global files.
+See [Live stream rules](stream-rules.md) for limits, trust, and retry behavior.
 
 ## Recipe 2: Session-Level Subscribers and Typed Hooks
 
@@ -395,6 +472,57 @@ fn main() -> pi::sdk::Result<()> {
     Ok(())
 }
 ```
+
+## Native Project Memory Synchronization
+
+`AgentSessionHandle::sync_memory()` extracts reusable facts from the current
+completed, persisted branch using its live provider and request options. Enable
+`memory.backend` (`local` or `cass`) in the configuration and create the SDK
+session with `no_session: false`. The operation works whether or not automatic
+extraction is enabled:
+
+```rust,ignore
+let report = handle.sync_memory().await?;
+println!("{}", report.summary());
+```
+
+The returned `MemorySyncReport` contains `status`, `retained`, `superseded`,
+`duplicates` and `source_messages`; it does not echo extracted source text.
+`updated` means an atomic extraction checkpoint was committed, including when
+there were no durable facts to retain. `unchanged` means the same completed
+source was already processed. `busy` means another extraction currently holds
+the project's lease and the caller can retry. Automatic hooks can additionally
+return `cadence` or `ineligible` without making a provider request.
+
+For direct native construction, install settings with
+`AgentSession::with_memory_settings(config.memory.as_ref())` or
+`set_memory_settings`. The normal CLI, SDK and ACP builders already apply this
+configuration. The native `AgentSession::sync_memory()` method exposes the same
+explicit operation. Configure `memory.autoExtract: true` to extract after
+completed saved turns and `memory.extractEveryTurns` to set the authored-turn
+cadence (default 3, clamped to 1–100). Advisor and extension-generated user rows
+do not advance the cadence. Automatic extraction is disabled by default and
+does not run for ephemeral or delegated child sessions.
+
+The operation is inline and tool-free, uses a 30-second abort-aware deadline,
+and never changes the current model or starts a conversation turn. Automatic
+calls also observe the native turn's remaining time budget; optional failures
+do not fail a completed answer. The source is revalidated before committing
+against the current session identity, branch content and attached workdir.
+Processed-source checkpoints survive reopening and branch navigation. Project
+leases prevent simultaneous extraction requests; expired leases can be retried.
+
+Privacy discovery covers the complete bounded branch text and active memory
+bank before a recent window is selected. The traversal admits at most 512 KiB
+of branch text, 512 KiB of active memory evidence and 256 active memories; larger
+inputs are refused. Requests include at most 48 recent text messages and 16
+existing facts, with a combined source window of 128 KiB before JSON overhead.
+Image, audio, hidden thinking and executable tool arguments are not sent as
+learning evidence. The model may return at most eight 2 KiB facts. All facts,
+FTS updates, audit events and the successful checkpoint share one transaction.
+Only supplied generated facts whose original content, kind, tags and timestamp
+still match can be superseded. Manual facts and later human edits are preserved;
+replaced generated versions remain in the audited history.
 
 ## Compatibility Notes for Migrating Integrators
 

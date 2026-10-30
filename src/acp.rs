@@ -12,6 +12,8 @@
 //! - `session/prompt` — send a prompt; the response (with `stopReason`) is
 //!   delivered only after the turn completes
 //! - `session/cancel` — abort the current prompt turn for a session
+//! - `_session/steering` — inject native input into a running turn or its
+//!   follow-up queue without starting a second prompt
 //! - `session/list`, `session/load`, `session/resume` — session management
 //! - `session/set_model` — switch the live session's provider/model at runtime
 //! - `session/set_config_option` — set a runtime option (e.g. thinking/effort)
@@ -27,11 +29,14 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::significant_drop_tightening)]
 
+mod client_files;
+mod client_terminals;
 mod content;
 mod history;
 mod mcp;
 #[cfg(test)]
 mod recovery_tests;
+mod steering;
 
 use crate::agent::{
     AbortHandle, AbortSignal, AgentEvent, AgentSession, ToolApprovalDecision, ToolApprovalHandler,
@@ -156,7 +161,13 @@ fn json_rpc_notification(method: &str, params: Value) -> String {
 // ============================================================================
 
 type AcpSessionsMap = Arc<Mutex<HashMap<String, Arc<Mutex<AcpSessionState>>>>>;
-type PendingPermissionMap = Arc<StdMutex<HashMap<String, oneshot::Sender<Value>>>>;
+type PendingPermissionMap = Arc<StdMutex<HashMap<String, PendingPermission>>>;
+
+struct PendingPermission {
+    session_id: String,
+    request_id: Value,
+    sender: oneshot::Sender<Value>,
+}
 
 /// Synchronous agent callbacks cannot wait for the editor to drain stdout.
 /// Preserve the bounded FIFO, but turn saturation into a terminal transport
@@ -173,28 +184,38 @@ struct AcpOutputShared {
     failed: AbortHandle,
     failure: AbortSignal,
     pending_permissions: PendingPermissionMap,
+    files: client_files::Requests,
+    terminals: client_terminals::Requests,
 }
 
 #[derive(Default)]
 struct AcpOutputState {
     failure: Option<&'static str>,
     stopping: bool,
-    prompts: HashMap<String, AbortHandle>,
+    prompts: HashMap<String, AcpPromptState>,
+}
+
+struct AcpPromptState {
+    abort: AbortHandle,
+    input: Arc<steering::Mailbox>,
 }
 
 impl AcpOutputShared {
     fn record_failure(&self, state: &mut AcpOutputState, reason: &'static str) {
         state.failure.get_or_insert(reason);
         state.stopping = true;
-        for handle in state.prompts.values() {
+        for prompt in state.prompts.values() {
             // Use the native abort lane. Cancelling the runtime context can
             // prevent the task from running its persistence/owner cleanup.
-            handle.abort();
+            prompt.abort.abort();
+            drop(prompt.input.close());
         }
         self.pending_permissions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.files.close();
+        self.terminals.close();
         self.failed.abort();
     }
 
@@ -217,6 +238,8 @@ impl AcpOutput {
                 failed,
                 failure,
                 pending_permissions: Arc::new(StdMutex::new(HashMap::new())),
+                files: client_files::Requests::default(),
+                terminals: client_terminals::Requests::default(),
             }),
         }
     }
@@ -294,9 +317,28 @@ impl AcpOutput {
         if state.prompts.contains_key(&session_id) {
             return Err(Error::session("ACP session already has an active prompt"));
         }
-        state.prompts.insert(session_id.clone(), abort);
+        if self.shared.files.has_write(&session_id) {
+            return Err(Error::session(
+                "Waiting for the editor to acknowledge a previous file write",
+            ));
+        }
+        if self.shared.terminals.has_unsettled(&session_id) {
+            return Err(Error::session(
+                "Editor terminal cleanup is unconfirmed; cancel this session to retry cleanup or reconnect the editor",
+            ));
+        }
+        let input = Arc::new(steering::Mailbox::new());
+        state.prompts.insert(
+            session_id.clone(),
+            AcpPromptState {
+                abort,
+                input: Arc::clone(&input),
+            },
+        );
         Ok(AcpPromptGuard {
             shared: Arc::clone(&self.shared),
+            output: self.clone(),
+            input,
             session_id,
             started: false,
             settled: false,
@@ -309,9 +351,12 @@ impl AcpOutput {
     fn register_permission(
         &self,
         key: String,
+        session_id: &str,
+        request_id: Value,
         sender: oneshot::Sender<Value>,
+        frame: String,
     ) -> std::result::Result<(), &'static str> {
-        let state = self
+        let mut state = self
             .shared
             .state
             .lock()
@@ -321,22 +366,138 @@ impl AcpOutput {
                 .failure
                 .unwrap_or("permission request client is shutting down"));
         }
+        if state
+            .prompts
+            .get(session_id)
+            .is_some_and(|prompt| !prompt.input.permits_tool())
+        {
+            return Err("permission request superseded by queued steering");
+        }
         self.shared
             .pending_permissions
             .lock()
             .map_err(|_| "permission request registry unavailable")?
-            .insert(key, sender);
+            .insert(
+                key,
+                PendingPermission {
+                    session_id: session_id.to_string(),
+                    request_id,
+                    sender,
+                },
+            );
+        // Publication shares the admission lock with steering/cancel. A
+        // cancellation frame can never precede this dialog's request frame.
+        if self.sender.try_send(frame).is_err() {
+            self.shared
+                .record_failure(&mut state, "ACP permission request could not be delivered");
+            return Err("permission request client disconnected");
+        }
         Ok(())
     }
 
     fn abort_prompt(&self, session_id: &str) {
+        let (cancelled, reads) = {
+            let state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(prompt) = state.prompts.get(session_id) {
+                prompt.input.seal();
+                prompt.abort.abort();
+            }
+            (
+                self.take_permissions(session_id),
+                self.shared.files.cancel_reads(session_id),
+            )
+        };
+        self.cancel_permissions(cancelled);
+        for request_id in reads {
+            let _ = self.send(json_rpc_notification(
+                "$/cancel_request",
+                json!({"requestId":request_id}),
+            ));
+        }
+        self.shared.terminals.cancel_session(self, session_id);
+    }
+
+    /// Detach under the output-state lock so admission cannot race a new
+    /// permission publication or cancellation of a subsequent prompt.
+    fn take_permissions(&self, session_id: &str) -> Vec<PendingPermission> {
+        self.shared
+            .pending_permissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extract_if(|_, permission| permission.session_id == session_id)
+            .map(|(_, permission)| permission)
+            .collect()
+    }
+
+    fn cancel_permissions(&self, cancelled: Vec<PendingPermission>) {
+        for permission in cancelled {
+            let _ = self.send(json_rpc_notification(
+                "$/cancel_request",
+                json!({ "requestId": permission.request_id }),
+            ));
+            // Closing just this response channel denies the pending tool.
+            // Late editor replies cannot authorize it or affect another turn.
+            drop(permission.sender);
+        }
+    }
+
+    fn prompt_input(&self, session_id: &str) -> Option<Arc<steering::Mailbox>> {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .prompts
+            .get(session_id)
+            .map(|prompt| Arc::clone(&prompt.input))
+    }
+
+    fn finish_steering(&self, session_id: &str) {
+        if let Some(input) = self.prompt_input(session_id) {
+            input.seal();
+        }
+    }
+
+    fn enqueue_steering(&self, session_id: &str, input: steering::Input) {
         let state = self
             .shared
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(handle) = state.prompts.get(session_id) {
-            handle.abort();
+        let Some(prompt) = state.prompts.get(session_id) else {
+            drop(state);
+            input.reply(self, "promptRequired");
+            return;
+        };
+        let steer = input.is_steering();
+        let admitted = prompt.input.enqueue(input);
+        let cancelled = if admitted.is_ok() && steer {
+            self.take_permissions(session_id)
+        } else {
+            Vec::new()
+        };
+        let reads = if admitted.is_ok() && steer {
+            self.shared.files.cancel_reads(session_id)
+        } else {
+            Vec::new()
+        };
+        drop(state);
+        self.cancel_permissions(cancelled);
+        for request_id in reads {
+            let _ = self.send(json_rpc_notification(
+                "$/cancel_request",
+                json!({"requestId":request_id}),
+            ));
+        }
+        match admitted {
+            Ok(()) => {}
+            Err((input, false)) => {
+                input.reply(self, "promptRequired");
+            }
+            Err((input, true)) => input.reply_full(self),
         }
     }
 
@@ -350,8 +511,9 @@ impl AcpOutput {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.stopping = true;
-            for handle in state.prompts.values() {
-                handle.abort();
+            for prompt in state.prompts.values() {
+                prompt.input.seal();
+                prompt.abort.abort();
             }
         }
         self.shared
@@ -359,6 +521,8 @@ impl AcpOutput {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.shared.files.close();
+        self.shared.terminals.shutdown(self);
         let drain = async {
             loop {
                 if self
@@ -376,7 +540,15 @@ impl AcpOutput {
         };
         timeout(wall_now(), Duration::from_secs(30), Box::pin(drain))
             .await
-            .map_err(|_| Error::session("ACP prompt cleanup timed out; persistence is incomplete"))
+            .map_err(|_| {
+                Error::session("ACP prompt cleanup timed out; persistence is incomplete")
+            })?;
+        if self.shared.terminals.has_pending() {
+            return Err(Error::session(
+                "Editor terminal cleanup could not be confirmed before ACP shutdown",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -384,6 +556,8 @@ impl AcpOutput {
 /// Retirement follows the durable prompt result and owner restoration.
 struct AcpPromptGuard {
     shared: Arc<AcpOutputShared>,
+    output: AcpOutput,
+    input: Arc<steering::Mailbox>,
     session_id: String,
     started: bool,
     settled: bool,
@@ -391,17 +565,24 @@ struct AcpPromptGuard {
 
 impl Drop for AcpPromptGuard {
     fn drop(&mut self) {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.prompts.remove(&self.session_id);
-        if self.started && !self.settled {
-            self.shared.record_failure(
-                &mut state,
-                "ACP prompt task ended before session cleanup completed",
-            );
+        let pending = {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.prompts.remove(&self.session_id);
+            let pending = self.input.close();
+            if self.started && !self.settled {
+                self.shared.record_failure(
+                    &mut state,
+                    "ACP prompt task ended before session cleanup completed",
+                );
+            }
+            pending
+        };
+        for input in pending {
+            input.reply(&self.output, "promptRequired");
         }
     }
 }
@@ -465,12 +646,24 @@ pub struct AcpLaunchOptions {
     pub api_key: Option<String>,
     pub tools: Option<String>,
     pub no_tools: bool,
+    /// Host-level refusal of all client-supplied MCP servers.
+    pub no_mcp: bool,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
     pub no_context_files: bool,
     pub hide_cwd_in_prompt: bool,
     pub max_tool_iterations: Option<usize>,
     pub max_time: Option<u64>,
+    pub warn_cost: Option<f64>,
+    pub max_cost: Option<f64>,
+    /// Explicit launch intent; settings never implicitly arm editor sessions.
+    pub prewalk: bool,
+    pub prewalk_into: Option<String>,
+    pub no_prewalk: bool,
+    pub smol: Option<String>,
+    pub slow: Option<String>,
+    pub plan: Option<String>,
+    pub advisor: Option<String>,
 }
 
 impl AcpLaunchOptions {
@@ -484,12 +677,22 @@ impl AcpLaunchOptions {
             api_key: crate::models::normalize_api_key_opt(cli.api_key.clone()),
             tools: Some(cli.tools.clone()),
             no_tools: cli.no_tools,
+            no_mcp: cli.no_mcp,
             system_prompt: cli.system_prompt.clone(),
             append_system_prompt: cli.append_system_prompt.clone(),
             no_context_files: cli.no_context_files,
             hide_cwd_in_prompt: cli.hide_cwd_in_prompt,
             max_tool_iterations: cli.max_tool_iterations,
             max_time: cli.max_time,
+            warn_cost: cli.warn_cost,
+            max_cost: cli.max_cost,
+            prewalk: cli.prewalk,
+            prewalk_into: cli.prewalk_into.clone(),
+            no_prewalk: cli.no_prewalk,
+            smol: cli.smol.clone(),
+            slow: cli.slow.clone(),
+            plan: cli.plan.clone(),
+            advisor: cli.advisor.clone(),
         }
     }
 
@@ -513,6 +716,7 @@ impl AcpLaunchOptions {
             cli.tools.clone_from(tools);
         }
         cli.no_tools = self.no_tools;
+        cli.no_mcp = self.no_mcp;
         cli.system_prompt.clone_from(&self.system_prompt);
         cli.append_system_prompt
             .clone_from(&self.append_system_prompt);
@@ -520,6 +724,15 @@ impl AcpLaunchOptions {
         cli.hide_cwd_in_prompt = self.hide_cwd_in_prompt;
         cli.max_tool_iterations = self.max_tool_iterations;
         cli.max_time = self.max_time;
+        cli.prewalk = self.prewalk;
+        cli.prewalk_into.clone_from(&self.prewalk_into);
+        cli.no_prewalk = self.no_prewalk;
+        cli.warn_cost = self.warn_cost;
+        cli.max_cost = self.max_cost;
+        cli.smol.clone_from(&self.smol);
+        cli.slow.clone_from(&self.slow);
+        cli.plan.clone_from(&self.plan);
+        cli.advisor.clone_from(&self.advisor);
         Ok(cli)
     }
 }
@@ -596,25 +809,19 @@ impl AcpPermissionClient {
         let request_key = json_rpc_id_key(&request_id);
         let (reply_tx, mut reply_rx) = oneshot::channel();
 
-        if let Err(reason) = self
-            .out_tx
-            .register_permission(request_key.clone(), reply_tx)
-        {
+        if let Err(reason) = self.out_tx.register_permission(
+            request_key.clone(),
+            session_id,
+            request_id.clone(),
+            reply_tx,
+            json_rpc_permission_request(&request_id, session_id, &request),
+        ) {
             return ToolApprovalDecision::deny(reason);
         }
         let _pending_guard = PendingPermissionGuard {
             pending: Arc::clone(&self.pending),
             key: request_key,
         };
-
-        let request_line = json_rpc_permission_request(&request_id, session_id, &request);
-        if self.out_tx.send(request_line).is_err() {
-            return ToolApprovalDecision::deny(
-                self.out_tx
-                    .failure_reason()
-                    .unwrap_or("permission request client disconnected"),
-            );
-        }
 
         let response = timeout(
             wall_now(),
@@ -686,7 +893,7 @@ pub async fn run_stdio(options: AcpOptions) -> Result<()> {
         let _ = writer_done_tx.send(result);
     });
 
-    let result = run(options, in_rx, out_tx).await;
+    let result = Box::pin(run(options, in_rx, out_tx)).await;
     // Prompt settlement can leave final frames queued. The process must keep
     // running until stdout flushes them, or report that delivery is incomplete.
     // A blocked OS write cannot be joined safely on an async worker.
@@ -777,7 +984,14 @@ async fn run(
                 };
 
                 if raw_message.get("method").is_none() {
-                    let _ = route_permission_response(&raw_message, &pending_permissions, &cx);
+                    if !route_permission_response(&raw_message, &pending_permissions, &cx)
+                        && !out_tx
+                            .shared
+                            .terminals
+                            .route_response(&out_tx, &raw_message, &cx)
+                    {
+                        out_tx.shared.files.route_response(&raw_message, &cx);
+                    }
                     continue;
                 }
 
@@ -810,6 +1024,8 @@ async fn run(
 
                 match request.method.as_str() {
                     "initialize" => {
+                        out_tx.shared.files.negotiate(&request.params);
+                        out_tx.shared.terminals.negotiate(&request.params);
                         let result = handle_initialize();
                         initialized.store(true, Ordering::SeqCst);
                         let _ = out_tx.send(json_rpc_ok(id, result));
@@ -844,7 +1060,7 @@ async fn run(
                         let validated = history::requested_cwd(&request.params)
                             .map_err(|error| error.message)
                             .and_then(|cwd| {
-                                crate::mcp::config::parse_acp_servers(&request.params, &cwd)
+                                mcp::parse_servers(&request.params, &cwd, options.launch.no_mcp)
                                     .map(|_| ())
                             });
                         if let Err(error) = validated {
@@ -864,7 +1080,15 @@ async fn run(
                             &options,
                             Some(&permission_client),
                         ) {
-                            Ok((session_id, state)) => {
+                            Ok((session_id, mut state)) => {
+                                if let Err(error) = arm_acp_prewalk(&mut state, &options).await {
+                                    let _ = out_tx.send(json_rpc_error(
+                                        id,
+                                        INVALID_PARAMS,
+                                        format!("Cannot arm prewalk: {error}"),
+                                    ));
+                                    continue;
+                                }
                                 let models: Vec<AcpModel> = state
                                     .available_models
                                     .iter()
@@ -955,8 +1179,8 @@ async fn run(
                         };
 
                         // Decode the complete ContentBlock[] before starting a turn.
-                        // Images stay native image blocks, and embedded editor context
-                        // retains its provenance without implicitly opening its URI.
+                        // Images/audio/video stay native blocks, and embedded editor
+                        // context retains its provenance without opening its URI.
                         let prompt_blocks = request.params.get("prompt").and_then(Value::as_array);
                         let Some(prompt_blocks) = prompt_blocks else {
                             let _ = out_tx.send(json_rpc_error(
@@ -974,7 +1198,10 @@ async fn run(
                                 continue;
                             }
                         };
-                        let message_content = match content::extract_prompt_content(prompt_blocks) {
+                        let message_content = match content::extract_prompt_content(
+                            prompt_blocks,
+                            &options.config,
+                        ) {
                             Ok(content) => content,
                             Err(err) => {
                                 let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, err));
@@ -1017,7 +1244,17 @@ async fn run(
 
                         let (abort_handle, abort_signal) = AbortHandle::new();
                         let mut prompt_guard =
-                            out_tx.begin_prompt(session_id.clone(), abort_handle)?;
+                            match out_tx.begin_prompt(session_id.clone(), abort_handle) {
+                                Ok(guard) => guard,
+                                Err(error) => {
+                                    let _ = out_tx.send(json_rpc_error(
+                                        id,
+                                        PROMPT_IN_PROGRESS,
+                                        error.to_string(),
+                                    ));
+                                    continue;
+                                }
+                            };
 
                         // Per ACP, the server replies to session/prompt only after the
                         // turn completes — with a stopReason. Spawn the work and have
@@ -1029,7 +1266,7 @@ async fn run(
 
                         let spawned = options.runtime_handle.try_spawn(async move {
                             prompt_guard.started = true;
-                            let stop_reason = run_prompt(
+                            let stop_reason = Box::pin(run_prompt(
                                 session_state,
                                 message_content,
                                 mcp_command,
@@ -1037,7 +1274,7 @@ async fn run(
                                 out_tx_prompt.clone(),
                                 prompt_session_id.clone(),
                                 prompt_cx.clone(),
-                            )
+                            ))
                             .await;
 
                             prompt_guard.settled = true;
@@ -1055,6 +1292,63 @@ async fn run(
                                 "Cannot start ACP prompt task",
                             ));
                         }
+                    }
+
+                    "_session/steering" => {
+                        if !initialized.load(Ordering::SeqCst) {
+                            if request.id.is_some() {
+                                let _ = out_tx.send(json_rpc_error(
+                                    id,
+                                    INVALID_REQUEST,
+                                    "Server not initialized",
+                                ));
+                            }
+                            continue;
+                        }
+                        let Some(session_id) = request
+                            .params
+                            .get("sessionId")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                        else {
+                            if request.id.is_some() {
+                                let _ = out_tx.send(json_rpc_error(
+                                    id,
+                                    INVALID_PARAMS,
+                                    "sessionId required",
+                                ));
+                            }
+                            continue;
+                        };
+                        let known = sessions
+                            .lock(&cx)
+                            .await
+                            .is_ok_and(|sessions| sessions.contains_key(session_id));
+                        if !known {
+                            if request.id.is_some() {
+                                let _ = out_tx.send(json_rpc_error(
+                                    id,
+                                    INVALID_PARAMS,
+                                    "Unknown ACP session",
+                                ));
+                            }
+                            continue;
+                        }
+                        match steering::Input::parse(
+                            &request.params,
+                            request.id.clone(),
+                            &options.config,
+                        ) {
+                            Ok(input) => out_tx.enqueue_steering(session_id, input),
+                            Err(error) => {
+                                if request.id.is_some() {
+                                    let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, error));
+                                }
+                            }
+                        }
+                        // The prompt's mailbox owns the eventual reply. Never
+                        // wait here: this loop also receives editor approvals
+                        // and session/cancel while the native turn is running.
                     }
 
                     // ACP defines session/cancel as a notification that aborts the
@@ -1123,12 +1417,14 @@ async fn run(
                         };
                         // Check the reservation as well as agent_session: a spawned
                         // prompt may not yet have taken the agent out of its state.
-                        let busy = out_tx.prompt_is_active(session_id);
+                        let busy = out_tx.prompt_is_active(session_id)
+                            || out_tx.shared.files.has_write(session_id)
+                            || out_tx.shared.terminals.has_unsettled(session_id);
                         if busy {
                             let _ = out_tx.send(json_rpc_error(
                                 id,
                                 PROMPT_IN_PROGRESS,
-                                "Cannot load or resume a session while a prompt is in progress",
+                                "Cannot load or resume a session while a prompt, editor file write, or terminal cleanup is in progress",
                             ));
                             continue;
                         }
@@ -1490,8 +1786,8 @@ fn route_permission_response(
 
     let sender = pending.lock().ok().and_then(|mut guard| guard.remove(&key));
 
-    sender.is_some_and(|sender| {
-        let _ = sender.send(cx.cx(), response);
+    sender.is_some_and(|permission| {
+        let _ = permission.sender.send(cx.cx(), response);
         true
     })
 }
@@ -1655,7 +1951,7 @@ fn handle_initialize() -> Value {
             "loadSession": true,
             "mcpCapabilities": {
                 "http": true,
-                "sse": false,
+                "sse": true,
             },
             "promptCapabilities": content::prompt_capabilities(),
             "sessionCapabilities": { "list": {} },
@@ -1667,37 +1963,71 @@ fn handle_initialize() -> Value {
             },
         },
         "authMethods": [],
+        "_meta": { "steering": { "supported": true } },
     })
 }
 
-fn select_acp_model_entry(config: &Config, available_models: &[ModelEntry]) -> Option<ModelEntry> {
-    if let (Some(default_provider), Some(default_model)) = (
-        config.default_provider.as_deref(),
-        config.default_model.as_deref(),
-    ) && let Some(entry) = available_models.iter().find(|entry| {
-        provider_ids_match(&entry.model.provider, default_provider)
-            && entry.model.id.eq_ignore_ascii_case(default_model)
-    }) {
-        return Some(entry.clone());
-    }
+fn acp_model_registry(options: &AcpOptions) -> ModelRegistry {
+    let mut registry = options.model_registry.clone();
+    registry.merge_missing_entries(options.available_models.clone());
+    registry
+}
 
-    if let Some(default_provider) = config.default_provider.as_deref()
-        && let Some(entry) = available_models
-            .iter()
-            .find(|entry| provider_ids_match(&entry.model.provider, default_provider))
-    {
-        return Some(entry.clone());
+/// ACP's admitted catalog retains its order for automatic selection. Explicit
+/// defaults, model roles, and scope are resolved by the shared selector first.
+fn acp_automatic_fallback(
+    options: &AcpOptions,
+    registry: &ModelRegistry,
+) -> crate::app::AutomaticModelFallback {
+    let preferred = options
+        .config
+        .default_provider
+        .as_deref()
+        .and_then(|provider| {
+            let exact_provider_exists = registry.models().iter().any(|entry| {
+                entry
+                    .model
+                    .provider
+                    .trim()
+                    .eq_ignore_ascii_case(provider.trim())
+            });
+            options.available_models.iter().find(|entry| {
+                if exact_provider_exists {
+                    entry
+                        .model
+                        .provider
+                        .trim()
+                        .eq_ignore_ascii_case(provider.trim())
+                } else {
+                    provider_ids_match(&entry.model.provider, provider)
+                }
+            })
+        });
+    let model_entry = preferred
+        .or_else(|| options.available_models.first())
+        .and_then(|entry| registry.find(&entry.model.provider, &entry.model.id));
+    let warning = if preferred.is_none() {
+        options
+            .config
+            .default_provider
+            .as_deref()
+            .and_then(|provider| {
+                model_entry.as_ref().map(|entry| {
+                    format!(
+                        "Configured default_provider '{provider}' has no admitted ACP model. \
+                         Using {}/{}. Check default_provider and credentials, run pi --list-models, \
+                         or use --provider/--model to select a destination explicitly.",
+                        entry.model.provider, entry.model.id,
+                    )
+                })
+            })
+    } else {
+        None
+    };
+    crate::app::AutomaticModelFallback {
+        model_entry,
+        warning,
     }
-
-    if let Some(default_model) = config.default_model.as_deref()
-        && let Some(entry) = available_models
-            .iter()
-            .find(|entry| entry.model.id.eq_ignore_ascii_case(default_model))
-    {
-        return Some(entry.clone());
-    }
-
-    available_models.first().cloned()
 }
 
 fn resolve_acp_thinking_level(
@@ -1713,24 +2043,26 @@ fn resolve_acp_thinking_level(
 }
 
 /// Resolve against the actual new/reopened session, without constructing a
-/// throwaway agent. ACP retains its configured-default selection when no model
-/// choice was supplied, and shares the CLI's explicit model/effort resolver.
+/// throwaway agent. Saved branches keep their identity and effort; fresh
+/// conversations share the CLI's configured-model, role, and scope resolution.
 fn resolve_acp_selection(
     session: &Session,
     cwd: &std::path::Path,
     options: &AcpOptions,
     cli: &mut crate::cli::Cli,
 ) -> Result<crate::app::ModelSelection> {
-    let mut registry = options.model_registry.clone();
+    let mut registry = acp_model_registry(options);
     let mut scoped_models = Vec::new();
     if let Some((provider, model)) = session.effective_model_for_current_path() {
-        let entry = registry
-            .find(&provider, &model)
-            .or_else(|| crate::models::ad_hoc_model_entry(&provider, &model))
+        let entry = crate::models::resolve_model_entry(registry.models(), &provider, &model)
             .ok_or_else(|| {
                 Error::provider(
                     "acp",
-                    format!("Saved session model is not registered: {provider}/{model}"),
+                    format!(
+                        "Saved session model is not registered: {provider}/{model}. \
+                         Restore that provider's model registration or choose a registered \
+                         model in a new session; use pi --list-models to inspect the catalog."
+                    ),
                 )
             })?;
         cli.provider = Some(provider);
@@ -1745,7 +2077,7 @@ fn resolve_acp_selection(
                     .to_string(),
                 None => resolve_acp_thinking_level(&options.config, &entry).to_string(),
             });
-        registry.merge_entries(vec![entry]);
+        registry.merge_missing_entries(vec![entry]);
     } else if cli.provider.is_none() && cli.model.is_none() {
         let scope_override = options
             .config
@@ -1768,48 +2100,26 @@ fn resolve_acp_selection(
             cwd,
         )
         .map_err(|error| Error::config(error.to_string()))?;
-        let scoped = scoped_models
-            .iter()
-            .find(|scoped| {
-                options
-                    .config
-                    .default_provider
-                    .as_deref()
-                    .is_some_and(|provider| {
-                        provider_ids_match(provider, &scoped.model.model.provider)
-                    })
-                    && options
-                        .config
-                        .default_model
-                        .as_deref()
-                        .is_some_and(|model| model.eq_ignore_ascii_case(&scoped.model.model.id))
-            })
-            .or_else(|| scoped_models.first());
-        let entry = if let Some(scoped) = scoped {
-            if cli.thinking.is_none() {
-                cli.thinking = scoped.thinking_level.map(|level| level.to_string());
-            }
-            scoped.model.clone()
-        } else {
-            if cli.api_key.is_some() {
-                return Err(Error::config(
-                    "--api-key requires a model to be specified via --provider/--model or --models",
-                ));
-            }
-            select_acp_model_entry(&options.config, &options.available_models)
-                .ok_or_else(|| Error::provider("acp", "No models available"))?
-        };
-        cli.provider = Some(entry.model.provider.clone());
-        cli.model = Some(entry.model.id.clone());
-        registry.merge_entries(vec![entry]);
+        if scoped_models.is_empty()
+            && cli
+                .api_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty())
+        {
+            return Err(Error::config(
+                "--api-key requires a model to be specified via --provider/--model or --models",
+            ));
+        }
     }
-    crate::app::select_model_and_thinking(
+    let fallback = acp_automatic_fallback(options, &registry);
+    crate::app::select_model_and_thinking_with_fallback(
         cli,
         &options.config,
         session,
         &registry,
         &scoped_models,
         &Config::global_dir(),
+        Some(fallback),
     )
     .map_err(|error| Error::config(error.to_string()))
 }
@@ -1889,7 +2199,7 @@ fn handle_session_new(
     permission_client: Option<&AcpPermissionClient>,
 ) -> Result<(String, AcpSessionState)> {
     let cwd = history::requested_cwd(params).map_err(|error| Error::session(error.message))?;
-    let servers = crate::mcp::config::parse_acp_servers(params, &cwd)
+    let servers = mcp::parse_servers(params, &cwd, options.launch.no_mcp)
         .map_err(Error::session)?
         .unwrap_or_default();
 
@@ -1934,8 +2244,19 @@ fn build_acp_session(
     } else {
         ToolRegistry::new(&enabled_tools, &cwd, Some(&options.config))
     };
+    client_files::bind(
+        &tools,
+        permission_client,
+        &session_id,
+        &cwd,
+        options.session_dir.as_ref(),
+    )?;
+    client_terminals::bind(&tools, permission_client, &session_id, &cwd)?;
 
     let selection = resolve_acp_selection(&session, &cwd, options, &mut cli)?;
+    if let Some(message) = &selection.fallback_message {
+        eprintln!("Warning: {message}");
+    }
     let model_entry = &selection.model_entry;
     if cli.api_key.is_none()
         && options
@@ -1952,13 +2273,21 @@ fn build_acp_session(
         .map_err(|error| Error::provider("acp", error.to_string()))?;
     let stream_options =
         crate::app::build_stream_options(&options.config, api_key, &selection, &session);
-    crate::app::update_session_for_selection(&mut session, &selection);
-    let mut registry = options.model_registry.clone();
-    registry.merge_entries(vec![model_entry.clone()]);
+    let mut registry = acp_model_registry(options);
+    registry.merge_missing_entries(vec![model_entry.clone()]);
+    crate::app::update_session_for_selection(&mut session, &selection, &registry);
     let mut available_models = options.available_models.clone();
     if !available_models.iter().any(|entry| {
-        provider_ids_match(&entry.model.provider, &model_entry.model.provider)
-            && entry.model.id.eq_ignore_ascii_case(&model_entry.model.id)
+        entry
+            .model
+            .provider
+            .trim()
+            .eq_ignore_ascii_case(model_entry.model.provider.trim())
+            && entry
+                .model
+                .id
+                .trim()
+                .eq_ignore_ascii_case(model_entry.model.id.trim())
     }) {
         available_models.push(model_entry.clone());
     }
@@ -1991,6 +2320,13 @@ fn build_acp_session(
             .map(|client| client.handler_for_session(session_id.clone())),
         keyword_settings: options.config.keywords.clone(),
         max_time: cli.max_time.map(Duration::from_secs),
+        cost_budget: crate::cost::resolve_budget(
+            &session,
+            options.config.session.as_ref(),
+            cli.warn_cost,
+            cli.max_cost,
+            None,
+        )?,
         turn_recovery: options.config.turn_recovery_mode(),
         approval_state: None,
         bash_settings: options.config.bash.clone(),
@@ -2020,7 +2356,8 @@ fn build_acp_session(
         .with_runtime_handle(options.runtime_handle.clone())
         .with_model_registry(registry.clone())
         .with_auth_storage(auth.clone())
-        .with_api_key_override(cli.api_key.clone());
+        .with_api_key_override(cli.api_key.clone())
+        .with_memory_settings(options.config.memory.as_ref());
     // Keep the exact configured AgentSession for the lifetime of the editor
     // session. The SDK owns one durable recovery driver and its cross-turn
     // fallback state; rebuilding a handle per prompt would lose that state.
@@ -2043,6 +2380,34 @@ fn build_acp_session(
             mcp: None,
         },
     ))
+}
+
+/// Apply explicit host intent before the new/restored session is admitted to
+/// the editor. Reattaching an already live session does not re-arm a consumed
+/// handoff. Resolve policy and credentials in the editor's requested workspace.
+async fn arm_acp_prewalk(state: &mut AcpSessionState, options: &AcpOptions) -> Result<()> {
+    let cli = options.launch.selection_cli()?;
+    if cli.no_prewalk || (!cli.prewalk && cli.prewalk_into.is_none()) {
+        return Ok(());
+    }
+    let handle = state
+        .agent_session
+        .as_mut()
+        .ok_or_else(|| Error::session("Cannot arm prewalk while the session is busy"))?;
+    let registry = handle
+        .session()
+        .model_registry()
+        .ok_or_else(|| Error::config("Prewalk requires a model registry"))?;
+    let target = crate::app::resolve_prewalk_target(
+        cli.prewalk_into.as_deref().unwrap_or("@smol"),
+        &cli,
+        &options.config,
+        registry,
+        &state.cwd,
+    )
+    .map_err(|error| Error::config(error.to_string()))?;
+    handle.arm_prewalk(target).await?;
+    Ok(())
 }
 
 // ============================================================================
@@ -2176,6 +2541,7 @@ impl AcpRecoveryUpdates {
 
     fn observe(&self, event: &AgentEvent) {
         match event {
+            AgentEvent::CostWarning { message, .. } => self.notice(message),
             AgentEvent::AutoRetryStart {
                 attempt,
                 max_attempts,
@@ -2203,6 +2569,16 @@ impl AcpRecoveryUpdates {
                 restored_primary: true,
             } => {
                 self.notice(&format!("Restored primary provider: {provider}/{model}."));
+                self.committed_model(provider, model);
+            }
+            AgentEvent::PrewalkSwitched {
+                provider,
+                model,
+                thinking,
+            } => {
+                self.notice(&format!(
+                    "Prewalk switched → {provider}/{model}:{thinking}."
+                ));
                 self.committed_model(provider, model);
             }
             _ => {}
@@ -2491,6 +2867,20 @@ async fn run_prompt(
         Ok(taken) => taken,
         Err(error) => return report_prompt_error(&out_tx, &session_id, &error).await,
     };
+    // The reservation exists before spawn. These readers therefore also claim
+    // steering received while this task was still waiting to be polled. They
+    // are scoped to this exact prompt, never another prompt on the session.
+    let input_lifetime = Arc::new(());
+    if let Some(input) = out_tx.prompt_input(&session_id) {
+        agent_session
+            .session_mut()
+            .agent
+            .register_scoped_message_fetchers(
+                &input_lifetime,
+                Some(input.fetcher(&out_tx, steering::Queue::Steering)),
+                Some(input.fetcher(&out_tx, steering::Queue::FollowUp)),
+            );
+    }
     let recovery_updates =
         AcpRecoveryUpdates::new(&agent_session, available_models, &out_tx, &session_id);
     let recovery_callback = Arc::clone(&recovery_updates);
@@ -2550,6 +2940,12 @@ async fn run_prompt(
         }
     };
 
+    // Seal native delivery before owner cleanup can yield again. The prompt
+    // guard resolves unclaimed input only after the stopReason and reservation
+    // retirement, when the client can safely submit it as a new prompt.
+    out_tx.finish_steering(&session_id);
+    drop(input_lifetime);
+
     // Even a failed/aborted fallback can have committed a different model.
     // Publish the final selections before returning the prompt response.
     recovery_updates.finish(&agent_session);
@@ -2581,6 +2977,8 @@ async fn report_prompt_error(out_tx: &AcpOutput, session_id: &str, error: &Error
     } else if let Error::Provider { provider, message } = error {
         let summary = crate::error::ProviderErrorSummary::from_error_text(Some(provider), message);
         format!("{}\n{}", summary.headline(), summary.retry_note(None))
+    } else if matches!(error, Error::CostCap { .. }) {
+        error.to_string()
     } else {
         // Hint context and raw provider payloads can contain credentials,
         // private prompts or paths. Only the public category summary is sent.
@@ -2607,6 +3005,8 @@ async fn report_prompt_error(out_tx: &AcpOutput, session_id: &str, error: &Error
 const ACP_STOP_REASON_END_TURN: &str = "end_turn";
 const ACP_STOP_REASON_MAX_TOKENS: &str = "max_tokens";
 const ACP_STOP_REASON_CANCELLED: &str = "cancelled";
+// A provider refusal lets the editor show its refusal state (OMP does the same).
+const ACP_STOP_REASON_REFUSAL: &str = "refusal";
 // Spec lists: end_turn | max_tokens | max_turn_requests | refusal | cancelled.
 // Provider/local errors use end_turn to keep the response well-formed;
 // report_prompt_error publishes their safe summary before the response.
@@ -2615,9 +3015,8 @@ const ACP_STOP_REASON_ERROR: &str = "end_turn";
 const fn map_stop_reason(reason: crate::model::StopReason) -> &'static str {
     use crate::model::StopReason;
     match reason {
-        StopReason::Stop | StopReason::ToolUse | StopReason::PauseTurn | StopReason::Refusal => {
-            ACP_STOP_REASON_END_TURN
-        }
+        StopReason::Stop | StopReason::ToolUse | StopReason::PauseTurn => ACP_STOP_REASON_END_TURN,
+        StopReason::Refusal => ACP_STOP_REASON_REFUSAL,
         StopReason::Length => ACP_STOP_REASON_MAX_TOKENS,
         StopReason::Aborted => ACP_STOP_REASON_CANCELLED,
         StopReason::Error => ACP_STOP_REASON_ERROR,
@@ -2723,7 +3122,10 @@ fn build_acp_event_handler(
                 args: _,
                 partial_result,
             } => {
-                let tool_content = content::tool_result_content(&partial_result.content);
+                let tool_content = client_terminals::tool_content(
+                    &partial_result.content,
+                    partial_result.details.as_ref(),
+                );
                 let mut update = json!({
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": tool_call_id,
@@ -2741,7 +3143,8 @@ fn build_acp_event_handler(
                 result,
                 is_error,
             } => {
-                let tool_content = content::tool_result_content(&result.content);
+                let tool_content =
+                    client_terminals::tool_content(&result.content, result.details.as_ref());
 
                 Some(json!({
                     "sessionUpdate": "tool_call_update",
@@ -2988,7 +3391,7 @@ mod tests {
     ) -> (&'static str, Vec<Value>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(16);
         let tx = AcpOutput::new(tx);
-        let reason = run_prompt(
+        let reason = Box::pin(run_prompt(
             state,
             vec![ContentBlock::Text(TextContent::new("editor prompt"))],
             None,
@@ -2996,7 +3399,7 @@ mod tests {
             tx,
             "editor-session".to_string(),
             AgentCx::for_current_or_request(),
-        )
+        ))
         .await;
         let updates = rx
             .try_iter()
@@ -3063,12 +3466,14 @@ mod tests {
                 .begin_prompt("second".into(), second_abort)
                 .expect("second prompt");
             let (reply_tx, mut reply_rx) = oneshot::channel();
-            output
-                .shared
-                .pending_permissions
-                .lock()
-                .unwrap()
-                .insert("approval".into(), reply_tx);
+            output.shared.pending_permissions.lock().unwrap().insert(
+                "approval".into(),
+                PendingPermission {
+                    session_id: "first".into(),
+                    request_id: json!("approval"),
+                    sender: reply_tx,
+                },
+            );
 
             assert!(matches!(
                 output.send("overflow".into()),
@@ -3099,6 +3504,247 @@ mod tests {
     }
 
     #[test]
+    fn steering_dispatch_inputs_reach_the_native_agent_and_persist_once() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (state, provider, stored) =
+                prompt_test_state(root.path(), PromptTestOutcome::Complete, false).await;
+            let (tx, rx) = std::sync::mpsc::sync_channel(64);
+            let output = AcpOutput::new(tx);
+            let (abort, signal) = AbortHandle::new();
+            let mut guard = output.begin_prompt("editor-session".into(), abort).unwrap();
+            for (id, text, queue) in [
+                (11, "steered instruction", "steering"),
+                (12, "next task", "followUp"),
+            ] {
+                let input = steering::Input::parse(
+                    &json!({
+                        "prompt": [{ "type": "text", "text": text }],
+                        "_meta": { "steering": { "queue": queue } },
+                    }),
+                    Some(json!(id)),
+                    &Config::default(),
+                )
+                .unwrap();
+                output.enqueue_steering("editor-session", input);
+            }
+            assert!(
+                rx.try_recv().is_err(),
+                "dispatch must not claim native delivery before execution"
+            );
+            guard.started = true;
+            let reason = Box::pin(run_prompt(
+                Arc::clone(&state),
+                vec![ContentBlock::Text(TextContent::new("editor prompt"))],
+                None,
+                signal,
+                output.clone(),
+                "editor-session".into(),
+                AgentCx::for_current_or_request(),
+            ))
+            .await;
+            guard.settled = true;
+            drop(guard);
+            assert_eq!(reason, ACP_STOP_REASON_END_TURN);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            let path = stored.try_lock().unwrap().path.clone().unwrap();
+            let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+            let users = reopened
+                .to_messages_for_current_path()
+                .iter()
+                .filter_map(|message| match message {
+                    crate::model::Message::User(user) => {
+                        Some(serde_json::to_string(&user.content).unwrap())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(users.len(), 3);
+            for (user, expected) in
+                users
+                    .iter()
+                    .zip(["editor prompt", "steered instruction", "next task"])
+            {
+                assert!(user.contains(expected));
+            }
+            let frames = rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+                .collect::<Vec<_>>();
+            for (id, queue) in [(11, "steering"), (12, "followUp")] {
+                let replies = frames
+                    .iter()
+                    .filter(|frame| frame["id"] == id)
+                    .collect::<Vec<_>>();
+                assert_eq!(replies.len(), 1);
+                assert_eq!(
+                    replies[0]["result"],
+                    json!({ "outcome": "injected", "queue": queue })
+                );
+            }
+            assert!(state.try_lock().unwrap().agent_session.is_some());
+        });
+    }
+
+    #[test]
+    fn steering_idle_terminal_and_cancelled_dispatch_keep_input_with_client() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (state, provider, _) =
+                prompt_test_state(root.path(), PromptTestOutcome::Complete, false).await;
+            let (tx, rx) = std::sync::mpsc::sync_channel(16);
+            let output = AcpOutput::new(tx);
+            let input = |id| {
+                steering::Input::parse(
+                    &json!({ "prompt": "retained by editor" }),
+                    Some(json!(id)),
+                    &Config::default(),
+                )
+                .unwrap()
+            };
+            output.enqueue_steering("editor-session", input(1));
+            let idle: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!(idle["id"], 1);
+            assert_eq!(idle["result"]["outcome"], "promptRequired");
+            let (abort, signal) = AbortHandle::new();
+            let mut guard = output.begin_prompt("editor-session".into(), abort).unwrap();
+            output.enqueue_steering("editor-session", input(2));
+            output.abort_prompt("editor-session");
+            output.enqueue_steering("editor-session", input(3));
+            assert!(
+                rx.try_recv().is_err(),
+                "fallback replies wait until the owning turn retires"
+            );
+            guard.started = true;
+            let reason = Box::pin(run_prompt(
+                state,
+                vec![ContentBlock::Text(TextContent::new(
+                    "cancelled before start",
+                ))],
+                None,
+                signal,
+                output.clone(),
+                "editor-session".into(),
+                AgentCx::for_current_or_request(),
+            ))
+            .await;
+            guard.settled = true;
+            output
+                .send(json_rpc_ok(json!(99), json!({ "stopReason": reason })))
+                .unwrap();
+            drop(guard);
+            assert_eq!(reason, ACP_STOP_REASON_CANCELLED);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            let (abort, _) = AbortHandle::new();
+            let guard = output.begin_prompt("editor-session".into(), abort).unwrap();
+            output.enqueue_steering("editor-session", input(4));
+            output.finish_steering("editor-session");
+            drop(guard);
+            let frames = rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(frames.len(), 4);
+            assert_eq!(frames[0]["id"], 99);
+            assert_eq!(frames[0]["result"]["stopReason"], "cancelled");
+            for (frame, id) in frames[1..].iter().zip(2..=4) {
+                assert_eq!(frame["id"], id);
+                assert_eq!(frame["result"]["outcome"], "promptRequired");
+            }
+        });
+    }
+
+    #[test]
+    fn steering_supersedes_only_its_sessions_permission_and_follow_up_does_not() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let (tx, rx) = std::sync::mpsc::sync_channel(16);
+            let output = AcpOutput::new(tx);
+            let first_guard = output
+                .begin_prompt("first".into(), AbortHandle::new().0)
+                .unwrap();
+            let second_guard = output
+                .begin_prompt("second".into(), AbortHandle::new().0)
+                .unwrap();
+            let cx = AgentCx::for_current_or_request();
+            let client = AcpPermissionClient {
+                out_tx: output.clone(),
+                pending: Arc::clone(&output.shared.pending_permissions),
+                request_counter: Arc::new(AtomicU64::new(0)),
+                timeout: Duration::from_secs(60),
+                cx: cx.clone(),
+            };
+            let request = || ToolApprovalRequest {
+                tool_call_id: "permission-tool".into(),
+                tool_name: "bash".into(),
+                arguments: json!({ "command": "echo approved" }),
+            };
+            let first = client.request_permission("first", request());
+            let second = client.request_permission("second", request());
+            futures::pin_mut!(first, second);
+            futures::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(first.as_mut(), cx).is_pending());
+                assert!(std::future::Future::poll(second.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let first_frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            let second_frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            let follow_up = steering::Input::parse(
+                &json!({
+                    "prompt": "after this", "_meta": { "steering": { "queue": "followUp" } },
+                }),
+                Some(json!(10)),
+                &Config::default(),
+            )
+            .unwrap();
+            output.enqueue_steering("first", follow_up);
+            assert!(rx.try_recv().is_err());
+            assert_eq!(client.pending.lock().unwrap().len(), 2);
+            output.enqueue_steering(
+                "first",
+                steering::Input::parse(
+                    &json!({ "prompt": "stop that tool and inspect instead" }),
+                    Some(json!(11)),
+                    &Config::default(),
+                )
+                .unwrap(),
+            );
+            let cancelled: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!(cancelled["method"], "$/cancel_request");
+            assert_eq!(cancelled["params"]["requestId"], first_frame["id"]);
+            assert!(matches!(first.await, ToolApprovalDecision::Deny { .. }));
+            // The other admission order must also deny: no fresh dialog may
+            // appear after steering was queued but before its next boundary.
+            assert!(matches!(
+                client.request_permission("first", request()).await,
+                ToolApprovalDecision::Deny { .. }
+            ));
+            assert!(rx.try_recv().is_err());
+            let allow = |id| json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": { "outcome": { "outcome": "selected", "optionId": ACP_PERMISSION_ALLOW_ONCE } },
+            });
+            assert!(!route_permission_response(
+                &allow(first_frame["id"].clone()),
+                &client.pending,
+                &cx,
+            ));
+            assert!(route_permission_response(
+                &allow(second_frame["id"].clone()),
+                &client.pending,
+                &cx,
+            ));
+            assert_eq!(second.await, ToolApprovalDecision::Allow);
+            drop(first_guard);
+            drop(second_guard);
+            assert!(client.pending.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
     fn output_drain_waits_for_settlement_and_detects_abandoned_turns() {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         runtime.block_on(async {
@@ -3115,8 +3761,15 @@ mod tests {
             guard.started = true;
             let (reply_tx, mut reply_rx) = oneshot::channel();
             output
-                .register_permission("before-shutdown".into(), reply_tx)
+                .register_permission(
+                    "before-shutdown".into(),
+                    "running",
+                    json!("before-shutdown"),
+                    reply_tx,
+                    "permission-before-shutdown".into(),
+                )
                 .expect("permission admitted before shutdown");
+            assert_eq!(rx.try_recv().unwrap(), "permission-before-shutdown");
             let drain = output.finish_prompts();
             futures::pin_mut!(drain);
             futures::future::poll_fn(|cx| {
@@ -3189,7 +3842,7 @@ mod tests {
                         .begin_prompt("editor-session".into(), abort)
                         .expect("register native prompt");
                     guard.started = true;
-                    let reason = run_prompt(
+                    let reason = Box::pin(run_prompt(
                         Arc::clone(&state),
                         vec![ContentBlock::Text(TextContent::new("editor prompt"))],
                         None,
@@ -3197,7 +3850,7 @@ mod tests {
                         output.clone(),
                         "editor-session".into(),
                         AgentCx::for_current_or_request(),
-                    )
+                    ))
                     .await;
                     guard.settled = true;
 
@@ -3734,6 +4387,7 @@ mod tests {
                 reasoning: true,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -3749,6 +4403,41 @@ mod tests {
             compat: None,
             oauth_config: None,
         }
+    }
+
+    fn ready_selection_model(provider: &str, id: &str) -> ModelEntry {
+        let mut entry = test_model_entry(provider, id);
+        entry.model.base_url = format!("https://{provider}.example.test/v1");
+        entry.api_key = Some("acp-selection-fixture-key".to_string());
+        entry
+    }
+
+    fn selection_options(
+        config: Config,
+        models: Vec<ModelEntry>,
+        runtime_handle: RuntimeHandle,
+    ) -> AcpOptions {
+        AcpOptions {
+            config,
+            launch: AcpLaunchOptions::default(),
+            available_models: models.clone(),
+            model_registry: ModelRegistry::from_entries_for_tests(models),
+            auth: AuthStorage::empty_at(PathBuf::from("/tmp/acp-selection-auth.json")),
+            oauth_refresh_failures: Vec::new(),
+            runtime_handle,
+            session_dir: None,
+            skills_prompt: None,
+        }
+    }
+
+    fn select_new_acp_model(options: &AcpOptions) -> Result<crate::app::ModelSelection> {
+        let mut cli = options.launch.selection_cli()?;
+        resolve_acp_selection(
+            &Session::in_memory(),
+            std::path::Path::new("/tmp/acp-selection"),
+            options,
+            &mut cli,
+        )
     }
 
     fn pending_permissions_empty(pending: &PendingPermissionMap) -> bool {
@@ -3843,16 +4532,18 @@ mod tests {
 
         // ACP requires protocolVersion as an integer, not a string.
         assert_eq!(result["protocolVersion"], 1);
+        // The OMP extension advertises outside agentCapabilities.
+        assert_eq!(result["_meta"]["steering"]["supported"], true);
         assert_eq!(result["agentInfo"]["name"], "pi-agent");
         assert_eq!(result["agentInfo"]["version"], env!("CARGO_PKG_VERSION"));
         // Loading now replays history before returning its response.
         assert_eq!(result["agentCapabilities"]["loadSession"], true);
         // GH #245: session/list is implemented, so it is advertised.
         assert!(result["agentCapabilities"]["sessionCapabilities"]["list"].is_object());
-        // Native image and embedded-context prompt decoding is wired to the agent.
+        // Native image/audio and embedded-context decoding is wired to the agent.
         assert_eq!(
             result["agentCapabilities"]["promptCapabilities"]["audio"],
-            false
+            true
         );
         assert_eq!(
             result["agentCapabilities"]["promptCapabilities"]["image"],
@@ -3864,7 +4555,7 @@ mod tests {
         );
         // mcpCapabilities advertised explicitly so the client knows transports.
         assert_eq!(result["agentCapabilities"]["mcpCapabilities"]["http"], true);
-        assert_eq!(result["agentCapabilities"]["mcpCapabilities"]["sse"], false);
+        assert_eq!(result["agentCapabilities"]["mcpCapabilities"]["sse"], true);
         // Tool approval is exposed as implementation metadata; the standard
         // permission request itself is an Agent -> Client JSON-RPC call.
         assert_eq!(
@@ -3884,87 +4575,468 @@ mod tests {
     }
 
     #[test]
-    fn select_acp_model_entry_prefers_exact_configured_model() {
-        let config = Config {
-            default_provider: Some("anthropic".to_string()),
-            default_model: Some("claude-opus-4-5".to_string()),
-            ..Config::default()
-        };
-        let available = vec![
-            test_model_entry("openai", "gpt-5.2"),
-            test_model_entry("anthropic", "claude-opus-4-5"),
-        ];
-
-        let selected = select_acp_model_entry(&config, &available).expect("selected model");
-
-        assert_eq!(selected.model.provider, "anthropic");
-        assert_eq!(selected.model.id, "claude-opus-4-5");
+    fn acp_configured_model_is_independent_of_provider_and_scope_order() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let model_id = "deepseek/deepseek-v4.1-flash-1017";
+        for reverse_registry in [false, true] {
+            for scope_order in [None, Some(false), Some(true)] {
+                for (provider, spec) in [
+                    ("routerAI", format!("routerAI/{model_id}")),
+                    ("polza", format!("routerAI/{model_id}")),
+                    ("routerAI", model_id.to_string()),
+                ] {
+                    let mut models = vec![
+                        ready_selection_model("polza", model_id),
+                        ready_selection_model("routerAI", "deepseek/different"),
+                        ready_selection_model("routerAI", model_id),
+                    ];
+                    if reverse_registry {
+                        models.reverse();
+                    }
+                    let enabled_models = scope_order.map(|reverse| {
+                        let mut patterns = vec![
+                            format!("polza/{model_id}"),
+                            "routerAI/deepseek/different".to_string(),
+                            format!("routerAI/{model_id}"),
+                        ];
+                        if reverse {
+                            patterns.reverse();
+                        }
+                        patterns
+                    });
+                    let options = selection_options(
+                        Config {
+                            default_provider: Some(provider.to_string()),
+                            default_model: Some(spec),
+                            enabled_models,
+                            ..Config::default()
+                        },
+                        models,
+                        runtime.handle(),
+                    );
+                    let selected = select_new_acp_model(&options).expect("configured ACP model");
+                    assert_eq!(selected.model_entry.model.provider, "routerAI");
+                    assert_eq!(selected.model_entry.model.id, model_id);
+                    assert_eq!(
+                        selected.model_entry.model.base_url,
+                        "https://routerAI.example.test/v1"
+                    );
+                    assert!(selected.fallback_message.is_none());
+                }
+            }
+        }
     }
 
     #[test]
-    fn select_acp_model_entry_prefers_default_provider_when_model_is_unset() {
-        let config = Config {
-            default_provider: Some("anthropic".to_string()),
-            ..Config::default()
-        };
-        let available = vec![
-            test_model_entry("openai", "gpt-5.2"),
-            test_model_entry("anthropic", "claude-sonnet-4"),
-        ];
-
-        let selected = select_acp_model_entry(&config, &available).expect("selected model");
-
-        assert_eq!(selected.model.provider, "anthropic");
-        assert_eq!(selected.model.id, "claude-sonnet-4");
+    fn acp_unresolved_configured_model_never_uses_automatic_fallback() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        for scoped in [false, true] {
+            for (provider, spec) in [
+                ("routerAI", "routerAI/missing"),
+                ("routerAI", "unknown-acp-provider/shared"),
+                ("unknown-acp-provider", "shared"),
+                ("routerAI", ""),
+            ] {
+                let options = selection_options(
+                    Config {
+                        default_provider: Some(provider.to_string()),
+                        default_model: Some(spec.to_string()),
+                        enabled_models: scoped.then(|| vec!["polza/shared".to_string()]),
+                        ..Config::default()
+                    },
+                    vec![
+                        ready_selection_model("polza", "shared"),
+                        ready_selection_model("routerAI", "different"),
+                    ],
+                    runtime.handle(),
+                );
+                let error = select_new_acp_model(&options)
+                    .expect_err("unresolvable configured ACP model")
+                    .to_string();
+                assert!(
+                    error.contains(&format!("default_model '{spec}'")),
+                    "{error}"
+                );
+                assert!(error.contains("--list-models"), "{error}");
+            }
+        }
     }
 
     #[test]
-    fn select_acp_model_entry_prefers_default_model_when_provider_is_unset() {
-        let config = Config {
-            default_model: Some("gpt-5.2".to_string()),
-            ..Config::default()
-        };
-        let available = vec![
-            test_model_entry("anthropic", "claude-sonnet-4"),
-            test_model_entry("openai", "gpt-5.2"),
-        ];
-
-        let selected = select_acp_model_entry(&config, &available).expect("selected model");
-
-        assert_eq!(selected.model.provider, "openai");
-        assert_eq!(selected.model.id, "gpt-5.2");
+    fn acp_unprefixed_defaults_and_undeclared_provider_aliases_resolve() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        for (provider, model_id, expected_provider) in [
+            (Some("anthropic"), "claude-opus-4-5", "anthropic"),
+            (None, "gpt-5.2", "openai"),
+            (Some("gemini-cli"), "gemini-2.5-pro", "google-gemini-cli"),
+        ] {
+            let options = selection_options(
+                Config {
+                    default_provider: provider.map(str::to_string),
+                    default_model: Some(model_id.to_string()),
+                    ..Config::default()
+                },
+                vec![
+                    ready_selection_model("acp-first", "different"),
+                    ready_selection_model(expected_provider, model_id),
+                ],
+                runtime.handle(),
+            );
+            let selected = select_new_acp_model(&options).expect("configured ACP model");
+            assert_eq!(selected.model_entry.model.provider, expected_provider);
+            assert_eq!(selected.model_entry.model.id, model_id);
+            assert!(selected.fallback_message.is_none());
+        }
     }
 
     #[test]
-    fn select_acp_model_entry_matches_provider_aliases() {
-        let config = Config {
-            default_provider: Some("gemini-cli".to_string()),
-            default_model: Some("gemini-2.5-pro".to_string()),
-            ..Config::default()
-        };
-        let available = vec![
-            test_model_entry("openai", "gpt-5.2"),
-            test_model_entry("google-gemini-cli", "gemini-2.5-pro"),
-        ];
+    fn acp_automatic_selection_preserves_admitted_order_and_provider_preference() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        for (provider, expected_provider, expected_id) in [
+            (None, "anthropic", "claude-sonnet-4"),
+            (Some("acp-second"), "acp-second", "shared"),
+        ] {
+            let mut options = selection_options(
+                Config {
+                    default_provider: provider.map(str::to_string),
+                    ..Config::default()
+                },
+                vec![ready_selection_model("openai", "gpt-5.5")],
+                runtime.handle(),
+            );
+            options.available_models = vec![
+                ready_selection_model("anthropic", "claude-sonnet-4"),
+                ready_selection_model("anthropic", "claude-opus-4-5"),
+                ready_selection_model("acp-second", "shared"),
+            ];
+            let selected = select_new_acp_model(&options).expect("admitted automatic model");
+            assert_eq!(selected.model_entry.model.provider, expected_provider);
+            assert_eq!(selected.model_entry.model.id, expected_id);
+            assert!(selected.fallback_message.is_none());
+        }
 
-        let selected = select_acp_model_entry(&config, &available).expect("selected model");
-
-        assert_eq!(selected.model.provider, "google-gemini-cli");
-        assert_eq!(selected.model.id, "gemini-2.5-pro");
+        let authoritative = test_model_entry("acp-admitted", "shared");
+        let mut options = selection_options(
+            Config::default(),
+            vec![
+                ready_selection_model("openai", "gpt-5.5"),
+                authoritative.clone(),
+            ],
+            runtime.handle(),
+        );
+        options.available_models = vec![ready_selection_model("acp-admitted", "shared")];
+        let selected = select_new_acp_model(&options).expect("admitted identity remains selected");
+        assert_eq!(selected.model_entry.model.provider, "acp-admitted");
+        assert_eq!(
+            selected.model_entry.model.base_url,
+            authoritative.model.base_url
+        );
+        assert!(selected.model_entry.api_key.is_none());
+        let cli = options.launch.selection_cli().expect("launch CLI");
+        let error = crate::app::resolve_api_key(&options.auth, &cli, &selected.model_entry)
+            .expect_err("authoritative missing credentials must remain visible")
+            .to_string();
+        assert!(error.contains("No API key found for provider acp-admitted"));
     }
 
     #[test]
-    fn select_acp_model_entry_falls_back_to_first_available_model() {
-        let available = vec![
-            test_model_entry("openai", "gpt-5.2"),
-            test_model_entry("anthropic", "claude-sonnet-4"),
-        ];
+    fn acp_automatic_selection_keeps_declared_provider_aliases_distinct() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        for (provider, competitor) in [("azure", "azure-openai"), ("azure-openai", "azure")] {
+            for reverse in [false, true] {
+                let mut options = selection_options(
+                    Config {
+                        default_provider: Some(provider.to_string()),
+                        ..Config::default()
+                    },
+                    vec![ready_selection_model(competitor, "shared")],
+                    runtime.handle(),
+                );
+                options
+                    .available_models
+                    .push(ready_selection_model(provider, "shared"));
+                if reverse {
+                    options.available_models.reverse();
+                }
+                let selected = select_new_acp_model(&options).expect("exact admitted provider");
+                assert_eq!(selected.model_entry.model.provider, provider);
+                assert!(selected.fallback_message.is_none());
 
-        let selected =
-            select_acp_model_entry(&Config::default(), &available).expect("selected model");
+                let mut entries = acp_model_registry(&options).models().to_vec();
+                for entry in &mut entries {
+                    if entry.model.provider == provider {
+                        entry.api_key = None;
+                    }
+                }
+                options.model_registry = ModelRegistry::from_entries_for_tests(entries);
+                options
+                    .available_models
+                    .retain(|entry| entry.model.provider == competitor);
+                let selected = select_new_acp_model(&options).expect("permitted ACP fallback");
+                assert_eq!(selected.model_entry.model.provider, competitor);
+                let warning = selected
+                    .fallback_message
+                    .expect("provider fallback diagnostic");
+                assert!(warning.contains(&format!("default_provider '{provider}'")));
+                assert!(warning.contains(&format!("{competitor}/shared")));
+                assert!(warning.contains("--provider/--model"));
+            }
+        }
+        let options = selection_options(
+            Config {
+                default_provider: Some("azure".to_string()),
+                ..Config::default()
+            },
+            vec![ready_selection_model("azure-openai", "shared")],
+            runtime.handle(),
+        );
+        let selected = select_new_acp_model(&options).expect("undeclared alias");
+        assert_eq!(selected.model_entry.model.provider, "azure-openai");
+        assert!(selected.fallback_message.is_none());
+    }
 
-        assert_eq!(selected.model.provider, "openai");
-        assert_eq!(selected.model.id, "gpt-5.2");
+    #[test]
+    fn acp_empty_admitted_catalog_still_allows_configured_models_and_roles() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let mut options = selection_options(
+            Config::default(),
+            vec![
+                ready_selection_model("polza", "shared"),
+                ready_selection_model("routerAI", "shared"),
+            ],
+            runtime.handle(),
+        );
+        options.available_models.clear();
+        assert!(
+            select_new_acp_model(&options)
+                .expect_err("an empty admitted catalog forbids registry fallback")
+                .to_string()
+                .contains("No models available")
+        );
+        options.config.default_model = Some("routerAI/shared".to_string());
+        let selected = select_new_acp_model(&options).expect("explicit configured destination");
+        assert_eq!(selected.model_entry.model.provider, "routerAI");
+        options.config.default_model = None;
+        options.config.model_roles = Some(crate::config::ModelRoleSettings {
+            default: Some("routerAI/shared:low".to_string()),
+            ..crate::config::ModelRoleSettings::default()
+        });
+        let selected = select_new_acp_model(&options).expect("configured default role");
+        assert_eq!(selected.model_entry.model.provider, "routerAI");
+        assert_eq!(selected.thinking_level, crate::model::ThinkingLevel::Low);
+    }
+
+    #[test]
+    fn acp_default_role_precedes_legacy_defaults_and_preserves_thinking_precedence() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        for explicit_thinking in [None, Some("low")] {
+            let mut options = selection_options(
+                Config {
+                    default_provider: Some("missing-acp-provider".to_string()),
+                    default_model: Some("missing-acp-provider/missing".to_string()),
+                    model_roles: Some(crate::config::ModelRoleSettings {
+                        default: Some("routerAI/shared:high".to_string()),
+                        ..crate::config::ModelRoleSettings::default()
+                    }),
+                    enabled_models: Some(vec![
+                        "polza/shared:low".to_string(),
+                        "routerAI/shared:medium".to_string(),
+                    ]),
+                    ..Config::default()
+                },
+                vec![
+                    ready_selection_model("polza", "shared"),
+                    ready_selection_model("routerAI", "shared"),
+                ],
+                runtime.handle(),
+            );
+            options.launch.thinking = explicit_thinking.map(str::to_string);
+            let selected = select_new_acp_model(&options).expect("default role selection");
+            assert_eq!(selected.model_entry.model.provider, "routerAI");
+            assert_eq!(
+                selected.thinking_level,
+                if explicit_thinking.is_some() {
+                    crate::model::ThinkingLevel::Low
+                } else {
+                    crate::model::ThinkingLevel::High
+                }
+            );
+            assert!(selected.fallback_message.is_none());
+        }
+    }
+
+    #[test]
+    fn acp_scope_fallback_reports_requested_destination_and_preserves_scoped_thinking() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let options = selection_options(
+            Config {
+                default_model: Some("routerAI/shared".to_string()),
+                enabled_models: Some(vec!["polza/shared:low".to_string()]),
+                ..Config::default()
+            },
+            vec![
+                ready_selection_model("routerAI", "shared"),
+                ready_selection_model("polza", "shared"),
+            ],
+            runtime.handle(),
+        );
+        let selected = select_new_acp_model(&options).expect("permitted scope fallback");
+        assert_eq!(selected.model_entry.model.provider, "polza");
+        assert_eq!(selected.thinking_level, crate::model::ThinkingLevel::Low);
+        let warning = selected
+            .fallback_message
+            .expect("scope fallback diagnostic");
+        assert!(warning.contains("routerAI/shared"));
+        assert!(warning.contains("Using polza/shared"));
+        assert!(warning.contains("enabled_models/--models"));
+    }
+
+    #[test]
+    fn acp_supplied_key_requires_a_launch_destination_or_resolved_scope() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let mut options = selection_options(
+            Config {
+                default_model: Some("routerAI/shared".to_string()),
+                ..Config::default()
+            },
+            vec![ready_selection_model("routerAI", "shared")],
+            runtime.handle(),
+        );
+        for key in [None, Some(" \t ")] {
+            options.launch.api_key = key.map(str::to_string);
+            let selected = select_new_acp_model(&options).expect("no key override");
+            assert_eq!(selected.model_entry.model.provider, "routerAI");
+        }
+        options.launch.api_key = Some("supplied-fixture-key".to_string());
+        let error = select_new_acp_model(&options)
+            .expect_err("bare key cannot authorize automatic selection")
+            .to_string();
+        assert!(error.contains("--api-key requires a model"));
+
+        let mut unready = test_model_entry("routerAI", "shared");
+        unready.model.base_url = "https://routerAI.example.test/v1".to_string();
+        options.model_registry = ModelRegistry::from_entries_for_tests(vec![unready]);
+        options.available_models.clear();
+        options.launch.models = Some("routerAI/shared:low".to_string());
+        let selected = select_new_acp_model(&options).expect("scoped supplied key");
+        assert_eq!(selected.model_entry.model.provider, "routerAI");
+        assert_eq!(selected.thinking_level, crate::model::ThinkingLevel::Low);
+        assert!(selected.fallback_message.is_none());
+    }
+
+    #[test]
+    fn acp_explicit_launch_selection_overrides_invalid_configured_defaults() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        for (provider, model) in [
+            (Some("routerAI"), Some("shared")),
+            (Some("routerAI"), None),
+            (None, Some("routerAI/shared")),
+        ] {
+            let mut options = selection_options(
+                Config {
+                    default_model: Some("missing-acp-provider/missing".to_string()),
+                    enabled_models: Some(vec!["missing-acp-provider/missing".to_string()]),
+                    ..Config::default()
+                },
+                vec![
+                    ready_selection_model("polza", "shared"),
+                    ready_selection_model("routerAI", "shared"),
+                ],
+                runtime.handle(),
+            );
+            options.launch.provider = provider.map(str::to_string);
+            options.launch.model = model.map(str::to_string);
+            let selected = select_new_acp_model(&options).expect("explicit launch override");
+            assert_eq!(selected.model_entry.model.provider, "routerAI");
+            assert_eq!(selected.model_entry.model.id, "shared");
+            if model.is_none() {
+                assert!(selected.fallback_message.is_some());
+            } else {
+                assert!(selected.fallback_message.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn acp_restores_selected_branch_before_launch_scope_and_default_settings() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let mut options = selection_options(
+            Config {
+                default_model: Some("missing-acp-provider/missing".to_string()),
+                enabled_models: Some(vec!["missing-acp-provider/missing".to_string()]),
+                ..Config::default()
+            },
+            vec![
+                ready_selection_model("routerAI", "shared"),
+                ready_selection_model("polza", "different"),
+            ],
+            runtime.handle(),
+        );
+        options.launch.provider = Some("polza".to_string());
+        options.launch.model = Some("different".to_string());
+        options.launch.thinking = Some("off".to_string());
+        let mut session = Session::in_memory();
+        session.append_model_change("routerAI".to_string(), "shared".to_string());
+        session.append_thinking_level_change("low".to_string());
+        let branch = session.leaf_id.clone().expect("selected branch");
+        session.append_model_change("polza".to_string(), "different".to_string());
+        assert!(session.navigate_to(&branch));
+        let mut cli = options.launch.selection_cli().expect("launch CLI");
+        let selected = resolve_acp_selection(
+            &session,
+            std::path::Path::new("/tmp/acp-selection"),
+            &options,
+            &mut cli,
+        )
+        .expect("saved branch selection");
+        assert_eq!(selected.model_entry.model.provider, "routerAI");
+        assert_eq!(selected.model_entry.model.id, "shared");
+        assert_eq!(selected.thinking_level, crate::model::ThinkingLevel::Low);
+
+        let mut missing = Session::in_memory();
+        missing.append_model_change("missing-acp-provider".to_string(), "shared".to_string());
+        let error = resolve_acp_selection(
+            &missing,
+            std::path::Path::new("/tmp/acp-selection"),
+            &options,
+            &mut cli,
+        )
+        .expect_err("missing saved destination cannot silently change")
+        .to_string();
+        assert!(error.contains("Saved session model is not registered"));
+        assert!(error.contains("missing-acp-provider/shared"));
+    }
+
+    #[test]
+    fn acp_saved_declared_alias_cannot_synthesize_a_native_route() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        for reverse in [false, true] {
+            let mut entries = vec![
+                ready_selection_model("openrouter", "unlisted"),
+                ready_selection_model("open-router", "known"),
+            ];
+            if reverse {
+                entries.reverse();
+            }
+            let options = selection_options(Config::default(), entries, runtime.handle());
+            let mut session = Session::in_memory();
+            session.append_model_change("open-router".to_string(), "unlisted".to_string());
+            let previous = session.effective_model_for_current_path();
+            let mut cli = options.launch.selection_cli().expect("launch CLI");
+            let error = resolve_acp_selection(
+                &session,
+                std::path::Path::new("/tmp/acp-selection"),
+                &options,
+                &mut cli,
+            )
+            .expect_err("missing saved declared model must not use native routing")
+            .to_string();
+            assert!(error.contains("open-router/unlisted"));
+            assert!(error.contains("--list-models"));
+            assert_eq!(session.effective_model_for_current_path(), previous);
+            assert!(cli.provider.is_none());
+            assert!(cli.model.is_none());
+        }
     }
 
     #[test]
@@ -4045,6 +5117,7 @@ mod tests {
         assert_eq!(map_stop_reason(StopReason::ToolUse), "end_turn");
         assert_eq!(map_stop_reason(StopReason::Length), "max_tokens");
         assert_eq!(map_stop_reason(StopReason::Aborted), "cancelled");
+        assert_eq!(map_stop_reason(StopReason::Refusal), "refusal");
         // Errors collapse to end_turn — the failure has already been streamed
         // via session/update; the response only carries a stopReason string.
         assert_eq!(map_stop_reason(StopReason::Error), "end_turn");
@@ -4401,6 +5474,7 @@ mod tests {
                 tool_approval: None,
                 keyword_settings: None,
                 max_time: None,
+                cost_budget: None,
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
                 approval_state: None,
                 bash_settings: None,

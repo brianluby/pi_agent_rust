@@ -1,6 +1,6 @@
 [package]
 name = "pi_agent_rust"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Native AI coding agent CLI - Rust port of Pi Agent"
@@ -225,6 +225,10 @@ async-trait = "0.1"
 # (release binary size budget, 22 MiB). `full` includes it.
 htmd = "0.5.5"
 pdf-extract = { version = "0.12", optional = true }
+# Native archive/document reads. Reuse the existing flate2 backend without
+# enabling ZIP encryption, additional codecs, or the write-only zopfli backend.
+zip = { version = "=9.0.5", default-features = false, features = ["deflate-flate2"] }
+quick-xml = { version = "=0.42.0", default-features = false, features = ["escape-html"] }
 
 # URL parsing/building
 url = "2"
@@ -239,6 +243,12 @@ portable-pty = "0.9"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 json5 = "1.3.1"
+
+# Native jq-compatible Read filters run in resource-bounded Pi workers.
+jaq-core = "=3.1.1"
+jaq-std = "=3.0.3"
+jaq-json = "=2.0.3"
+jaq-fmts = { version = "=0.1.1", default-features = false, features = ["tabular"] }
 
 # Error handling
 anyhow = "1.0.104"
@@ -574,6 +584,28 @@ opt-level = 3
 opt-level = 0
 debug = true
 
+# RPC get_state reports contextTokens, a BPE count over the whole active branch
+# on every call. Unoptimized, the tokenizer and its regex engines take seconds
+# on a large session, which buries the RPC latency budgets under debug-build
+# noise. `test` inherits these overrides.
+[profile.dev.package.tiktoken-rs]
+opt-level = 3
+
+[profile.dev.package.fancy-regex]
+opt-level = 3
+
+[profile.dev.package.regex]
+opt-level = 3
+
+[profile.dev.package.regex-automata]
+opt-level = 3
+
+[profile.dev.package.regex-syntax]
+opt-level = 3
+
+[profile.dev.package.bstr]
+opt-level = 3
+
 [profile.test]
 # Full-suite RCH workers have limited artifact storage; keep test binaries
 # debuggable enough for line traces without emitting full debug sections.
@@ -632,6 +664,15 @@ assert_is_empty = "allow"
 # the wrong trade; a sibling project on the same build fleet allows it too.
 suboptimal_flops = "allow"
 
+[patch.crates-io]
+# rquickjs-sys 0.12.2 with one quickjs-ng fix: JS_FreeContext freed every
+# module definition while the reactions of an unsettled top-level-await
+# evaluation still referenced it, so a timed-out `await import()` corrupted
+# the heap (malloc abort) when its realm was retired. The two hunks are marked
+# "pi_agent_rust patch" in vendor/rquickjs-sys/quickjs/quickjs.c; the vendored
+# copy keeps only the files its build script compiles.
+rquickjs-sys = { path = "vendor/rquickjs-sys" }
+
 # ---------------------------------------------------------------------------
 # Local development with sibling crates
 # ---------------------------------------------------------------------------
@@ -639,16 +680,16 @@ suboptimal_flops = "allow"
 # rich_rust, charmed-*, and fsqlite. CI builds verify this (no sibling
 # repos are checked out).
 #
-# To develop against LOCAL checkouts of these crates, uncomment the
-# [patch.crates-io] section below. Cargo will use the local paths when they
-# satisfy the version requirement and fall back to crates.io otherwise.
+# To develop against LOCAL checkouts of these crates, uncomment the entries
+# below; they extend the [patch.crates-io] table above. Cargo will use the
+# local paths when they satisfy the version requirement and fall back to
+# crates.io otherwise.
 #
-# IMPORTANT: Do NOT commit this section. To prevent accidental commits:
+# IMPORTANT: Do NOT commit these entries. To prevent accidental commits:
 #   git update-index --skip-worktree Cargo.toml
 # To re-enable tracking:
 #   git update-index --no-skip-worktree Cargo.toml
 #
-# [patch.crates-io]
 # asupersync = { path = "../asupersync" }
 # rich_rust = { path = "../rich_rust" }
 # charmed-bubbletea = { path = "../charmed_rust/crates/bubbletea" }

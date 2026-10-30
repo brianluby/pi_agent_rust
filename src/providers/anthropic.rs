@@ -418,7 +418,7 @@ fn anthropic_effort_for_level(
     if let Some(map) = compat.and_then(|c| c.thinking_level_map.as_ref())
         && let Some(mapped) = map.get(level.to_string().as_str())
     {
-        return Some(mapped.clone());
+        return mapped.clone();
     }
     match level {
         ThinkingLevel::Off => None,
@@ -1099,15 +1099,24 @@ where
             }
             Some(ContentBlock::ToolCall(tc)) => {
                 if let Some(accum) = self.tool_accums.remove(&index) {
-                    let arguments: serde_json::Value = match serde_json::from_str(&accum.json) {
-                        Ok(args) => args,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                raw = %accum.json,
-                                "Failed to parse tool arguments as JSON"
-                            );
-                            serde_json::Value::Null
+                    // Final tool arguments are execution authority. Validate
+                    // the original JSON before Value can erase duplicate keys.
+                    // Empty input remains a sentinel so the transport can
+                    // distinguish "no deltas" from an observed empty fragment.
+                    let arguments = if accum.json.trim().is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        match super::openai::parse_final_tool_arguments(&accum.json) {
+                            Ok(arguments) => arguments,
+                            Err(reason) => {
+                                // Arguments may contain credentials, commands,
+                                // or file contents; never echo them in logs.
+                                tracing::warn!(
+                                    reason,
+                                    "Rejected invalid or ambiguous tool arguments"
+                                );
+                                serde_json::Value::Null
+                            }
                         }
                     };
                     let tool_call = ToolCall {
@@ -1276,7 +1285,7 @@ enum AnthropicToolResultContent<'a> {
 struct AnthropicTool<'a> {
     name: &'a str,
     description: &'a str,
-    input_schema: &'a serde_json::Value,
+    input_schema: Cow<'a, serde_json::Value>,
     /// Prompt-cache breakpoint. Set on the LAST tool only: Anthropic caches
     /// everything up to and including a marked block, so one marker covers
     /// the whole tools array.
@@ -1566,7 +1575,7 @@ fn convert_tool_to_anthropic(tool: &ToolDef) -> AnthropicTool<'_> {
     AnthropicTool {
         name: &tool.name,
         description: &tool.description,
-        input_schema: &tool.parameters,
+        input_schema: super::tool_schema::anthropic_tool_schema(&tool.parameters),
         cache_control: None,
     }
 }
@@ -1798,6 +1807,59 @@ mod tests {
                 "required": ["text"]
             })
         );
+    }
+
+    #[test]
+    fn build_request_projects_root_tool_variants_without_changing_the_tool_contract() {
+        let parameters = json!({
+            "oneOf": [
+                {
+                    "type":"object",
+                    "properties":{"action":{"const":"read"},"path":{"type":"string"}},
+                    "required":["action","path"],
+                    "additionalProperties":false
+                },
+                {
+                    "type":"object",
+                    "properties":{"action":{"const":"list"},"recursive":{"type":"boolean"}},
+                    "required":["action"],
+                    "additionalProperties":false
+                }
+            ]
+        });
+        let context = Context::owned(
+            None,
+            vec![],
+            vec![ToolDef {
+                name: "workspace".to_string(),
+                description: "Read or list the workspace.".to_string(),
+                parameters: parameters.clone(),
+            }],
+        );
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Short,
+            ..Default::default()
+        };
+        let provider = AnthropicProvider::new("claude-test");
+        let request = provider.build_request(&context, &options);
+        let body = serde_json::to_value(&request).expect("serialize request");
+        let schema = &body["tools"][0]["input_schema"];
+        assert_eq!(schema["type"], "object");
+        assert!(schema.get("oneOf").is_none());
+        assert_eq!(schema["required"], json!(["action"]));
+        assert_eq!(schema["properties"]["path"]["type"], "string");
+        assert_eq!(schema["properties"]["recursive"]["type"], "boolean");
+        assert_eq!(
+            body["tools"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        assert_eq!(context.tools[0].parameters, parameters);
+        let validator = jsonschema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .build(&context.tools[0].parameters)
+            .expect("original tool contract");
+        assert!(validator.is_valid(&json!({"action":"read","path":"src/lib.rs"})));
+        assert!(!validator.is_valid(&json!({"action":"read","recursive":true})));
     }
 
     #[test]
@@ -2193,7 +2255,7 @@ mod tests {
     #[test]
     fn test_build_request_thinking_level_map_overrides_effort() {
         let mut map = HashMap::new();
-        map.insert("xhigh".to_string(), "max".to_string());
+        map.insert("xhigh".to_string(), Some("max".to_string()));
         let compat = CompatConfig {
             thinking_level_map: Some(map),
             ..CompatConfig::default()
@@ -2212,6 +2274,22 @@ mod tests {
                 .and_then(|c| c.effort.as_deref()),
             Some("max"),
             "thinkingLevelMap xhigh->max must win over the default xhigh"
+        );
+    }
+
+    #[test]
+    fn nullable_effort_map_suppresses_explicitly_unsupported_tier() {
+        let compat = CompatConfig {
+            thinking_level_map: Some(HashMap::from([("xhigh".to_string(), None)])),
+            ..CompatConfig::default()
+        };
+        assert_eq!(
+            anthropic_effort_for_level(ThinkingLevel::XHigh, Some(&compat)),
+            None
+        );
+        assert_eq!(
+            anthropic_effort_for_level(ThinkingLevel::High, Some(&compat)),
+            Some("high".to_string())
         );
     }
 

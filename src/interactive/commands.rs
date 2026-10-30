@@ -1,8 +1,8 @@
 use super::*;
 
 use crate::models::{
-    ExtensionProviderBinding, ModelEntry, ModelRole, extension_provider_bindings,
-    model_requires_configured_credential, normalize_api_key_opt,
+    ExtensionProviderBinding, ModelEntry, ModelRole, extension_provider_bindings, find_model_entry,
+    model_requires_configured_credential, normalize_api_key_opt, resolve_model_entry,
 };
 use crate::provider_metadata::{
     ProviderMetadata, ProviderOnboardingMode, provider_ids_match, provider_metadata,
@@ -15,7 +15,7 @@ use arboard::Clipboard as ArboardClipboard;
 const BASH_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExcludedBashPersistenceOutcome {
+enum BashPersistenceOutcome {
     Saved,
     Disabled,
     NotConfirmed {
@@ -24,7 +24,7 @@ enum ExcludedBashPersistenceOutcome {
     },
 }
 
-impl ExcludedBashPersistenceOutcome {
+impl BashPersistenceOutcome {
     fn warning_text(self) -> Option<String> {
         let Self::NotConfirmed {
             pending_mutations,
@@ -48,20 +48,20 @@ impl ExcludedBashPersistenceOutcome {
     }
 }
 
-async fn persist_excluded_bash_execution(
+async fn persist_bash_execution(
     session: Arc<Mutex<Session>>,
     message: SessionMessage,
     save_enabled: bool,
     cx: &Cx,
-) -> ExcludedBashPersistenceOutcome {
+) -> BashPersistenceOutcome {
     let mut session_guard = match OwnedMutexGuard::lock(session, cx).await {
         Ok(guard) => guard,
         Err(err) => {
             tracing::error!(
                 error = %err,
-                "completed excluded-context bash command could not lock its session for recording"
+                "completed `!` bash command could not lock its session for recording"
             );
-            return ExcludedBashPersistenceOutcome::NotConfirmed {
+            return BashPersistenceOutcome::NotConfirmed {
                 pending_mutations: None,
                 failed_flushes: None,
             };
@@ -70,7 +70,7 @@ async fn persist_excluded_bash_execution(
 
     session_guard.append_message(message);
     if !save_enabled {
-        return ExcludedBashPersistenceOutcome::Disabled;
+        return BashPersistenceOutcome::Disabled;
     }
 
     if let Err(err) = session_guard.save().await {
@@ -79,34 +79,32 @@ async fn persist_excluded_bash_execution(
             error = %err,
             pending_mutations = metrics.pending_mutations,
             failed_flushes = metrics.flush_failed,
-            "completed excluded-context bash command was retained in memory but its session save was not confirmed"
+            "completed `!` bash command was retained in memory but its session save was not confirmed"
         );
-        return ExcludedBashPersistenceOutcome::NotConfirmed {
+        return BashPersistenceOutcome::NotConfirmed {
             pending_mutations: Some(metrics.pending_mutations),
             failed_flushes: Some(metrics.flush_failed),
         };
     }
 
-    ExcludedBashPersistenceOutcome::Saved
+    BashPersistenceOutcome::Saved
 }
 
-async fn persist_excluded_bash_execution_bounded(
+async fn persist_bash_execution_bounded(
     session: Arc<Mutex<Session>>,
     message: SessionMessage,
     save_enabled: bool,
     cx: &Cx,
-) -> ExcludedBashPersistenceOutcome {
+) -> BashPersistenceOutcome {
     asupersync::time::timeout(
         asupersync::time::wall_now(),
         BASH_COMPLETION_TIMEOUT,
-        persist_excluded_bash_execution(session, message, save_enabled, cx),
+        persist_bash_execution(session, message, save_enabled, cx),
     )
     .await
     .unwrap_or_else(|_| {
-        tracing::error!(
-            "completed excluded-context bash command exceeded its persistence cleanup budget"
-        );
-        ExcludedBashPersistenceOutcome::NotConfirmed {
+        tracing::error!("completed `!` bash command exceeded its persistence cleanup budget");
+        BashPersistenceOutcome::NotConfirmed {
             pending_mutations: None,
             failed_flushes: None,
         }
@@ -128,31 +126,18 @@ fn spawn_bash_completion(
     event_tx: asupersync::channel::mpsc::Sender<PiMsg>,
     persistence: Option<(Arc<Mutex<Session>>, SessionMessage, bool)>,
     mut display: String,
-    content_for_agent: Option<Vec<ContentBlock>>,
 ) {
     if let Err(err) = runtime_handle.try_spawn_with_cx(move |completion_cx| async move {
         if let Some((session, message, save_enabled)) = persistence {
-            let persistence = persist_excluded_bash_execution_bounded(
-                session,
-                message,
-                save_enabled,
-                &completion_cx,
-            )
-            .await;
+            let persistence =
+                persist_bash_execution_bounded(session, message, save_enabled, &completion_cx)
+                    .await;
             if let Some(warning) = persistence.warning_text() {
                 display.push_str("\n\n");
                 display.push_str(&warning);
             }
         }
-        deliver_bash_result(
-            &event_tx,
-            &completion_cx,
-            PiMsg::BashResult {
-                display,
-                content_for_agent,
-            },
-        )
-        .await;
+        deliver_bash_result(&event_tx, &completion_cx, PiMsg::BashResult { display }).await;
     }) {
         tracing::error!(
             error = %err,
@@ -191,6 +176,7 @@ pub enum SlashCommand {
     Share,
     Mcp,
     Plan,
+    Prewalk,
     Advisor,
     Checkpoint,
     Rewind,
@@ -254,6 +240,7 @@ impl SlashCommand {
             Self::Share => "/share",
             Self::Mcp => "/mcp",
             Self::Plan => "/plan",
+            Self::Prewalk => "/prewalk",
             Self::Advisor => "/advisor",
             Self::Checkpoint => "/checkpoint",
             Self::Rewind => "/rewind",
@@ -312,6 +299,7 @@ impl SlashCommand {
         Self::Share,
         Self::Mcp,
         Self::Plan,
+        Self::Prewalk,
         Self::Advisor,
         Self::Checkpoint,
         Self::Rewind,
@@ -347,8 +335,9 @@ impl SlashCommand {
             "/login" => Self::Login,
             "/logout" => Self::Logout,
             "/clear" | "/cls" => Self::Clear,
-            "/model" | "/m" => Self::Model,
-            "/thinking" | "/think" | "/t" => Self::Thinking,
+            // `/models` and `/effort` are OMP's spellings.
+            "/model" | "/m" | "/models" => Self::Model,
+            "/thinking" | "/think" | "/t" | "/effort" => Self::Thinking,
             "/scoped-models" | "/scoped" => Self::ScopedModels,
             "/exit" | "/quit" | "/q" => Self::Exit,
             "/history" | "/hist" => Self::History,
@@ -370,6 +359,7 @@ impl SlashCommand {
             "/share" => Self::Share,
             "/mcp" => Self::Mcp,
             "/plan" => Self::Plan,
+            "/prewalk" => Self::Prewalk,
             "/advisor" => Self::Advisor,
             "/checkpoint" | "/cp2" => Self::Checkpoint,
             "/rewind" => Self::Rewind,
@@ -422,10 +412,12 @@ impl SlashCommand {
   /reload            - Reload skills/prompts from disk
   /template <name> [args] - Expand a prompt template by name
   /share             - Upload current branch to an unlisted gist (not private; inspect sensitive context)
-  /mcp               - Manage MCP servers: list, add, remove, test, trust (Model Context Protocol)
+  /mcp               - Manage MCP servers: list, add, remove, test, trust, reauth, unauth
   /plan [approve|reject|off|status] - Enter plan mode / review a submitted plan
+  /prewalk [status|off] - Hand off to @smol after planning and the first edit
   /approval [always-ask|write|yolo|status] - Set or show tool approval mode
-  /handoff [to] [path] - Generate structured cross-session/cross-agent handoff brief
+  /handoff [focus]   - Compact context into a continuation brief in this session
+  /handoff --report [to] [path] - Generate or deliver a local session report
   /rules [list|remove|toggle] - Manage time-traveling stream rules (TTSR)
   /add-dir <dir>     - Grant access to an additional workspace root
   /remove-dir <dir>  - Revoke an additional workspace root immediately
@@ -1012,12 +1004,12 @@ pub fn parse_scoped_model_patterns(args: &str) -> Vec<String> {
 }
 
 pub fn model_entry_matches(left: &ModelEntry, right: &ModelEntry) -> bool {
-    let left_provider = crate::provider_metadata::canonical_provider_id(&left.model.provider)
-        .unwrap_or(&left.model.provider);
-    let right_provider = crate::provider_metadata::canonical_provider_id(&right.model.provider)
-        .unwrap_or(&right.model.provider);
-
-    left_provider.eq_ignore_ascii_case(right_provider)
+    // Entries already carry their resolved provider identity. Canonicalizing
+    // them here hides separately declared providers from switching/cycling.
+    left.model
+        .provider
+        .trim()
+        .eq_ignore_ascii_case(right.model.provider.trim())
         && left.model.id.eq_ignore_ascii_case(&right.model.id)
 }
 
@@ -1118,63 +1110,6 @@ fn plan_session_thinking_sync(
         thinking_changed,
         persist_needed,
     }
-}
-
-fn parse_user_bash_event_result(value: &Value) -> Option<crate::tools::BashRunResult> {
-    let result = value
-        .as_object()
-        .map_or(value, |obj| obj.get("result").unwrap_or(value));
-    let obj = result.as_object()?;
-
-    let output = obj
-        .get("output")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let exit_code = obj
-        .get("exitCode")
-        .and_then(Value::as_i64)
-        .or_else(|| obj.get("exit_code").and_then(Value::as_i64))
-        .unwrap_or(0);
-    let cancelled = obj
-        .get("cancelled")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let truncated = obj
-        .get("truncated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let full_output_path = obj
-        .get("fullOutputPath")
-        .or_else(|| obj.get("full_output_path"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    let cancellation = obj.get("cancellation").and_then(Value::as_object);
-    let cancellation_reason = cancellation
-        .and_then(|details| details.get("reason"))
-        .and_then(Value::as_str)
-        .and_then(|reason| match reason {
-            "timeout" => Some(crate::tools::BashCancellationReason::Timeout),
-            "ambient_cancellation" => {
-                Some(crate::tools::BashCancellationReason::AmbientCancellation)
-            }
-            _ => None,
-        });
-    let timeout_ms = cancellation
-        .and_then(|details| details.get("timeoutMs"))
-        .or_else(|| obj.get("timeoutMs"))
-        .and_then(Value::as_u64);
-
-    Some(crate::tools::BashRunResult {
-        output,
-        exit_code: i32::try_from(exit_code).unwrap_or(0),
-        cancelled,
-        cancellation_reason,
-        timeout_ms,
-        truncated,
-        full_output_path,
-        truncation: None,
-    })
 }
 
 pub fn resolve_scoped_model_entries(
@@ -1641,21 +1576,25 @@ impl PiApp {
 
         let session_model = session_guard.effective_model_for_current_path();
         let session_thinking = session_guard.effective_thinking_level_for_current_path();
+        let catalog = agent_guard.handle.session().model_registry().map_or(
+            self.available_models.as_slice(),
+            crate::models::ModelRegistry::models,
+        );
 
         let (target_entry, sync_model) = match session_model.as_ref() {
             Some((provider, model_id)) => {
-                if provider_ids_match(&self.model_entry.model.provider, provider)
+                if self
+                    .model_entry
+                    .model
+                    .provider
+                    .trim()
+                    .eq_ignore_ascii_case(provider.trim())
                     && self.model_entry.model.id.eq_ignore_ascii_case(model_id)
                 {
                     (self.model_entry.clone(), true)
                 } else {
                     (
-                        self.available_models
-                            .iter()
-                            .find(|entry| {
-                                provider_ids_match(&entry.model.provider, provider)
-                                    && entry.model.id.eq_ignore_ascii_case(model_id)
-                            })
+                        find_model_entry(catalog, provider, model_id)
                             .cloned()
                             .ok_or_else(|| {
                                 format!("Unable to switch provider/model to {provider}/{model_id}")
@@ -1679,10 +1618,18 @@ impl PiApp {
 
         let provider = agent_guard.provider();
         let runtime_matches_target =
-            provider_ids_match(provider.name(), &target_entry.model.provider)
-                && provider
-                    .model_id()
-                    .eq_ignore_ascii_case(&target_entry.model.id);
+            find_model_entry(catalog, provider.name(), provider.model_id()).map_or_else(
+                || {
+                    provider
+                        .name()
+                        .trim()
+                        .eq_ignore_ascii_case(target_entry.model.provider.trim())
+                        && provider
+                            .model_id()
+                            .eq_ignore_ascii_case(&target_entry.model.id)
+                },
+                |entry| model_entry_matches(entry, &target_entry),
+            );
         if !runtime_matches_target {
             let resolved_key_opt = target_entry
                 .api_key
@@ -1864,7 +1811,6 @@ impl PiApp {
         let session = Arc::clone(&self.session);
         let save_enabled = self.save_enabled;
         let cwd = self.cwd.clone();
-        let cwd_display = cwd.display().to_string();
         let shell_path = self.config.shell_path.clone();
         let command_prefix = self.config.shell_command_prefix.clone();
         let extensions = self.extensions.clone();
@@ -1872,24 +1818,14 @@ impl PiApp {
         let completion_runtime_handle = runtime_handle.clone();
 
         runtime_handle.spawn_with_cx(move |_command_cx| async move {
-            let mut override_result = None;
-            if let Some(manager) = extensions {
-                let response = manager
-                    .dispatch_event_with_response(
-                        ExtensionEventName::UserBash,
-                        Some(json!({
-                            "command": command.clone(),
-                            "excludeFromContext": exclude_from_context,
-                            "cwd": cwd_display,
-                        })),
-                        EXTENSION_EVENT_TIMEOUT_MS,
-                    )
-                    .await
-                    .unwrap_or(None);
-                if let Some(value) = response {
-                    override_result = parse_user_bash_event_result(&value);
+            let override_result = match extensions {
+                Some(manager) => {
+                    manager
+                        .dispatch_user_bash(&command, exclude_from_context, &cwd)
+                        .await
                 }
-            }
+                None => None,
+            };
 
             let result = match override_result {
                 Some(result) => Ok(result),
@@ -1907,7 +1843,7 @@ impl PiApp {
             };
             match result {
                 Ok(result) => {
-                    let display = bash_execution_to_text(
+                    let mut display = bash_execution_to_text(
                         &command,
                         &result.output,
                         result.exit_code,
@@ -1916,41 +1852,30 @@ impl PiApp {
                         result.full_output_path.as_deref(),
                     );
 
+                    // OMP's bash runner records the run and starts no turn:
+                    // `!` output reaches the model with the next prompt, and
+                    // `!!` output is kept in the session but never sent.
+                    let mut extra = HashMap::new();
                     if exclude_from_context {
-                        let mut extra = HashMap::new();
                         extra.insert("excludeFromContext".to_string(), Value::Bool(true));
-
-                        let bash_message = SessionMessage::BashExecution {
-                            command: command.clone(),
-                            output: result.output.clone(),
-                            exit_code: result.exit_code,
-                            cancelled: Some(result.cancelled),
-                            truncated: Some(result.truncated),
-                            full_output_path: result.full_output_path,
-                            timestamp: Some(Utc::now().timestamp_millis()),
-                            extra,
-                        };
-
-                        let mut display = display;
                         display.push_str("\n\n[Output excluded from model context]");
-                        spawn_bash_completion(
-                            &completion_runtime_handle,
-                            event_tx.clone(),
-                            Some((Arc::clone(&session), bash_message, save_enabled)),
-                            display,
-                            None,
-                        );
-                    } else {
-                        let content_for_agent =
-                            vec![ContentBlock::Text(TextContent::new(display.clone()))];
-                        spawn_bash_completion(
-                            &completion_runtime_handle,
-                            event_tx.clone(),
-                            None,
-                            display,
-                            Some(content_for_agent),
-                        );
                     }
+                    let bash_message = SessionMessage::BashExecution {
+                        command: command.clone(),
+                        output: result.output,
+                        exit_code: result.exit_code,
+                        cancelled: Some(result.cancelled),
+                        truncated: Some(result.truncated),
+                        full_output_path: result.full_output_path,
+                        timestamp: Some(Utc::now().timestamp_millis()),
+                        extra,
+                    };
+                    spawn_bash_completion(
+                        &completion_runtime_handle,
+                        event_tx.clone(),
+                        Some((Arc::clone(&session), bash_message, save_enabled)),
+                        display,
+                    );
                 }
                 Err(err) => {
                     spawn_bash_completion(
@@ -1958,7 +1883,6 @@ impl PiApp {
                         event_tx,
                         None,
                         format!("Bash command failed: {err}"),
-                        None,
                     );
                 }
             }
@@ -2313,7 +2237,12 @@ impl PiApp {
                     return None;
                 }
 
-                let Some(extensions) = self.extensions.clone() else {
+                let extensions = self.extensions.clone();
+                let requires_cost_save = self
+                    .agent
+                    .try_lock()
+                    .map_or(true, |agent| agent.cost_budget().is_some());
+                if extensions.is_none() && !requires_cost_save {
                     let Ok(mut agent_guard) = self.agent.try_lock() else {
                         self.status_message = Some("Session busy; try again".to_string());
                         return None;
@@ -2366,7 +2295,7 @@ impl PiApp {
                     self.scroll_to_bottom();
                     self.input.focus();
                     return None;
-                };
+                }
 
                 let model_provider = self.model_entry.model.provider.clone();
                 let runtime_cwd = self.cwd.clone();
@@ -2395,14 +2324,18 @@ impl PiApp {
 
                 let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
                 runtime_handle.spawn(async move {
-                    let cancelled = extensions
-                        .dispatch_cancellable_event(
-                            ExtensionEventName::SessionBeforeSwitch,
-                            Some(json!({ "reason": "new" })),
-                            EXTENSION_EVENT_TIMEOUT_MS,
-                        )
-                        .await
-                        .unwrap_or(false);
+                    let cancelled = if let Some(extensions) = &extensions {
+                        extensions
+                            .dispatch_cancellable_event(
+                                ExtensionEventName::SessionBeforeSwitch,
+                                Some(json!({ "reason": "new" })),
+                                EXTENSION_EVENT_TIMEOUT_MS,
+                            )
+                            .await
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
                     if cancelled {
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
@@ -2426,6 +2359,7 @@ impl PiApp {
                         new_session,
                         Vec::new(),
                         Some(reset_thinking),
+                        false,
                     )
                     .await
                     {
@@ -2452,16 +2386,18 @@ impl PiApp {
                     )
                     .await;
 
-                    let _ = extensions
-                        .dispatch_event(
-                            ExtensionEventName::SessionSwitch,
-                            Some(json!({
-                                "reason": "new",
-                                "previousSessionFile": previous_session_file,
-                                "sessionId": new_session_id,
-                            })),
-                        )
-                        .await;
+                    if let Some(extensions) = extensions {
+                        let _ = extensions
+                            .dispatch_event(
+                                ExtensionEventName::SessionSwitch,
+                                Some(json!({
+                                    "reason": "new",
+                                    "previousSessionFile": previous_session_file,
+                                    "sessionId": new_session_id,
+                                })),
+                            )
+                            .await;
+                    }
                 });
 
                 None
@@ -2663,6 +2599,7 @@ impl PiApp {
             SlashCommand::Share => self.handle_slash_share(args),
             SlashCommand::Mcp => self.handle_slash_mcp(args),
             SlashCommand::Plan => self.handle_slash_plan(args),
+            SlashCommand::Prewalk => self.handle_slash_prewalk(args),
             SlashCommand::Advisor => self.handle_slash_advisor(args),
             SlashCommand::Checkpoint => self.handle_slash_checkpoint(args),
             SlashCommand::Rewind => self.handle_slash_rewind(args),
@@ -3021,6 +2958,29 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         None
     }
 
+    /// Resolve explicit commands against the complete runtime catalog. The
+    /// picker list may omit unready providers, but their names remain owned.
+    fn requested_model_entry(
+        &self,
+        provider: &str,
+        model_id: &str,
+        allow_unlisted_native_model: bool,
+    ) -> Result<Option<ModelEntry>, String> {
+        let agent = self
+            .agent
+            .try_lock()
+            .map_err(|_| "Agent busy; try again".to_string())?;
+        let catalog = agent.handle.session().model_registry().map_or(
+            self.available_models.as_slice(),
+            crate::models::ModelRegistry::models,
+        );
+        Ok(if allow_unlisted_native_model {
+            resolve_model_entry(catalog, provider, model_id)
+        } else {
+            find_model_entry(catalog, provider, model_id).cloned()
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_model(&mut self, args: &str) -> Option<Cmd> {
         // Role targeting (bd-cv653.3.1): `/model <role>` shows the role's
@@ -3073,21 +3033,29 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let pattern_lower = pattern.to_ascii_lowercase();
         let provider_scoped_pattern = split_provider_model_spec(pattern);
 
-        let mut exact_matches = Vec::new();
-        for entry in &self.available_models {
-            let full = format!("{}/{}", entry.model.provider, entry.model.id);
-            if full.eq_ignore_ascii_case(pattern)
-                || entry.model.id.eq_ignore_ascii_case(pattern)
-                || provider_scoped_pattern.is_some_and(|(provider, model_id)| {
-                    provider_ids_match(&entry.model.provider, provider)
-                        && entry.model.id.eq_ignore_ascii_case(model_id)
-                })
-            {
-                exact_matches.push(entry.clone());
+        let qualified = match provider_scoped_pattern {
+            Some((provider, model_id)) => {
+                match self.requested_model_entry(provider, model_id, false) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        self.status_message = Some(error);
+                        return None;
+                    }
+                }
             }
+            None => None,
+        };
+        let mut exact_matches: Vec<_> = qualified.into_iter().collect();
+        if exact_matches.is_empty() {
+            exact_matches.extend(
+                self.available_models
+                    .iter()
+                    .filter(|entry| entry.model.id.eq_ignore_ascii_case(pattern))
+                    .cloned(),
+            );
         }
 
-        let mut matches = if exact_matches.is_empty() {
+        let mut matches = if exact_matches.is_empty() && provider_scoped_pattern.is_none() {
             let mut fuzzy = Vec::new();
             for entry in &self.available_models {
                 let full = format!("{}/{}", entry.model.provider, entry.model.id);
@@ -3111,20 +3079,21 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         matches.dedup_by(|a, b| model_entry_matches(a, b));
 
         if matches.is_empty()
-            && let Some((provider, model_id)) = pattern.split_once('/')
+            && let Some((provider, model_id)) = provider_scoped_pattern
         {
-            let provider = normalize_auth_provider_input(provider);
-            let model_id = model_id.trim();
-            if !provider.is_empty()
-                && !model_id.is_empty()
-                && let Some(entry) = crate::models::ad_hoc_model_entry(&provider, model_id)
-            {
-                matches.push(entry);
+            match self.requested_model_entry(provider, model_id, true) {
+                Ok(entry) => matches.extend(entry),
+                Err(error) => {
+                    self.status_message = Some(error);
+                    return None;
+                }
             }
         }
 
         if matches.is_empty() {
-            self.status_message = Some(format!("Model not found: {pattern}"));
+            self.status_message = Some(format!(
+                "Model not found: {pattern}. Use /model to inspect registered provider/model pairs."
+            ));
             return None;
         }
         if matches.len() > 1 {
@@ -3197,26 +3166,33 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     /// bd-cv653.3.1). Records the override in app state and appends a
     /// role-tagged `ModelChange` entry so the assignment replays.
     fn assign_model_to_role(&mut self, role: ModelRole, pattern: &str) -> Option<Cmd> {
-        let mut found: Option<ModelEntry> = None;
-        for entry in &self.available_models {
-            let full = format!("{}/{}", entry.model.provider, entry.model.id);
-            if full.eq_ignore_ascii_case(pattern)
-                || entry.model.id.eq_ignore_ascii_case(pattern)
-                || split_provider_model_spec(pattern).is_some_and(|(provider, model_id)| {
-                    provider_ids_match(&entry.model.provider, provider)
-                        && entry.model.id.eq_ignore_ascii_case(model_id)
-                })
-            {
-                found = Some(entry.clone());
-                break;
+        let qualified = match split_provider_model_spec(pattern) {
+            Some((provider, model_id)) => {
+                match self.requested_model_entry(provider, model_id, false) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        self.status_message = Some(error);
+                        return None;
+                    }
+                }
             }
-        }
+            None => None,
+        };
+        let mut found = qualified.or_else(|| {
+            self.available_models
+                .iter()
+                .find(|entry| entry.model.id.eq_ignore_ascii_case(pattern))
+                .cloned()
+        });
         if found.is_none()
             && let Some((provider, model_id)) = split_provider_model_spec(pattern)
         {
-            let provider = normalize_auth_provider_input(provider);
-            if !provider.is_empty() && !model_id.trim().is_empty() {
-                found = crate::models::ad_hoc_model_entry(&provider, model_id.trim());
+            match self.requested_model_entry(provider, model_id, true) {
+                Ok(entry) => found = entry,
+                Err(error) => {
+                    self.status_message = Some(error);
+                    return None;
+                }
             }
         }
         let Some(entry) = found else {
@@ -3257,6 +3233,100 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         } else {
             format!("Role {role} set to {provider}/{model_id}")
         });
+        None
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle_slash_prewalk(&mut self, args: &str) -> Option<Cmd> {
+        if self.agent_state != AgentState::Idle {
+            self.status_message =
+                Some("Wait for the current turn before changing prewalk".to_string());
+            return None;
+        }
+        let Ok(mut agent) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
+        match args.trim() {
+            "off" => {
+                agent.handle.disarm_prewalk();
+                self.status_message = Some("Prewalk disarmed".to_string());
+                return None;
+            }
+            "status" => {
+                self.status_message = Some(agent.handle.prewalk_target().map_or_else(
+                    || "Prewalk is not armed".to_string(),
+                    |target| format!("Prewalk armed → {}", target.label()),
+                ));
+                return None;
+            }
+            "" => {}
+            _ => {
+                self.status_message = Some("Usage: /prewalk [status|off]".to_string());
+                return None;
+            }
+        }
+        let target = if let Some(target) = agent.handle.prewalk_target() {
+            target.clone()
+        } else {
+            let spec = self
+                .role_model_overrides
+                .get(&ModelRole::Smol)
+                .map(|(provider, model)| format!("{provider}/{model}"))
+                .or_else(|| {
+                    self.config
+                        .model_roles
+                        .as_ref()
+                        .and_then(|roles| roles.smol.clone())
+                });
+            let Some(spec) = spec else {
+                self.status_message = Some(
+                    "Prewalk requires a configured @smol model; use /model smol provider/model"
+                        .to_string(),
+                );
+                return None;
+            };
+            let Some(registry) = agent.handle.session().model_registry() else {
+                self.status_message = Some("Prewalk requires a model registry".to_string());
+                return None;
+            };
+            match crate::app::resolve_prewalk_model_spec(&spec, &self.config, registry, &self.cwd) {
+                Ok(target) => target,
+                Err(error) => {
+                    self.status_message = Some(format!("Prewalk: {error}"));
+                    return None;
+                }
+            }
+        };
+        let owner = self.displayed_session_id.clone();
+        drop(agent);
+        let agent = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            let note = match OwnedMutexGuard::lock(agent, &cx).await {
+                Ok(mut agent) => {
+                    let current = agent
+                        .handle
+                        .with_session(|session| session.header.id.clone())
+                        .await;
+                    if current.ok().as_ref() != owner.as_ref() {
+                        return;
+                    }
+                    match agent.handle.arm_prewalk(target).await {
+                        Ok(Some(target)) => format!("Prewalk armed → {}", target.label()),
+                        Ok(None) => {
+                            "Prewalk: nothing to switch; target model and thinking already match"
+                                .to_string()
+                        }
+                        Err(error) => format!("Prewalk: {error}"),
+                    }
+                }
+                Err(error) => format!("Prewalk: {error}"),
+            };
+            let _ = enqueue_pi_event(&event_tx, &cx, PiMsg::SystemNote(note)).await;
+        });
+        self.status_message = Some("Arming prewalk...".to_string());
         None
     }
 
@@ -3352,14 +3422,101 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     }
 
     pub(super) fn handle_slash_handoff(&mut self, args: &str) -> Option<Cmd> {
-        let report = {
-            let Ok(session_guard) = self.session.try_lock() else {
-                self.status_message = Some("Session busy; try again".to_string());
+        use super::workspace_reports::HandoffMode;
+        let focus = match super::workspace_reports::handoff_mode(args) {
+            Ok(HandoffMode::InPlace(focus)) => focus.to_string(),
+            Ok(HandoffMode::Report(args)) => {
+                let report = {
+                    let Ok(session_guard) = self.session.try_lock() else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
+                    };
+                    super::workspace_reports::handoff(&session_guard, args)
+                };
+                self.show_workspace_report(report);
                 return None;
-            };
-            super::workspace_reports::handoff(&session_guard, args)
+            }
+            Ok(HandoffMode::ModelPreview(_)) => {
+                self.status_message = Some(
+                    "Model preview/export is available in the default terminal; use /handoff [focus] here to compact this session".to_string(),
+                );
+                return None;
+            }
+            Ok(HandoffMode::Import(_)) => {
+                self.status_message = Some(
+                    "Handoff bundle import is available in the default terminal with /handoff --import".to_string(),
+                );
+                return None;
+            }
+            Err(error) => {
+                self.status_message = Some(error.to_string());
+                return None;
+            }
         };
-        self.show_workspace_report(report);
+        if self.agent_state != AgentState::Idle
+            || self.bash_running
+            || self.agent.try_lock().is_err()
+        {
+            self.status_message =
+                Some("Handoff is available after the current request finishes".to_string());
+            return None;
+        }
+        let Some(owner_session_id) = self
+            .session
+            .try_lock()
+            .ok()
+            .map(|session| session.header.id.clone())
+        else {
+            self.status_message = Some("Handoff unavailable: session is busy".to_string());
+            return None;
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (abort_handle, abort_signal) = AbortHandle::new();
+        self.handoff_request_id = Some(request_id.clone());
+        self.abort_handle = Some(abort_handle);
+        self.agent_state = AgentState::Processing;
+        self.extension_compacting.store(true, Ordering::SeqCst);
+        self.status_message = Some("Preparing in-place handoff (Esc to cancel)...".to_string());
+        let owner = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            let event = match OwnedMutexGuard::lock(owner, &cx).await {
+                Ok(mut owner) => {
+                    match owner
+                        .handle
+                        .with_session(|session| session.header.id.clone())
+                        .await
+                    {
+                        Ok(current) if current == owner_session_id => {
+                            super::workspace_reports::run_in_place_handoff(
+                                &mut owner.handle,
+                                &focus,
+                                &abort_signal,
+                            )
+                            .await
+                        }
+                        Ok(_) => PiMsg::AgentError(
+                            "Handoff cancelled: the session changed before it started".to_string(),
+                        ),
+                        Err(error) => PiMsg::AgentError(format!("Handoff unavailable: {error}")),
+                    }
+                }
+                Err(error) => PiMsg::AgentError(format!("Handoff unavailable: {error}")),
+            };
+            // Drop the Agent owner before the UI applies its terminal reset.
+            // Delivery uses a fresh context even after owner cancellation.
+            let _ = enqueue_pi_event(
+                &event_tx,
+                &Cx::for_request(),
+                PiMsg::HandoffFinished {
+                    request_id,
+                    event: Box::new(event),
+                },
+            )
+            .await;
+        });
+        self.scroll_to_bottom();
         None
     }
 
@@ -3475,31 +3632,90 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     /// written to the session JSONL: the call builds a throwaway message
     /// list that shares nothing with the session writer.
     pub(super) fn handle_slash_btw(&mut self, args: &str) -> Option<Cmd> {
+        if self.start_side_question(args, None) {
+            self.history.push(format!("/btw {}", args.trim()));
+            self.clear_side_question_input();
+        }
+        None
+    }
+
+    /// A file command with `side: true` never enters the main input queues,
+    /// even when its side client is unavailable or its expansion is empty.
+    pub(super) fn submit_side_template(&mut self, input: &str) -> bool {
+        let invocation = match SlashCommand::parse(input) {
+            Some((SlashCommand::Template, args)) => {
+                let args = args.trim();
+                let (name, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+                let name = name.trim_start_matches('/');
+                if name.is_empty() {
+                    return false;
+                }
+                Some(format!("/{name} {rest}"))
+            }
+            Some(_) => return false,
+            None => None,
+        };
+        let command = invocation.as_deref().unwrap_or(input);
+        let name = command
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('/');
+        if self
+            .extensions
+            .as_ref()
+            .is_some_and(|manager| manager.has_command(name))
+        {
+            return false;
+        }
+        let Some(question) = self.resources.expand_side_prompt(command) else {
+            return false;
+        };
+        if self.start_side_question(&question, Some(input)) {
+            self.history.push(input.to_string());
+            self.clear_side_question_input();
+        }
+        true
+    }
+
+    fn clear_side_question_input(&mut self) {
+        self.input.reset();
+        self.input_mode = InputMode::SingleLine;
+        self.set_input_height(3);
+        self.input.focus();
+    }
+
+    /// Returns whether a side request was admitted, so refusals retain the
+    /// editor draft. Its title is display-only; the provider sees the expanded
+    /// question and screened context, never another authored main-agent turn.
+    fn start_side_question(&mut self, args: &str, title: Option<&str>) -> bool {
+        let label = title.unwrap_or("/btw").to_string();
         let Some(client) = self.btw_client.clone() else {
-            self.status_message = Some(
-                "/btw unavailable: no smol role model configured (set --smol or model_roles.smol)"
-                    .to_string(),
-            );
+            self.status_message = Some(format!(
+                "{label} unavailable: no smol role model configured (set --smol or model_roles.smol)"
+            ));
             self.scroll_to_bottom();
-            return None;
+            return false;
         };
         let question = args.trim().to_string();
         if question.is_empty() {
-            self.status_message = Some("Usage: /btw <question>".to_string());
+            self.status_message = Some(title.map_or_else(
+                || "Usage: /btw <question>".to_string(),
+                |title| format!("{title}: template expansion produced empty output"),
+            ));
             self.scroll_to_bottom();
-            return None;
+            return false;
         }
         if question
             .len()
             .saturating_add(pi::btw::BTW_SYSTEM_PROMPT.len())
             > pi::text_completion::MAX_INPUT_BYTES
         {
-            self.status_message = Some(
-                "/btw refused: PI_AUXILIARY_INPUT_LIMIT: side question exceeds the privacy scan budget"
-                    .to_string(),
-            );
+            self.status_message = Some(format!(
+                "{label} refused: PI_AUXILIARY_INPUT_LIMIT: side question exceeds the privacy scan budget"
+            ));
             self.scroll_to_bottom();
-            return None;
+            return false;
         }
         // Screen complete source fields and the question before clipping;
         // a busy agent defers preparation until its remembered credentials
@@ -3513,9 +3729,9 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let request = match prepared {
             Some(Ok(request)) => Some(request),
             Some(Err(err)) => {
-                self.status_message = Some(format!("/btw refused: {err}"));
+                self.status_message = Some(format!("{label} refused: {err}"));
                 self.scroll_to_bottom();
-                return None;
+                return false;
             }
             None => None,
         };
@@ -3527,24 +3743,24 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             |session| (session.header.id.clone(), false),
         );
         if session_busy {
-            self.status_message = Some("/btw unavailable: session is busy".to_string());
+            self.status_message = Some(format!("{label} unavailable: session is busy"));
             self.scroll_to_bottom();
-            return None;
+            return false;
         }
         self.messages.push(ConversationMessage {
             role: MessageRole::System,
             content: if agent_busy {
-                format!("(/btw) {question} — queued until the current turn finishes")
+                format!("({label}) {question} — queued until the current turn finishes")
             } else {
-                format!("(/btw) {question}")
+                format!("({label}) {question}")
             },
             thinking: None,
             collapsed: false,
         });
         self.status_message = Some(if agent_busy {
-            "(/btw) waiting for the current turn...".to_string()
+            format!("({label}) waiting for the current turn...")
         } else {
-            "(/btw) thinking...".to_string()
+            format!("({label}) thinking...")
         });
         let runtime = self.runtime_handle.clone();
         let event_tx = self.event_tx.clone();
@@ -3575,8 +3791,8 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             // reset live agent state (Idle + dropped abort handle), while an
             // answer landing after a session switch must be discarded.
             let message = match result {
-                Ok(answer) => format!("(/btw) {answer}"),
-                Err(err) => format!("(/btw) failed: {err}"),
+                Ok(answer) => format!("({label}) {answer}"),
+                Err(err) => format!("({label}) failed: {err}"),
             };
             let msg = PiMsg::SessionSystemNote {
                 owner_session_id,
@@ -3585,7 +3801,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             let _ = crate::interactive::enqueue_pi_event(&event_tx, &Cx::for_request(), msg).await;
         });
         self.scroll_to_bottom();
-        None
+        true
     }
 
     fn completed_tan_event(
@@ -3610,7 +3826,10 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     /// parent agent's next idle turn boundary.
     pub(super) fn handle_slash_tan(&mut self, args: &str) -> Option<Cmd> {
         enum TanGate {
-            Enabled(Option<pi::tools::ToolModelSelection>),
+            Enabled(
+                Option<pi::tools::ToolModelSelection>,
+                Option<pi::cost::CostBudget>,
+            ),
             Disabled,
             Busy,
         }
@@ -3624,12 +3843,13 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
         let gate = self.agent.try_lock().map_or(TanGate::Busy, |agent| {
             if agent.has_tool("subagent") {
-                TanGate::Enabled(agent.shared_tools().snapshot().model_scope().current())
+                let tools = agent.shared_tools().snapshot();
+                TanGate::Enabled(tools.model_scope().current(), tools.cost_scope().current())
             } else {
                 TanGate::Disabled
             }
         });
-        let parent_model = match gate {
+        let (parent_model, cost_budget) = match gate {
             TanGate::Busy => {
                 self.status_message = Some("/tan unavailable: agent session is busy".to_string());
                 self.scroll_to_bottom();
@@ -3643,7 +3863,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 self.scroll_to_bottom();
                 return None;
             }
-            TanGate::Enabled(model) => model,
+            TanGate::Enabled(model, cost) => (model, cost),
         };
 
         // Same TryLockError-guard temporary pattern as /btw (bd-9x70g).
@@ -3658,8 +3878,10 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         }
 
         let tool = pi::subagents::SubagentTool::new(&self.cwd)
-            .with_role_model_spec(pi::app::subagent_role_spec(&self.config))
-            .with_parent_model(parent_model);
+            .with_role_model_selection(pi::app::subagent_role_selection(&self.config))
+            .with_model_config(Some(self.config.clone()))
+            .with_parent_model(parent_model)
+            .with_cost_budget(cost_budget);
         let runtime = self.runtime_handle.clone();
         let event_tx = self.event_tx.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
@@ -3753,34 +3975,78 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     }
 
     pub(super) fn handle_slash_review(&mut self, args: &str) -> Option<Cmd> {
-        let report = super::workspace_reports::review(&self.cwd, args);
-        self.show_workspace_report(report);
+        if self.agent_state != AgentState::Idle {
+            self.status_message =
+                Some("Review is available after the current request finishes".to_string());
+            return None;
+        }
+        let prepared = self
+            .agent
+            .try_lock()
+            .map_err(|_| pi::error::Error::validation("agent is busy"))
+            .and_then(|agent| super::workspace_reports::prepare_review(&self.cwd, args, &agent));
+        let request = match prepared {
+            Ok(request) => request,
+            Err(error) => {
+                self.status_message = Some(format!("Review failed: {error}"));
+                return None;
+            }
+        };
+        let owner = self
+            .session
+            .try_lock()
+            .ok()
+            .map(|session| session.header.id.clone());
+        let Some(owner_session_id) = owner else {
+            self.status_message = Some("Review unavailable: session is busy".to_string());
+            return None;
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (abort_handle, abort_signal) = AbortHandle::new();
+        self.review_request_id = Some(request_id.clone());
+        self.abort_handle = Some(abort_handle);
+        self.agent_state = AgentState::Processing;
+        self.status_message =
+            Some("Reviewing text changes with the current model (Esc to cancel)...".to_string());
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let report = request.run(Some(&abort_signal)).await;
+            let message = report.card.unwrap_or(report.status);
+            let _ = crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &Cx::for_request(),
+                PiMsg::ReviewFinished {
+                    owner_session_id,
+                    request_id,
+                    message,
+                },
+            )
+            .await;
+        });
+        self.scroll_to_bottom();
         None
     }
 
     /// Switch the active model to a role-resolved spec when one is configured.
-    fn switch_to_role_spec(&mut self, spec: &str, source: &str) {
-        let Some((provider, model_id)) = crate::provider_metadata::split_provider_model_spec(spec)
-        else {
-            return;
-        };
+    fn switch_to_role_spec(&mut self, spec: &str, source: &str) -> Result<(), String> {
+        let (provider, model_id) = split_provider_model_spec(spec).ok_or_else(|| {
+            format!("Invalid model {spec}. Use /model to choose a provider/model pair")
+        })?;
         let entry = self
-            .available_models
-            .iter()
-            .find(|m| {
-                crate::provider_metadata::provider_ids_match(&m.model.provider, provider)
-                    && m.model.id.eq_ignore_ascii_case(model_id)
-            })
-            .cloned()
-            .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id));
-        if let Some(entry) = entry {
-            let key = resolve_model_key_from_default_auth(&entry, &self.cwd);
-            if let Ok(provider_impl) =
-                create_runtime_provider(&entry, self.extensions.as_ref(), &self.cwd)
-            {
-                let _ = self.switch_active_model(&entry, provider_impl, key.as_deref(), source);
-            }
+            .requested_model_entry(provider, model_id, true)?
+            .ok_or_else(|| {
+                format!("Model not found: {spec}. Use /model to inspect registered models")
+            })?;
+        let key = resolve_model_key_from_default_auth(&entry, &self.cwd);
+        if model_requires_configured_credential(&entry) && key.is_none() {
+            return Err(format!(
+                "Missing credentials for provider {}. Run /login {}",
+                entry.model.provider, entry.model.provider
+            ));
         }
+        let provider_impl = create_runtime_provider(&entry, self.extensions.as_ref(), &self.cwd)
+            .map_err(|error| error.to_string())?;
+        self.switch_active_model(&entry, provider_impl, key.as_deref(), source)
     }
 
     fn enter_plan_mode(&mut self, plan_state: &crate::plan::PlanState) {
@@ -3794,15 +4060,13 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         plan_state.enter_planning();
         plan_state
             .stash_previous_model(&self.model_entry.model.provider, &self.model_entry.model.id);
-        if let Some(spec) = self
+        let model_warning = self
             .config
             .model_roles
             .as_ref()
             .and_then(|roles| crate::app::role_spec_from_settings(roles, ModelRole::Plan))
             .map(str::to_string)
-        {
-            self.switch_to_role_spec(&spec, "plan-role");
-        }
+            .and_then(|spec| self.switch_to_role_spec(&spec, "plan-role").err());
         Self::log_plan_transition(&self.session, "planning");
         self.messages.push(ConversationMessage {
             role: MessageRole::System,
@@ -3810,7 +4074,15 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             thinking: None,
             collapsed: false,
         });
-        self.status_message = Some("Plan mode: planning (read-only)".to_string());
+        self.status_message = Some(model_warning.map_or_else(
+            || "Plan mode: planning (read-only)".to_string(),
+            |error| {
+                format!(
+                    "Plan mode: planning (read-only). {error}. Continuing with {}",
+                    session_model_line(&self.model_entry)
+                )
+            },
+        ));
         self.scroll_to_bottom();
     }
 
@@ -3828,11 +4100,26 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                         "{existing}\n\n## Approved Plan (execute this)\n\n{plan}"
                     )));
                 }
-                if let Some((provider, model_id)) = plan_state.take_previous_model() {
-                    self.switch_to_role_spec(&format!("{provider}/{model_id}"), "plan-restore");
-                }
+                let model_warning =
+                    plan_state
+                        .take_previous_model()
+                        .and_then(|(provider, model_id)| {
+                            self.switch_to_role_spec(
+                                &format!("{provider}/{model_id}"),
+                                "plan-restore",
+                            )
+                            .err()
+                        });
                 Self::log_plan_transition(&self.session, "approved");
-                self.status_message = Some("Plan approved — execute it.".to_string());
+                self.status_message = Some(model_warning.map_or_else(
+                    || "Plan approved — execute it.".to_string(),
+                    |error| {
+                        format!(
+                            "Plan approved. {error}. Continuing with {}",
+                            session_model_line(&self.model_entry)
+                        )
+                    },
+                ));
             }
             None => {
                 self.status_message = Some("No submitted plan to approve".to_string());
@@ -4123,17 +4410,23 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             });
             return None;
         };
+        let trimmed = args.trim();
+        if let Some((verb @ ("reauth" | "unauth"), name)) = trimmed.split_once(char::is_whitespace)
+        {
+            return self.mcp_handle_auth(&manager, verb, name.trim());
+        }
         let mut parts = args.split_whitespace();
         let subcommand = parts.next().unwrap_or("list");
         let rest: Vec<&str> = parts.collect();
         match subcommand {
+            "reauth" | "unauth" => self.mcp_handle_auth(&manager, subcommand, ""),
             "list" => self.mcp_handle_list(&manager),
             "add" => self.mcp_handle_add(&rest),
             "remove" => self.mcp_handle_remove(&rest),
             "trust" | "deny" | "test" => self.mcp_handle_action(&manager, subcommand, &rest),
             other => {
                 self.status_message = Some(format!(
-                    "unknown /mcp subcommand {other:?}; expected list|add|remove|test|trust|deny"
+                    "unknown /mcp subcommand {other:?}; expected list|add|remove|test|trust|deny|reauth|unauth"
                 ));
                 None
             }
@@ -4262,6 +4555,88 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             }
             Err(err) => self.status_message = Some(format!("/mcp remove failed: {err}")),
         }
+        None
+    }
+
+    /// Browser login is an operator action, with the same abort lane as a turn.
+    /// No agent lock is held while the callback waits for the browser.
+    fn mcp_handle_auth(
+        &mut self,
+        manager: &std::sync::Arc<crate::mcp::McpManager>,
+        subcommand: &str,
+        name: &str,
+    ) -> Option<Cmd> {
+        if name.is_empty() || name.contains(['\r', '\n']) {
+            self.status_message = Some(format!("usage: /mcp {subcommand} <name>"));
+            return None;
+        }
+        if self.agent_state != AgentState::Idle || self.bash_running {
+            self.status_message = Some("MCP authentication needs an idle session".to_string());
+            return None;
+        }
+        let name = name.to_string();
+        let subcommand = subcommand.to_string();
+        let manager = Arc::clone(manager);
+        let agent = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        let owner = crate::agent_cx::AgentCx::for_current_or_request();
+        let (abort_handle, abort_signal) = AbortHandle::new();
+        self.abort_handle = Some(abort_handle);
+        self.agent_state = AgentState::Processing;
+        self.status_message = Some(format!("MCP {subcommand} {name:?} (Esc to cancel)…"));
+        let request_id = uuid::Uuid::new_v4().to_string();
+        self.mcp_auth_request_id = Some(request_id.clone());
+        self.runtime_handle.spawn(async move {
+            let output_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let callback_failed = Arc::clone(&output_failed);
+            let callback_tx = event_tx.clone();
+            let on_url: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |url| {
+                if callback_tx.try_send(PiMsg::SystemNote(format!(
+                    "Open this URL to sign in to the MCP server:\n{url}\n"
+                ))).is_err() {
+                    callback_failed.store(true, Ordering::Release);
+                }
+            });
+            let work = owner.with_current(async {
+                if subcommand == "reauth" {
+                    manager.reauthenticate(&name, None, on_url).await
+                } else {
+                    manager.unauthenticate(&name).await
+                }
+            });
+            let cancelled = async {
+                while !abort_signal.is_aborted()
+                    && !owner.is_cancel_requested()
+                    && !output_failed.load(Ordering::Acquire)
+                {
+                    owner.time().sleep(std::time::Duration::from_millis(10)).await;
+                }
+            };
+            let outcome = match futures::future::select(
+                Box::pin(cancelled), Box::pin(work),
+            ).await {
+                futures::future::Either::Left(((), pending)) => {
+                    drop(pending);
+                    Err(crate::error::Error::tool(
+                        "mcp", "[MCP_AUTH_CANCELLED] authentication cancelled or sign-in URL could not be delivered",
+                    ))
+                }
+                futures::future::Either::Right((result, _)) => result,
+            };
+            let cleanup = Cx::for_request();
+            if let Ok(agent) = agent.lock(&cleanup).await {
+                crate::mcp::reconcile_tools(&manager, &agent.shared_tools());
+            }
+            let message = match outcome {
+                Ok(()) if subcommand == "unauth" =>
+                    format!("Removed the managed login for MCP server {name:?}; its connection and tools were retired. Trust is unchanged."),
+                Ok(()) => format!("Signed in to MCP server {name:?}; its tool catalog has been refreshed."),
+                Err(error) => format!("MCP {name:?}: {error}"),
+            };
+            let _ = enqueue_pi_event(
+                &event_tx, &cleanup, PiMsg::McpAuthFinished { request_id, message },
+            ).await;
+        });
         None
     }
 
@@ -4467,8 +4842,8 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 mod tests {
     use super::{AgentState, PendingInput, PendingLoginKind, PiApp, SlashCommand};
     use super::{
-        ExcludedBashPersistenceOutcome, PiMsg, parse_bash_command, parse_extension_command,
-        persist_excluded_bash_execution, should_show_startup_oauth_hint, spawn_bash_completion,
+        BashPersistenceOutcome, PiMsg, parse_bash_command, parse_extension_command,
+        persist_bash_execution, should_show_startup_oauth_hint, spawn_bash_completion,
     };
     use crate::agent::{Agent, AgentConfig, QueuedAgentMessage};
     use crate::auth::{AuthCredential, AuthStorage};
@@ -4476,7 +4851,7 @@ mod tests {
     use crate::extensions::ExtensionManager;
     use crate::keybindings::KeyBindings;
     use crate::model::{Message as ModelMessage, StreamEvent, Usage, UserContent, UserMessage};
-    use crate::models::{ExtensionProviderBinding, ModelEntry};
+    use crate::models::{ExtensionProviderBinding, ModelEntry, ModelRole};
     use crate::package_manager::PackageManager;
     use crate::provider::{Context, Provider, StreamOptions};
     use crate::provider::{InputType, Model, ModelCost};
@@ -4639,14 +5014,14 @@ mod tests {
         let cx = Cx::for_testing();
 
         let persisted_path = runtime().block_on(async {
-            let outcome = persist_excluded_bash_execution(
+            let outcome = persist_bash_execution(
                 Arc::clone(&session),
                 excluded_bash_message("create-once"),
                 true,
                 &cx,
             )
             .await;
-            assert_eq!(outcome, ExcludedBashPersistenceOutcome::Saved);
+            assert_eq!(outcome, BashPersistenceOutcome::Saved);
 
             let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
                 .await
@@ -4671,7 +5046,7 @@ mod tests {
         let session = Arc::new(Mutex::new(raw_session));
         let cx = Cx::for_testing();
 
-        let outcome = runtime().block_on(persist_excluded_bash_execution(
+        let outcome = runtime().block_on(persist_bash_execution(
             Arc::clone(&session),
             excluded_bash_message("charge-card-once"),
             true,
@@ -4679,7 +5054,7 @@ mod tests {
         ));
         assert_eq!(
             outcome,
-            ExcludedBashPersistenceOutcome::NotConfirmed {
+            BashPersistenceOutcome::NotConfirmed {
                 pending_mutations: Some(1),
                 failed_flushes: Some(1),
             }
@@ -4736,7 +5111,6 @@ mod tests {
                     true,
                 )),
                 "side effect completed\n\n[Output excluded from model context]".to_string(),
-                None,
             );
         });
 
@@ -4751,17 +5125,12 @@ mod tests {
                 Err(err) => panic!("bash completion was not delivered before deadline: {err}"),
             }
         };
-        let PiMsg::BashResult {
-            display,
-            content_for_agent,
-        } = result
-        else {
+        let PiMsg::BashResult { display } = result else {
             unreachable!("loop only exits with BashResult")
         };
         assert!(display.contains("side effect completed"));
         assert!(display.contains("[Persistence warning]"));
         assert!(display.contains("do not rerun"));
-        assert!(content_for_agent.is_none());
 
         let cx = Cx::for_testing();
         runtime().block_on(async {
@@ -4791,7 +5160,6 @@ mod tests {
             event_tx,
             None,
             "terminal bash result".to_string(),
-            None,
         );
 
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -4803,12 +5171,8 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             match event_rx.try_recv() {
-                Ok(PiMsg::BashResult {
-                    display,
-                    content_for_agent,
-                }) => {
+                Ok(PiMsg::BashResult { display }) => {
                     assert_eq!(display, "terminal bash result");
-                    assert!(content_for_agent.is_none());
                     break;
                 }
                 Ok(other) => panic!("unexpected event while awaiting bash result: {other:?}"),
@@ -5296,6 +5660,178 @@ mod tests {
     }
 
     #[test]
+    fn session_install_preserves_fork_spend_and_rebinds_new_or_resumed_accounts() {
+        let temp = TempDir::new().unwrap();
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        let original = crate::cost::CostBudget::new(None, Some(2.0), 1.25).unwrap();
+        app.agent
+            .try_lock()
+            .unwrap()
+            .set_cost_budget(Some(original.clone()));
+
+        runtime()
+            .block_on(PiApp::try_install_session(
+                &session,
+                &app.agent,
+                &app.session_action_admission,
+                Session::in_memory(),
+                Vec::new(),
+                None,
+                true,
+            ))
+            .unwrap();
+        assert!(
+            app.agent
+                .try_lock()
+                .unwrap()
+                .cost_budget()
+                .unwrap()
+                .same_tree(&original)
+        );
+        assert!(
+            (crate::cost::recorded_spend(&session.try_lock().unwrap()).unwrap() - 1.25).abs()
+                < f64::EPSILON
+        );
+
+        let same_session = session.try_lock().unwrap().clone();
+        runtime()
+            .block_on(PiApp::try_install_session(
+                &session,
+                &app.agent,
+                &app.session_action_admission,
+                same_session,
+                Vec::new(),
+                None,
+                false,
+            ))
+            .unwrap();
+        assert!(
+            app.agent
+                .try_lock()
+                .unwrap()
+                .cost_budget()
+                .unwrap()
+                .same_tree(&original)
+        );
+
+        let mut resumed = Session::in_memory();
+        crate::cost::CostBudget::new(None, Some(2.0), 0.5)
+            .unwrap()
+            .checkpoint(&mut resumed)
+            .unwrap();
+        runtime()
+            .block_on(PiApp::try_install_session(
+                &session,
+                &app.agent,
+                &app.session_action_admission,
+                resumed,
+                Vec::new(),
+                None,
+                false,
+            ))
+            .unwrap();
+        let resumed_budget = app
+            .agent
+            .try_lock()
+            .unwrap()
+            .cost_budget()
+            .cloned()
+            .unwrap();
+        assert!(!resumed_budget.same_tree(&original));
+        assert!((resumed_budget.spent() - 0.5).abs() < f64::EPSILON);
+        assert!(
+            app.agent
+                .try_lock()
+                .unwrap()
+                .shared_tools()
+                .snapshot()
+                .cost_scope()
+                .current()
+                .unwrap()
+                .same_tree(&resumed_budget)
+        );
+
+        runtime()
+            .block_on(PiApp::try_install_session(
+                &session,
+                &app.agent,
+                &app.session_action_admission,
+                Session::in_memory(),
+                Vec::new(),
+                None,
+                false,
+            ))
+            .unwrap();
+        let fresh = app
+            .agent
+            .try_lock()
+            .unwrap()
+            .cost_budget()
+            .cloned()
+            .unwrap();
+        assert!(!fresh.same_tree(&resumed_budget));
+        assert!(fresh.spent().abs() < f64::EPSILON);
+        assert!((original.spent() - 1.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn new_without_extensions_saves_departing_shared_spend_before_reset() {
+        let temp = TempDir::new().unwrap();
+        let mut initial = Session::create_with_dir(Some(temp.path().join("sessions")));
+        initial.header.cwd = temp.path().display().to_string();
+        runtime().block_on(initial.save()).unwrap();
+        let source_path = initial.path.clone().unwrap();
+        let session = Arc::new(Mutex::new(initial));
+        let (mut app, mut events) = build_bash_test_app(session, temp.path());
+        let original_id = current_session_id(&app);
+        let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.75).unwrap();
+        app.agent
+            .try_lock()
+            .unwrap()
+            .set_cost_budget(Some(budget.clone()));
+        let _ = app.handle_slash_command(SlashCommand::New, "");
+        let terminal = runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(10),
+                events.recv(&cx),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        });
+        assert!(
+            matches!(terminal, PiMsg::ConversationReset { .. }),
+            "{terminal:?}"
+        );
+        let _ = app.handle_pi_message(terminal);
+        assert_ne!(current_session_id(&app), original_id);
+        let active = app
+            .agent
+            .try_lock()
+            .unwrap()
+            .cost_budget()
+            .cloned()
+            .unwrap();
+        assert!(!active.same_tree(&budget));
+        assert!(active.spent().abs() < f64::EPSILON);
+        let saved = runtime()
+            .block_on(Session::open(source_path.to_str().unwrap()))
+            .unwrap();
+        assert!((crate::cost::recorded_spend(&saved).unwrap() - 0.75).abs() < f64::EPSILON);
+        let original_transcript = std::fs::read(&source_path).unwrap();
+        budget.record(0.125).unwrap();
+        let saved = runtime()
+            .block_on(Session::open(source_path.to_str().unwrap()))
+            .unwrap();
+        assert!((crate::cost::recorded_spend(&saved).unwrap() - 0.875).abs() < f64::EPSILON);
+        assert_eq!(std::fs::read(&source_path).unwrap(), original_transcript);
+        assert!(active.spent().abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn atomic_session_install_does_not_mutate_agent_when_session_is_busy() {
         let temp = TempDir::new().expect("tempdir");
         let session = Arc::new(Mutex::new(Session::in_memory()));
@@ -5321,6 +5857,7 @@ mod tests {
             Session::in_memory(),
             vec![replacement_message],
             None,
+            false,
         ));
 
         assert!(result.is_err());
@@ -5481,18 +6018,13 @@ mod tests {
             }
         };
 
-        let PiMsg::BashResult {
-            display,
-            content_for_agent,
-        } = &result_message
-        else {
+        let PiMsg::BashResult { display } = &result_message else {
             unreachable!("loop only exits with BashResult")
         };
         assert!(display.contains("side-effect-output"));
         assert!(display.contains("[Output excluded from model context]"));
         assert!(display.contains("[Persistence warning]"));
         assert!(display.contains("do not rerun"));
-        assert!(content_for_agent.is_none());
         let delivered_at = chrono::Utc::now().timestamp_millis();
         assert!(
             !display.contains(blocked_path.to_string_lossy().as_ref()),
@@ -5525,6 +6057,68 @@ mod tests {
         });
     }
 
+    /// `!cmd` used to submit its output as a prompt, so every shell command
+    /// started a model turn. OMP's bash runner records the run instead: the
+    /// output joins the context the next prompt sends, and nothing runs now.
+    #[test]
+    fn bang_command_is_recorded_for_the_next_prompt_without_starting_a_turn() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+            temp.path().join("sessions"),
+        ))));
+        let (mut app, mut event_rx) = build_bash_test_app(Arc::clone(&session), temp.path());
+
+        let command = "printf bang-output";
+        let _ = app.submit_bash_command(&format!("!{command}"), command.to_string(), false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let display = loop {
+            match event_rx.try_recv() {
+                Ok(PiMsg::BashResult { display }) => break display,
+                Ok(_) | Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(other) => panic!("unexpected event after bash deadline: {other:?}"),
+                Err(err) => panic!("bash result was not delivered before deadline: {err}"),
+            }
+        };
+        assert!(display.contains("bang-output"), "{display}");
+        assert!(!display.contains("[Output excluded"), "{display}");
+
+        let follow_up = app.handle_pi_message(PiMsg::BashResult { display });
+        assert!(follow_up.is_none(), "a `!` run must not start a turn");
+        assert_eq!(app.agent_state, AgentState::Idle);
+
+        runtime().block_on(async {
+            let cx = Cx::for_testing();
+            let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock session");
+            let records = guard
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    SessionEntry::Message(message) => match &message.message {
+                        SessionMessage::BashExecution {
+                            command,
+                            output,
+                            extra,
+                            ..
+                        } => Some((command.clone(), output.clone(), extra.is_empty())),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                records,
+                vec![(command.to_string(), "bang-output".to_string(), true)]
+            );
+            let context = serde_json::to_string(&guard.to_messages_for_current_path())
+                .expect("serialize context");
+            assert!(context.contains("bang-output"), "{context}");
+        });
+    }
+
     fn empty_auth_storage() -> AuthStorage {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -5545,6 +6139,7 @@ mod tests {
                 reasoning: true,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -5616,6 +6211,16 @@ mod tests {
         vision.model.input.push(InputType::Image);
         let text = test_model_entry("dummy", "text-model");
         app.available_models = vec![vision.clone(), text.clone()];
+        // Session restores resolve against the session registry that PiApp
+        // seeds at construction, not the later-replaced picker list.
+        app.agent
+            .try_lock()
+            .expect("agent")
+            .handle
+            .session_mut()
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(
+                app.available_models.clone(),
+            ));
 
         for entry in [&vision, &text, &vision] {
             {
@@ -5640,6 +6245,177 @@ mod tests {
             assert!(Arc::ptr_eq(&provider, &agent.provider()));
             assert_eq!(agent.model_accepts_images(), accepts_images);
         }
+    }
+
+    #[test]
+    fn classic_model_commands_switch_declared_aliases_without_losing_the_route() {
+        for reverse in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+            app.save_enabled = false;
+            let mut native = test_model_entry("openrouter", "vendor/shared");
+            native.model.api = "openai-completions".to_string();
+            native
+                .headers
+                .insert("x-route".to_string(), "native".to_string());
+            let mut custom = native.clone();
+            custom.model.provider = "open-router".to_string();
+            custom.model.base_url = "https://declared.example.test/v1".to_string();
+            custom
+                .headers
+                .insert("x-route".to_string(), "declared".to_string());
+            let mut catalog = vec![native.clone(), custom.clone()];
+            if reverse {
+                catalog.reverse();
+            }
+            app.available_models = catalog.clone();
+            app.agent
+                .try_lock()
+                .expect("agent")
+                .handle
+                .session_mut()
+                .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(
+                    catalog,
+                ));
+            for target in [&native, &custom, &native] {
+                let spec = format!("{}/{}", target.model.provider, target.model.id);
+                let _ = app.handle_slash_model(&spec);
+                assert_eq!(app.model_entry.model.provider, target.model.provider);
+                assert_eq!(app.model_entry.model.base_url, target.model.base_url);
+                assert_eq!(app.model_entry.headers, target.headers);
+                let running = {
+                    let agent = app.agent.try_lock().expect("running agent");
+                    assert_eq!(agent.provider().name(), target.model.provider);
+                    assert_eq!(agent.provider().model_id(), target.model.id);
+                    assert_eq!(agent.stream_options().headers, target.headers);
+                    agent.provider()
+                };
+                let before = session.try_lock().expect("session").entries.len();
+                let _ = app.handle_slash_model(&spec);
+                assert_eq!(session.try_lock().expect("session").entries.len(), before);
+                assert!(Arc::ptr_eq(
+                    &running,
+                    &app.agent.try_lock().expect("agent").provider()
+                ));
+                assert_eq!(
+                    session
+                        .try_lock()
+                        .expect("session")
+                        .effective_model_for_current_path(),
+                    Some((target.model.provider.clone(), target.model.id.clone())),
+                );
+            }
+            let _ = app.handle_slash_model("plan open-router/vendor/shared");
+            assert_eq!(
+                app.role_model_overrides.get(&ModelRole::Plan),
+                Some(&("open-router".to_string(), "vendor/shared".to_string())),
+            );
+            app.switch_to_role_spec("open-router/vendor/shared", "plan-role")
+                .expect("switch to the declared plan model");
+            assert_eq!(app.model_entry.model.provider, "open-router");
+            assert_eq!(app.model_entry.headers, custom.headers);
+
+            // A branch/extension selection must reach the same runtime route.
+            session
+                .try_lock()
+                .expect("session")
+                .append_model_change(native.model.provider.clone(), native.model.id.clone());
+            app.sync_runtime_selection_from_session_header()
+                .expect("restore exact provider");
+            assert_eq!(app.model_entry.model.provider, "openrouter");
+            assert_eq!(
+                app.agent
+                    .try_lock()
+                    .expect("agent")
+                    .stream_options()
+                    .headers,
+                native.headers
+            );
+        }
+    }
+
+    #[test]
+    fn classic_explicit_resolution_keeps_providers_hidden_from_the_ready_picker() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        app.save_enabled = false;
+        let native = test_model_entry("openrouter", "vendor/shared");
+        let mut custom = test_model_entry("open-router", "vendor/shared");
+        custom.api_key = None;
+        custom.model.base_url = "https://unready-declared.example.test/v1".to_string();
+        let mut native_only = native.clone();
+        native_only.model.id = "vendor/unlisted".to_string();
+        app.available_models = vec![native.clone(), native_only.clone()];
+        app.agent
+            .try_lock()
+            .expect("agent")
+            .handle
+            .session_mut()
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(vec![
+                native,
+                native_only,
+                custom,
+            ]));
+        let resolved = app
+            .requested_model_entry("open-router", "vendor/shared", true)
+            .expect("catalog lookup")
+            .expect("unready declared entry");
+        assert_eq!(resolved.model.provider, "open-router");
+        assert_eq!(
+            resolved.model.base_url,
+            "https://unready-declared.example.test/v1"
+        );
+        assert!(resolved.api_key.is_none());
+        let before = session.try_lock().expect("session").entries.len();
+        let _ = app.handle_slash_model("open-router/vendor/unlisted");
+        assert!(
+            app.status_message
+                .as_deref()
+                .expect("diagnostic")
+                .contains("Model not found")
+        );
+        assert_eq!(app.model_entry.model.provider, "dummy");
+        assert_eq!(session.try_lock().expect("session").entries.len(), before);
+        let error = app
+            .switch_to_role_spec("open-router/vendor/unlisted", "plan-role")
+            .expect_err("a missing role model must return an actionable failure");
+        assert!(error.contains("open-router/vendor/unlisted"));
+        assert!(error.contains("/model"));
+        assert_eq!(app.model_entry.model.provider, "dummy");
+        assert_eq!(session.try_lock().expect("session").entries.len(), before);
+    }
+
+    #[test]
+    fn classic_undeclared_native_alias_is_an_idempotent_command() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        app.save_enabled = false;
+        let mut native = test_model_entry("openrouter", "vendor/shared");
+        native.model.api = "openai-completions".to_string();
+        app.available_models = vec![native.clone()];
+        // Explicit commands resolve against the session registry that PiApp
+        // seeds at construction, not the later-replaced picker list.
+        app.agent
+            .try_lock()
+            .expect("agent")
+            .handle
+            .session_mut()
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(vec![
+                native,
+            ]));
+        let _ = app.handle_slash_model("openrouter/vendor/shared");
+        let before = session.try_lock().expect("session").entries.len();
+        let running = app.agent.try_lock().expect("agent").provider();
+        let _ = app.handle_slash_model("open-router/vendor/shared");
+        assert_eq!(app.model_entry.model.provider, "openrouter");
+        assert_eq!(session.try_lock().expect("session").entries.len(), before);
+        assert!(Arc::ptr_eq(
+            &running,
+            &app.agent.try_lock().expect("agent").provider()
+        ));
     }
 
     #[test]
@@ -5906,10 +6682,12 @@ mod tests {
     }
 
     #[test]
-    fn model_entry_matches_provider_aliases_case_insensitively() {
+    fn resolved_model_entries_keep_declared_aliases_distinct() {
         let left = test_model_entry("openrouter", "openai/gpt-4o-mini");
         let right = test_model_entry("open-router", "openai/gpt-4o-mini");
-        assert!(super::model_entry_matches(&left, &right));
+        assert!(!super::model_entry_matches(&left, &right));
+        let same = test_model_entry(" OpenRouter ", "OPENAI/GPT-4O-MINI");
+        assert!(super::model_entry_matches(&left, &same));
     }
 
     #[test]
@@ -5929,7 +6707,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_scoped_model_entries_dedupes_provider_alias_variants() {
+    fn resolve_scoped_model_entries_preserves_separately_declared_aliases() {
         let available = vec![
             test_model_entry("openrouter", "openai/gpt-4o-mini"),
             test_model_entry("open-router", "openai/gpt-4o-mini"),
@@ -5938,7 +6716,11 @@ mod tests {
         let resolved = super::resolve_scoped_model_entries(&patterns, &available)
             .expect("resolve scoped models");
         assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].model.provider, "openrouter");
         assert_eq!(resolved[0].model.id, "openai/gpt-4o-mini");
+        let resolved = super::resolve_scoped_model_entries(&["*".to_string()], &available)
+            .expect("both declared providers remain in the scope");
+        assert_eq!(resolved.len(), 2);
     }
 
     #[test]

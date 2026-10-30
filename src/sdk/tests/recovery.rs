@@ -772,6 +772,422 @@ fn every_entrypoint_resumes_instead_of_replaying_user_input() {
     }
 }
 
+struct CredentialRetryProvider {
+    keys: Arc<Mutex<Vec<Option<String>>>>,
+    streamed_failure: bool,
+    failures: usize,
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl crate::provider::Provider for CredentialRetryProvider {
+    fn name(&self) -> &str {
+        "openai"
+    }
+
+    fn api(&self) -> &str {
+        "test-api"
+    }
+
+    fn model_id(&self) -> &str {
+        "credential-retry"
+    }
+
+    async fn stream(
+        &self,
+        _context: &crate::provider::Context<'_>,
+        options: &crate::provider::StreamOptions,
+    ) -> Result<
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<crate::model::StreamEvent>> + Send>>,
+    > {
+        let failed = {
+            let mut keys = self.keys.lock().unwrap();
+            keys.push(options.api_key.clone());
+            keys.len() <= self.failures
+        };
+        if failed && !self.streamed_failure {
+            return Err(Error::provider("openai", "HTTP 429: rate limit exceeded"));
+        }
+        let message = AssistantMessage {
+            api: self.api().to_string(),
+            provider: self.name().to_string(),
+            model: self.model_id().to_string(),
+            content: if failed {
+                Vec::new()
+            } else {
+                vec![ContentBlock::Text(TextContent::new(
+                    "credential retry completed",
+                ))]
+            },
+            stop_reason: if failed {
+                StopReason::Error
+            } else {
+                StopReason::Stop
+            },
+            error_message: failed.then(|| "HTTP 429: rate limit exceeded".to_string()),
+            ..Default::default()
+        };
+        let event = if failed {
+            crate::model::StreamEvent::Error {
+                reason: StopReason::Error,
+                error: message,
+            }
+        } else {
+            crate::model::StreamEvent::Done {
+                reason: StopReason::Stop,
+                message,
+            }
+        };
+        Ok(Box::pin(futures::stream::iter(vec![Ok(event)])))
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn rate_limit_retries_rotate_credentials_and_preserve_explicit_pins() {
+    const CHILD: &str = "PI_SDK_CREDENTIAL_RETRY_CHILD";
+    // Keep process-global environment and credential rings out of the other
+    // tests. The child runs this exact test, with synthetic keys and no network.
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sdk::tests::recovery::rate_limit_retries_rotate_credentials_and_preserve_explicit_pins",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("OPENAI_API_KEYS", "rotation-fixture-a,rotation-fixture-b")
+            .env_remove("OPENAI_API_KEY")
+            .env("PI_DEBUG_ROTATION", "1")
+            .output()
+            .expect("run isolated credential retry fixture");
+        assert!(
+            output.status.success(),
+            "credential retry fixture failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        assert!(diagnostics.contains("key_present=true"));
+        for key in ["rotation-fixture-a", "rotation-fixture-b"] {
+            assert!(
+                !diagnostics.contains(key),
+                "rotation diagnostics exposed a key"
+            );
+        }
+        return;
+    }
+
+    for entrypoint in ENTRYPOINTS {
+        for streamed_failure in [false, true] {
+            for pin in [None, Some("session"), Some("failover")] {
+                crate::auth::reset_credential_rings_for_tests();
+                let directory = tempdir().unwrap();
+                let auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+                let initial = auth.resolve_api_key("openai", None).unwrap();
+                let keys = Arc::new(Mutex::new(Vec::new()));
+                let (handle, _) = flaky_handle_as(0, "openai", "credential-retry");
+                let mut handle = handle.with_retry(Some(fast_retry_policy(1)));
+                handle
+                    .session
+                    .agent
+                    .set_provider(Arc::new(CredentialRetryProvider {
+                        keys: Arc::clone(&keys),
+                        streamed_failure,
+                        failures: 1,
+                    }));
+                handle.session.agent.stream_options_mut().api_key = Some(initial.clone());
+                handle.session.set_auth_storage(auth.clone());
+                if pin == Some("session") {
+                    handle.session.set_api_key_override(Some(initial.clone()));
+                } else if pin == Some("failover") {
+                    handle = handle.with_failover(Some(FailoverOptions {
+                        chains: std::collections::HashMap::new(),
+                        available_models: Vec::new(),
+                        auth: auth.clone(),
+                        cli_api_key: Some(initial.clone()),
+                        cooldown_secs: 300,
+                    }));
+                }
+                let result = run_async(invoke(&mut handle, entrypoint, Arc::new(|_| {})))
+                    .expect("retry with credential rotation");
+                assert_eq!(result.stop_reason, StopReason::Stop);
+                let keys = keys.lock().unwrap();
+                assert_eq!(keys.len(), 2, "one admitted retry: {entrypoint:?}");
+                assert_eq!(keys[0].as_deref(), Some(initial.as_str()));
+                if pin.is_some() {
+                    assert_eq!(keys[1], keys[0], "explicit key stays pinned");
+                } else {
+                    assert_ne!(keys[1], keys[0], "rate-limited key must rotate");
+                    assert_eq!(keys[1], auth.resolve_api_key("openai", None));
+                }
+                let messages = run_async(handle.messages()).unwrap();
+                let expected_users = usize::from(matches!(
+                    entrypoint,
+                    Entrypoint::Prompt | Entrypoint::PromptWithAbort
+                ));
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|message| matches!(message, Message::User(_)))
+                        .count(),
+                    expected_users,
+                    "rotation must not replay authored input",
+                );
+            }
+        }
+    }
+
+    crate::auth::reset_credential_rings_for_tests();
+    let directory = tempdir().unwrap();
+    let auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+    let initial = auth.resolve_api_key("openai", None).unwrap();
+    let keys = Arc::new(Mutex::new(Vec::new()));
+    let (handle, _) = flaky_handle_as(0, "openai", "credential-retry");
+    let mut handle = handle.with_retry(Some(fast_retry_policy(1)));
+    handle
+        .session
+        .agent
+        .set_provider(Arc::new(CredentialRetryProvider {
+            keys: Arc::clone(&keys),
+            streamed_failure: false,
+            failures: 1,
+        }));
+    handle.session.agent.stream_options_mut().api_key = Some(initial.clone());
+    handle.session.set_auth_storage(auth.clone());
+    let (abort, signal) = AbortHandle::new();
+    let result = run_async(
+        handle.prompt_with_abort("cancel retry", signal, move |event| {
+            if matches!(event, AgentEvent::AutoRetryStart { .. }) {
+                abort.abort();
+            }
+        }),
+    );
+    assert!(matches!(result, Err(Error::Aborted)));
+    assert_eq!(keys.lock().unwrap().len(), 1);
+    assert_eq!(auth.resolve_api_key("openai", None), Some(initial));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn exhausted_credential_pools_fence_later_prompts_and_preserve_pins() {
+    const CHILD: &str = "PI_SDK_CREDENTIAL_EXHAUSTION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sdk::tests::recovery::exhausted_credential_pools_fence_later_prompts_and_preserve_pins",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("OPENAI_API_KEYS", "exhaustion-pool-a,exhaustion-pool-b")
+            .env("OPENAI_API_KEY", "must-not-use-singular")
+            .env_remove("PI_DEBUG_ROTATION")
+            .output()
+            .expect("isolated credential exhaustion fixture");
+        assert!(
+            output.status.success(),
+            "credential exhaustion fixture failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+
+    for entrypoint in ENTRYPOINTS {
+        for streamed_failure in [false, true] {
+            for max_retries in [1, 5] {
+                for with_registry in [false, true] {
+                    crate::auth::reset_credential_rings_for_tests();
+                    let directory = tempdir().unwrap();
+                    let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+                    auth.set(
+                        "openai",
+                        crate::auth::AuthCredential::ApiKey {
+                            key: "must-not-use-stored".to_string(),
+                        },
+                    );
+                    let initial = auth.resolve_api_key("openai", None).unwrap();
+                    let keys = Arc::new(Mutex::new(Vec::new()));
+                    let (handle, _) = flaky_handle_as(0, "openai", "credential-retry");
+                    let mut handle = handle.with_retry(Some(fast_retry_policy(max_retries)));
+                    handle
+                        .session
+                        .agent
+                        .set_provider(Arc::new(CredentialRetryProvider {
+                            keys: Arc::clone(&keys),
+                            streamed_failure,
+                            failures: 2,
+                        }));
+                    handle.session.agent.stream_options_mut().api_key = Some(initial.clone());
+                    handle.session.set_auth_storage(auth.clone());
+                    if with_registry {
+                        let mut entry = recovery_route_entry("openai", "credential-retry");
+                        entry.api_key = Some("must-not-use-catalog".to_string());
+                        handle
+                            .session
+                            .set_model_registry(ModelRegistry::from_entries_for_tests(vec![entry]));
+                    }
+                    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+                    let observed = Arc::clone(&events);
+                    let error = run_async(invoke(
+                        &mut handle,
+                        entrypoint,
+                        Arc::new(move |event| {
+                            observed
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::to_value(event).unwrap());
+                        }),
+                    ))
+                    .expect_err("the third request must not use a cooled or lower-priority key");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(crate::auth::CREDENTIAL_POOL_EXHAUSTED)
+                    );
+                    let requests = keys.lock().unwrap().clone();
+                    assert_eq!(
+                        requests.len(),
+                        2,
+                        "{entrypoint:?}/{max_retries}/{with_registry}"
+                    );
+                    assert_eq!(requests[0].as_deref(), Some(initial.as_str()));
+                    assert_ne!(requests[0], requests[1]);
+                    for key in requests.iter().flatten() {
+                        assert!(["exhaustion-pool-a", "exhaustion-pool-b"].contains(&key.as_str()));
+                    }
+                    assert!(matches!(
+                        auth.resolve_api_key_status("openai", None),
+                        crate::auth::CredentialResolution::Exhausted { .. }
+                    ));
+                    // A terminal quota error is recorded once, including when
+                    // the retry budget ended before another retry preparation.
+                    let ring = crate::auth::credential_ring_for_tests("openai").unwrap();
+                    assert_eq!(
+                        ring.cooling_count(
+                            std::time::Instant::now() + std::time::Duration::from_secs(16)
+                        ),
+                        0
+                    );
+                    let events = events.lock().unwrap();
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| event["type"] == "auto_retry_start")
+                            .count(),
+                        events
+                            .iter()
+                            .filter(|event| event["type"] == "auto_retry_end")
+                            .count()
+                    );
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| event["type"] == "agent_end")
+                            .count(),
+                        1
+                    );
+                    assert!(
+                        events.last().unwrap()["error"]
+                            .as_str()
+                            .unwrap()
+                            .contains(crate::auth::CREDENTIAL_POOL_EXHAUSTED)
+                    );
+                    drop(events);
+
+                    let messages_before =
+                        serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap();
+                    let entries_before =
+                        serde_json::to_value(&handle.session_store().try_lock().unwrap().entries)
+                            .unwrap();
+                    for later in ENTRYPOINTS {
+                        let error = run_async(invoke(&mut handle, later, Arc::new(|_| {})))
+                            .expect_err("already exhausted admission must be refused");
+                        assert!(
+                            error
+                                .to_string()
+                                .contains(crate::auth::CREDENTIAL_POOL_EXHAUSTED)
+                        );
+                        assert_eq!(keys.lock().unwrap().len(), 2);
+                        assert_eq!(
+                            serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap(),
+                            messages_before
+                        );
+                        assert_eq!(
+                            serde_json::to_value(
+                                &handle.session_store().try_lock().unwrap().entries
+                            )
+                            .unwrap(),
+                            entries_before
+                        );
+                    }
+
+                    // Both explicit pin sources outrank a managed pool even
+                    // when the chosen key is one of its cooling members.
+                    if with_registry {
+                        handle.session.set_api_key_override(Some(initial.clone()));
+                    } else {
+                        handle = handle.with_failover(Some(FailoverOptions {
+                            chains: HashMap::new(),
+                            available_models: Vec::new(),
+                            auth,
+                            cli_api_key: Some(initial.clone()),
+                            cooldown_secs: 300,
+                        }));
+                    }
+                    let result =
+                        run_async(handle.prompt("explicit pinned request", |_| {})).unwrap();
+                    assert_eq!(result.stop_reason, StopReason::Stop);
+                    let requests = keys.lock().unwrap();
+                    assert_eq!(requests.len(), 3);
+                    assert_eq!(requests[2].as_deref(), Some(initial.as_str()));
+                }
+            }
+        }
+    }
+
+    // A zero retry budget records each final failure too. With no catalog,
+    // the following prompt must install the healthy sibling resolved during
+    // admission, rather than retaining the previously installed credential.
+    for streamed_failure in [false, true] {
+        crate::auth::reset_credential_rings_for_tests();
+        let directory = tempdir().unwrap();
+        let auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+        let initial = auth.resolve_api_key("openai", None).unwrap();
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let (handle, _) = flaky_handle_as(0, "openai", "credential-retry");
+        let mut handle = handle.with_retry(Some(fast_retry_policy(0)));
+        handle
+            .session
+            .agent
+            .set_provider(Arc::new(CredentialRetryProvider {
+                keys: Arc::clone(&keys),
+                streamed_failure,
+                failures: 2,
+            }));
+        handle.session.agent.stream_options_mut().api_key = Some(initial);
+        handle.session.set_auth_storage(auth);
+        let _ = run_async(handle.prompt("first failed request", |_| {}));
+        let error = run_async(handle.prompt("second failed request", |_| {})).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(crate::auth::CREDENTIAL_POOL_EXHAUSTED)
+        );
+        let requests = keys.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(
+            requests[0], requests[1],
+            "no-registry admission installs its newly resolved key"
+        );
+        assert!(run_async(handle.prompt("blocked request", |_| {})).is_err());
+        assert_eq!(keys.lock().unwrap().len(), 2);
+    }
+}
+
 #[test]
 fn no_policy_preserves_the_first_error_on_every_entrypoint() {
     for entrypoint in ENTRYPOINTS {
@@ -1345,6 +1761,8 @@ fn saving_handle_after_failover(dir: &Path) -> (AgentSessionHandle, Arc<AtomicUs
         handle.with_retry(Some(crate::failover::RetryPolicy {
             max_retries: 0,
             max_failovers_per_turn: 1,
+            model_fallback: true,
+            fallback_on: crate::failover::FallbackOn::Any,
             base_delay_ms: 0,
             max_delay_ms: 0,
         })),
@@ -1785,6 +2203,8 @@ fn http_chain_handle(url: &str, cap: u32) -> (AgentSessionHandle, Arc<AtomicUsiz
         .with_retry(Some(crate::failover::RetryPolicy {
             max_retries: 0,
             max_failovers_per_turn: cap,
+            model_fallback: true,
+            fallback_on: crate::failover::FallbackOn::Any,
             base_delay_ms: 0,
             max_delay_ms: 0,
         }))
@@ -1805,6 +2225,81 @@ fn http_chain_handle(url: &str, cap: u32) -> (AgentSessionHandle, Arc<AtomicUsiz
             cooldown_secs: 300,
         }));
     (handle, calls)
+}
+
+#[test]
+fn configured_fallback_controls_preserve_retries_and_gate_actual_provider_requests() {
+    for (model_fallback, filter, expected_swap) in [
+        (false, "any", false),
+        (true, "usage-limit", false),
+        (true, "except-usage-limit", true),
+        (true, "any", true),
+    ] {
+        let mut server = RecoveryHttpFixture::new(vec![completion_response()]);
+        let (mut handle, calls) = http_chain_handle(&server.url, 1);
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "retry": {
+                "enabled": true,
+                "maxRetries": 1,
+                "baseDelayMs": 0,
+                "maxDelayMs": 0,
+                "modelFallback": model_fallback,
+                "fallbackOn": filter,
+            }
+        }))
+        .expect("fallback policy");
+        handle.set_retry_policy(crate::failover::RetryPolicy::from_config(&config));
+        let (events, callback) = event_log();
+        let result = run_async(handle.prompt("recover once", move |event| callback(event)))
+            .expect("provider returns a completed or errored message");
+        server.finish();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "same-model retry is retained"
+        );
+        assert_eq!(
+            result.stop_reason,
+            if expected_swap {
+                StopReason::Stop
+            } else {
+                StopReason::Error
+            }
+        );
+        assert_eq!(
+            handle.model().1,
+            if expected_swap {
+                "fallback-a"
+            } else {
+                "claude-x"
+            }
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), usize::from(expected_swap));
+        if expected_swap {
+            assert_eq!(requests[0]["model"], "fallback-a");
+        }
+        drop(requests);
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "failover_start")
+                .count(),
+            usize::from(expected_swap),
+        );
+        drop(events);
+        let messages = run_async(handle.messages()).expect("transcript");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, Message::User(_)))
+                .count(),
+            1,
+            "recovery must not duplicate the user turn"
+        );
+    }
 }
 
 #[test]
@@ -1981,6 +2476,311 @@ fn write_tool_response() -> (u16, &'static str, String) {
     )
 }
 
+fn prewalk_tool_batch(calls: &[(&str, &str, Value)]) -> (u16, &'static str, String) {
+    let calls = calls
+        .iter()
+        .enumerate()
+        .map(|(index, (id, name, args))| {
+            serde_json::json!({
+                "index": index, "id": id, "type": "function",
+                "function": {"name": name, "arguments": args.to_string()}
+            })
+        })
+        .collect::<Vec<_>>();
+    let chunk = serde_json::json!({
+        "id": "chatcmpl-prewalk", "object": "chat.completion.chunk", "created": 0,
+        "model": "walk-source",
+        "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": calls}, "finish_reason": null}]
+    });
+    let end = serde_json::json!({
+        "id": "chatcmpl-prewalk",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+    });
+    (
+        200,
+        "text/event-stream",
+        format!("data: {chunk}\n\ndata: {end}\n\ndata: [DONE]\n\n"),
+    )
+}
+
+fn prewalk_http_handle(
+    dir: &Path,
+    source_url: &str,
+    target_url: &str,
+    with_todo: bool,
+    max_tool_iterations: usize,
+) -> AgentSessionHandle {
+    let mut source = crate::models::ad_hoc_model_entry("openai", "walk-source").unwrap();
+    source.model.api = "openai-completions".to_string();
+    source.model.base_url = source_url.to_string();
+    source.api_key = Some("source-fixture-key".to_string());
+    let mut target = crate::models::ad_hoc_model_entry("groq", "walk-target").unwrap();
+    target.model.api = "openai-completions".to_string();
+    target.model.base_url = target_url.to_string();
+    target.model.context_window = 65_536;
+    target.model.max_tokens = 8_192;
+    target.model.input = vec![crate::provider::InputType::Text];
+    target.api_key = Some("target-fixture-key".to_string());
+    let provider = crate::providers::create_provider(&source, None).unwrap();
+    let agent = Agent::new(
+        provider,
+        ToolRegistry::new(&["write", "read"], dir, None),
+        AgentConfig {
+            system_prompt: Some("ordinary-system".to_string()),
+            max_tool_iterations,
+            stream_options: StreamOptions {
+                api_key: source.api_key.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let mut stored = Session::create_with_dir(Some(dir.join("sessions")));
+    stored.header.cwd = dir.display().to_string();
+    stored.header.provider = Some(source.model.provider.clone());
+    stored.header.model_id = Some(source.model.id.clone());
+    let mut session = AgentSession::new(
+        agent,
+        Arc::new(AsyncMutex::new(stored)),
+        true,
+        ResolvedCompactionSettings {
+            enabled: false,
+            ..Default::default()
+        },
+    );
+    session.set_model_registry(ModelRegistry::from_entries_for_tests(vec![source, target]));
+    session.set_auth_storage(AuthStorage::empty_at(dir.join("auth.json")));
+    if with_todo {
+        let stored = Arc::clone(&session.session);
+        session.agent.extend_tools(vec![
+            Box::new(crate::todo::TodoTool::new(stored)) as Box<dyn crate::tools::Tool>
+        ]);
+    }
+    AgentSessionHandle::from_session_with_listeners(session, EventListeners::new())
+}
+
+fn prewalk_destination() -> crate::prewalk::PrewalkTarget {
+    crate::prewalk::PrewalkTarget {
+        provider: "groq".to_string(),
+        model: "walk-target".to_string(),
+        thinking: Some(crate::model::ThinkingLevel::Off),
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn prewalk_cross_provider_persists_the_whole_batch_and_retains_hook_prompt_across_retry() {
+    let dir = tempdir().unwrap();
+    let mut source = RecoveryHttpFixture::new(vec![prewalk_tool_batch(&[
+        (
+            "walk-plan",
+            "todo",
+            serde_json::json!({"op":"init", "tasks":["implement both files"]}),
+        ),
+        (
+            "walk-first",
+            "write",
+            serde_json::json!({"path":"first.txt", "content":"first"}),
+        ),
+        (
+            "walk-second",
+            "write",
+            serde_json::json!({"path":"second.txt", "content":"second"}),
+        ),
+    ])]);
+    let mut target = RecoveryHttpFixture::new(vec![capacity_response(), completion_response()]);
+    let mut handle = prewalk_http_handle(dir.path(), &source.url, &target.url, true, 32)
+        .with_retry(Some(fast_retry_policy(1)));
+    install_native_content_hooks(&mut handle, &serde_json::json!({"action":"continue"}));
+    assert!(
+        run_async(handle.arm_prewalk(prewalk_destination()))
+            .unwrap()
+            .is_some()
+    );
+    let (events, callback) = event_log();
+    let store = handle.session_store();
+    let result = run_async(handle.prompt("implement both files", move |event| {
+        if matches!(event, AgentEvent::PrewalkSwitched { .. }) {
+            let saved = store.try_lock().expect("handoff releases session lock");
+            let durable = std::fs::read_to_string(saved.path.as_ref().unwrap()).unwrap();
+            assert!(durable.contains("walk-first") && durable.contains("walk-second"));
+            assert_eq!(saved.header.provider.as_deref(), Some("groq"));
+            assert_eq!(saved.header.model_id.as_deref(), Some("walk-target"));
+        }
+        callback(event);
+    }))
+    .unwrap();
+    source.finish();
+    target.finish();
+    assert_eq!(result.stop_reason, StopReason::Stop);
+    assert_eq!(
+        handle.model(),
+        ("groq".to_string(), "walk-target".to_string())
+    );
+    assert!(
+        handle.prewalk_target().is_none(),
+        "one-shot handoff is consumed"
+    );
+    assert_eq!(handle.compaction_settings().context_window_tokens, 65_536);
+    assert_eq!(
+        handle.session.agent.stream_options().max_tokens,
+        Some(8_192)
+    );
+    assert!(!handle.session.agent.model_accepts_images());
+    assert_eq!(
+        handle.session.agent.system_prompt(),
+        Some("ordinary-system")
+    );
+    assert_prompt_hook_ran_once(&handle);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("first.txt")).unwrap(),
+        "first"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("second.txt")).unwrap(),
+        "second"
+    );
+    let source_requests = source.requests.lock().unwrap();
+    assert_eq!(
+        source_requests.len(),
+        1,
+        "strong model stops at the first completed edit batch"
+    );
+    assert!(source_requests[0].to_string().contains("## Prewalk"));
+    drop(source_requests);
+    let target_requests = target.requests.lock().unwrap();
+    assert_eq!(target_requests.len(), 2, "target retry stays on the target");
+    for request in &*target_requests {
+        let messages = request["messages"].as_array().unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .count(),
+            3
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message["role"] == "user"
+                        && message["content"]
+                            .to_string()
+                            .contains("implement both files")
+                })
+                .count(),
+            1
+        );
+        assert!(request.to_string().contains("native-content-hook"));
+        assert!(!request.to_string().contains("## Prewalk"));
+    }
+    drop(target_requests);
+    let events = events.lock().unwrap();
+    for kind in ["agent_start", "agent_end", "prewalk_switched"] {
+        assert_eq!(
+            events.iter().filter(|event| event["type"] == kind).count(),
+            1,
+            "{kind}"
+        );
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "tool_execution_start")
+            .count(),
+        3
+    );
+    let path = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .path
+        .clone()
+        .unwrap();
+    let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+    assert_eq!(
+        reopened.effective_model_for_current_path(),
+        Some(handle.model())
+    );
+    assert!(!crate::todo::latest_from_entries(reopened.entries_for_current_path()).is_empty());
+    assert_eq!(
+        reopened
+            .to_messages_for_current_path()
+            .iter()
+            .filter(|message| matches!(message, Message::ToolResult(_)))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn prewalk_preserves_the_original_tool_budget_across_the_handoff() {
+    let dir = tempdir().unwrap();
+    let mut source = RecoveryHttpFixture::new(vec![write_tool_response()]);
+    let mut target = RecoveryHttpFixture::new(vec![prewalk_tool_batch(&[(
+        "over-budget",
+        "write",
+        serde_json::json!({"path":"second.txt", "content":"must not run"}),
+    )])]);
+    let mut handle = prewalk_http_handle(dir.path(), &source.url, &target.url, false, 1);
+    run_async(handle.arm_prewalk(prewalk_destination())).unwrap();
+    let result = run_async(handle.prompt("write two files", |_| {})).unwrap();
+    source.finish();
+    target.finish();
+    assert_eq!(source.requests.lock().unwrap().len(), 1);
+    assert_eq!(target.requests.lock().unwrap().len(), 1);
+    assert_eq!(result.stop_reason, StopReason::Error);
+    assert!(
+        result
+            .error_message
+            .unwrap()
+            .contains("Maximum tool iterations (1)")
+    );
+    assert!(dir.path().join("result.txt").is_file());
+    assert!(!dir.path().join("second.txt").exists());
+}
+
+#[test]
+fn prewalk_cancellation_at_the_completed_batch_never_calls_the_destination() {
+    let dir = tempdir().unwrap();
+    let mut source = RecoveryHttpFixture::new(vec![write_tool_response()]);
+    let mut target = RecoveryHttpFixture::new(vec![completion_response()]);
+    let mut handle = prewalk_http_handle(dir.path(), &source.url, &target.url, false, 32);
+    run_async(handle.arm_prewalk(prewalk_destination())).unwrap();
+    let (abort, signal) = AbortHandle::new();
+    let result = run_async(handle.prompt_with_abort("write once", signal, move |event| {
+        if matches!(event, AgentEvent::TurnEnd { ref tool_results, .. } if !tool_results.is_empty()) {
+            abort.abort();
+        }
+    }));
+    source.finish();
+    target.finish();
+    assert!(
+        matches!(&result, Err(Error::Aborted))
+            || matches!(&result, Ok(message) if message.stop_reason == StopReason::Aborted)
+    );
+    assert_eq!(handle.model().0, "openai");
+    assert!(handle.prewalk_target().is_none());
+    assert!(target.requests.lock().unwrap().is_empty());
+    assert!(dir.path().join("result.txt").is_file());
+}
+
+#[test]
+fn prewalk_waits_for_a_real_todo_list_when_the_tool_is_available() {
+    let dir = tempdir().unwrap();
+    let mut source = RecoveryHttpFixture::new(vec![write_tool_response(), completion_response()]);
+    let mut target = RecoveryHttpFixture::new(vec![completion_response()]);
+    let mut handle = prewalk_http_handle(dir.path(), &source.url, &target.url, true, 32);
+    run_async(handle.arm_prewalk(prewalk_destination())).unwrap();
+    let result = run_async(handle.prompt("edit without creating todos", |_| {})).unwrap();
+    source.finish();
+    target.finish();
+    assert_eq!(result.stop_reason, StopReason::Stop);
+    assert_eq!(handle.model().0, "openai");
+    assert!(handle.prewalk_target().is_some());
+    assert!(target.requests.lock().unwrap().is_empty());
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn real_tool_work_survives_retry_once_and_terminal_end_follows_persistence() {
@@ -2089,6 +2889,642 @@ fn real_tool_work_survives_retry_once_and_terminal_end_follows_persistence() {
         events.last().unwrap()["messages"],
         serde_json::to_value(reopened.to_messages_for_current_path()).unwrap()
     );
+}
+
+struct OverflowRecoveryProvider {
+    calls: AtomicUsize,
+    summaries: AtomicUsize,
+    large_read: std::sync::atomic::AtomicBool,
+    observed: Mutex<Vec<Vec<Message>>>,
+    write_first: bool,
+    repeat_overflow: bool,
+    summary: String,
+    abort_summary: Option<AbortHandle>,
+}
+
+#[async_trait::async_trait]
+impl Provider for OverflowRecoveryProvider {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn name(&self) -> &str {
+        "overflow-fixture"
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn api(&self) -> &str {
+        "test-api"
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn model_id(&self) -> &str {
+        "overflow-model"
+    }
+
+    async fn stream(
+        &self,
+        context: &crate::provider::Context<'_>,
+        _options: &StreamOptions,
+    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>> {
+        let is_summary = context
+            .system_prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("context summarization assistant"));
+        let (content, stop_reason) = if is_summary {
+            self.summaries.fetch_add(1, Ordering::SeqCst);
+            if let Some(abort) = &self.abort_summary {
+                abort.abort();
+                return futures::future::pending().await;
+            }
+            (
+                vec![ContentBlock::Text(TextContent::new(self.summary.clone()))],
+                StopReason::Stop,
+            )
+        } else {
+            self.observed
+                .lock()
+                .unwrap()
+                .push(context.messages.to_vec());
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let large_read = self.write_first && self.large_read.load(Ordering::SeqCst);
+            if self.write_first && call == 0 {
+                (
+                    vec![ContentBlock::ToolCall(crate::model::ToolCall {
+                        id: "overflow-write-once".to_string(),
+                        name: "write".to_string(),
+                        arguments: serde_json::json!({
+                            "path": "overflow-result.txt",
+                            "content": "completed before overflow",
+                        }),
+                        thought_signature: None,
+                    })],
+                    StopReason::ToolUse,
+                )
+            } else if large_read && call == 1 {
+                (
+                    vec![ContentBlock::ToolCall(crate::model::ToolCall {
+                        id: "overflow-read-once".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": "large-result.txt"}),
+                        thought_signature: None,
+                    })],
+                    StopReason::ToolUse,
+                )
+            } else if call == usize::from(self.write_first) + usize::from(large_read)
+                || self.repeat_overflow
+            {
+                return Err(Error::api("context_length_exceeded: prompt is too long"));
+            } else {
+                (
+                    vec![ContentBlock::Text(TextContent::new(
+                        "continued after compaction",
+                    ))],
+                    StopReason::Stop,
+                )
+            }
+        };
+        let message = AssistantMessage {
+            content,
+            api: self.api().to_string(),
+            provider: self.name().to_string(),
+            model: self.model_id().to_string(),
+            stop_reason,
+            ..Default::default()
+        };
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::Start {
+                partial: message.clone(),
+            }),
+            Ok(StreamEvent::Done {
+                reason: stop_reason,
+                message,
+            }),
+        ])))
+    }
+}
+
+fn overflow_recovery_handle(
+    dir: &Path,
+    write_first: bool,
+    repeat_overflow: bool,
+    summary: String,
+    abort_summary: Option<AbortHandle>,
+) -> (AgentSessionHandle, Arc<OverflowRecoveryProvider>) {
+    let provider = Arc::new(OverflowRecoveryProvider {
+        calls: AtomicUsize::new(0),
+        summaries: AtomicUsize::new(0),
+        large_read: std::sync::atomic::AtomicBool::new(false),
+        observed: Mutex::new(Vec::new()),
+        write_first,
+        repeat_overflow,
+        summary,
+        abort_summary,
+    });
+    let mut agent = Agent::new(
+        provider.clone(),
+        ToolRegistry::new(&["write", "read"], dir, None),
+        AgentConfig::default(),
+    );
+    agent.set_model_accepts_images(true);
+    let mut stored = Session::create_with_dir(Some(dir.join("sessions")));
+    stored.header.provider = Some(provider.name().to_string());
+    stored.header.model_id = Some(provider.model_id().to_string());
+    stored.append_model_message(Message::User(UserMessage {
+        content: UserContent::Text("earlier task with historical details ".repeat(500)),
+        timestamp: 0,
+    }));
+    stored.append_model_message(Message::Assistant(Arc::new(AssistantMessage {
+        content: vec![ContentBlock::Text(TextContent::new(
+            "earlier answer with resolved details ".repeat(500),
+        ))],
+        provider: provider.name().to_string(),
+        model: provider.model_id().to_string(),
+        stop_reason: StopReason::Stop,
+        ..Default::default()
+    })));
+    let session = AgentSession::new(
+        agent,
+        Arc::new(AsyncMutex::new(stored)),
+        true,
+        ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 128_000,
+            keep_recent_tokens: 2_000,
+            ..Default::default()
+        },
+    );
+    (
+        AgentSessionHandle::from_session_with_listeners(session, EventListeners::new()),
+        provider,
+    )
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn overflow_compaction_preserves_native_input_tools_and_durable_order_without_retry_policy() {
+    let dir = tempdir().unwrap();
+    let (mut handle, provider) = overflow_recovery_handle(
+        dir.path(),
+        true,
+        false,
+        "The earlier task was completed.".to_string(),
+        None,
+    );
+    assert!(handle.retry_policy().is_none());
+    let content = vec![
+        ContentBlock::Text(TextContent::new("write this result exactly once")),
+        ContentBlock::Image(ImageContent {
+            data: "aGVsbG8=".to_string(),
+            mime_type: "image/png".to_string(),
+        }),
+    ];
+    let expected_content = serde_json::to_value(&content).unwrap();
+    let (events, callback) = event_log();
+    let store = handle.session_store();
+    let result = run_async(handle.prompt_with_content(content, move |event| {
+        if let AgentEvent::AutoCompactionEnd {
+            result: Some(_), ..
+        } = &event
+        {
+            let stored = store
+                .try_lock()
+                .expect("compaction callback releases session lock");
+            let disk = std::fs::read_to_string(stored.path.as_ref().unwrap()).unwrap();
+            assert!(disk.contains("\"type\":\"compaction\""));
+        }
+        callback(event);
+    }))
+    .expect("overflow recovery");
+    assert_eq!(result.stop_reason, StopReason::Stop);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    assert!(provider.summaries.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("overflow-result.txt")).unwrap(),
+        "completed before overflow"
+    );
+    let observed = provider.observed.lock().unwrap();
+    let resumed = observed.last().unwrap();
+    assert_eq!(
+        resumed
+            .iter()
+            .filter(|message| matches!(
+                message, Message::ToolResult(result)
+                    if result.tool_call_id == "overflow-write-once"
+            ))
+            .count(),
+        1,
+    );
+    assert_eq!(
+        resumed
+            .iter()
+            .filter(|message| matches!(
+                message, Message::User(UserMessage { content: UserContent::Blocks(blocks), .. })
+                    if serde_json::to_value(blocks).unwrap() == expected_content
+            ))
+            .count(),
+        1,
+        "accepted images and user input must not be replayed or flattened",
+    );
+    assert!(
+        crate::compaction::estimate_model_context_tokens(resumed)
+            < crate::compaction::estimate_model_context_tokens(&observed[1])
+    );
+    drop(observed);
+    let events = events.lock().unwrap();
+    let compaction_end = events
+        .iter()
+        .find(|event| event["type"] == "auto_compaction_end")
+        .unwrap();
+    assert_eq!(compaction_end["willRetry"], true);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "tool_execution_start")
+            .count(),
+        1,
+    );
+    assert_eq!(lifecycle_names(&events), ["agent_start", "agent_end"]);
+    let path = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .path
+        .clone()
+        .unwrap();
+    let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+    // The overflow summary is re-stamped on every projection, so only its
+    // timestamp may differ between the live context and the reopened file.
+    let (live, durable) =
+        reopened.current_path_comparison_values(&run_async(handle.messages()).unwrap());
+    assert_eq!(durable, live);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn overflow_keeps_native_request_and_large_completed_tool_tail_or_stops_without_history() {
+    for older_history in [false, true] {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("large-result.txt"),
+            "large completed result with detailed evidence\n".repeat(1_000),
+        )
+        .unwrap();
+        let (mut handle, provider) = overflow_recovery_handle(
+            dir.path(),
+            true,
+            false,
+            "The earlier task was completed.".to_string(),
+            None,
+        );
+        provider.large_read.store(true, Ordering::SeqCst);
+        if !older_history {
+            let mut fresh = Session::create_with_dir(Some(dir.path().join("sessions")));
+            fresh.header.provider = Some(provider.name().to_string());
+            fresh.header.model_id = Some(provider.model_id().to_string());
+            *handle.session_store().try_lock().unwrap() = fresh;
+        }
+        let content = native_content_fixture();
+        let expected = serde_json::to_value(&content).unwrap();
+        let (events, callback) = event_log();
+        let result = run_async(handle.prompt_with_content(content, move |event| callback(event)));
+        if older_history {
+            assert_eq!(
+                result.expect("compacted older prefix").stop_reason,
+                StopReason::Stop
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+            assert_eq!(provider.summaries.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(result.is_err(), "active-only overflow must stop");
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+            assert_eq!(provider.summaries.load(Ordering::SeqCst), 0);
+        }
+        let observed = provider.observed.lock().unwrap();
+        let before_overflow = &observed[2];
+        let input_index = before_overflow
+            .iter()
+            .rposition(|message| matches!(message, Message::User(_)))
+            .unwrap();
+        let protected_tail = &before_overflow[input_index..];
+        assert!(
+            crate::compaction::estimate_model_context_tokens(protected_tail)
+                > u64::from(handle.session.compaction_settings().keep_recent_tokens),
+            "the active tool tail must exercise the ordinary split-turn cut",
+        );
+        let messages = run_async(handle.messages()).unwrap();
+        let retained = if older_history {
+            observed.last().unwrap()
+        } else {
+            &messages
+        };
+        let kept_input_index = retained
+            .iter()
+            .rposition(|message| {
+                matches!(
+                    message, Message::User(UserMessage { content: UserContent::Blocks(blocks), .. })
+                        if serde_json::to_value(blocks).unwrap() == expected
+                )
+            })
+            .expect("exact native user blocks retained");
+        assert_eq!(
+            serde_json::to_value(&retained[kept_input_index..]).unwrap(),
+            serde_json::to_value(protected_tail).unwrap(),
+            "current media and both completed tool pairs must remain byte-for-byte",
+        );
+        for call_id in ["overflow-write-once", "overflow-read-once"] {
+            assert_eq!(
+                retained
+                    .iter()
+                    .filter(|message| matches!(
+                        message, Message::ToolResult(result) if result.tool_call_id == call_id
+                    ))
+                    .count(),
+                1,
+            );
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "tool_execution_start")
+                .count(),
+            2,
+        );
+        assert_eq!(lifecycle_names(&events), ["agent_start", "agent_end"]);
+        let path = handle
+            .session_store()
+            .try_lock()
+            .unwrap()
+            .path
+            .clone()
+            .unwrap();
+        let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+        // The overflow summary is re-stamped on every projection; the retained
+        // native input and tool pairs keep their authored timestamps.
+        let (live, durable) = reopened.current_path_comparison_values(&messages);
+        assert_eq!(durable, live);
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::significant_drop_tightening)] // `end` borrows the events guard
+fn overflow_rejects_extension_cuts_that_discard_current_input_or_name_unknown_entries() {
+    for unknown_cut in [false, true] {
+        let dir = tempdir().unwrap();
+        let (mut handle, provider) = overflow_recovery_handle(
+            dir.path(),
+            false,
+            false,
+            "unused provider summary".to_string(),
+            None,
+        );
+        let late_cut = {
+            let store = handle.session_store();
+            let mut stored = store.try_lock().unwrap();
+            stored.append_model_message(Message::User(UserMessage {
+                content: UserContent::Blocks(native_content_fixture()),
+                timestamp: 0,
+            }));
+            let late_cut =
+                stored.append_model_message(Message::Assistant(Arc::new(AssistantMessage {
+                    content: vec![ContentBlock::ToolCall(crate::model::ToolCall {
+                        id: "already-completed-write".to_string(),
+                        name: "write".to_string(),
+                        arguments: serde_json::json!({
+                            "path": "result.txt",
+                            "content": "already saved",
+                        }),
+                        thought_signature: None,
+                    })],
+                    provider: provider.name().to_string(),
+                    model: provider.model_id().to_string(),
+                    stop_reason: StopReason::ToolUse,
+                    ..Default::default()
+                })));
+            stored.append_model_message(Message::tool_result(crate::model::ToolResultMessage {
+                tool_call_id: "already-completed-write".to_string(),
+                tool_name: "write".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new("saved"))],
+                details: None,
+                is_error: false,
+                timestamp: 0,
+            }));
+            late_cut
+        };
+        run_async(handle.session.persist_session()).unwrap();
+        let before = serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap();
+        install_native_event_hooks(
+            &mut handle,
+            &serde_json::json!({
+                "session_before_compact": {
+                    "compaction": {
+                        "summary": "A concise extension summary.",
+                        "firstKeptEntryId": if unknown_cut { "missing-entry" } else { &late_cut },
+                    },
+                },
+            }),
+        );
+        let (events, callback) = event_log();
+        let error = run_async(handle.continue_turn(move |event| callback(event)))
+            .expect_err("unsafe extension cut must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("discard the current user request")
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.summaries.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap(),
+            before,
+            "refusal must preserve exact native user content and completed tool work",
+        );
+        handle.session.ensure_provider_reentry_allowed().unwrap();
+        let store = handle.session_store();
+        let stored = store.try_lock().unwrap();
+        assert!(
+            stored
+                .entries
+                .iter()
+                .all(|entry| !matches!(entry, crate::session::SessionEntry::Compaction(_)))
+        );
+        let path = stored.path.clone().unwrap();
+        drop(stored);
+        let reopened = run_async(Session::open(&path.display().to_string())).unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.to_messages_for_current_path()).unwrap(),
+            before,
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(lifecycle_names(&events), ["agent_start", "agent_end"]);
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "auto_compaction_end")
+            .unwrap();
+        assert_eq!(end["willRetry"], false);
+        assert!(end["result"].is_null());
+    }
+}
+
+#[test]
+fn overflow_recovery_is_bounded_and_rejects_a_summary_that_cannot_shrink_context() {
+    for no_progress in [false, true] {
+        let dir = tempdir().unwrap();
+        let summary = if no_progress {
+            "summary adds more context than it removes ".repeat(4_000)
+        } else {
+            "Earlier history summarized.".to_string()
+        };
+        let (mut handle, provider) =
+            overflow_recovery_handle(dir.path(), false, true, summary, None);
+        handle = handle.with_retry(Some(fast_retry_policy(3)));
+        let (events, callback) = event_log();
+        let result = run_async(handle.prompt("continue the current task", move |event| {
+            callback(event);
+        }));
+        let error = result.expect_err("unrecoverable overflow");
+        if no_progress {
+            assert!(error.to_string().contains("made no progress"), "{error}");
+        }
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            if no_progress { 1 } else { 2 }
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "auto_compaction_start")
+                .count(),
+            1,
+            "one maintenance attempt per logical turn",
+        );
+        assert_eq!(lifecycle_names(&events), ["agent_start", "agent_end"]);
+        let store = handle.session_store();
+        let stored = store.try_lock().unwrap();
+        assert_eq!(
+            stored
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry, crate::session::SessionEntry::Compaction(_)))
+                .count(),
+            usize::from(!no_progress),
+            "a no-progress candidate must not replace live or durable history",
+        );
+    }
+}
+
+#[test]
+fn disabled_compaction_and_unsplittable_input_never_reenter_the_provider() {
+    for disabled in [false, true] {
+        let dir = tempdir().unwrap();
+        let (mut handle, provider) = overflow_recovery_handle(
+            dir.path(),
+            false,
+            true,
+            "Earlier history summarized.".to_string(),
+            None,
+        );
+        handle = handle.with_retry(Some(fast_retry_policy(3)));
+        if disabled {
+            handle.session.set_auto_compaction(false);
+        } else {
+            // Only the upcoming authored request remains: no older prefix or
+            // safe split exists, even when the provider says it is too large.
+            let mut fresh = Session::create_with_dir(Some(dir.path().join("sessions")));
+            fresh.header.provider = Some(provider.name().to_string());
+            fresh.header.model_id = Some(provider.model_id().to_string());
+            *handle.session_store().try_lock().unwrap() = fresh;
+        }
+        let (events, callback) = event_log();
+        let result = run_async(
+            handle.prompt("one unsplittable current request", move |event| {
+                callback(event);
+            }),
+        );
+        assert!(result.is_err(), "disabled={disabled}: {result:?}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.summaries.load(Ordering::SeqCst), 0);
+        let events = events.lock().unwrap();
+        assert_eq!(lifecycle_names(&events), ["agent_start", "agent_end"]);
+        assert!(
+            events
+                .iter()
+                .all(|event| event["type"] != "auto_compaction_start")
+        );
+        drop(events);
+        handle.session.ensure_provider_reentry_allowed().unwrap();
+    }
+}
+
+#[test]
+fn overflow_compaction_save_failure_quarantines_later_provider_entry() {
+    let dir = tempdir().unwrap();
+    let (mut handle, provider) = overflow_recovery_handle(
+        dir.path(),
+        false,
+        false,
+        "Earlier history summarized.".to_string(),
+        None,
+    );
+    let blocked = dir.path().join("blocked-session");
+    std::fs::create_dir(&blocked).unwrap();
+    let store = handle.session_store();
+    let original = Arc::new(Mutex::new(None));
+    let saved_original = Arc::clone(&original);
+    let result = run_async(handle.prompt("continue after overflow", move |event| {
+        if matches!(event, AgentEvent::AutoCompactionStart { .. }) {
+            let mut session = store.try_lock().unwrap();
+            *saved_original.lock().unwrap() = session.path.clone();
+            session.path = Some(blocked.clone());
+        }
+    }));
+    assert!(
+        result.as_ref().is_err_and(Error::is_session_persistence),
+        "{result:?}"
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    handle.session_store().try_lock().unwrap().path = original.lock().unwrap().clone();
+    let result = run_async(handle.continue_turn(|_| {}));
+    assert!(result.as_ref().is_err_and(Error::is_session_persistence));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn overflow_compaction_honors_cancellation_before_and_during_summary() {
+    for during_summary in [false, true] {
+        let dir = tempdir().unwrap();
+        let (abort, signal) = AbortHandle::new();
+        let (mut handle, provider) = overflow_recovery_handle(
+            dir.path(),
+            false,
+            false,
+            "Earlier history summarized.".to_string(),
+            during_summary.then(|| abort.clone()),
+        );
+        let (events, callback) = event_log();
+        let result = run_async(handle.prompt_with_abort("continue", signal, move |event| {
+            if !during_summary && matches!(event, AgentEvent::AutoCompactionStart { .. }) {
+                abort.abort();
+            }
+            callback(event);
+        }));
+        assert!(matches!(result, Err(Error::Aborted)), "{result:?}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider.summaries.load(Ordering::SeqCst),
+            usize::from(during_summary)
+        );
+        let events = events.lock().unwrap();
+        let end = events
+            .iter()
+            .find(|event| event["type"] == "auto_compaction_end")
+            .unwrap();
+        assert_eq!(end["aborted"], true);
+        assert_eq!(end["willRetry"], false);
+        assert_eq!(lifecycle_names(&events), ["agent_start", "agent_end"]);
+        drop(events);
+        handle.session.ensure_provider_reentry_allowed().unwrap();
+    }
 }
 
 struct TransportDropProvider;
@@ -2272,6 +3708,249 @@ fn an_old_provider_error_cannot_fail_over_an_extension_model_selection() {
     );
     assert!(handle.failover_state.primary().is_none());
     assert!(events.lock().unwrap().is_empty());
+}
+
+fn recovery_route_entry(provider: &str, model: &str) -> crate::models::ModelEntry {
+    let mut entry = crate::models::ad_hoc_model_entry("openai", model).unwrap();
+    entry.model.provider = provider.to_string();
+    entry.model.api = "openai-completions".to_string();
+    entry.model.base_url = format!("https://{provider}.example.test/v1");
+    entry.api_key = Some(format!("{provider}-fixture-key"));
+    entry
+        .headers
+        .insert("x-recovery-route".to_string(), provider.to_string());
+    entry
+}
+
+#[test]
+fn sdk_failover_policies_use_full_catalog_ownership_and_destination_metadata() {
+    for (current, other) in [("openrouter", "open-router"), ("open-router", "openrouter")] {
+        for reverse in [false, true] {
+            let (mut handle, _) = flaky_handle_as(0, current, "vendor/shared");
+            let mut native = recovery_route_entry("openrouter", "vendor/shared");
+            let mut declared = recovery_route_entry("open-router", "vendor/shared");
+            native.api_key = None;
+            declared.api_key = None;
+            let accepted = recovery_route_entry("policy-owner-fallback", "accepted");
+            let wrong = recovery_route_entry("policy-other-fallback", "wrong");
+            let mut catalog = vec![native, declared, accepted.clone(), wrong.clone()];
+            if reverse {
+                catalog.reverse();
+            }
+            let mut registry = ModelRegistry::default();
+            registry
+                .merge_extension_entries(catalog)
+                .expect("separately declared provider catalog");
+            handle.session.set_model_registry(registry);
+            let store = handle.session_store();
+            store.try_lock().unwrap().set_model_header(
+                Some(current.to_string()),
+                Some("vendor/shared".to_string()),
+                None,
+            );
+            let before = serde_json::to_value(&store.try_lock().unwrap().entries).unwrap();
+            let mut options = FailoverOptions {
+                chains: HashMap::from([(
+                    format!("{other}/vendor/shared"),
+                    vec!["policy-other-fallback/wrong".to_string()],
+                )]),
+                // The primary names are intentionally absent from the admitted
+                // pool. Their full-catalog declarations still own their policies.
+                available_models: vec![accepted.clone(), wrong],
+                auth: AuthStorage::empty_at(PathBuf::from("unused-policy-auth.json")),
+                cli_api_key: None,
+                cooldown_secs: 300,
+            };
+            handle = handle.with_failover(Some(options.clone()));
+            let (events, callback) = event_log();
+            let failure = Err(Error::provider(current, "503 service unavailable"));
+            assert!(
+                !run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap(),
+                "{current} cannot use {other}'s policy (reverse={reverse})"
+            );
+            assert_eq!(
+                handle.model(),
+                (current.to_string(), "vendor/shared".to_string())
+            );
+            assert_eq!(
+                serde_json::to_value(&store.try_lock().unwrap().entries).unwrap(),
+                before
+            );
+            assert!(events.lock().unwrap().is_empty());
+
+            options.chains.insert(
+                format!(" {} / VENDOR/SHARED ", current.to_ascii_uppercase()),
+                vec!["policy-owner-fallback/accepted".to_string()],
+            );
+            handle = handle.with_failover(Some(options));
+            assert!(
+                run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap()
+            );
+            assert_eq!(
+                handle.model(),
+                (accepted.model.provider.clone(), accepted.model.id.clone())
+            );
+            let installed = handle.session.current_model_entry().unwrap();
+            assert_eq!(installed.model.base_url, accepted.model.base_url);
+            assert_eq!(installed.headers, accepted.headers);
+            assert_eq!(handle.session.agent.provider().api(), accepted.model.api);
+            assert_eq!(
+                handle.session.agent.stream_options().headers,
+                accepted.headers
+            );
+            assert_eq!(
+                handle.session.agent.stream_options().api_key,
+                accepted.api_key
+            );
+            let stored = store.try_lock().unwrap();
+            let provenance = stored
+                .active_failover_provenance_for_current_path()
+                .unwrap();
+            assert_eq!(provenance.primary_provider, current);
+            assert_eq!(provenance.primary_model_id, "vendor/shared");
+            assert_eq!(provenance.fallback_provider, accepted.model.provider);
+            assert_eq!(provenance.fallback_model_id, accepted.model.id);
+            assert_eq!(events.lock().unwrap()[0]["type"], "failover_start");
+        }
+    }
+}
+
+fn saving_alias_recovery_handle(
+    dir: &Path,
+    current: &str,
+    catalog: Vec<crate::models::ModelEntry>,
+    fallback: &crate::models::ModelEntry,
+    with_registry: bool,
+) -> AgentSessionHandle {
+    let mut handle = saving_handle(dir);
+    handle
+        .session
+        .agent
+        .set_provider(Arc::new(FlakyThenOkProvider {
+            failures: 0,
+            calls: Arc::new(AtomicUsize::new(0)),
+            name: current.to_string(),
+            model: "vendor/shared".to_string(),
+            input_tokens: 0,
+        }));
+    let available_models = if with_registry {
+        let mut registry = ModelRegistry::default();
+        registry
+            .merge_extension_entries(catalog)
+            .expect("separately declared provider catalog");
+        handle.session.set_model_registry(registry);
+        vec![fallback.clone()]
+    } else {
+        catalog
+    };
+    handle.with_failover(Some(FailoverOptions {
+        chains: HashMap::from([(
+            "default".to_string(),
+            vec![format!("{}/{}", fallback.model.provider, fallback.model.id)],
+        )]),
+        available_models,
+        auth: AuthStorage::empty_at(dir.join("auth.json")),
+        cli_api_key: None,
+        cooldown_secs: 300,
+    }))
+}
+
+#[test]
+fn sdk_recovery_preserves_pending_declared_alias_selection_and_native_aliases() {
+    use crate::extensions::ExtensionSession as _;
+
+    for separately_declared in [false, true] {
+        for with_registry in [false, true] {
+            for reverse in [false, true] {
+                for (current, selected) in
+                    [("openrouter", "open-router"), ("open-router", "openrouter")]
+                {
+                    let dir = tempdir().unwrap();
+                    let mut native = recovery_route_entry("openrouter", "vendor/shared");
+                    native.api_key = None;
+                    let mut catalog = vec![native];
+                    if separately_declared {
+                        let mut declared = recovery_route_entry("open-router", "vendor/shared");
+                        declared.api_key = None;
+                        catalog.push(declared);
+                    }
+                    let fallback = recovery_route_entry("selection-fallback", "accepted");
+                    catalog.push(fallback.clone());
+                    if reverse {
+                        catalog.reverse();
+                    }
+                    let mut handle = saving_alias_recovery_handle(
+                        dir.path(),
+                        current,
+                        catalog,
+                        &fallback,
+                        with_registry,
+                    );
+                    let original_runtime = handle.session.agent.provider();
+                    let store = handle.session_store();
+                    store.try_lock().unwrap().set_model_header(
+                        Some(current.to_string()),
+                        Some("vendor/shared".to_string()),
+                        None,
+                    );
+                    let extension = crate::session::SessionHandle(Arc::clone(&store));
+                    run_async(extension.set_model(
+                        selected.to_string(),
+                        "vendor/shared".to_string(),
+                        None,
+                    ))
+                    .unwrap();
+                    run_async(handle.session.persist_session()).unwrap();
+                    let before = serde_json::to_value(&store.try_lock().unwrap().entries).unwrap();
+                    let path = store.try_lock().unwrap().path.clone().unwrap();
+                    let bytes_before = std::fs::read(&path).unwrap();
+                    let (events, callback) = event_log();
+                    let failure = Err(Error::provider(current, "503 service unavailable"));
+                    let swapped =
+                        run_async(handle.try_chain_failover(&failure, false, None, 1, &callback))
+                            .unwrap();
+                    assert_eq!(
+                        swapped, !separately_declared,
+                        "current={current}, selected={selected}, full registry={with_registry}, reverse={reverse}"
+                    );
+                    if separately_declared {
+                        run_async(handle.maybe_restore_primary(&callback)).unwrap();
+                        assert!(Arc::ptr_eq(
+                            &original_runtime,
+                            &handle.session.agent.provider()
+                        ));
+                        assert_eq!(
+                            serde_json::to_value(&store.try_lock().unwrap().entries).unwrap(),
+                            before
+                        );
+                        assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
+                        let reopened =
+                            run_async(Session::open(&path.display().to_string())).unwrap();
+                        assert_eq!(
+                            reopened.effective_model_for_current_path(),
+                            Some((selected.to_string(), "vendor/shared".to_string()))
+                        );
+                        assert!(handle.failover_state.primary().is_none());
+                        assert!(events.lock().unwrap().is_empty());
+                    } else {
+                        assert_eq!(
+                            handle.model(),
+                            (fallback.model.provider.clone(), fallback.model.id.clone())
+                        );
+                        assert_eq!(
+                            handle.session.agent.stream_options().headers,
+                            fallback.headers
+                        );
+                        assert_eq!(
+                            handle.session.agent.stream_options().api_key,
+                            fallback.api_key
+                        );
+                        assert_eq!(events.lock().unwrap()[0]["type"], "failover_start");
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn install_reconciliation_provenance(
@@ -2590,4 +4269,334 @@ fn interactive_auth_adoption_updates_fallback_credentials_and_preserves_cli_pin(
                 .is_none()
         );
     }
+}
+
+fn credential_binding_handle(
+    entries: &[crate::models::ModelEntry],
+    bound_key: Option<&str>,
+) -> AgentSessionHandle {
+    let initial = &entries[0];
+    let (mut handle, _) = flaky_handle_as(0, &initial.model.provider, &initial.model.id);
+    handle
+        .session
+        .set_api_key_override(bound_key.map(str::to_string));
+    handle
+        .session
+        .set_model_registry(ModelRegistry::from_entries_for_tests(entries.to_vec()));
+    handle.session_store().try_lock().unwrap().set_model_header(
+        Some(initial.model.provider.clone()),
+        Some(initial.model.id.clone()),
+        Some("off".to_string()),
+    );
+    handle
+}
+
+#[test]
+fn bound_cli_key_cannot_admit_an_unready_foreign_fallback_and_survives_restoration() {
+    let dir = tempdir().unwrap();
+    let mut primary = recovery_route_entry("bound-primary", "execution");
+    primary.api_key = None;
+    let mut unready = recovery_route_entry("unready-other", "unready");
+    unready.api_key = None;
+    let fallback = recovery_route_entry("ready-other", "fallback");
+    let entries = vec![primary, unready, fallback.clone()];
+    let mut handle = credential_binding_handle(&entries, Some("execution-only-pin")).with_failover(
+        Some(FailoverOptions {
+            chains: HashMap::from([(
+                "default".to_string(),
+                vec![
+                    "unready-other/unready".to_string(),
+                    "ready-other/fallback".to_string(),
+                ],
+            )]),
+            available_models: vec![fallback.clone()],
+            auth: AuthStorage::empty_at(dir.path().join("auth.json")),
+            cli_api_key: Some("execution-only-pin".to_string()),
+            cooldown_secs: 0,
+        }),
+    );
+    let (_, callback) = event_log();
+    let failure = Err(Error::provider("bound-primary", "503 service unavailable"));
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert_eq!(
+        handle.model(),
+        ("ready-other".to_string(), "fallback".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().api_key,
+        fallback.api_key
+    );
+
+    // A temporary planning role may remove the SDK's active-provider pin.
+    // The native execution binding still admits its otherwise unready primary.
+    Arc::make_mut(handle.failover.as_mut().unwrap()).cli_api_key = None;
+    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    assert_eq!(
+        handle.model(),
+        ("bound-primary".to_string(), "execution".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().api_key.as_deref(),
+        Some("execution-only-pin")
+    );
+}
+
+#[test]
+fn planner_fallback_recovers_original_pin_without_reusing_it_for_planner_restore() {
+    let dir = tempdir().unwrap();
+    let mut primary = recovery_route_entry("bound-executor", "execution");
+    primary.api_key = None;
+    let planner = recovery_route_entry("separate-planner", "planning");
+    let entries = vec![primary, planner.clone()];
+    let mut handle = credential_binding_handle(&entries, Some("bound-execution-pin"));
+    run_async(handle.set_model("separate-planner", "planning")).unwrap();
+    handle = handle.with_failover(Some(FailoverOptions {
+        chains: HashMap::from([(
+            "default".to_string(),
+            vec!["bound-executor/execution".to_string()],
+        )]),
+        available_models: vec![planner.clone()],
+        auth: AuthStorage::empty_at(dir.path().join("auth.json")),
+        cli_api_key: None,
+        cooldown_secs: 0,
+    }));
+    let (_, callback) = event_log();
+    let failure = Err(Error::provider(
+        "separate-planner",
+        "503 service unavailable",
+    ));
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert_eq!(
+        handle.model(),
+        ("bound-executor".to_string(), "execution".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().api_key.as_deref(),
+        Some("bound-execution-pin")
+    );
+
+    Arc::make_mut(handle.failover.as_mut().unwrap()).cli_api_key =
+        Some("bound-execution-pin".to_string());
+    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    assert_eq!(
+        handle.model(),
+        ("separate-planner".to_string(), "planning".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().api_key,
+        planner.api_key
+    );
+}
+
+#[test]
+fn recovery_without_a_native_key_binding_preserves_explicit_embedder_override() {
+    let dir = tempdir().unwrap();
+    let mut primary = recovery_route_entry("embedder-primary", "primary");
+    primary.api_key = None;
+    let mut fallback = recovery_route_entry("embedder-fallback", "fallback");
+    fallback.api_key = None;
+    let entries = vec![primary, fallback];
+    let mut handle =
+        credential_binding_handle(&entries, None).with_failover(Some(FailoverOptions {
+            chains: HashMap::from([(
+                "default".to_string(),
+                vec!["embedder-fallback/fallback".to_string()],
+            )]),
+            available_models: Vec::new(),
+            auth: AuthStorage::empty_at(dir.path().join("auth.json")),
+            cli_api_key: Some("explicit-embedder-pin".to_string()),
+            cooldown_secs: 0,
+        }));
+    let (_, callback) = event_log();
+    let failure = Err(Error::provider(
+        "embedder-primary",
+        "503 service unavailable",
+    ));
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert_eq!(
+        handle.model(),
+        ("embedder-fallback".to_string(), "fallback".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().api_key.as_deref(),
+        Some("explicit-embedder-pin")
+    );
+    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    assert_eq!(
+        handle.model(),
+        ("embedder-primary".to_string(), "primary".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().api_key.as_deref(),
+        Some("explicit-embedder-pin")
+    );
+}
+
+#[test]
+fn child_role_policy_controls_native_multi_hop_failover_effort_and_exclusions() {
+    use crate::model::ThinkingLevel;
+    let dir = tempdir().unwrap();
+    let mut primary = recovery_route_entry("child-primary", "primary");
+    let mut first = recovery_route_entry("child-first", "first");
+    let mut second = recovery_route_entry("child-second", "second");
+    primary.model.reasoning = true;
+    first.model.reasoning = true;
+    second.model.reasoning = true;
+    let excluded = recovery_route_entry("child-excluded", "excluded");
+    let wrong = recovery_route_entry("child-default", "wrong");
+    let entries = vec![primary, first, second, excluded, wrong];
+    let config = Config {
+        retry: Some(crate::config::RetrySettings {
+            fallback_chains: Some(HashMap::from([
+                (
+                    "task".to_string(),
+                    vec![
+                        "child-excluded/excluded".to_string(),
+                        "child-first/first:low".to_string(),
+                        "child-second/second:high".to_string(),
+                    ],
+                ),
+                (
+                    "default".to_string(),
+                    vec!["child-default/wrong".to_string()],
+                ),
+            ])),
+            ..Default::default()
+        }),
+        disabled_providers: Some(vec!["child-excluded".to_string()]),
+        ..Default::default()
+    };
+    let mut handle =
+        credential_binding_handle(&entries, None).with_failover(Some(FailoverOptions {
+            // A different live driver map cannot replace the child's frozen role.
+            chains: HashMap::from([(
+                "default".to_string(),
+                vec!["child-default/wrong".to_string()],
+            )]),
+            available_models: entries,
+            auth: AuthStorage::empty_at(dir.path().join("auth.json")),
+            cli_api_key: Some("explicit-pin-cannot-enable-excluded-provider".to_string()),
+            cooldown_secs: 0,
+        }));
+    handle.session.agent.stream_options_mut().thinking_level = Some(ThinkingLevel::High);
+    handle.session_store().try_lock().unwrap().set_model_header(
+        Some("child-primary".to_string()),
+        Some("primary".to_string()),
+        Some("high".to_string()),
+    );
+    handle
+        .session
+        .set_child_fallback_policy(Some(crate::failover::ChildFallbackPolicy::capture(
+            &config,
+            crate::models::ModelRole::Task,
+            &[],
+        )));
+    let (_, callback) = event_log();
+    let failure = Err(Error::provider("child-primary", "503 service unavailable"));
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert_eq!(
+        handle.model(),
+        ("child-first".to_string(), "first".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().thinking_level,
+        Some(ThinkingLevel::Low)
+    );
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 2, &callback)).unwrap());
+    assert_eq!(
+        handle.model(),
+        ("child-second".to_string(), "second".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().thinking_level,
+        Some(ThinkingLevel::High)
+    );
+    assert_eq!(
+        handle
+            .failover_state
+            .primary()
+            .unwrap()
+            .requested_thinking_level,
+        ThinkingLevel::High
+    );
+    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    assert_eq!(
+        handle.model(),
+        ("child-primary".to_string(), "primary".to_string())
+    );
+    assert_eq!(
+        handle.session.agent.stream_options().thinking_level,
+        Some(ThinkingLevel::High)
+    );
+}
+
+#[test]
+fn explicit_model_selection_retires_child_role_but_automatic_changes_preserve_it() {
+    let dir = tempdir().unwrap();
+    let primary = recovery_route_entry("role-primary", "primary");
+    let automatic = recovery_route_entry("role-automatic", "automatic");
+    let fallback = recovery_route_entry("role-fallback", "fallback");
+    let entries = vec![primary, automatic, fallback];
+    let config = Config {
+        retry: Some(crate::config::RetrySettings {
+            fallback_chains: Some(HashMap::from([
+                ("task".to_string(), vec![]),
+                (
+                    "default".to_string(),
+                    vec!["role-fallback/fallback".to_string()],
+                ),
+                (
+                    "role-automatic/automatic".to_string(),
+                    vec!["role-fallback/fallback".to_string()],
+                ),
+            ])),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut handle =
+        credential_binding_handle(&entries, None).with_failover(Some(FailoverOptions {
+            chains: config
+                .retry
+                .as_ref()
+                .unwrap()
+                .fallback_chains
+                .clone()
+                .unwrap(),
+            available_models: entries,
+            auth: AuthStorage::empty_at(dir.path().join("auth.json")),
+            cli_api_key: None,
+            cooldown_secs: 300,
+        }));
+    handle
+        .session
+        .set_child_fallback_policy(Some(crate::failover::ChildFallbackPolicy::capture(
+            &config,
+            crate::models::ModelRole::Task,
+            &[],
+        )));
+    let origin = handle
+        .session
+        .session_action_admission_gate()
+        .capture_origin();
+    assert!(
+        run_async(handle.session.set_automatic_model_selection(
+            "role-automatic",
+            "automatic",
+            crate::model::ThinkingLevel::Off,
+            &origin,
+        ))
+        .unwrap()
+    );
+    run_async(handle.session.sync_runtime_selection_from_session_header()).unwrap();
+    let (events, callback) = event_log();
+    let failure = Err(Error::provider("role-automatic", "503 service unavailable"));
+    assert!(!run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert!(events.lock().unwrap().is_empty());
+    run_async(handle.set_model("role-automatic", "automatic")).unwrap();
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert_eq!(
+        handle.model(),
+        ("role-fallback".to_string(), "fallback".to_string())
+    );
 }

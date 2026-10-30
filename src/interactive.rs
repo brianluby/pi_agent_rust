@@ -107,7 +107,10 @@ use self::commands::{
 // Session→conversation snapshot; re-exported for the ftui migration stack
 // (bd-cv653.9.1) to rebuild its transcript after /resume.
 pub use self::conversation::conversation_from_session;
-pub(crate) use self::tree::{fork_candidates, format_fork_candidates, select_fork_candidate};
+pub(crate) use self::tree::{
+    branch_candidates, fork_candidates, format_branch_candidates, format_fork_candidates,
+    select_branch_candidate, select_fork_candidate,
+};
 
 /// Where `/export` writes when it is given no argument.
 ///
@@ -142,7 +145,7 @@ pub(crate) fn resolve_output_path(cwd: &Path, raw: &str) -> PathBuf {
 }
 use self::ext_session::{InteractiveExtensionHostActions, InteractiveExtensionSession};
 pub use self::ext_session::{format_extension_ui_prompt, parse_extension_ui_response};
-pub(crate) use self::file_refs::extract_file_references;
+pub(crate) use self::file_refs::{extract_file_references, names_an_empty_file};
 use self::file_refs::{
     file_url_to_path, format_file_ref, path_for_display, strip_wrapping_quotes,
     unescape_dragged_path,
@@ -690,9 +693,10 @@ impl PiApp {
         session: &Arc<Mutex<Session>>,
         agent: &Arc<Mutex<InteractiveAgent>>,
         admission: &SessionActionAdmissionGate,
-        new_session: Session,
+        mut new_session: Session,
         messages_for_agent: Vec<ModelMessage>,
         thinking_level: Option<ThinkingLevel>,
+        preserve_cost: bool,
     ) -> std::result::Result<(), &'static str> {
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let _permit = admission
@@ -706,7 +710,42 @@ impl PiApp {
             return Err("Session busy; session change was not applied");
         };
 
+        let retiring_session = !crate::cost::same_session_target(&session_guard, &new_session);
+        let save_enabled = agent_guard.handle.session().save_enabled();
+        let preserve_cost = preserve_cost || session_guard.header.id == new_session.header.id;
+        let cost_budget = agent_guard
+            .replacement_cost_budget(&new_session, preserve_cost)
+            .map_err(|_| "Invalid model spend; session change was not applied")?;
+        if let Some(budget) = agent_guard.cost_budget() {
+            budget
+                .checkpoint(&mut session_guard)
+                .map_err(|_| "Failed to read model spend; session change was not applied")?;
+            if save_enabled {
+                session_guard
+                    .save()
+                    .await
+                    .map_err(|_| "Failed to save model spend; session change was not applied")?;
+            }
+        }
+        if preserve_cost && let Some(budget) = &cost_budget {
+            budget
+                .checkpoint(&mut new_session)
+                .map_err(|_| "Failed to retain model spend; session change was not applied")?;
+            if save_enabled {
+                new_session.save().await.map_err(
+                    |_| "Failed to save retained model spend; session change was not applied",
+                )?;
+            }
+        }
+        // The source stays live if any candidate preparation fails. Once
+        // retirement succeeds, install the replacement without another await.
+        if save_enabled && retiring_session && let Some(budget) = agent_guard.cost_budget() {
+            budget.retire_session(&session_guard, cx.cx()).map_err(|_| {
+                "Failed to preserve background model spend; session change was not applied"
+            })?;
+        }
         *session_guard = new_session;
+        agent_guard.set_cost_budget(cost_budget);
         agent_guard.replace_messages(messages_for_agent);
         if let Some(level) = thinking_level {
             agent_guard.stream_options_mut().thinking_level = Some(level);
@@ -1525,11 +1564,14 @@ impl PiApp {
         let cwd = &self.cwd;
         let provider = &mut self.autocomplete.provider;
         file_refs::extract_file_references(message, |path| {
-            provider.resolve_file_ref(path).or_else(|| {
-                resolve_read_path(path, cwd)
-                    .exists()
-                    .then(|| path.to_string())
-            })
+            provider
+                .resolve_file_ref(path)
+                .or_else(|| {
+                    resolve_read_path(path, cwd)
+                        .exists()
+                        .then(|| path.to_string())
+                })
+                .filter(|resolved| !names_an_empty_file(&resolve_read_path(resolved, cwd)))
         })
     }
 
@@ -1617,6 +1659,7 @@ impl PiApp {
                 loaded_session,
                 messages_for_agent,
                 None,
+                false,
             )
             .await
             {
@@ -2005,6 +2048,12 @@ pub enum PiMsg {
     /// built-in list; the charmed stack builds its catalog inline and
     /// ignores this.
     AutocompleteCatalog(crate::autocomplete::AutocompleteCatalog),
+    /// Atomically replace reloaded prompt/skill bodies and their completion
+    /// catalog. Side-command routing must use the same loader as the driver.
+    ResourcesReloaded {
+        resources: Box<crate::resources::ResourceLoader>,
+        catalog: crate::autocomplete::AutocompleteCatalog,
+    },
     /// Text delta from assistant.
     TextDelta(String),
     /// Thinking delta from assistant.
@@ -2066,6 +2115,19 @@ pub enum PiMsg {
         owner_session_id: String,
         message: String,
     },
+    /// Classic terminal review completion, scoped to its session and request.
+    ReviewFinished {
+        owner_session_id: String,
+        request_id: String,
+        message: String,
+    },
+    /// Only the matching operator request can end an MCP authentication wait.
+    McpAuthFinished { request_id: String, message: String },
+    /// A terminal handoff reply can settle only the request that admitted it.
+    HandoffFinished {
+        request_id: String,
+        event: Box<Self>,
+    },
     /// Update last user message content (input transform/redaction).
     UpdateLastUserMessage(String),
     /// Display driver-submitted input that did not pass through the editor.
@@ -2076,11 +2138,9 @@ pub enum PiMsg {
         /// Authored input only; display text may include generated file bodies.
         history_text: String,
     },
-    /// Bash command result (non-agent).
-    BashResult {
-        display: String,
-        content_for_agent: Option<Vec<ContentBlock>>,
-    },
+    /// Bash command result (non-agent). The run is already recorded in the
+    /// session; this only shows it.
+    BashResult { display: String },
     /// Async OAuth device flow start
     OAuthDeviceFlowStarted {
         provider: String,
@@ -2752,6 +2812,9 @@ impl InteractiveAgent {
             .session_mut()
             .agent
             .reset_session_scoped_state(plan_mode);
+        self.handle
+            .session()
+            .refresh_extension_completion_host_state();
         self.handle.session().provider_admission_gate().clear();
     }
 }
@@ -2865,6 +2928,9 @@ pub struct PiApp {
     agent: Arc<Mutex<InteractiveAgent>>,
     save_enabled: bool,
     abort_handle: Option<AbortHandle>,
+    review_request_id: Option<String>,
+    handoff_request_id: Option<String>,
+    mcp_auth_request_id: Option<String>,
     bash_running: bool,
 
     // Token tracking
@@ -3156,12 +3222,19 @@ impl PiApp {
         failover: Option<crate::sdk::FailoverOptions>,
     ) -> Self {
         let session = Arc::clone(&agent_session.session);
+        // Keep the authoritative routes, including unready models, and admit
+        // entries supplied by embedders before extensions receive this catalog.
+        let mut registry = agent_session.model_registry().cloned().unwrap_or_default();
+        registry.merge_missing_entries(available_models.clone());
+        registry.merge_missing_entries(vec![model_entry.clone()]);
+        agent_session.set_model_registry(registry);
         let extensions = agent_session
             .extensions
             .as_ref()
             .map(|region| region.manager().clone());
         let session_action_admission = agent_session.session_action_admission_gate();
         let provider_admission = agent_session.provider_admission_gate();
+        let extension_model_catalog = agent_session.extension_model_catalog();
         if let Some(manager) = &mcp_manager {
             agent_session.set_mcp_manager(Arc::clone(manager));
         }
@@ -3394,6 +3467,9 @@ impl PiApp {
             status_message: None,
             save_enabled,
             abort_handle: None,
+            review_request_id: None,
+            handoff_request_id: None,
+            mcp_auth_request_id: None,
             bash_running: false,
             pending_oauth: None,
             extensions,
@@ -3431,6 +3507,7 @@ impl PiApp {
             let session_handle = Arc::new(InteractiveExtensionSession {
                 session: Arc::clone(&app.session),
                 model_entry: model_entry_shared,
+                model_catalog: extension_model_catalog,
                 is_streaming: extension_streaming,
                 is_compacting: extension_compacting,
                 config: app.config.clone(),
@@ -3622,6 +3699,11 @@ impl PiApp {
     /// Inner update handler (extracted for frame timing instrumentation).
     #[allow(clippy::too_many_lines)]
     fn update_inner(&mut self, msg: Message) -> Option<Cmd> {
+        if self.prune_expired_ask_cards() && msg.is::<KeyMsg>() {
+            // This key belonged to the cancelled card. In particular, Enter
+            // must not submit the pre-card draft restored by pruning.
+            return None;
+        }
         // Memory pressure sampling + progressive collapse (PERF-6)
         self.memory_monitor.maybe_sample();
         self.run_memory_pressure_actions();

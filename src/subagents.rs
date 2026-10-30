@@ -9,7 +9,10 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
-use crate::tools::{Tool, ToolEffects, ToolModelScope, ToolModelSelection, ToolOutput, ToolUpdate};
+use crate::tools::{
+    Tool, ToolEffects, ToolInvocationContext, ToolModelScope, ToolModelSelection, ToolOutput,
+    ToolUpdate,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,13 +24,21 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod background;
+mod bundled;
 mod deadline;
 #[cfg(test)]
 mod deadline_tests;
+mod definition;
 mod execution;
 #[cfg(test)]
 mod execution_tests;
+mod model_selection;
 mod protocol;
+mod seance;
+mod worker;
+mod workflow;
+mod workspace;
 
 use deadline::Deadline;
 use execution::ChildRunner;
@@ -54,6 +65,8 @@ const TAN_AGENT_NAME: &str = "tan";
 const TAN_SYSTEM_PROMPT: &str = "You are a background tangential coding agent. Complete the assigned work autonomously in the current working directory. Keep your final response concise and lead with the concrete outcome, changed files, and verification performed. Do not ask follow-up questions.";
 
 type UpdateCallback = Arc<dyn Fn(ToolUpdate) + Send + Sync>;
+/// Optional live admission policy retained by retries and explicit revival.
+type LaunchAdmission = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 
 /// Settled result from an interactive `/tan` background child.
 #[derive(Debug, Clone, Serialize)]
@@ -114,17 +127,30 @@ impl TanCompletion {
 pub struct SubagentTool {
     cwd: PathBuf,
     global_dir: PathBuf,
+    /// Shared admission policy for saved-session reads, including live roots.
+    workspace: crate::workspace::WorkspaceHandle,
     child_binary: PathBuf,
     structured_results: bool,
     /// Model spec children run with when their agent definition does not pin
     /// `model:` — the `task` role spec, else `smol` (bd-cv653.3.1).
     role_model_spec: Option<String>,
+    /// The role that actually supplied the spec, distinct from model identity.
+    role_model_role: Option<crate::models::ModelRole>,
+    /// Effective host policy used when admitting explicit task model choices.
+    model_config: Option<Config>,
     /// Live host identity for tools mounted in an agent's registry.
     model_scope: Option<ToolModelScope>,
+    /// Live session budget; each admitted run retains its original gate.
+    cost_scope: crate::cost::CostScope,
     /// An explicit launch-time snapshot for background host commands.
     parent_model: Option<ToolModelSelection>,
     /// Host ceiling for the entire request, not a fresh allowance per child.
     timeout: Option<Duration>,
+    /// Fallback policy for direct SDK calls; live Agent execution supplies its
+    /// own projection so discoveries stay scoped to the invoking session.
+    privacy: Option<crate::text_completion::AuxiliaryPrivacy>,
+    /// The same native owner identity used by jobs list/wait/cancel.
+    job_session_scope: crate::jobs::JobSessionScope,
 }
 
 /// Private execution policy retained for an explicit hub revival. In
@@ -142,6 +168,26 @@ pub(crate) struct RevivalSpec {
     parent_model: Option<ToolModelSelection>,
     timeout: Duration,
     depth: usize,
+    public_task: Option<String>,
+    launch_admission: Option<LaunchAdmission>,
+    cost_budget: Option<crate::cost::CostBudget>,
+}
+
+impl RevivalSpec {
+    /// Public assignment label; the private launch keeps its complete prompt.
+    pub(crate) fn public_task(&self) -> Option<&str> {
+        self.public_task.as_deref()
+    }
+
+    fn display_task(&self) -> &str {
+        self.public_task().unwrap_or(&self.task.task)
+    }
+
+    fn check_launch_admission(&self) -> Result<()> {
+        self.launch_admission
+            .as_ref()
+            .map_or(Ok(()), |check| check())
+    }
 }
 
 /// Execute one explicitly requested replacement through the ordinary native
@@ -190,13 +236,14 @@ pub(crate) async fn revive_child(
         deadline,
     )
     .with_parent_model(launch.parent_model.clone())
+    .with_cost_budget(launch.cost_budget.clone())
     .with_revival(id.to_string(), launch.clone());
     let mut result = owner
         .with_current(runner.run_one(&agents, task, launch.step, on_update.map(Arc::from)))
         .await;
     // Continuation and schema-correction prompts are transport details. The
     // returned assignment and any later revival keep the authored source.
-    result.task = launch.task.task;
+    result.task = launch.display_task().to_string();
     let text = render_results(std::slice::from_ref(&result));
     Ok(ToolOutput {
         content: vec![ContentBlock::Text(TextContent::new(text))],
@@ -221,13 +268,40 @@ impl SubagentTool {
         Self {
             cwd: cwd.to_path_buf(),
             global_dir: Config::global_dir(),
+            workspace: crate::workspace::WorkspaceHandle::default(),
             child_binary,
             structured_results: false,
             role_model_spec: None,
+            role_model_role: None,
+            model_config: None,
             model_scope: None,
+            cost_scope: crate::cost::CostScope::default(),
             parent_model: None,
             timeout: None,
+            privacy: None,
+            job_session_scope: crate::jobs::JobSessionScope::default(),
         }
+    }
+
+    /// Share the owning agent's live additional roots with saved-session
+    /// consultation. Changes to this handle apply to subsequent admission checks.
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: crate::workspace::WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    /// Configure privacy for saved-session consultation through direct SDK
+    /// calls. Live Agent calls use the invoking session's current vault.
+    #[must_use]
+    pub fn with_secrets_settings(
+        mut self,
+        settings: Option<&crate::secrets::SecretsSettings>,
+    ) -> Self {
+        self.privacy = Some(crate::text_completion::AuxiliaryPrivacy::from_settings(
+            settings,
+        ));
+        self
     }
 
     /// Set the role model spec children fall back to when their agent
@@ -235,6 +309,29 @@ impl SubagentTool {
     #[must_use]
     pub fn with_role_model_spec(mut self, spec: Option<String>) -> Self {
         self.role_model_spec = spec.filter(|s| !s.trim().is_empty());
+        self.role_model_role = None;
+        self
+    }
+
+    /// Preserve the selected task/smol role's recovery policy. An unlabeled
+    /// explicit model spec never acquires role ownership by matching its ID.
+    #[must_use]
+    pub fn with_role_model_selection(
+        mut self,
+        selection: Option<(crate::models::ModelRole, String)>,
+    ) -> Self {
+        let selection = selection.filter(|(_, spec)| !spec.trim().is_empty());
+        self.role_model_role = selection.as_ref().map(|(role, _)| *role);
+        self.role_model_spec = selection.map(|(_, spec)| spec);
+        self
+    }
+
+    /// Retain the host's already trust-filtered provider policy. Standalone
+    /// callers without a snapshot use global settings, never untrusted project
+    /// settings, when admitting an explicit model override.
+    #[must_use]
+    pub fn with_model_config(mut self, config: Option<Config>) -> Self {
+        self.model_config = config;
         self
     }
 
@@ -244,6 +341,22 @@ impl SubagentTool {
     pub fn with_model_scope(mut self, scope: ToolModelScope) -> Self {
         self.bind_model_scope(scope);
         self
+    }
+
+    /// Bind the owning session's live cost gate. Background runs capture it
+    /// before launch, so switching the parent's session cannot reset them.
+    #[must_use]
+    pub fn with_cost_scope(mut self, scope: crate::cost::CostScope) -> Self {
+        self.cost_scope = scope;
+        self
+    }
+
+    /// Explicit shared budget for standalone SDK delegation.
+    #[must_use]
+    pub fn with_cost_budget(self, budget: Option<crate::cost::CostBudget>) -> Self {
+        let scope = crate::cost::CostScope::default();
+        scope.set(budget);
+        self.with_cost_scope(scope)
     }
 
     /// Freeze the parent's identity before dispatching background work such
@@ -306,15 +419,19 @@ impl SubagentTool {
         let deadline = Deadline::for_request(self.timeout, None)?;
         let definition = tan_agent_definition();
         let agents = BTreeMap::from([(TAN_AGENT_NAME.to_string(), definition)]);
-        let request = SubagentTask {
+        let mut request = SubagentTask {
             agent: TAN_AGENT_NAME.to_string(),
             task: task.to_string(),
+            model: None,
+            model_selection: None,
+            fallback_policy: None,
             cwd: Some(self.cwd.clone()),
             isolation: None,
             iso_apply: None,
             output_schema: None,
             schema_mode: SchemaMode::Permissive,
         };
+        model_selection::prepare(self, &agents, std::iter::once(&mut request), deadline)?;
         let result = ChildRunner::new(
             self.cwd.clone(),
             self.global_dir.clone(),
@@ -323,7 +440,9 @@ impl SubagentTool {
             crate::agent_hub::ChildKind::Tan,
             deadline,
         )
+        .into_background()
         .with_parent_model(self.capture_parent_model())
+        .with_cost_budget(self.cost_scope.current())
         .run_one(&agents, request, None, None)
         .await;
         Ok(TanCompletion::from_result(result))
@@ -336,16 +455,22 @@ impl SubagentTool {
     /// process-global agent directory or current executable.
     #[doc(hidden)]
     #[must_use]
-    pub const fn with_paths(cwd: PathBuf, global_dir: PathBuf, child_binary: PathBuf) -> Self {
+    pub fn with_paths(cwd: PathBuf, global_dir: PathBuf, child_binary: PathBuf) -> Self {
         Self {
             cwd,
             global_dir,
+            workspace: crate::workspace::WorkspaceHandle::default(),
             child_binary,
             structured_results: false,
             role_model_spec: None,
+            role_model_role: None,
+            model_config: None,
             model_scope: None,
+            cost_scope: crate::cost::CostScope::default(),
             parent_model: None,
             timeout: None,
+            privacy: None,
+            job_session_scope: crate::jobs::JobSessionScope::default(),
         }
     }
 
@@ -358,22 +483,40 @@ impl SubagentTool {
         request: SubagentRequest,
         on_update: Option<UpdateCallback>,
     ) -> Result<Vec<SubagentResult>> {
-        let parent_model = self.capture_parent_model();
+        Ok(self.prepare_request(&request)?.run(on_update).await)
+    }
+
+    /// Freeze discovery, model affinity and the original deadline before a
+    /// caller transfers execution into a managed background job.
+    fn prepare_request(&self, request: &SubagentRequest) -> Result<PreparedRequest> {
         // Capture once, before discovery and queueing. Every parallel task,
         // sequential step and schema-correction retry consumes this budget.
         let deadline = Deadline::for_request(self.timeout, request.timeout_seconds)?;
+        self.prepare_request_with_deadline(request, deadline)
+    }
+
+    fn prepare_request_with_deadline(
+        &self,
+        request: &SubagentRequest,
+        deadline: Deadline,
+    ) -> Result<PreparedRequest> {
+        let parent_model = self.capture_parent_model();
+        let mut mode = request.mode()?;
         let agents = self.discover(request.scope)?;
+        match &mut mode {
+            RequestMode::Single(task) => {
+                model_selection::prepare(self, &agents, std::iter::once(task), deadline)?;
+            }
+            RequestMode::Parallel(tasks) | RequestMode::Chain(tasks) => {
+                model_selection::prepare(self, &agents, tasks.iter_mut(), deadline)?;
+            }
+        }
         let concurrency = request
             .concurrency
             .unwrap_or(DEFAULT_CONCURRENCY)
             .clamp(1, MAX_PARALLEL_TASKS);
-
-        match request.mode()? {
-            RequestMode::Single(task) => Ok(vec![
-                self.run_one(&agents, task, None, on_update, deadline, parent_model)
-                    .await,
-            ]),
-            RequestMode::Parallel(tasks) => Ok(ChildRunner::new(
+        Ok(PreparedRequest {
+            runner: ChildRunner::new(
                 self.cwd.clone(),
                 self.global_dir.clone(),
                 self.child_binary.clone(),
@@ -382,22 +525,49 @@ impl SubagentTool {
                 deadline,
             )
             .with_parent_model(parent_model)
-            .run_parallel(&agents, tasks, concurrency, on_update)
-            .await),
+            .with_cost_budget(self.cost_scope.current()),
+            agents,
+            mode,
+            concurrency,
+            deadline,
+        })
+    }
+}
+
+/// An admitted delegation contains no borrowed Agent, mutable tool registry or
+/// caller callback. Queued work cannot rediscover a changed agent definition or
+/// silently adopt a new model after the caller receives its job handle.
+struct PreparedRequest {
+    runner: ChildRunner,
+    agents: BTreeMap<String, AgentDefinition>,
+    mode: RequestMode,
+    concurrency: usize,
+    deadline: Deadline,
+}
+
+impl PreparedRequest {
+    async fn run(self, on_update: Option<UpdateCallback>) -> Vec<SubagentResult> {
+        let Self {
+            runner,
+            agents,
+            mode,
+            concurrency,
+            ..
+        } = self;
+        match mode {
+            RequestMode::Single(task) => vec![runner.run_one(&agents, task, None, on_update).await],
+            RequestMode::Parallel(tasks) => {
+                runner
+                    .run_parallel(&agents, tasks, concurrency, on_update)
+                    .await
+            }
             RequestMode::Chain(tasks) => {
                 let mut previous: Option<SubagentResult> = None;
                 let mut results = Vec::with_capacity(tasks.len());
                 for (step, task) in tasks.into_iter().enumerate() {
                     let task = task.with_rendered_previous_result(previous.as_ref());
-                    let result = self
-                        .run_one(
-                            &agents,
-                            task,
-                            Some(step + 1),
-                            on_update.clone(),
-                            deadline,
-                            parent_model.clone(),
-                        )
+                    let result = runner
+                        .run_one(&agents, task, Some(step + 1), on_update.clone())
                         .await;
                     let failed = result.is_error;
                     previous = Some(result.clone());
@@ -406,31 +576,9 @@ impl SubagentTool {
                         break;
                     }
                 }
-                Ok(results)
+                results
             }
         }
-    }
-
-    async fn run_one(
-        &self,
-        agents: &BTreeMap<String, AgentDefinition>,
-        task: SubagentTask,
-        step: Option<usize>,
-        on_update: Option<UpdateCallback>,
-        deadline: Deadline,
-        parent_model: Option<ToolModelSelection>,
-    ) -> SubagentResult {
-        ChildRunner::new(
-            self.cwd.clone(),
-            self.global_dir.clone(),
-            self.child_binary.clone(),
-            self.role_model_spec.clone(),
-            crate::agent_hub::ChildKind::Subagent,
-            deadline,
-        )
-        .with_parent_model(parent_model)
-        .run_one(agents, task, step, on_update)
-        .await
     }
 }
 
@@ -445,18 +593,40 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Agent definitions live in $PI_CODING_AGENT_DIR/agents/*.md or .pi/agents/*.md. Workspace isolation: per-task `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; parallel tasks and their retries share a captured baseline, then accepted patches apply in task order after execution; conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>)."
+        concat!(
+            "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Built-in agents: task (implementation), scout (read-only exploration), reviewer (read-only correctness review), security-reviewer (read-only security review), sonic (mechanical updates). User definitions in $PI_CODING_AGENT_DIR/agents/*.md override built-ins; the nearest .pi/agents/*.md definitions override both. All built-ins use the ordinary task-role/parent model selection and do not enable recursive delegation. Workspace isolation: single requests and each tasks/chain entry accept cwd, isolation and isoApply. `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; parallel tasks and their retries share a captured baseline, then accepted patches apply in task order after execution; conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>).",
+            " Model selection: an optional model on one task or workflow call accepts an exact provider/model[:thinking] or unambiguous catalog ID, overriding definition/task-role/parent defaults. Every explicit selector is checked before any child or worktree is created; unknown, unavailable, disabled or unsupported destinations fail without fallback. Put model on each tasks/chain entry, not the batch. worker_start and pool_start freeze the same option for their entire lifetime; send/push cannot switch models.",
+            " Historical consultation: use a single request with agent: \"seance\", sourceSession: an explicit saved v3 JSONL path, and task: your question. The fixed consultant receives the active branch's complete bounded, privacy-protected text, no tools/extensions/MCP/current-workspace context, and the saved branch model/effort unless model explicitly overrides it. It never resumes or writes the source. Large snapshots refuse instead of truncating. seance cannot be overridden by agent files or used with cwd, isolation, scope, batches or workflows.",
+            " workflow is an alternative dependency graph of up to 32 named nodes with native call objects and needs IDs. Ready nodes execute in parallel waves, with accepted worktree writeback settled before dependent waves start. Failed or schema-invalid predecessors skip descendants; independent branches continue. One original deadline covers the graph. Inspect each ordered node's state, native result and hubId; this is not graph-wide rollback.",
+            " Set async: true on a single, parallel tasks, chain, or workflow request to return a session-owned background job immediately. Use jobs list/wait/cancel with its jobId; a settled wait includes the native subagent or workflow result. Completion also arrives through the normal background follow-up queue. Definitions, model and request deadline freeze before acknowledgment; queued work does not get a fresh timeout. Background delegation does not retain an eval cell or an Agent callback. Seance remains foreground.",
+            " Reusable workers: operation worker_start launches a persistent RPC child with agent/task; worker_send queues another task on its retained conversation. worker_status/worker_wait select workerId and optional turnId; worker_close cancels the entire worker and its queued turns. Each worker has one fixed lifetime deadline and at most 32 total turns; wait timeout does not cancel work. Workers currently require Unix and isolation none. outputSchema on worker_start or pool_start (or the agent's output_schema) freezes one contract for every turn: each final answer must be bare JSON that validates, returned as data, with no corrective retry; schemaMode there may only be strict. Their jobId owns the whole process lifetime; use worker_wait for individual turn results.",
+            " Native pools: pool_start freezes one agent and up to 8 reusable children under one session-owned job, with optional tasks as a string array. pool_push atomically appends a nonempty task batch, up to 32 items total. Idle workers with lower observed context pressure receive new work first; busy workers retain balanced FIFO queues. pool_finish seals admission and drains all accepted work before reaping children and delivering one ordered aggregate completion. pool_status returns bounded item summaries and result references; pool_result and pool_wait select poolId/itemId for full results. pool_wait without itemId observes aggregate completion without sealing. pool_drain returns up to 4 settled full results with an explicit replayable cursor, without waiting for earlier items, sealing admission or consuming results. pool_close cancels all unfinished work. Pool identities and results survive eval kernel resets; original deadlines and session ownership remain fixed. Failed assignments are never replayed or transferred to replacement children."
+        )
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        workflow::schema(json!({
             "type": "object",
             "properties": {
+                "operation": {"type": "string", "enum": ["worker_start", "worker_send", "worker_status", "worker_wait", "worker_close", "pool_start", "pool_push", "pool_finish", "pool_status", "pool_result", "pool_wait", "pool_drain", "pool_close"], "description": "Persistent RPC worker or aggregate pool control. Omit for ordinary one-shot delegation. Each operation rejects unrelated fields."},
+                "workerId": {"type": "string", "minLength": 1, "description": "Stable session-owned worker identity returned by worker_start."},
+                "poolId": {"type": "string", "minLength": 1, "description": "Stable session-owned pool identity returned by pool_start."},
+                "itemId": {"type": "integer", "minimum": 1, "maximum": 32, "description": "pool_result requires an admitted item ID; pool_wait optionally selects one item instead of the whole pool."},
+                "turnId": {"type": "integer", "minimum": 1, "maximum": 32, "description": "worker_status/worker_wait: select a specific admitted turn; defaults to the latest."},
+                "timeoutMs": {"type": "integer", "minimum": 0, "maximum": 600_000, "description": "worker_wait/pool_wait: bounded observation time, default 30000. pool_drain defaults to zero. Zero polls; expiration leaves accepted work running."},
+                "cursor": {"type":"object","additionalProperties":false,"required":["schema","poolId","itemIds"],"properties":{"schema":{"const":"pi.subagent.pool.cursor.v1"},"poolId":{"type":"string","minLength":1},"itemIds":{"type":"array","maxItems":32,"uniqueItems":true,"items":{"type":"integer","minimum":1,"maximum":32}}},"description":"pool_drain only: caller-owned acknowledgment of already processed terminal items, sorted by item ID. Omit for an empty cursor; replaying a cursor does not consume results."},
+                "maxItems": {"type":"integer","minimum":1,"maximum":4,"description":"pool_drain only: maximum full results in one page, default 4."},
                 "agent": {"type": "string", "description": "Named agent for a single delegation."},
                 "task": {"type": "string", "description": "Task for a single delegation."},
+                "async": {"type": "boolean", "default": false, "description": "Return a managed background job for a single, tasks, chain, or workflow request. jobs wait returns its native result; cancellation and session shutdown terminate unfinished children. Not supported with seance."},
+                "sourceSession": {"type": "string", "minLength": 1, "description": "Required only for agent: seance. Explicit v3 JSONL file path, absolute or relative to the host workspace, admitted only within the workspace, live added roots, or configured agent data directory. The source is inspected read only; IDs, discovery and SQLite sessions are not supported."},
+                "model": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Explicit model for one delegation, worker_start or pool_start: provider/model with optional :thinking, or an unambiguous exact model ID. Overrides agent definition and task/smol/parent defaults. Validated before launch; unknown, unavailable or disabled models fail without fallback. Put model on each tasks/chain entry or workflow call. Workers/pools freeze it for their lifetime. Seance instead defaults to its saved branch model."},
+                "cwd": {"type": "string", "minLength": 1, "description": "Single delegation working directory, absolute or relative to the host workspace. For tasks/chain, put this on each entry."},
+                "isolation": {"type": "string", "enum": ["none", "worktree"], "default": "none", "description": "Single delegation isolation. worktree uses the existing captured-baseline and acceptance gates; non-Git directories refuse rather than falling back."},
+                "isoApply": {"type": "string", "enum": ["keep", "apply", "drop"], "description": "Single delegation worktree disposition, requiring isolation: worktree. Defaults to apply; keep preserves it for inspection, drop reports the patch without writeback."},
                 "outputSchema": {"type": "object", "description": "JSON Schema the single delegation's final output must match; the parent validates and returns parsed data."},
-                "schemaMode": {"type": "string", "enum": ["permissive", "strict"], "default": "permissive", "description": "permissive keeps an invalid result with a warning; strict fails the task."},
-                "tasks": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Independent tasks to run in parallel."},
+                "schemaMode": {"type": "string", "enum": ["permissive", "strict"], "default": "permissive", "description": "permissive keeps an invalid result with a warning; strict fails the task. worker_start and pool_start are always strict and accept only strict."},
+                "tasks": {"anyOf": [{"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}}, {"type": "array", "maxItems": 32, "items": {"type": "string", "minLength": 1}}], "description": "Ordinary delegation: up to 8 task objects. pool_start/pool_push: string assignments for the pool's frozen agent, up to 32 items over the entire pool lifetime."},
                 "chain": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Sequential tasks; {previous} is replaced with the prior child output, and {{previous.data.<field.path>}} addresses the prior task's schema-validated data."},
                 "concurrency": {"type": "integer", "minimum": 1, "maximum": MAX_PARALLEL_TASKS},
                 "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": deadline::MAX_TIMEOUT_SECS, "description": "Budget for this whole delegation request, including queueing, chained steps and corrective retries. May shorten, never extend, the host's limit."},
@@ -469,24 +639,89 @@ impl Tool for SubagentTool {
                     "properties": {
                         "agent": {"type": "string"},
                         "task": {"type": "string"},
-                        "cwd": {"type": "string"},
+                        "model": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Explicit provider/model[:thinking] or unambiguous exact model ID. Overrides the definition and task/smol/parent defaults, frozen before any child or worktree is created."},
+                        "cwd": {"type": "string", "minLength": 1},
                         "isolation": {"type": "string", "enum": ["none", "worktree"], "default": "none", "description": "worktree runs the child in a git worktree with the parent's uncommitted state; non-git dirs refuse with PI_ISO_NOT_GIT."},
-                        "isoApply": {"type": "string", "enum": ["keep", "apply", "drop"], "default": "apply", "description": "What to do with the isolated worktree after completion."},
+                        "isoApply": {"type": "string", "enum": ["keep", "apply", "drop"], "default": "apply", "description": "What to do with the isolated worktree after completion; requires isolation: worktree."},
                         "outputSchema": {"type": "object", "description": "JSON Schema this task's final output must match."},
                         "schemaMode": {"type": "string", "enum": ["permissive", "strict"], "default": "permissive"}
                     }
                 }
             },
             "additionalProperties": false
-        })
+        }))
     }
 
     async fn execute(
         &self,
-        _tool_call_id: &str,
+        tool_call_id: &str,
         input: Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        let privacy = self
+            .privacy
+            .clone()
+            .unwrap_or_else(|| crate::text_completion::AuxiliaryPrivacy::from_settings(None));
+        if worker::requested(&input)? {
+            return worker::execute(
+                self,
+                input,
+                crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(privacy),
+            )
+            .await;
+        }
+        if background::requested(&input)? {
+            return background::start(
+                self,
+                input,
+                crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(privacy),
+            )
+            .await;
+        }
+        let protect = |parts: &[&str]| crate::text_completion::redact_inputs(parts, &privacy);
+        self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, &protect)
+            .await
+    }
+
+    async fn execute_with_invocation(
+        &self,
+        tool_call_id: &str,
+        input: Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        context: ToolInvocationContext<'_>,
+    ) -> Result<ToolOutput> {
+        if worker::requested(&input)? {
+            return worker::execute(self, input, (context.snapshot_privacy)()).await;
+        }
+        if background::requested(&input)? {
+            return background::start(self, input, (context.snapshot_privacy)()).await;
+        }
+        self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, context.protect)
+            .await
+    }
+
+    async fn execute_with_auxiliary_privacy(
+        &self,
+        _tool_call_id: &str,
+        mut input: Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        protect: &(dyn for<'a, 'b> Fn(&'a [&'b str]) -> Result<Vec<String>> + Send + Sync),
+    ) -> Result<ToolOutput> {
+        if worker::requested(&input)? {
+            return Err(Error::tool(
+                "subagent",
+                "PI_SUBAGENT_WORKER_PRIVACY: worker operations require an owned invocation privacy snapshot; use execute_with_invocation or standalone execute",
+            ));
+        }
+        if background::requested(&input)? {
+            return Err(Error::tool(
+                "subagent",
+                "PI_SUBAGENT_BACKGROUND_PRIVACY: background execution requires an owned invocation privacy snapshot; use execute_with_invocation or the standalone execute entry point",
+            ));
+        }
+        if let Some(fields) = input.as_object_mut() {
+            fields.remove("async");
+        }
         if current_subagent_depth() >= MAX_SUBAGENT_DEPTH {
             return Err(Error::tool(
                 "subagent",
@@ -506,27 +741,20 @@ impl Tool for SubagentTool {
                 "PI_SUBAGENT_INVALID_TIMEOUT: timeoutSeconds must be an integer from 1 to 86400",
             ));
         }
+        if seance::is_request(&input)? {
+            return seance::execute(self, input, on_update.map(Arc::from), protect).await;
+        }
+        if let Some(plan) = workflow::Plan::parse(&input)? {
+            return plan.execute(self, on_update.map(Arc::from)).await;
+        }
+        workspace::validate_request(&input)?;
+        model_selection::validate_request(&input)?;
         let request: SubagentRequest = serde_json::from_value(input)
             .map_err(|error| Error::tool("subagent", format!("Invalid input: {error}")))?;
         let update = on_update.map(Arc::from);
         let mode = request.mode_name()?;
         let results = self.run_request(request, update).await?;
-        let is_error = results.iter().any(|result| result.is_error);
-        let mut content = render_results(&results);
-        if self.structured_results {
-            content.push_str("\n\n");
-            content.push_str(&structured_result_block(&results));
-        }
-        Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(content))],
-            details: Some(json!({
-                "schema": SUBAGENT_RESULT_SCHEMA,
-                "mode": mode,
-                "sessionIsolation": "ephemeral_no_session",
-                "results": results,
-            })),
-            is_error,
-        })
+        Ok(result_output(&results, mode, self.structured_results))
     }
 
     fn effects(&self) -> ToolEffects {
@@ -537,6 +765,33 @@ impl Tool for SubagentTool {
         self.model_scope = Some(scope);
         self.parent_model = None;
     }
+
+    fn bind_cost_scope(&mut self, scope: crate::cost::CostScope) {
+        self.cost_scope = scope;
+    }
+
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.job_session_scope = scope;
+    }
+}
+
+fn result_output(results: &[SubagentResult], mode: &str, structured_results: bool) -> ToolOutput {
+    let is_error = results.iter().any(|result| result.is_error);
+    let mut content = render_results(results);
+    if structured_results {
+        content.push_str("\n\n");
+        content.push_str(&structured_result_block(results));
+    }
+    ToolOutput {
+        content: vec![ContentBlock::Text(TextContent::new(content))],
+        details: Some(json!({
+            "schema": SUBAGENT_RESULT_SCHEMA,
+            "mode": mode,
+            "sessionIsolation": "ephemeral_no_session",
+            "results": results,
+        })),
+        is_error,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -546,6 +801,15 @@ struct SubagentRequest {
     agent: Option<String>,
     #[serde(default)]
     task: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    /// Single-delegation workspace controls use the same runner as array entries.
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    isolation: Option<String>,
+    #[serde(default)]
+    iso_apply: Option<String>,
     /// Single-delegation form of the per-task `outputSchema` (bd-cv653.5.1).
     #[serde(default)]
     output_schema: Option<Value>,
@@ -565,6 +829,20 @@ struct SubagentRequest {
 
 impl SubagentRequest {
     fn mode(&self) -> Result<RequestMode> {
+        if (self.tasks.is_some() || self.chain.is_some()) && self.model.is_some() {
+            return Err(Error::tool(
+                "subagent",
+                "PI_SUBAGENT_MODEL: model belongs on each tasks/chain entry, not the batch",
+            ));
+        }
+        if (self.tasks.is_some() || self.chain.is_some())
+            && (self.cwd.is_some() || self.isolation.is_some() || self.iso_apply.is_some())
+        {
+            return Err(Error::tool(
+                "subagent",
+                "PI_SUBAGENT_WORKSPACE_SCOPE: cwd, isolation and isoApply belong on each tasks/chain entry, not the batch",
+            ));
+        }
         let single = self
             .agent
             .as_ref()
@@ -572,9 +850,12 @@ impl SubagentRequest {
             .map(|(agent, task)| SubagentTask {
                 agent: agent.clone(),
                 task: task.clone(),
-                cwd: None,
-                isolation: None,
-                iso_apply: None,
+                model: self.model.clone(),
+                model_selection: None,
+                fallback_policy: None,
+                cwd: self.cwd.clone(),
+                isolation: self.isolation.clone(),
+                iso_apply: self.iso_apply.clone(),
                 output_schema: self.output_schema.clone(),
                 schema_mode: self.schema_mode,
             });
@@ -640,6 +921,15 @@ enum RequestMode {
 struct SubagentTask {
     agent: String,
     task: String,
+    #[serde(default)]
+    model: Option<String>,
+    /// Admission resolves the public selector once. Retries, queues and hub
+    /// revival retain this identity; callers cannot inject a resolved target.
+    #[serde(skip)]
+    model_selection: Option<model_selection::Selection>,
+    /// Bounded, credential-free launch snapshot; never accepted from callers.
+    #[serde(skip)]
+    fallback_policy: Option<String>,
     #[serde(default)]
     cwd: Option<PathBuf>,
     /// Workspace isolation: `none` (default) or `worktree` (bd-cv653.5.2).
@@ -746,7 +1036,7 @@ struct AgentDefinition {
     skills: Vec<PathBuf>,
     system_prompt: String,
     /// Default JSON Schema for the child's final output, from the definition's
-    /// single-line `output_schema:` frontmatter field (bd-cv653.5.1). A task's
+    /// `output_schema:` (or `output:`) frontmatter field. A task's
     /// `outputSchema` overrides it.
     output_schema: Option<Value>,
     source: AgentSource,
@@ -773,7 +1063,8 @@ fn discover_agents_with_roots(
     global_dir: &Path,
     scope: AgentScope,
 ) -> Result<BTreeMap<String, AgentDefinition>> {
-    let mut agents = BTreeMap::new();
+    // Scope selects authored overrides; bundled definitions are always available.
+    let mut agents = bundled::definitions();
     if !matches!(scope, AgentScope::Project) {
         load_agent_dir(&global_dir.join("agents"), AgentSource::User, &mut agents)?;
     }
@@ -816,98 +1107,42 @@ fn load_agent_dir(
             ),
         )
     })?;
-    let mut paths = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
-        })
-        .collect::<Vec<_>>();
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|error| {
+                Error::tool(
+                    "subagent",
+                    format!("Cannot enumerate agent definitions: {error}"),
+                )
+            })?
+            .path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+        {
+            if paths.len() >= definition::MAX_DEFINITIONS {
+                return Err(Error::tool(
+                    "subagent",
+                    "PI_AGENT_DEFINITION_LIMIT: too many agent definitions in one directory",
+                ));
+            }
+            paths.push(path);
+        }
+    }
     paths.sort();
+    let mut names = std::collections::BTreeSet::new();
     for path in paths {
-        let raw = std::fs::read_to_string(&path).map_err(|error| {
-            Error::tool(
+        let agent = definition::read(&path, source)?;
+        if !names.insert(agent.name.clone()) {
+            return Err(Error::tool(
                 "subagent",
-                format!("Cannot read agent definition {}: {error}", path.display()),
-            )
-        })?;
-        let (frontmatter, body) = parse_frontmatter(&raw);
-        let name = required_agent_field(&frontmatter, "name", &path)?;
-        let description = required_agent_field(&frontmatter, "description", &path)?;
-        let tools = frontmatter.get("tools").map(|value| split_csv(value));
-        let definition_dir = path.parent().unwrap_or(directory);
-        let skills = frontmatter
-            .get("skills")
-            .map(|value| {
-                split_csv(value)
-                    .into_iter()
-                    .map(PathBuf::from)
-                    .map(|skill| {
-                        if skill.is_absolute() {
-                            skill
-                        } else {
-                            definition_dir.join(skill)
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let output_schema = frontmatter
-            .get("output_schema")
-            .map(|raw| {
-                serde_json::from_str::<Value>(raw).map_err(|error| {
-                    Error::tool(
-                        "subagent",
-                        format!(
-                            "Agent definition {} has an invalid output_schema (must be single-line JSON): {error}",
-                            path.display()
-                        ),
-                    )
-                })
-            })
-            .transpose()?;
-        agents.insert(
-            name.clone(),
-            AgentDefinition {
-                name,
-                description,
-                model: frontmatter.get("model").cloned(),
-                reasoning: frontmatter
-                    .get("reasoning")
-                    .or_else(|| frontmatter.get("thinking"))
-                    .cloned(),
-                tools,
-                skills,
-                system_prompt: body,
-                output_schema,
-                source,
-                file_path: path,
-            },
-        );
+                "PI_AGENT_DEFINITION_DUPLICATE: two files declare the same agent name in one directory",
+            ));
+        }
+        agents.insert(agent.name.clone(), agent);
     }
     Ok(())
-}
-
-fn required_agent_field(
-    fields: &BTreeMap<String, String>,
-    field: &str,
-    path: &Path,
-) -> Result<String> {
-    fields
-        .get(field)
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| {
-            Error::tool(
-                "subagent",
-                format!(
-                    "Agent definition {} requires frontmatter field {field:?}",
-                    path.display()
-                ),
-            )
-        })
 }
 
 fn split_csv(value: &str) -> Vec<String> {
@@ -919,42 +1154,13 @@ fn split_csv(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_frontmatter(raw: &str) -> (BTreeMap<String, String>, String) {
-    let mut lines = raw.lines();
-    if !matches!(lines.next(), Some(first) if first.trim().eq("---")) {
-        return (BTreeMap::new(), raw.to_string());
-    }
-    let mut fields = BTreeMap::new();
-    let mut body = Vec::new();
-    let mut closed = false;
-    for line in lines.by_ref() {
-        if line.trim().eq("---") {
-            closed = true;
-            break;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if let Some((key, value)) = trimmed.split_once(':') {
-            let key = key.trim();
-            if !key.is_empty() {
-                fields.insert(
-                    key.to_string(),
-                    value
-                        .trim()
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .to_string(),
-                );
-            }
-        }
-    }
-    if !closed {
-        return (BTreeMap::new(), raw.to_string());
-    }
-    body.extend(lines);
-    (fields, body.join("\n"))
+fn with_fallback_policy_args(args: Vec<OsString>, policy: Option<&str>) -> Vec<OsString> {
+    let Some(policy) = policy else {
+        return args;
+    };
+    let mut launch = vec!["--subagent-fallback-policy".into(), policy.into()];
+    launch.extend(args);
+    launch
 }
 
 fn child_args(
@@ -962,12 +1168,46 @@ fn child_args(
     task: &str,
     role_model_spec: Option<&str>,
     parent_model: Option<&ToolModelSelection>,
+    selection: Option<&model_selection::Selection>,
+    output_schema: Option<&Value>,
+) -> Vec<OsString> {
+    let mut args = vec!["--mode".into(), "json".into(), "--print".into()];
+    args.extend(child_options(
+        agent,
+        role_model_spec,
+        parent_model,
+        selection,
+        output_schema,
+    ));
+    args.push(format!("Task: {task}").into());
+    args
+}
+
+fn worker_args(
+    agent: &AgentDefinition,
+    role_model_spec: Option<&str>,
+    parent_model: Option<&ToolModelSelection>,
+    selection: Option<&model_selection::Selection>,
+) -> Vec<OsString> {
+    let mut args = vec!["--mode".into(), "rpc".into()];
+    args.extend(child_options(
+        agent,
+        role_model_spec,
+        parent_model,
+        selection,
+        None,
+    ));
+    args
+}
+
+fn child_options(
+    agent: &AgentDefinition,
+    role_model_spec: Option<&str>,
+    parent_model: Option<&ToolModelSelection>,
+    selection: Option<&model_selection::Selection>,
     output_schema: Option<&Value>,
 ) -> Vec<OsString> {
     let mut args = vec![
-        "--mode".into(),
-        "json".into(),
-        "--print".into(),
         "--no-session".into(),
         "--tools".into(),
         agent
@@ -976,9 +1216,36 @@ fn child_args(
             .map_or_else(|| DEFAULT_CHILD_TOOLS.to_string(), |tools| tools.join(","))
             .into(),
     ];
-    // Model precedence (bd-cv653.3.1): agent-def `model:` pin > task/smol role
-    // spec from settings > captured active parent > ambient configuration.
-    if let Some(model) = &agent.model {
+    if agent.tools.as_ref().is_some_and(Vec::is_empty) {
+        args.push("--no-tools".into());
+    }
+    let consultant = seance::is_consultant(agent);
+    if consultant {
+        args.extend(
+            [
+                "--no-mcp",
+                "--no-extensions",
+                "--no-skills",
+                "--no-context-files",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--no-migrations",
+                "--hide-cwd-in-prompt",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        );
+    }
+    // An admitted per-call identity wins over the definition, task/smol role,
+    // captured parent and ambient configuration. Never reparse its model ID.
+    if let Some(selection) = selection {
+        args.extend([
+            "--provider".into(),
+            selection.provider.clone().into(),
+            "--model".into(),
+            selection.model.clone().into(),
+        ]);
+    } else if let Some(model) = &agent.model {
         args.extend(["--model".into(), model.clone().into()]);
     } else if let Some(spec) = role_model_spec {
         args.extend(["--model".into(), spec.into()]);
@@ -992,7 +1259,9 @@ fn child_args(
             parent.model.clone().into(),
         ]);
     }
-    if let Some(reasoning) = &agent.reasoning {
+    if let Some(thinking) = selection.and_then(|selection| selection.thinking) {
+        args.extend(["--thinking".into(), thinking.to_string().into()]);
+    } else if let Some(reasoning) = &agent.reasoning {
         args.extend(["--thinking".into(), reasoning.clone().into()]);
     }
     for skill in &agent.skills {
@@ -1013,9 +1282,15 @@ fn child_args(
         (prompt, Some(directive)) => Some(format!("{prompt}\n\n{directive}")),
     };
     if let Some(prompt) = appended_prompt {
-        args.extend(["--append-system-prompt".into(), prompt.into()]);
+        // The historical consultant owns the entire prompt. Ordinary agents
+        // continue appending their definitions to the host's context.
+        let flag = if consultant {
+            "--system-prompt"
+        } else {
+            "--append-system-prompt"
+        };
+        args.extend([flag.into(), prompt.into()]);
     }
-    args.push(format!("Task: {task}").into());
     args
 }
 
@@ -1184,7 +1459,9 @@ struct SubagentResult {
     preserved_worktrees: Vec<crate::worktree_iso::IsoOutcome>,
     session_isolation: &'static str,
     /// Agent-hub run id (bd-cv653.5.3) when the registry tracked this run.
-    #[serde(skip)]
+    /// Serialized as `hubId`: callers revive, steer and correlate runs from
+    /// `details.results[]`, so the documented hub reference must reach them.
+    #[serde(skip_serializing_if = "Option::is_none")]
     hub_id: Option<String>,
     #[serde(skip)]
     is_error: bool,
@@ -1472,7 +1749,7 @@ mod tests {
         };
         let args_of =
             |agent: &AgentDefinition, spec: Option<&str>, parent: Option<&ToolModelSelection>| {
-                child_args(agent, "inspect provider", spec, parent, None)
+                child_args(agent, "inspect provider", spec, parent, None, None)
                     .iter()
                     .map(|arg| arg.to_string_lossy().to_string())
                     .collect::<Vec<_>>()
@@ -1536,7 +1813,7 @@ mod tests {
             source: AgentSource::User,
             file_path: PathBuf::from("/tmp/scout.md"),
         };
-        let args = child_args(&agent, "inspect provider", None, None, None)
+        let args = child_args(&agent, "inspect provider", None, None, None, None)
             .iter()
             .map(|arg| arg.to_string_lossy().to_string())
             .collect::<Vec<_>>();
@@ -1558,6 +1835,30 @@ mod tests {
             args.last().map(String::as_str),
             Some("Task: inspect provider")
         );
+        let selected = model_selection::Selection {
+            provider: "local".to_string(),
+            model: "vendor/model:literal".to_string(),
+            thinking: Some(crate::model::ThinkingLevel::Low),
+        };
+        let args = child_args(
+            &agent,
+            "inspect provider",
+            Some("role/model"),
+            None,
+            Some(&selected),
+            None,
+        )
+        .iter()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair == ["--provider", "local"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--model", "vendor/model:literal"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--thinking", "low"]));
+        assert_eq!(args.iter().filter(|arg| *arg == "--thinking").count(), 1);
+        assert!(args.windows(2).any(|pair| pair == ["--tools", "read,grep"]));
     }
 
     #[test]
@@ -1566,6 +1867,7 @@ mod tests {
             &tan_agent_definition(),
             "update the changelog",
             Some("ai-router/gpt-5.6-terra"),
+            None,
             None,
             None,
         )
@@ -1598,6 +1900,9 @@ mod tests {
         let task = SubagentTask {
             agent: TAN_AGENT_NAME.to_string(),
             task: "update the changelog".to_string(),
+            model: None,
+            model_selection: None,
+            fallback_policy: None,
             cwd: None,
             isolation: None,
             iso_apply: None,
@@ -1630,6 +1935,9 @@ mod tests {
         let task = SubagentTask {
             agent: "review".to_string(),
             task: concat!("review {", "previous}").to_string(),
+            model: None,
+            model_selection: None,
+            fallback_policy: None,
             cwd: None,
             isolation: None,
             iso_apply: None,
@@ -1654,6 +1962,9 @@ mod tests {
             agent: "review".to_string(),
             task: "verdict {{previous.data.verdict}} n {{previous.data.stats.count}} miss {{previous.data.absent}}"
                 .to_string(),
+            model: None,
+            model_selection: None,
+            fallback_policy: None,
             cwd: None,
             isolation: None,
             iso_apply: None,
@@ -1775,7 +2086,7 @@ mod tests {
         runtime
             .block_on(tool.execute(
                 "subagent-structured",
-                json!({"agent": "scout", "task": "inspect"}),
+                json!({"agent": "missing-agent-fixture", "task": "inspect"}),
                 None,
             ))
             .expect("execute returns tool output")
@@ -1792,7 +2103,10 @@ mod tests {
     fn structured_block_disabled_by_default_keeps_output_byte_identical() {
         let output = execute_unknown_agent(false);
         let text = output_text(&output);
-        assert_eq!(text, "## scout\nUnknown agent: scout");
+        assert_eq!(
+            text,
+            "## missing-agent-fixture\nUnknown agent: missing-agent-fixture"
+        );
         assert!(!text.contains(STRUCTURED_BLOCK_OPEN));
         assert!(output.is_error);
     }
@@ -1801,7 +2115,7 @@ mod tests {
     fn structured_block_appends_parseable_json_matching_details() {
         let output = execute_unknown_agent(true);
         let text = output_text(&output);
-        let prefix = "## scout\nUnknown agent: scout\n\n";
+        let prefix = "## missing-agent-fixture\nUnknown agent: missing-agent-fixture\n\n";
         assert!(text.starts_with(prefix), "unexpected text: {text}");
         let block = &text[prefix.len()..];
         let body = block
@@ -1824,6 +2138,9 @@ mod tests {
         let task = |name: &str| SubagentTask {
             agent: name.to_string(),
             task: "t".to_string(),
+            model: None,
+            model_selection: None,
+            fallback_policy: None,
             cwd: None,
             isolation: None,
             iso_apply: None,
@@ -1872,6 +2189,9 @@ mod tests {
         let task = SubagentTask {
             agent: "inj".to_string(),
             task: "t".to_string(),
+            model: None,
+            model_selection: None,
+            fallback_policy: None,
             cwd: None,
             isolation: None,
             iso_apply: None,

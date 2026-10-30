@@ -216,6 +216,66 @@ not a full codec decode. Files default to `audio/speech_<id>.<format>`.
 Results identify the speech as AI-generated; disclose this when sharing it.
 No ElevenLabs, local/system speech engine, or voice-cloning backend is claimed.
 
+## Reading local video frames
+
+The ordinary `read` tool can inspect a local video through any model that accepts
+image input. A bare video path returns metadata and a contact sheet; a suffix
+selects one frame or timestamp:
+
+```json
+{"path":"recordings/reproduction.mp4"}
+```
+
+```json
+{"path":"recordings/reproduction.mp4:42"}
+```
+
+```json
+{"path":"recordings/reproduction.mp4:1m2s"}
+```
+
+```json
+{"path":"recordings/reproduction.mp4:00:01:02.5"}
+```
+
+Supported containers are MP4, MOV, M4V, MKV, WebM, AVI, and WMV. Embedded
+cover art is excluded when selecting the video stream. The contact sheet
+contains up to six 320 × 240 previews in chronological order; unknown-duration
+videos return the first frame. A selected frame is fitted into a 1200 × 1200
+image while preserving its aspect ratio.
+
+A bare integer suffix is a **zero-based decoded frame index**. Timestamp
+selectors accept explicit units, decimal seconds, or colon-separated time.
+Frame selection does not estimate the index by multiplying a timestamp by an
+average frame rate, so variable-frame-rate videos keep their frame ordering.
+An existing literal filename containing a colon takes precedence over a suffix.
+
+Install `ffmpeg` and `ffprobe` on an absolute directory in `PATH`; both must
+support the `fd` protocol. Pi checks that capability and gives an explicit
+dependency error if it is missing. No shell is involved. The decoder receives
+the already-opened file admitted by the normal workspace checks, so replacing
+a pathname does not redirect the read. Decoder protocol access is restricted
+to the inherited descriptor and pipes.
+
+Each read admits at most 256 MiB of source data, a 16-megapixel source frame,
+and a 24-hour duration. Frame indices are capped at 10,000,000. Metadata and
+stderr are each capped at 64 KiB, and the PNG output is capped at 4.5 MiB.
+At most two video reads run concurrently; further reads wait for a slot. Each
+read has one 60-second budget covering that wait, helper checks, metadata,
+and all frame extractions. Cancellation owns and
+reaps the helper processes. Decoder allocation limits are per allocation,
+not a total process-memory cap. Length and modification-time checks reject
+detected in-place source changes; the descriptor is not an immutable snapshot.
+
+Visual video reads honor the image-blocking setting and reject `hashline`,
+`offset`, and `limit`: a rendered frame has no source-line edit anchors.
+`raw: true` keeps the ordinary source-text behavior. Video results use normal
+image content blocks, so the existing provider conversion and session
+attachment storage handle them.
+
+This path extracts still images. Use `read_media` below to attach the original
+video or audio to a Gemini-family model.
+
 ## Local video/audio attachments
 
 `read_media` takes `path` to a video (`mp4`, `webm`, `mov`) or audio (`mp3`,
@@ -228,14 +288,63 @@ The result contains a short text note and an inline `media` content block:
 
 The default cap is 5 MiB (`media.maxBytes` overrides it). It is checked both
 before opening and while reading, so concurrent file growth cannot cause an
-unbounded whole-file allocation. Empty inputs are rejected. The block remains
-base64-inline in session JSONL and may be replayed until compaction; this adapter
-does not upload large attachments through the Gemini Files API.
+unbounded whole-file allocation. Empty inputs are rejected. In memory the block
+contains the original base64 bytes. Session storage moves large image/media
+payloads into integrity-checked attachment blobs and restores them for replay.
+The Gemini developer transport can stage large request media through its Files
+API; remote file URIs are transport state, not a replacement for the durable
+local attachment.
 
 Gemini-family transports serialize these media parts natively. Other provider
 transports retain the existing text-placeholder behavior instead of sending the
 inline media payload. This attachment path is distinct from `inspect_image`,
 which explicitly sends its input to the separately selected vision provider.
+
+## ACP audio and video prompts
+
+ACP editors can attach audio directly in `session/prompt`. Pi advertises the
+ACP v1 `promptCapabilities.audio` capability and accepts audio-only prompts:
+
+```json
+{
+  "sessionId": "<active session>",
+  "prompt": [
+    {"type": "text", "text": "Summarize this recording and compare the clip."},
+    {"type": "audio", "mimeType": "audio/wav", "data": "<base64 audio>"},
+    {"type": "resource", "resource": {
+      "uri": "memory:editor-clip.mp4",
+      "mimeType": "video/mp4",
+      "blob": "<base64 video>"
+    }}
+  ]
+}
+```
+
+ACP v1 carries video as an embedded binary resource. Audio resource blobs work
+too. The supplied bytes retain their order beside text and images; a resource
+also retains a labeled URI reference. The URI is never opened or fetched during
+attachment admission. Metadata in `_meta` and annotations is not forwarded to
+the model. MIME types must be bare audio/video labels such as `audio/ogg` or
+`video/webm`; casing is normalized, while parameters and malformed labels are
+rejected. Standard base64 may include or omit padding. Empty or malformed
+payloads reject the whole prompt before a turn starts. These are MIME/base64
+checks, not audio/video codec validation; the selected provider must support
+the submitted format.
+
+The decoded limit is `media.maxBytes`, defaulting to 5 MiB, with a hard 10 MiB
+ceiling for each attachment. A prompt accepts at most 32 audio/video blocks and
+1024 total ACP blocks. Text, URI/MIME metadata, and encoded binary payloads
+share a 32 MiB prompt budget. `_session/steering` uses the same media admission
+rules plus its existing smaller queue and serialized-request limits.
+
+Gemini-family providers receive the native audio/video. Other transports keep
+the explicit media-omission text; they do not receive the binary payload. The
+shared session store retains the full attachment, including large attachment
+sidecars, so ACP load/replay and a later model switch preserve the media. Live
+audio tool outputs and embedded video outputs use the same ACP wire forms and
+can be attached to a later prompt.
+
+The wire forms follow the [official ACP v1 content schema](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/schema/v1/schema.json).
 
 ## Operational boundaries and validation
 

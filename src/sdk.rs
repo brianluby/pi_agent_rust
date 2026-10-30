@@ -22,6 +22,7 @@
 mod extension_bootstrap;
 mod recovery;
 
+use crate::agent::SessionEditSnapshot;
 use crate::app;
 use crate::auth::AuthStorage;
 use crate::cli::Cli;
@@ -365,6 +366,10 @@ pub struct SessionOptions {
     pub model_scope: Option<Vec<String>>,
     pub api_key: Option<String>,
     pub thinking: Option<crate::model::ThinkingLevel>,
+    /// One-shot handoff after planning and the first successful project edit.
+    /// Explicitly opt in for this session; resumed sessions never re-arm it
+    /// from saved history. The destination must be registered and authenticated.
+    pub prewalk: Option<crate::prewalk::PrewalkTarget>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
     /// Built-in selection. `None` keeps CLI defaults; an empty vector disables
@@ -413,6 +418,13 @@ pub struct SessionOptions {
     /// and saves the turn. `None` keeps the run unbounded; zero stops before
     /// the first provider call. Mirrors the CLI's `--max-time` option.
     pub max_time: Option<Duration>,
+
+    /// Positive finite USD warning/cap overrides for the shared session tree.
+    pub warn_cost: Option<f64>,
+    pub max_cost: Option<f64>,
+    /// Share a parent account with an embedded child, or preserve a live account
+    /// across a same-session rebuild. Native child processes inherit theirs.
+    pub cost_budget: Option<crate::cost::CostBudget>,
 
     /// Provider retry for turns driven through this session.
     ///
@@ -496,6 +508,13 @@ pub struct SessionOptions {
     /// still exist; unavailable roots are reported and skipped.
     pub workspace: Option<crate::workspace::WorkspaceHandle>,
 
+    /// Undo history for the default registry's `write`, `edit` and
+    /// `hashline_edit` (bd-cv653.3.13). `None` starts an empty one. A host
+    /// that rebuilds the session, as FTUI does on `/new`, `/resume`, `/reload`
+    /// and `/fork`, passes the same recorder so `/undo` keeps working across
+    /// the rebuild, as on the classic stack. Unused with a [`Self::tool_factory`].
+    pub mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+
     /// Session-level event listener invoked for every [`AgentEvent`].
     ///
     /// Unlike the per-prompt callback passed to [`AgentSessionHandle::prompt`],
@@ -577,6 +596,7 @@ impl Default for SessionOptions {
             model_scope: None,
             api_key: None,
             thinking: None,
+            prewalk: None,
             system_prompt: None,
             append_system_prompt: None,
             enabled_tools: None,
@@ -591,12 +611,16 @@ impl Default for SessionOptions {
             extension_flags: Vec::new(),
             tool_factory: None,
             workspace: None,
+            mutation_recorder: None,
             repair_policy: None,
             include_cwd_in_prompt: true,
             skills_prompt: None,
             no_context_files: false,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
             max_time: None,
+            warn_cost: None,
+            max_cost: None,
+            cost_budget: None,
             retry: None,
             failover: None,
             mcp: None,
@@ -696,29 +720,6 @@ pub struct AgentSessionHandle {
     event_runtime: Option<asupersync::runtime::Runtime>,
 }
 
-/// A provider may read or mutate Session through an extension callback while
-/// a rewind summary is running. Bind the result to the complete source view,
-/// including branch navigation and persistence destination, before installing
-/// a candidate derived from it. These bytes never leave this process.
-#[derive(PartialEq, Eq)]
-struct SessionEditSnapshot {
-    path: Option<PathBuf>,
-    session_dir: Option<PathBuf>,
-    leaf_id: Option<String>,
-    content: Vec<u8>,
-}
-
-impl SessionEditSnapshot {
-    fn capture(session: &Session) -> Result<Self> {
-        Ok(Self {
-            path: session.path.clone(),
-            session_dir: session.session_dir.clone(),
-            leaf_id: session.leaf_id().map(str::to_string),
-            content: serde_json::to_vec(&(&session.header, &session.entries))?,
-        })
-    }
-}
-
 /// Snapshot of the current agent session state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSessionState {
@@ -802,10 +803,85 @@ pub struct RpcSessionState {
     pub auto_retry_enabled: bool,
     #[serde(default)]
     pub message_count: usize,
+    /// Estimated tokens in the selected branch's active model context.
+    /// Read at an idle boundary; this excludes archived and sibling history.
+    #[serde(default)]
+    pub context_tokens: u64,
+    /// Resolved current model capacity, when the model is registered.
+    #[serde(default)]
+    pub context_window: Option<u32>,
     #[serde(default)]
     pub pending_message_count: usize,
     #[serde(default)]
     pub durability_mode: String,
+}
+
+/// Goal operation accepted by RPC `goal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcGoalOp {
+    Get,
+    Create,
+    Resume,
+    Pause,
+    Drop,
+}
+
+impl RpcGoalOp {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Create => "create",
+            Self::Resume => "resume",
+            Self::Pause => "pause",
+            Self::Drop => "drop",
+        }
+    }
+}
+
+/// OMP-compatible goal progress returned by RPC `goal`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcGoal {
+    pub id: String,
+    pub objective: String,
+    pub status: String,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+    pub tokens_used: u64,
+    #[serde(default)]
+    pub time_used_seconds: u64,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub updated_at: u64,
+    #[serde(default)]
+    pub max_prompts: Option<u32>,
+    #[serde(default)]
+    pub prompts_started: Option<u32>,
+    #[serde(default)]
+    pub interrupted: bool,
+}
+
+/// Goal-mode state returned alongside RPC goal progress.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RpcGoalModeState {
+    pub enabled: bool,
+    pub mode: String,
+    pub goal: RpcGoal,
+}
+
+/// Result payload returned by RPC `goal`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcGoalResult {
+    #[serde(default)]
+    pub goal: Option<RpcGoal>,
+    #[serde(default)]
+    pub state: Option<RpcGoalModeState>,
+    #[serde(default)]
+    pub persistence: Option<String>,
+    #[serde(default)]
+    pub persistence_error: Option<String>,
 }
 
 /// Session-level token aggregates returned by RPC `get_session_stats`.
@@ -867,7 +943,7 @@ pub struct RpcBashResult {
     pub full_output_path: Option<String>,
 }
 
-/// Compaction result returned by RPC `compact`.
+/// Compaction result returned by RPC `compact` or in-place `handoff`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcCompactionResult {
@@ -1399,8 +1475,8 @@ impl RpcTransportClient {
         })
     }
 
-    /// Clone a write-only lane that remains usable while `prompt*` borrows
-    /// this client for its single response consumer.
+    /// Clone a write-only lane that remains usable while `prompt*` or
+    /// `handoff*` borrows this client for its single response consumer.
     #[must_use]
     pub fn control_handle(&self) -> RpcControlHandle {
         RpcControlHandle {
@@ -1411,6 +1487,15 @@ impl RpcTransportClient {
     }
 
     pub async fn request(&mut self, command: &str, payload: Map<String, Value>) -> Result<Value> {
+        self.request_with_events(command, payload, |_| {}).await
+    }
+
+    async fn request_with_events(
+        &mut self,
+        command: &str,
+        payload: Map<String, Value>,
+        on_event: impl FnMut(Value),
+    ) -> Result<Value> {
         if payload.contains_key("type") || payload.contains_key("id") {
             return Err(Error::validation(
                 "RPC request payload cannot override reserved type/id fields",
@@ -1425,7 +1510,9 @@ impl RpcTransportClient {
         let mut operation = RpcOperation::new(&self.owner)?;
         self.write_json_line(&Value::Object(command_payload))
             .await?;
-        let response = self.wait_for_response(&request_id, command).await?;
+        let response = self
+            .wait_for_response(&request_id, command, on_event)
+            .await?;
         let success = response
             .get("success")
             .and_then(Value::as_bool)
@@ -1498,6 +1585,52 @@ impl RpcTransportClient {
 
     pub async fn get_session_stats(&mut self) -> Result<RpcSessionStats> {
         self.request_typed("get_session_stats", Map::new()).await
+    }
+
+    /// Read or mutate the persistent goal attached to the current RPC session.
+    ///
+    /// This matches OMP's get/create/resume/pause/drop operation set. Create
+    /// accepts an optional token budget; `max_prompts` is an additive Rust
+    /// extension. No operation here automatically starts a provider turn.
+    pub async fn goal(
+        &mut self,
+        op: RpcGoalOp,
+        objective: Option<&str>,
+        token_budget: Option<u64>,
+    ) -> Result<RpcGoalResult> {
+        self.goal_with_limits(op, objective, token_budget, None)
+            .await
+    }
+
+    /// `goal` with an optional native prompt-count budget.
+    pub async fn goal_with_limits(
+        &mut self,
+        op: RpcGoalOp,
+        objective: Option<&str>,
+        token_budget: Option<u64>,
+        max_prompts: Option<u32>,
+    ) -> Result<RpcGoalResult> {
+        let mut payload = Map::new();
+        payload.insert("op".to_string(), Value::String(op.as_str().to_string()));
+        if let Some(objective) = objective {
+            payload.insert(
+                "objective".to_string(),
+                Value::String(objective.to_string()),
+            );
+        }
+        if let Some(token_budget) = token_budget {
+            payload.insert(
+                "token_budget".to_string(),
+                Value::Number(token_budget.into()),
+            );
+        }
+        if let Some(max_prompts) = max_prompts {
+            payload.insert(
+                "max_prompts".to_string(),
+                Value::Number(u64::from(max_prompts).into()),
+            );
+        }
+        self.request_typed("goal", payload).await
     }
 
     pub async fn get_messages(&mut self) -> Result<Vec<Value>> {
@@ -1619,6 +1752,39 @@ impl RpcTransportClient {
             );
         }
         self.request_typed("compact", payload).await
+    }
+
+    /// Durably replace an older safe prefix with a continuation brief in the
+    /// same session. Manual handoff works even when automatic compaction is off.
+    ///
+    /// Use [`Self::control_handle`] to send `abort` while this request is pending,
+    /// and keep polling this future until its terminal response arrives.
+    pub async fn handoff(&mut self, focus: Option<&str>) -> Result<RpcCompactionResult> {
+        self.handoff_with_events(focus, |_| {}).await
+    }
+
+    /// Handoff with the native compaction lifecycle and extension UI events.
+    ///
+    /// The callback receives non-response frames. Success is the terminal
+    /// `handoff` response after durable installation, not `agent_end`.
+    pub async fn handoff_with_events(
+        &mut self,
+        focus: Option<&str>,
+        on_event: impl FnMut(Value),
+    ) -> Result<RpcCompactionResult> {
+        let mut payload = Map::new();
+        if let Some(focus) = focus {
+            if focus.len() > 4096 || focus.contains('\0') {
+                return Err(Error::validation(
+                    "Handoff focus must fit 4096 bytes and contain no NUL",
+                ));
+            }
+            payload.insert("focus".to_string(), Value::String(focus.to_string()));
+        }
+        let data = self
+            .request_with_events("handoff", payload, on_event)
+            .await?;
+        Self::parse_response_data(data, "handoff")
     }
 
     pub async fn switch_session(&mut self, session_path: &Path) -> Result<RpcCancelledResult> {
@@ -1931,13 +2097,19 @@ impl RpcTransportClient {
             .ok_or_else(|| Error::api("RPC subprocess reader stopped before sending a response"))?
     }
 
-    async fn wait_for_response(&mut self, request_id: &str, command: &str) -> Result<Value> {
+    async fn wait_for_response(
+        &mut self,
+        request_id: &str,
+        command: &str,
+        mut on_event: impl FnMut(Value),
+    ) -> Result<Value> {
         loop {
             let item = self.read_json_line().await?;
             let Some(item_type) = item.get("type").and_then(Value::as_str) else {
                 continue;
             };
             if item_type != "response" {
+                on_event(item);
                 continue;
             }
             if item.get("id").and_then(Value::as_str) != Some(request_id) {
@@ -2058,11 +2230,44 @@ fn rpc_error_from_response(response: &Value, command: &str) -> Error {
     Error::api(format!("RPC {command} failed: {error}"))
 }
 
-/// Proof that replacement preflight completed without mutating runtime
-/// resources. The caller must install the prepared candidate before consuming
-/// the old handle with `commit_resource_shutdown`.
+/// A durable outgoing snapshot held stable while its replacement is prepared.
+/// Dropping this token cancels preparation and releases mutation admission.
+/// Install the candidate before consuming the old handle and token with
+/// `commit_resource_shutdown`.
 pub(crate) struct PreparedSessionShutdown {
     owner_session_id: String,
+    owner: asupersync::Cx,
+    cost_budget: Option<crate::cost::CostBudget>,
+    // Drop the store before mutation admission on an uncommitted token too.
+    session: asupersync::sync::OwnedMutexGuard<Session>,
+    session_actions: crate::agent::SessionActionAdmissionGate,
+    session_action_permit: asupersync::sync::OwnedMutexGuard<()>,
+}
+
+impl PreparedSessionShutdown {
+    /// Arm late billing only once the candidate is complete. The caller must
+    /// install it synchronously after this succeeds; dropping a preparation
+    /// before this point leaves the source account live and unretired.
+    pub(crate) fn retire_cost_for(&self, replacement: &AgentSessionHandle) -> Result<()> {
+        let Some(budget) = &self.cost_budget else {
+            return Ok(());
+        };
+        let candidate = replacement.session.session.try_lock().map_err(|_| {
+            Error::session("replacement session is busy; cost handoff was not applied")
+        })?;
+        // Reloading the same session keeps its account live. Treating its
+        // ongoing foreground usage as late billing would count it twice.
+        if crate::cost::same_session_target(&self.session, &candidate)
+            && replacement
+                .session
+                .agent
+                .cost_budget()
+                .is_some_and(|active| active.same_tree(budget))
+        {
+            return Ok(());
+        }
+        budget.retire_session(&self.session, &self.owner)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2173,16 +2378,30 @@ impl AgentSessionHandle {
         self.mcp_manager = None;
     }
 
-    /// Flush durable state and capture session ownership without stopping any
-    /// runtime resource. On success the caller can synchronously install its
-    /// prepared replacement before cleanup reaches an irreversible step.
+    /// Flush durable state and retain exclusive mutation admission while a
+    /// replacement is prepared, without stopping runtime resources. Dropping
+    /// the returned token keeps the current session available; a successful
+    /// replacement consumes it only after installing its candidate.
     // `&mut self` is deliberate: the preflight must hold exclusive access to
     // the handle while ownership is captured, even though no field is mutated.
     #[allow(clippy::needless_pass_by_ref_mut)]
     pub(crate) async fn preflight_replacement(
         &mut self,
     ) -> std::result::Result<PreparedSessionShutdown, SessionResourceShutdown> {
-        let cx = crate::agent_cx::AgentCx::for_request();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        // Extension mutations take action admission before the store. Keep
+        // that order so an in-flight callback can finish before we freeze it.
+        let session_actions = self.session.session_action_admission_gate();
+        let session_action_permit = match session_actions.acquire(cx.cx()).await {
+            Ok(permit) => permit,
+            Err(err) => {
+                let warning = format!("failed to reserve session replacement: {err}");
+                tracing::warn!(event = "sdk.session.shutdown.admission_failed", "{warning}");
+                let mut report = SessionResourceShutdown::default();
+                report.fail(warning);
+                return Err(report);
+            }
+        };
         let mut session = match asupersync::sync::OwnedMutexGuard::lock(
             Arc::clone(&self.session.session),
             cx.cx(),
@@ -2203,7 +2422,20 @@ impl AgentSessionHandle {
         };
         let owner_session_id = session.header.id.clone();
         if self.session.save_enabled()
-            && let Err(err) = session.flush_autosave_on_shutdown().await
+            && let Some(budget) = self.session.agent.cost_budget()
+            && let Err(error) = budget.checkpoint(&mut session)
+        {
+            let mut report = SessionResourceShutdown::default();
+            report.fail(format!("failed to checkpoint model spend: {error}"));
+            return Err(report);
+        }
+        // Replacing the only live handle must preserve every pending mutation,
+        // even when final process shutdown is configured as best-effort or
+        // skips its flush. A failed preflight leaves this handle available.
+        if self.session.save_enabled()
+            && let Err(err) = session
+                .flush_autosave(crate::session::AutosaveFlushTrigger::Shutdown)
+                .await
         {
             let warning = format!("failed to flush session autosave: {err}");
             tracing::warn!(event = "sdk.session.shutdown.autosave_failed", "{warning}");
@@ -2211,7 +2443,19 @@ impl AgentSessionHandle {
             report.fail(warning);
             return Err(report);
         }
-        Ok(PreparedSessionShutdown { owner_session_id })
+        Ok(PreparedSessionShutdown {
+            owner_session_id,
+            owner: cx.cx().clone(),
+            cost_budget: self
+                .session
+                .agent
+                .cost_budget()
+                .filter(|_| self.session.save_enabled())
+                .cloned(),
+            session,
+            session_actions,
+            session_action_permit,
+        })
     }
 
     async fn shutdown_runtime_resources(
@@ -2268,8 +2512,21 @@ impl AgentSessionHandle {
         self,
         prepared: PreparedSessionShutdown,
     ) -> SessionResourceShutdown {
+        let PreparedSessionShutdown {
+            owner_session_id,
+            session,
+            session_actions,
+            session_action_permit,
+            ..
+        } = prepared;
+        // Queued extension work must fail its old-origin check after the
+        // commit. Release both guards before awaiting runtime shutdown, whose
+        // callbacks may themselves need Session access.
+        session_actions.advance_generation();
+        drop(session);
+        drop(session_action_permit);
         self.shutdown_runtime_resources(
-            Some(prepared.owner_session_id.as_str()),
+            Some(owner_session_id.as_str()),
             SessionResourceShutdown::default(),
         )
         .await
@@ -2305,7 +2562,7 @@ impl AgentSessionHandle {
     /// failures are reported, but they never skip later independent cleanup.
     pub async fn shutdown_owned_resources(self) -> SessionResourceShutdown {
         let mut report = SessionResourceShutdown::default();
-        let cx = crate::agent_cx::AgentCx::for_request();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
         let owner_session_id = match asupersync::sync::OwnedMutexGuard::lock(
             Arc::clone(&self.session.session),
             cx.cx(),
@@ -2314,12 +2571,45 @@ impl AgentSessionHandle {
         {
             Ok(mut session) => {
                 let owner_session_id = session.header.id.clone();
-                if self.session.save_enabled()
-                    && let Err(err) = session.flush_autosave_on_shutdown().await
-                {
-                    let warning = format!("failed to flush session autosave: {err}");
-                    tracing::warn!(event = "sdk.session.shutdown.autosave_failed", "{warning}");
-                    report.fail(warning);
+                if self.session.save_enabled() {
+                    let budget = self.session.agent.cost_budget();
+                    let checkpointed = if let Some(budget) = budget {
+                        match budget.checkpoint(&mut session) {
+                            Ok(()) => true,
+                            Err(error) => {
+                                report.fail(format!("failed to checkpoint model spend: {error}"));
+                                false
+                            }
+                        }
+                    } else {
+                        true
+                    };
+                    // A late-cost journal needs an acknowledged baseline,
+                    // even when transcript shutdown is normally best-effort.
+                    let persisted = if budget.is_some() {
+                        session
+                            .flush_autosave(crate::session::AutosaveFlushTrigger::Shutdown)
+                            .await
+                    } else {
+                        session.flush_autosave_on_shutdown().await
+                    };
+                    match persisted {
+                        Ok(()) => {
+                            if checkpointed
+                                && let Some(budget) = budget
+                                && let Err(error) = budget.retire_session(&session, cx.cx())
+                            {
+                                report.fail(format!(
+                                    "failed to preserve late model spend: {error}"
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            let warning = format!("failed to flush session autosave: {err}");
+                            tracing::warn!(event = "sdk.session.shutdown.autosave_failed", "{warning}");
+                            report.fail(warning);
+                        }
+                    }
                 }
                 Some(owner_session_id)
             }
@@ -2511,6 +2801,45 @@ impl AgentSessionHandle {
         Ok(())
     }
 
+    /// The terminal's plan role is an automatic temporary selection. Preserve
+    /// prewalk, but retire an older fallback cycle only after durable install:
+    /// its cooldown must not silently replace the newly selected planner.
+    #[cfg(feature = "ftui")]
+    pub(crate) async fn set_plan_role_model(
+        &mut self,
+        provider: &str,
+        model: &str,
+        thinking: crate::model::ThinkingLevel,
+        origin: &crate::extensions::SessionActionOrigin,
+    ) -> Result<bool> {
+        let installed = self
+            .session
+            .set_automatic_model_selection(provider, model, thinking, origin)
+            .await?;
+        if installed {
+            self.failover_state.clear();
+        }
+        Ok(installed)
+    }
+
+    /// Arm a one-shot prewalk. Repeated calls preserve an already armed target.
+    /// `None` means the destination already matches the active model/reasoning.
+    pub async fn arm_prewalk(
+        &mut self,
+        target: crate::prewalk::PrewalkTarget,
+    ) -> Result<Option<crate::prewalk::PrewalkTarget>> {
+        self.session.arm_prewalk(target).await
+    }
+
+    #[must_use]
+    pub fn prewalk_target(&self) -> Option<&crate::prewalk::PrewalkTarget> {
+        self.session.agent.prewalk_target()
+    }
+
+    pub fn disarm_prewalk(&mut self) {
+        self.session.agent.disarm_prewalk();
+    }
+
     /// Return the currently configured thinking level.
     pub const fn thinking_level(&self) -> Option<crate::model::ThinkingLevel> {
         self.session.agent.stream_options().thinking_level
@@ -2631,6 +2960,26 @@ impl AgentSessionHandle {
         self.session.persist_session().await
     }
 
+    /// Record a user `!` / `!!` shell run (a `BashExecution` message), as
+    /// OMP's bash runner does. No turn starts: the next prompt carries the
+    /// output to the model, unless the record says `excludeFromContext`.
+    pub async fn record_bash_execution(
+        &mut self,
+        message: crate::session::SessionMessage,
+    ) -> Result<()> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            guard.append_message(message);
+        }
+        self.session.persist_session().await
+    }
+
     /// `/checkpoint [name] [note]` (bd-cv653.3.7): mark the active context so
     /// a later [`Self::rewind_to_checkpoint`] can collapse everything after it.
     pub async fn mark_checkpoint(
@@ -2651,7 +3000,8 @@ impl AgentSessionHandle {
         candidate.ensure_full_v2_hydration_before_save()?;
         let messages = candidate.to_messages_for_current_path();
         let checkpoint = crate::checkpoint::mark_checkpoint(&mut candidate, name, note, &messages);
-        self.install_context_candidate(&mut guard, candidate, false, &admission, "checkpoint")
+        self.session
+            .install_context_candidate(&mut guard, candidate, false, &admission, "checkpoint")
             .await?;
         Ok(checkpoint)
     }
@@ -2742,57 +3092,10 @@ impl AgentSessionHandle {
                 "Session changed while the rewind summary was running; the result was not applied",
             ));
         }
-        self.install_context_candidate(
-            &mut guard,
-            candidate,
-            true,
-            &admission,
-            "checkpoint rewind",
-        )
-        .await?;
+        self.session
+            .install_context_candidate(&mut guard, candidate, true, &admission, "checkpoint rewind")
+            .await?;
         Ok(outcome)
-    }
-
-    /// The caller owns provider and Session-action authority plus the live
-    /// Session lock. Persist a private candidate, then install its context
-    /// without another await. An interrupted or failed save keeps admission
-    /// quarantined even though the original live view remains intact.
-    async fn install_context_candidate(
-        &mut self,
-        live: &mut Session,
-        mut candidate: Session,
-        replace_context: bool,
-        admission: &crate::agent::ProviderAdmissionGate,
-        operation: &str,
-    ) -> Result<()> {
-        admission.ensure_allowed()?;
-        let save_enabled = self.session.save_enabled();
-        if save_enabled {
-            admission.block(format!(
-                "SDK {operation} persistence was interrupted before live installation completed"
-            ));
-            if let Err(first_error) = candidate.save().await
-                && let Err(retry_error) = candidate.save().await
-            {
-                let reason = format!(
-                    "SDK {operation} persistence remained indeterminate after an idempotent retry: first failure: {first_error}; retry failure: {retry_error}"
-                );
-                admission.block(reason.clone());
-                return Err(Error::session_persistence(reason));
-            }
-        }
-        // Save reconciles IDs, navigation and the persisted header. Project
-        // from the accepted candidate, not the view prepared before that I/O.
-        let messages = replace_context.then(|| candidate.to_messages_for_current_path());
-        *live = candidate;
-        if let Some(messages) = messages {
-            self.session.invalidate_background_compaction();
-            self.session.agent.replace_messages(messages);
-        }
-        if save_enabled {
-            admission.clear();
-        }
-        Ok(())
     }
 
     /// OMP `/retry`: move the session leaf to the parent of the last
@@ -2802,7 +3105,7 @@ impl AgentSessionHandle {
     /// Structured user input is refused before changing the session; use
     /// [`Self::prepare_retry_content`] to retain its ordered content blocks.
     pub async fn prepare_retry(&mut self) -> Result<String> {
-        match self.prepare_retry_input(true).await? {
+        match self.session.prepare_retry_input(true).await? {
             UserContent::Text(text) => Ok(text),
             UserContent::Blocks(_) => Err(Error::session(
                 "Structured retry input requires prepare_retry_content",
@@ -2819,39 +3122,7 @@ impl AgentSessionHandle {
     /// persisted before the live context changes. A failed save leaves the
     /// live turn intact and fences subsequent provider calls until recovery.
     pub async fn prepare_retry_content(&mut self) -> Result<UserContent> {
-        self.prepare_retry_input(false).await
-    }
-
-    async fn prepare_retry_input(&mut self, require_text: bool) -> Result<UserContent> {
-        let admission = self.session.provider_admission_gate();
-        admission.ensure_allowed()?;
-        let cx = crate::agent_cx::AgentCx::for_request();
-        // Provider callbacks may need Session actions and the store before
-        // releasing their provider permit. Match recovery's lock order and
-        // reserve authority without quarantining while validation is pending.
-        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
-        let session_actions = self.session.session_action_admission_gate();
-        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
-        let store = Arc::clone(&self.session.session);
-        let mut guard = asupersync::sync::OwnedMutexGuard::lock(store, cx.cx())
-            .await
-            .map_err(|e| Error::session(e.to_string()))?;
-        let plan = crate::checkpoint::plan_retry_content(&guard)
-            .ok_or_else(|| Error::session("No user turn to retry"))?;
-        if let UserContent::Blocks(blocks) = &plan.content {
-            if require_text {
-                return Err(Error::session(
-                    "The last user turn contains structured content; use prepare_retry_content to preserve its attachments",
-                ));
-            }
-            AgentSession::validate_user_content_blocks(blocks)?;
-        }
-        let mut candidate = guard.clone();
-        crate::checkpoint::apply_retry_content_plan(&mut candidate, &plan)
-            .map_err(|error| Error::session(error.to_string()))?;
-        self.install_context_candidate(&mut guard, candidate, true, &admission, "retry rewind")
-            .await?;
-        Ok(plan.content)
+        self.session.prepare_retry_content().await
     }
 
     /// OMP `/branch` and double-Esc rewind: move the session leaf to just
@@ -2876,9 +3147,33 @@ impl AgentSessionHandle {
         candidate.ensure_full_v2_hydration_before_save()?;
         let prepared = crate::checkpoint::rewind_to_user_entry(&mut candidate, entry_id)
             .ok_or_else(|| Error::session(format!("No user message {entry_id} on this branch")))?;
-        self.install_context_candidate(&mut guard, candidate, true, &admission, "branch rewind")
+        self.session
+            .install_context_candidate(&mut guard, candidate, true, &admission, "branch rewind")
             .await?;
         Ok(prepared)
+    }
+
+    /// Make `entry_id` the current leaf, such as another branch's tip (FTUI
+    /// `/tree <n|id>`), and rebuild the agent's context from that path.
+    /// Persisted and admitted like [`Self::rewind_to_user_message`].
+    pub async fn switch_to_entry(&mut self, entry_id: &str) -> Result<()> {
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        let _provider_authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session.session_action_admission_gate();
+        let _session_action_permit = session_actions.acquire(cx.cx()).await?;
+        let store = self.session_store();
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(store, cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        let mut candidate = guard.clone();
+        candidate.ensure_full_v2_hydration_before_save()?;
+        if !candidate.navigate_to(entry_id) {
+            return Err(Error::session(format!("No session entry {entry_id}")));
+        }
+        self.session
+            .install_context_candidate(&mut guard, candidate, true, &admission, "branch switch")
+            .await
     }
 
     /// Read the per-prompt `max_tokens` cap currently configured on the
@@ -2938,14 +3233,15 @@ impl AgentSessionHandle {
             roots.push(canonical.clone());
         }
         candidate.set_additional_roots(&roots);
-        self.install_context_candidate(
-            &mut guard,
-            candidate,
-            false,
-            &admission,
-            "workspace root grant",
-        )
-        .await?;
+        self.session
+            .install_context_candidate(
+                &mut guard,
+                candidate,
+                false,
+                &admission,
+                "workspace root grant",
+            )
+            .await?;
         if !workspace.replace_additional_roots_if_unchanged(previous_roots, roots) {
             // The candidate reached disk, but another host changed live access.
             // Preserve that authority and require deliberate reconciliation.
@@ -3008,14 +3304,15 @@ impl AgentSessionHandle {
         // restore access, including through a later flush of the live Session.
         guard.set_additional_roots(&roots);
         candidate.set_additional_roots(&roots);
-        self.install_context_candidate(
-            &mut guard,
-            candidate,
-            false,
-            &admission,
-            "workspace root removal",
-        )
-        .await?;
+        self.session
+            .install_context_candidate(
+                &mut guard,
+                candidate,
+                false,
+                &admission,
+                "workspace root removal",
+            )
+            .await?;
         if !workspace.replace_additional_roots_if_unchanged(&roots, roots.clone()) {
             guard.set_additional_roots(&workspace.additional_roots());
             let reason = "Workspace roots changed while a root removal was being saved; \
@@ -3083,21 +3380,57 @@ impl AgentSessionHandle {
         Ok(f(&guard))
     }
 
-    /// Trigger an immediate compaction pass (if compaction is enabled).
+    /// Trigger an immediate compaction pass, regardless of the automatic
+    /// threshold and with auto-compaction off too. `instructions`
+    /// (`/compact <focus>`) steer the summary. Returns whether it changed
+    /// the session; `false` means there was too little history to compact.
     pub async fn compact(
         &mut self,
+        instructions: Option<&str>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<()> {
-        self.session.compact_now(on_event).await
+    ) -> Result<bool> {
+        self.session.compact_now(instructions, on_event).await
     }
 
     /// OMP `/shake`: compaction that drops bulky tool output from the older
     /// span instead of summarizing it with the model (no provider request).
+    /// Returns whether it changed the session.
     pub async fn shake(
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.session.shake_now(on_event).await
+    }
+
+    /// Generate and durably install a continuation brief in this session.
+    ///
+    /// Uses the native handoff transaction, including safe recent-turn
+    /// retention, privacy screening, extension hooks and source validation.
+    /// Automatic compaction settings do not disable this explicit operation.
+    /// Cancellation is cooperative; keep polling until it returns so an
+    /// in-progress persistence transaction can finish or retain its fence.
+    /// Session subscribers and the supplied callback receive native compaction
+    /// events. No user prompt or new session is created.
+    pub async fn handoff(
+        &mut self,
+        focus: &str,
+        abort: &AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<()> {
+        let on_event = self.make_combined_callback(on_event);
+        self.session.handoff_now(focus, abort, on_event).await?;
+        // Installation has already committed. Caller cancellation must not
+        // leave idle observers reading the old, uncompacted Agent projection.
+        let cleanup_cx = crate::agent_cx::AgentCx::for_request();
+        let messages = self
+            .session
+            .session
+            .lock(cleanup_cx.cx())
+            .await
+            .map_err(|err| Error::session(err.to_string()))?
+            .to_messages_for_current_path();
+        self.session.agent.replace_messages(messages);
+        Ok(())
     }
 
     /// Access the underlying `AgentSession`.
@@ -3110,8 +3443,16 @@ impl AgentSessionHandle {
         &mut self.session
     }
 
+    /// Learn durable project facts from the current completed, persisted branch.
+    /// The explicit operation works independently of `memory.autoExtract`.
+    pub async fn sync_memory(&self) -> Result<crate::memory::MemorySyncReport> {
+        self.session.sync_memory().await
+    }
+
     /// The recovery policy used by the next turn. `None` disables both
-    /// automatic retries and fallback-provider requests.
+    /// transient-error retries and fallback-provider requests. Automatic
+    /// context-overflow compaction is controlled by the session's compaction
+    /// settings and may still shrink the context and continue once.
     pub const fn retry_policy(&self) -> Option<crate::failover::RetryPolicy> {
         self.retry
     }
@@ -3613,7 +3954,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         .map_err(|err| Error::validation(err.to_string()))?
     };
     if !has_extensions {
-        app::update_session_for_selection(&mut session, &selection);
+        app::update_session_for_selection(&mut session, &selection, &model_registry);
     }
 
     let enabled_tools_owned = cli
@@ -3688,6 +4029,13 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         tool_approval: options.tool_approval.clone(),
         keyword_settings: config.keywords.clone(),
         max_time: options.max_time,
+        cost_budget: crate::cost::resolve_budget(
+            &session,
+            config.session.as_ref(),
+            options.warn_cost,
+            options.max_cost,
+            options.cost_budget.clone(),
+        )?,
         turn_recovery: config.turn_recovery_mode(),
         approval_state: options.approval_state.clone(),
         bash_settings: config.bash.clone(),
@@ -3709,9 +4057,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
                 &enabled_tools,
                 &cwd,
                 Some(&config),
-                Some(std::sync::Arc::new(
-                    crate::undo::FileMutationRecorder::default(),
-                )),
+                Some(options.mutation_recorder.clone().unwrap_or_default()),
                 workspace.as_ref(),
             )
         },
@@ -3753,6 +4099,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     // whatever was configured. Extensions enabled below copy these modes.
     agent_session.set_queue_modes(config.steering_queue_mode(), config.follow_up_queue_mode());
     agent_session.set_api_key_override(options.api_key.clone());
+    agent_session.set_memory_settings(config.memory.as_ref());
     agent_session.advisor = options.advisor.as_ref().map(|options| {
         options
             .runtime()
@@ -3762,6 +4109,15 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         agent_session
             .agent
             .set_foreign_scoped_rules(foreign_rules.rules.clone(), cwd.clone());
+    }
+    if !sdk_test_mode && !cli.no_context_files {
+        agent_session
+            .agent
+            .set_stream_rule_source(crate::stream_rules::StreamRuleSource::new(
+                cwd.clone(),
+                global_dir.clone(),
+                options.workspace_trusted,
+            ))?;
     }
     // Session-coupled todo tool joins after construction (opt-in), matching
     // the CLI wiring in main.rs.
@@ -3884,7 +4240,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             &cwd,
             &global_dir,
             &mcp.config_paths,
-            options.workspace_trusted,
+            options.workspace_trusted && config.mcp_project_config_enabled(),
         )?);
         if let Some(extension_manager) = agent_session
             .extensions
@@ -3916,6 +4272,10 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     };
     if !history.is_empty() {
         agent_session.agent.replace_messages(history);
+    }
+
+    if let Some(target) = options.prewalk {
+        agent_session.arm_prewalk(target).await?;
     }
 
     let mut listeners = EventListeners::new();
@@ -4905,6 +5265,8 @@ mod tests {
             handle.with_retry(Some(crate::failover::RetryPolicy {
                 max_retries: 1,
                 max_failovers_per_turn: 1,
+                model_fallback: true,
+                fallback_on: crate::failover::FallbackOn::Any,
                 base_delay_ms: 1,
                 max_delay_ms: 1,
             })),
@@ -4946,6 +5308,8 @@ mod tests {
         crate::failover::RetryPolicy {
             max_retries,
             max_failovers_per_turn: 0,
+            model_fallback: true,
+            fallback_on: crate::failover::FallbackOn::Any,
             base_delay_ms: 1,
             max_delay_ms: 1,
         }
@@ -5070,6 +5434,8 @@ mod tests {
             handle.with_retry(Some(crate::failover::RetryPolicy {
                 max_retries: 1,
                 max_failovers_per_turn: 1,
+                model_fallback: true,
+                fallback_on: crate::failover::FallbackOn::Any,
                 base_delay_ms: 1,
                 max_delay_ms: 1,
             })),
@@ -5221,6 +5587,58 @@ mod tests {
 
     /// OMP `/shake`: the older span is compacted by dropping bulky content,
     /// recorded as a `shake` compaction, and the provider is never called.
+    /// OMP's bash runner: a user `!` run is recorded, not prompted. The next
+    /// prompt sends its output; a `!!` run is saved but never sent.
+    #[test]
+    fn recorded_bash_runs_reach_the_next_prompt_unless_excluded() {
+        let dir = tempdir().expect("tempdir");
+        let mut handle = saving_handle(dir.path());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        handle
+            .session
+            .agent
+            .set_provider(Arc::new(RewindPrivacyProvider {
+                requests: Arc::clone(&requests),
+            }));
+        let run = |command: &str, output: &str, exclude: bool| {
+            let mut extra = HashMap::new();
+            if exclude {
+                extra.insert("excludeFromContext".to_string(), Value::Bool(true));
+            }
+            crate::session::SessionMessage::BashExecution {
+                command: command.to_string(),
+                output: output.to_string(),
+                exit_code: 0,
+                cancelled: Some(false),
+                truncated: Some(false),
+                full_output_path: None,
+                timestamp: Some(1),
+                extra,
+            }
+        };
+        run_async(handle.record_bash_execution(run("echo a", "bang-shown", false))).expect("!");
+        run_async(handle.record_bash_execution(run("echo b", "bang-hidden", true))).expect("!!");
+        assert!(
+            requests.lock().expect("requests").is_empty(),
+            "recording a run starts no turn"
+        );
+
+        let (_abort, signal) = AgentSessionHandle::new_abort_handle();
+        run_async(handle.prompt_with_abort("what did it print?", signal, |_| {})).expect("turn");
+        let sent = requests.lock().expect("requests").clone();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].contains("bang-shown"), "{}", sent[0]);
+        assert!(!sent[0].contains("bang-hidden"), "{}", sent[0]);
+
+        let path = run_async(handle.with_session(|session| session.path.clone()))
+            .expect("session lock")
+            .expect("persisted");
+        let saved = std::fs::read_to_string(path).expect("read session file");
+        assert!(saved.contains("bang-shown") && saved.contains("bang-hidden"));
+    }
+
+    /// Auto-compaction is off: it gates pi's own compaction, not the user's
+    /// (turning it off used to make `/compact` and `/shake` no-ops).
     #[test]
     fn shake_compacts_without_a_provider_request() {
         let dir = tempdir().expect("tempdir");
@@ -5237,9 +5655,8 @@ mod tests {
             crate::tools::ToolRegistry::new(&[], Path::new("."), None),
             crate::agent::AgentConfig::default(),
         );
-        // A small window so ~3k tokens of history crosses the threshold.
         let settings = crate::compaction::ResolvedCompactionSettings {
-            enabled: true,
+            enabled: false,
             context_window_tokens: 2_000,
             reserve_tokens: 1_000,
             keep_recent_tokens: 1,
@@ -6960,6 +7377,7 @@ mod tests {
                 tool_approval: None,
                 keyword_settings: None,
                 max_time: None,
+                cost_budget: None,
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
                 approval_state: None,
                 bash_settings: None,
@@ -7127,6 +7545,7 @@ mod tests {
                     reasoning: false,
                     input: vec![InputType::Text],
                     cost: ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,
@@ -7181,6 +7600,7 @@ mod tests {
                 reasoning: false,
                 input: vec![InputType::Text],
                 cost: ModelCost {
+                    audio: None,
                     input: 0.0,
                     output: 0.0,
                     cache_read: 0.0,
@@ -7214,6 +7634,7 @@ mod tests {
                 tool_approval: None,
                 keyword_settings: None,
                 max_time: None,
+                cost_budget: None,
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
                 approval_state: None,
                 bash_settings: None,
@@ -7247,6 +7668,35 @@ mod tests {
     }
 
     #[test]
+    fn a_rebuilt_session_keeps_the_hosts_undo_history() {
+        // FTUI rebuilds the handle on /new, /resume, /reload and /fork from
+        // one template; a fresh recorder per handle dropped every undo unit.
+        let tmp = tempdir().expect("tempdir");
+        let options = SessionOptions {
+            mutation_recorder: Some(Arc::default()),
+            ..hermetic_session_options(tmp.path())
+        };
+        let shared = options.mutation_recorder.clone().expect("recorder");
+        for _ in 0..2 {
+            let handle = run_async(create_agent_session(options.clone())).expect("create session");
+            let recorder = handle
+                .session()
+                .agent
+                .mutation_recorder()
+                .expect("recorder");
+            assert!(Arc::ptr_eq(&recorder, &shared)); // ubs:ignore[rust.panic.assert-macros] -- pointer identity is a bool
+        }
+        let handle = run_async(create_agent_session(hermetic_session_options(tmp.path())))
+            .expect("create session");
+        let own = handle
+            .session()
+            .agent
+            .mutation_recorder()
+            .expect("recorder");
+        assert!(!Arc::ptr_eq(&own, &shared)); // ubs:ignore[rust.panic.assert-macros] -- pointer identity is a bool
+    }
+
+    #[test]
     fn compact_without_history_is_noop() {
         let tmp = tempdir().expect("tempdir");
         let options = hermetic_session_options(tmp.path());
@@ -7254,13 +7704,14 @@ mod tests {
         let mut handle = run_async(create_agent_session(options)).expect("create session");
         let events = Arc::new(Mutex::new(Vec::new()));
         let events_for_callback = Arc::clone(&events);
-        run_async(handle.compact(move |event| {
+        let changed = run_async(handle.compact(None, move |event| {
             events_for_callback
                 .lock()
                 .expect("compact callback lock")
                 .push(event);
         }))
         .expect("compact");
+        assert!(!changed, "an empty session reports no change"); // ubs:ignore[rust.panic.assert-macros] -- boolean result; assert_eq! on a bool fails clippy
 
         assert!(
             events
@@ -7269,6 +7720,164 @@ mod tests {
                 .is_empty(),
             "expected no compaction lifecycle events for empty session"
         );
+    }
+
+    /// `/compact <focus>`: the focus text reaches the summary request.
+    #[test]
+    fn compact_instructions_reach_the_summary_request() {
+        run_async(async {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let provider = Arc::new(RewindPrivacyProvider {
+                requests: Arc::clone(&requests),
+            });
+            let mut stored = Session::in_memory();
+            for i in 0..3 {
+                stored.append_message(crate::session::SessionMessage::User {
+                    content: UserContent::Text(format!("question {i} ").repeat(100)),
+                    timestamp: Some(i),
+                });
+                stored.append_message(crate::session::SessionMessage::Assistant {
+                    message: AssistantMessage {
+                        content: vec![ContentBlock::Text(TextContent::new(format!("answer {i}")))],
+                        stop_reason: StopReason::Stop,
+                        ..AssistantMessage::default()
+                    },
+                });
+            }
+            let mut agent = Agent::new(
+                provider,
+                ToolRegistry::new(&[], Path::new("."), None),
+                AgentConfig::default(),
+            );
+            agent.replace_messages(stored.to_messages_for_current_path());
+            let mut handle = AgentSessionHandle::from_session_with_listeners(
+                AgentSession::new(
+                    agent,
+                    Arc::new(AsyncMutex::new(stored)),
+                    false,
+                    ResolvedCompactionSettings {
+                        keep_recent_tokens: 1,
+                        ..ResolvedCompactionSettings::default()
+                    },
+                ),
+                EventListeners::new(),
+            );
+
+            let changed = handle
+                .compact(Some("keep the retry-count decision"), |_| {})
+                .await
+                .expect("compact");
+            assert!(changed, "the history compacts"); // ubs:ignore[rust.panic.assert-macros] -- boolean result
+            let sent = requests.lock().expect("requests").clone();
+            assert!(
+                sent.iter()
+                    .any(|request| request
+                        .contains("Additional focus: keep the retry-count decision")),
+                "{sent:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn native_handoff_fans_out_events_and_refreshes_live_history_after_installation() {
+        run_async(async {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let provider = Arc::new(RewindPrivacyProvider {
+                requests: Arc::clone(&requests),
+            });
+            let mut stored = Session::in_memory();
+            stored.append_message(crate::session::SessionMessage::User {
+                content: UserContent::Text("older authored context ".repeat(100)),
+                timestamp: Some(1),
+            });
+            stored.append_message(crate::session::SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new("older answer"))],
+                    stop_reason: StopReason::Stop,
+                    ..AssistantMessage::default()
+                },
+            });
+            stored.append_message(crate::session::SessionMessage::User {
+                content: UserContent::Blocks(vec![
+                    ContentBlock::Text(TextContent::new("keep this current request")),
+                    ContentBlock::Image(ImageContent {
+                        data: "aW1hZ2U=".to_string(),
+                        mime_type: "image/png".to_string(),
+                    }),
+                ]),
+                timestamp: Some(2),
+            });
+            let session_id = stored.header.id.clone();
+            let before = serde_json::to_value(stored.to_messages_for_current_path()).unwrap();
+            let mut agent = Agent::new(
+                provider,
+                ToolRegistry::new(&[], Path::new("."), None),
+                AgentConfig::default(),
+            );
+            agent.replace_messages(stored.to_messages_for_current_path());
+            let mut handle = AgentSessionHandle::from_session_with_listeners(
+                AgentSession::new(
+                    agent,
+                    Arc::new(AsyncMutex::new(stored)),
+                    false,
+                    ResolvedCompactionSettings {
+                        enabled: false,
+                        keep_recent_tokens: 1,
+                        ..ResolvedCompactionSettings::default()
+                    },
+                ),
+                EventListeners::new(),
+            );
+            let subscriber_events = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = Arc::clone(&subscriber_events);
+            handle.subscribe(move |event| {
+                subscriber
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(event).unwrap());
+            });
+
+            let (cancelled, cancelled_signal) = AbortHandle::new();
+            cancelled.abort();
+            assert!(matches!(
+                handle.handoff("", &cancelled_signal, |_| {}).await,
+                Err(Error::Aborted)
+            ));
+            assert!(requests.lock().unwrap().is_empty());
+            assert_eq!(
+                serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                before,
+            );
+
+            let (_, signal) = AbortHandle::new();
+            let callback_events = Arc::new(Mutex::new(Vec::new()));
+            let callback = Arc::clone(&callback_events);
+            handle
+                .handoff("keep the native attachment", &signal, move |event| {
+                    callback
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::to_value(event).unwrap());
+                })
+                .await
+                .expect("manual handoff ignores disabled automatic compaction");
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let stored = handle.session.session.lock(cx.cx()).await.unwrap();
+            assert_eq!(stored.header.id, session_id);
+            let projected = stored.to_messages_for_current_path();
+            assert_eq!(
+                serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                serde_json::to_value(&projected).unwrap(),
+            );
+            assert_eq!(serde_json::to_value(projected.last()).unwrap(), before[2]);
+            let observed = subscriber_events.lock().unwrap();
+            assert_eq!(*observed, *callback_events.lock().unwrap());
+            assert_eq!(observed.len(), 2);
+            assert_eq!(observed[0]["type"], "auto_compaction_start");
+            assert_eq!(observed[0]["reason"], "handoff");
+            assert_eq!(observed[1]["result"]["details"]["mode"], "handoff");
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        });
     }
 
     #[test]
@@ -7651,12 +8260,255 @@ mod tests {
     }
 
     #[test]
+    fn replacement_preflight_preserves_balanced_session_after_failed_save() {
+        let tmp = tempdir().expect("tempdir");
+        let mut handle = saving_handle(tmp.path());
+        let store = handle.session_store();
+        run_async(async {
+            handle
+                .prompt("persisted before replacement", |_| {})
+                .await
+                .expect("baseline turn");
+            let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+            let blocked = tmp.path().join("directory-not-session.jsonl");
+            std::fs::create_dir(&blocked).expect("block replacement save");
+            let (path, session_id, entry_count) = {
+                let mut session = store.try_lock().expect("session");
+                let path = session.path.clone().expect("saved session path");
+                session
+                    .set_autosave_durability_mode(crate::session::AutosaveDurabilityMode::Balanced);
+                session.append_session_info(Some("pending replacement name".to_string()));
+                session.path = Some(blocked.clone());
+                (path, session.header.id.clone(), session.entries.len())
+            };
+            let before_disk = std::fs::read(&path).expect("baseline session");
+            let failure = handle
+                .preflight_replacement()
+                .await
+                .err()
+                .expect("replacement must refuse an unsaved balanced session");
+            assert!(!failure.completed_cleanly());
+            assert!(
+                failure
+                    .messages()
+                    .any(|message| message.contains("failed to flush"))
+            );
+            assert!(Arc::ptr_eq(&store, &handle.session_store()));
+            assert_eq!(std::fs::read(&path).unwrap(), before_disk);
+            assert_eq!(
+                serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                before_agent
+            );
+            handle
+                .session
+                .ensure_provider_reentry_allowed()
+                .expect("preflight did not retire the current session");
+            {
+                let mut session = store.try_lock().expect("live session after refusal");
+                assert_eq!(session.header.id, session_id);
+                assert_eq!(session.entries.len(), entry_count);
+                assert_eq!(session.path.as_ref(), Some(&blocked));
+                assert_eq!(session.autosave_metrics().pending_mutations, 1);
+                assert_eq!(
+                    session.get_name().as_deref(),
+                    Some("pending replacement name")
+                );
+                session.path = Some(path.clone());
+            }
+
+            let prepared = handle
+                .preflight_replacement()
+                .await
+                .expect("retry preflight after repairing persistence");
+            assert!(store.try_lock().is_err(), "prepared snapshot stays locked");
+            let reopened = Session::open(path.to_str().expect("session path"))
+                .await
+                .expect("reopen flushed session");
+            assert_eq!(reopened.header.id, session_id);
+            assert_eq!(
+                reopened.get_name().as_deref(),
+                Some("pending replacement name")
+            );
+            assert_eq!(reopened.entries.len(), entry_count);
+
+            let next = saving_handle(tmp.path());
+            let next_store = next.session_store();
+            let old_handle = std::mem::replace(&mut handle, next);
+            assert!(
+                old_handle
+                    .commit_resource_shutdown(prepared)
+                    .await
+                    .completed_cleanly()
+            );
+            assert!(Arc::ptr_eq(&next_store, &handle.session_store()));
+            assert_eq!(
+                store
+                    .try_lock()
+                    .unwrap()
+                    .autosave_metrics()
+                    .pending_mutations,
+                0
+            );
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+        });
+    }
+
+    #[test]
+    fn cancelled_replacement_releases_store_and_action_guards_without_retiring_session() {
+        let tmp = tempdir().expect("tempdir");
+        let mut handle = saving_handle(tmp.path());
+        let store = handle.session_store();
+        let actions = handle.session.session_action_admission_gate();
+        let origin = actions.capture_origin();
+        store
+            .try_lock()
+            .unwrap()
+            .append_session_info(Some("retained pending history".to_string()));
+        run_async(async {
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let prepared = handle.preflight_replacement().await.expect("preflight");
+            assert!(store.try_lock().is_err());
+            let mut waiting_action = Box::pin(actions.acquire(cx.cx()));
+            assert!(futures::poll!(waiting_action.as_mut()).is_pending());
+            drop(prepared);
+            drop(
+                waiting_action
+                    .await
+                    .expect("cancelled preparation releases action admission"),
+            );
+            assert!(actions.origin_source().accepts(&origin));
+            {
+                let session = store
+                    .try_lock()
+                    .expect("cancelled preparation releases store");
+                assert_eq!(
+                    session.get_name().as_deref(),
+                    Some("retained pending history")
+                );
+                assert_eq!(session.autosave_metrics().pending_mutations, 0);
+            }
+
+            // Cancellation while waiting for the store must release the
+            // already-acquired action permit as well.
+            let held_store = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&store), cx.cx())
+                .await
+                .expect("hold store");
+            let mut preflight = Box::pin(handle.preflight_replacement());
+            assert!(futures::poll!(preflight.as_mut()).is_pending());
+            let mut waiting_action = Box::pin(actions.acquire(cx.cx()));
+            assert!(futures::poll!(waiting_action.as_mut()).is_pending());
+            drop(preflight);
+            drop(
+                waiting_action
+                    .await
+                    .expect("cancelled preflight releases action admission"),
+            );
+            drop(held_store);
+            assert!(actions.origin_source().accepts(&origin));
+            handle
+                .prompt("continue after cancelled replacement", |_| {})
+                .await
+                .expect("the old session remains usable");
+            assert_eq!(
+                store.try_lock().unwrap().get_name().as_deref(),
+                Some("retained pending history")
+            );
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+        });
+    }
+
+    #[test]
+    fn replacement_preserves_usage_after_checkpoint_and_after_handoff() {
+        for store_kind in [
+            crate::session::SessionStoreKind::Jsonl,
+            #[cfg(feature = "sqlite-sessions")]
+            crate::session::SessionStoreKind::Sqlite,
+        ] {
+            let tmp = tempdir().expect("tempdir");
+            let mut handle = saving_handle_with_store(tmp.path(), store_kind);
+            let budget = crate::cost::CostBudget::new(None, Some(10.0), 0.0).unwrap();
+            budget.record(0.25).unwrap();
+            handle.session.agent.set_cost_budget(Some(budget.clone()));
+            run_async(async {
+                let prepared = handle.preflight_replacement().await.unwrap();
+                let source_path = prepared.session.path.clone().unwrap();
+                let source_bytes = std::fs::read(&source_path).unwrap();
+
+                // This charge races with candidate construction, after the
+                // exact source checkpoint has already reached storage.
+                budget.record(0.5).unwrap();
+                let next = saving_handle_with_store(tmp.path(), store_kind);
+                prepared.retire_cost_for(&next).unwrap();
+                let old = std::mem::replace(&mut handle, next);
+                assert!(old.commit_resource_shutdown(prepared).await.completed_cleanly());
+
+                // A captured request keeps its original account after the
+                // foreground has installed a different session.
+                budget.record(0.75).unwrap();
+                assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+                let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
+                assert!(
+                    (crate::cost::recorded_spend(&reopened).unwrap() - 1.5).abs()
+                        < f64::EPSILON
+                );
+                let resumed = budget.for_replacement(&reopened, false).unwrap();
+                assert!(!resumed.same_tree(&budget));
+                assert!((resumed.spent() - 1.5).abs() < f64::EPSILON);
+                assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+            });
+        }
+    }
+
+    #[test]
+    fn cancelled_preflight_and_same_file_reload_keep_foreground_spend_live() {
+        let tmp = tempdir().expect("tempdir");
+        let mut handle = saving_handle(tmp.path());
+        let budget = crate::cost::CostBudget::new(None, Some(10.0), 0.0).unwrap();
+        budget.record(0.25).unwrap();
+        handle.session.agent.set_cost_budget(Some(budget.clone()));
+        run_async(async {
+            let prepared = handle.preflight_replacement().await.unwrap();
+            let source_path = prepared.session.path.clone().unwrap();
+            drop(prepared);
+            budget.record(0.5).unwrap();
+            let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
+            assert!(
+                (crate::cost::recorded_spend(&reopened).unwrap() - 0.25).abs() < f64::EPSILON
+            );
+
+            let prepared = handle.preflight_replacement().await.unwrap();
+            let mut next = saving_handle(tmp.path());
+            *next.session.session.try_lock().unwrap() = prepared.session.clone();
+            next.session.agent.set_cost_budget(Some(budget.clone()));
+            prepared.retire_cost_for(&next).unwrap();
+            let old = std::mem::replace(&mut handle, next);
+            assert!(old.commit_resource_shutdown(prepared).await.completed_cleanly());
+            budget.record(0.25).unwrap();
+            let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
+            assert!(
+                (crate::cost::recorded_spend(&reopened).unwrap() - 0.75).abs() < f64::EPSILON,
+                "same-file foreground usage must wait for its normal checkpoint"
+            );
+
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+            budget.record(0.5).unwrap();
+            let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
+            assert!(
+                (crate::cost::recorded_spend(&reopened).unwrap() - 1.5).abs() < f64::EPSILON
+            );
+        });
+    }
+
+    #[test]
     fn shutdown_skips_autosave_for_ephemeral_session() {
         let tmp = tempdir().expect("tempdir");
         let warnings = run_async(async {
-            let handle = create_agent_session(hermetic_session_options(tmp.path()))
+            let mut handle = create_agent_session(hermetic_session_options(tmp.path()))
                 .await
                 .expect("create session");
+            let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            budget.record(0.25).unwrap();
+            handle.session.agent.set_cost_budget(Some(budget.clone()));
             let cx = crate::agent_cx::AgentCx::for_request();
             {
                 let mut session = handle
@@ -7669,7 +8521,10 @@ mod tests {
                     .set_autosave_durability_mode(crate::session::AutosaveDurabilityMode::Strict);
                 session.append_session_info(Some("ephemeral mutation".to_string()));
             }
-            handle.shutdown_owned_resources().await
+            let report = handle.shutdown_owned_resources().await;
+            budget.record(0.25).unwrap();
+            assert!((budget.spent() - 0.5).abs() < f64::EPSILON);
+            report
         });
 
         assert!(

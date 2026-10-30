@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+mod operation;
+mod storage;
+
 const MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SCAN_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SCOPE_FILES: usize = 20_000;
@@ -31,6 +34,7 @@ fn scan_error(message: impl Into<String>) -> Error {
 // a Unix FIFO substituted after traversal from hanging a blocking worker.
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     use std::io::Read as _;
+    operation::checkpoint()?;
     let metadata =
         fs::metadata(path).map_err(|_| scan_error(format!("cannot inspect {}", path.display())))?;
     if !metadata.is_file() || metadata.len() > limit {
@@ -64,9 +68,19 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
         )));
     }
     let mut bytes = Vec::new();
-    file.take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| scan_error(format!("cannot read {}", path.display())))?;
+    let mut reader = file.take(limit + 1);
+    let mut chunk = vec![0_u8; 64 * 1024];
+    loop {
+        operation::checkpoint()?;
+        let count = reader
+            .read(&mut chunk)
+            .map_err(|_| scan_error(format!("cannot read {}", path.display())))?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    operation::checkpoint()?;
     if bytes.len() as u64 > limit {
         return Err(scan_error(format!(
             "{} grew beyond its byte limit",
@@ -210,6 +224,7 @@ fixHint = "Canonicalize and check against allowed roots."
 /// `<project>/.pi/security-rules/*.toml`. A malformed project pack is a
 /// named error (fail loud — silently dropping security rules is worse).
 pub fn load_rule_packs(project_root: &Path) -> Result<Vec<RulePack>> {
+    operation::checkpoint()?;
     let mut packs: Vec<RulePack> = vec![toml::from_str(DEFAULT_PACK).map_err(|e| {
         Error::validation(format!("embedded security rule pack failed to parse: {e}"))
     })?];
@@ -233,6 +248,7 @@ pub fn load_rule_packs(project_root: &Path) -> Result<Vec<RulePack>> {
         })?;
         let mut entries = Vec::new();
         for entry in reader {
+            operation::checkpoint()?;
             let path = entry
                 .map_err(|_| scan_error("cannot enumerate every project security rule pack"))?
                 .path();
@@ -247,6 +263,7 @@ pub fn load_rule_packs(project_root: &Path) -> Result<Vec<RulePack>> {
         }
         entries.sort();
         for path in entries {
+            operation::checkpoint()?;
             let text = String::from_utf8(read_bounded(&path, 1024 * 1024)?)
                 .map_err(|_| scan_error(format!("rule pack {} is not UTF-8", path.display())))?;
             let pack: RulePack = toml::from_str(&text)
@@ -260,6 +277,7 @@ pub fn load_rule_packs(project_root: &Path) -> Result<Vec<RulePack>> {
 /// Scope a scan: explicit paths, or the project root. Directories walk
 /// gitignore-respecting file lists via the repo's ignore machinery.
 fn scope_files(cwd: &Path, paths: &[String]) -> Result<Vec<PathBuf>> {
+    operation::checkpoint()?;
     if paths.len() > 256 {
         return Err(scan_error("at most 256 scan roots may be selected"));
     }
@@ -273,6 +291,7 @@ fn scope_files(cwd: &Path, paths: &[String]) -> Result<Vec<PathBuf>> {
             .collect::<Result<Vec<_>>>()?
     };
     for root in roots {
+        operation::checkpoint()?;
         // A mistyped scope must not yield a false-clean "0 findings".
         let metadata = fs::metadata(&root).map_err(|_| {
             scan_error(format!(
@@ -292,6 +311,7 @@ fn scope_files(cwd: &Path, paths: &[String]) -> Result<Vec<PathBuf>> {
                 .filter_entry(|entry| entry.file_name() != ".git")
                 .build();
             for entry in walker {
+                operation::checkpoint()?;
                 let entry = entry.map_err(|_| {
                     scan_error(format!(
                         "cannot completely traverse scope {}",
@@ -426,6 +446,7 @@ fn scan_file(
         .map_or_else(|_| path.to_path_buf(), Path::to_path_buf);
     let rel_display = relative_key(&rel)?;
     for compiled in rules {
+        operation::checkpoint()?;
         if !compiled.applies_to_path(Path::new(&rel_display)) {
             continue;
         }
@@ -435,6 +456,7 @@ fn scan_file(
         let mut cursor = 0;
         let mut line_no = 1_usize;
         for matched in compiled.regex.find_iter(content) {
+            operation::checkpoint()?;
             if findings.len() >= MAX_FINDINGS {
                 return Err(scan_error("scan exceeds 10000 findings; narrow paths"));
             }
@@ -487,6 +509,7 @@ fn compile_rules(packs: &[RulePack]) -> Result<Vec<CompiledRule>> {
     let mut ids = BTreeSet::new();
     for pack in packs {
         for rule in &pack.rules {
+            operation::checkpoint()?;
             if compiled.len() >= 1024 || rule.id.trim().is_empty() || !ids.insert(&rule.id) {
                 return Err(scan_error(
                     "rule inventory exceeds 1024 or contains empty/duplicate IDs",
@@ -509,6 +532,7 @@ fn scan_with_packs(cwd: &Path, paths: &[String], packs: &[RulePack]) -> Result<S
         bytes_read: 0,
     };
     for file in scope_files(cwd, paths)? {
+        operation::checkpoint()?;
         let bytes = read_bounded(&file, MAX_SOURCE_BYTES)?;
         outcome.bytes_read = outcome
             .bytes_read
@@ -646,53 +670,25 @@ fn confine_to_cwd(cwd: &Path, raw: &str, field: &str) -> Result<PathBuf> {
     Ok(cwd.join(candidate))
 }
 
-fn dispositions_path(project_root: &Path) -> PathBuf {
-    project_root.join(".pi").join("security-dispositions.json")
-}
-
 /// Missing store → empty map; unparseable store → error.
 ///
 /// Silently treating a corrupt store as empty would un-suppress every
 /// finding and, on the next `disposition`, overwrite it — destroying all
 /// prior dispositions.
 pub fn load_dispositions(project_root: &Path) -> Result<BTreeMap<String, Disposition>> {
-    let path = dispositions_path(project_root);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => {
-            return Err(Error::tool(
-                "security_scan",
-                format!("read {}: {e}", path.display()),
-            ));
-        }
-    };
-    serde_json::from_str(&text).map_err(|e| {
-        Error::validation(format!(
-            "corrupt disposition store {} ({e}); repair or move it aside before scanning",
-            path.display()
-        ))
-    })
+    storage::Storage::open(project_root)?.load()
 }
 
+/// Atomically replace a complete validated snapshot.
+///
+/// For concurrent individual decisions use the tool's `disposition` operation,
+/// which holds a lock across read/merge/publication. This SDK snapshot API is
+/// intentionally replacement.
 pub fn save_dispositions(
     project_root: &Path,
     dispositions: &BTreeMap<String, Disposition>,
 ) -> Result<()> {
-    let path = dispositions_path(project_root);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            Error::tool("security_scan", format!("create {}: {e}", parent.display()))
-        })?;
-    }
-    let text = serde_json::to_string_pretty(dispositions)
-        .map_err(|e| Error::validation(format!("serialize dispositions: {e}")))?;
-    // Temp + rename: a crash mid-write must not leave a truncated store.
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, text)
-        .map_err(|e| Error::tool("security_scan", format!("write {}: {e}", tmp.display())))?;
-    fs::rename(&tmp, &path)
-        .map_err(|e| Error::tool("security_scan", format!("persist {}: {e}", path.display())))
+    storage::Storage::open(project_root)?.save(dispositions)
 }
 
 /// Partition findings into active vs dispositioned (status false-positive or
@@ -1019,7 +1015,7 @@ impl Tool for SecurityScanTool {
                     "items": { "type": "string" },
                     "description": "Files/dirs to scope (relative to cwd); default: whole project"
                 },
-                "sarifOut": { "type": "string", "description": "run: SARIF output path (default .pi/security-scan.sarif)" },
+                "sarifOut": { "type": "string", "description": "run: NEW workspace-relative .sarif export, never overwritten; omit to atomically replace .pi/security-scan.sarif" },
                 "fingerprint": { "type": "string", "description": "disposition: finding fingerprint" },
                 "status": {
                     "type": "string",
@@ -1054,7 +1050,7 @@ impl Tool for SecurityScanTool {
         let tool = Self {
             cwd: self.cwd.clone(),
         };
-        asupersync::runtime::spawn_blocking(move || match op.as_str() {
+        operation::run(move || match op.as_str() {
             "plan" => tool.op_plan(&parsed),
             "run" => tool.op_run(&parsed),
             "disposition" => tool.op_disposition(&parsed),
@@ -1104,9 +1100,17 @@ impl SecurityScanTool {
 
     fn op_run(&self, input: &ScanInput) -> Result<ToolOutput> {
         use std::fmt::Write as _;
+        // Pin the publication workspace before scanning or other long work.
+        let storage = storage::Storage::open(&self.cwd)?;
+        let relative = storage::report_path(
+            input
+                .sarif_out
+                .as_deref()
+                .unwrap_or(storage::DEFAULT_REPORT),
+        )?;
         let packs = load_rule_packs(&self.cwd)?;
         let outcome = scan_with_packs(&self.cwd, &input.paths, &packs)?;
-        let dispositions = load_dispositions(&self.cwd)?;
+        let dispositions = storage.load()?;
         let (active, suppressed) = partition_by_disposition(outcome.findings, &dispositions);
         let mut sarif = to_sarif(&active, &suppressed, &packs);
         sarif["runs"][0]["invocations"] = json!([{ "executionSuccessful": true }]);
@@ -1115,26 +1119,13 @@ impl SecurityScanTool {
             "skippedNonUtf8Files": outcome.skipped_non_utf8,
             "bytesRead": outcome.bytes_read,
         });
-        let out_path = match input.sarif_out.as_deref() {
-            None => self.cwd.join(".pi/security-scan.sarif"),
-            Some(p) => confine_to_cwd(&self.cwd, p, "sarifOut")?,
-        };
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                Error::tool("security_scan", format!("create {}: {e}", parent.display()))
-            })?;
-        }
+        let out_path = self.cwd.join(relative);
         let encoded = serde_json::to_vec_pretty(&sarif)
             .map_err(|_| scan_error("source report could not be serialized"))?;
         if encoded.len() as u64 > MAX_SOURCE_BYTES {
             return Err(scan_error("source report exceeds 16 MiB; narrow paths"));
         }
-        fs::write(&out_path, encoded).map_err(|e| {
-            Error::tool(
-                "security_scan",
-                format!("write {}: {e}", out_path.display()),
-            )
-        })?;
+        storage.write_report(input.sarif_out.as_deref(), &encoded)?;
         let by_severity = |sev: &str| active.iter().filter(|f| f.severity == sev).count();
         let details = json!({
             "schema": SCAN_SCHEMA,
@@ -1204,8 +1195,7 @@ impl SecurityScanTool {
             .clone()
             .filter(|r| !r.trim().is_empty())
             .ok_or_else(|| Error::validation("security_scan disposition requires reason"))?;
-        let mut dispositions = load_dispositions(&self.cwd)?;
-        dispositions.insert(
+        let count = storage::Storage::open(&self.cwd)?.update(
             fingerprint.clone(),
             Disposition {
                 status: status.clone(),
@@ -1214,26 +1204,24 @@ impl SecurityScanTool {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
             },
-        );
-        save_dispositions(&self.cwd, &dispositions)?;
+        )?;
         Ok(scan_text_output(
             format!("Disposition recorded: {fingerprint} → {status}."),
             json!({
                 "schema": SCAN_SCHEMA,
                 "fingerprint": fingerprint,
                 "status": status,
-                "dispositions": dispositions.len(),
+                "dispositions": count,
             }),
         ))
     }
 
     fn op_compare(&self, input: &ScanInput) -> Result<ToolOutput> {
-        let baseline_path = match input.baseline.as_deref() {
-            None => self.cwd.join(".pi/security-scan.sarif"),
-            Some(p) => confine_to_cwd(&self.cwd, p, "baseline")?,
-        };
-        let text = String::from_utf8(read_bounded(&baseline_path, MAX_SOURCE_BYTES)?)
-            .map_err(|_| invalid_baseline())?;
+        let storage = storage::Storage::open(&self.cwd)?;
+        let selected = input.baseline.as_deref().unwrap_or(storage::DEFAULT_REPORT);
+        let baseline_path = self.cwd.join(storage::report_path(selected)?);
+        let text =
+            String::from_utf8(storage.read_report(selected)?).map_err(|_| invalid_baseline())?;
         let baseline = source_baseline(&text)?;
         let mut previous = baseline.findings;
         // Scope-narrowed compare: baseline findings outside the requested
@@ -1255,7 +1243,7 @@ impl SecurityScanTool {
         }
         let packs = load_rule_packs(&self.cwd)?;
         let current = scan_with_packs(&self.cwd, &input.paths, &packs)?;
-        let dispositions = load_dispositions(&self.cwd)?;
+        let dispositions = storage.load()?;
         let mut report = compare(&previous, &current.findings, &dispositions);
         let current_rules: BTreeMap<_, _> = compile_rules(&packs)?
             .into_iter()

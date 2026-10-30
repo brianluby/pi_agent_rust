@@ -255,6 +255,7 @@ while True:
                 &[],
                 root,
                 None,
+                None,
                 Duration::from_secs(5),
             ))
             .unwrap()
@@ -276,6 +277,182 @@ while True:
         let path = root.join("source.txt");
         std::fs::write(&path, text).unwrap();
         path.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn workspace_refresh_preserves_each_language_and_incremental_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = runtime();
+        let client = connect(temp.path(), json!({"textDocumentSync":2}), &rt);
+        let path = source(temp.path(), "before😀\n");
+        let other = temp.path().join("other.rs");
+        std::fs::write(&other, "before🦀\r\n").unwrap();
+        let other = other.canonicalize().unwrap();
+        let uri = client.ensure_synced(&path, "plaintext").unwrap();
+        let other_uri = client.ensure_synced(&other, "rust").unwrap();
+        std::fs::write(&path, "header\r\nafter😀\n").unwrap();
+        std::fs::write(&other, "header\nafter🦀\r\n").unwrap();
+        rt.block_on(client.ensure_open_documents_synced(Duration::from_secs(5)))
+            .unwrap();
+        let messages = frames(&client, &rt);
+        let opens: Vec<_> = messages
+            .iter()
+            .filter(|message| message["method"] == "textDocument/didOpen")
+            .collect();
+        assert_eq!(
+            opens.len(),
+            2,
+            "refresh must not reopen documents under the source language"
+        );
+        assert_eq!(
+            opens[0]["params"]["textDocument"]["languageId"],
+            "plaintext"
+        );
+        assert_eq!(opens[1]["params"]["textDocument"]["languageId"], "rust");
+        let changes: Vec<_> = messages
+            .iter()
+            .filter(|message| message["method"] == "textDocument/didChange")
+            .collect();
+        assert_eq!(changes.len(), 2);
+        for (target, before, after) in [
+            (uri, "before😀\n", "header\r\nafter😀\n"),
+            (other_uri, "before🦀\r\n", "header\nafter🦀\r\n"),
+        ] {
+            let change = changes
+                .iter()
+                .find(|message| message["params"]["textDocument"]["uri"] == target)
+                .unwrap();
+            assert_eq!(
+                replay_change(before, &change["params"]["contentChanges"][0]),
+                after
+            );
+        }
+        rt.block_on(client.ensure_open_documents_synced(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(frames(&client, &rt).len(), messages.len());
+    }
+
+    #[test]
+    fn workspace_refresh_closes_retained_documents_that_were_deleted_or_replaced() {
+        let temp = tempfile::tempdir().unwrap();
+        let rt = runtime();
+        let client = connect(temp.path(), json!({"textDocumentSync":2}), &rt);
+        let deleted = source(temp.path(), "gone\n");
+        let replaced = temp.path().join("replaced.rs");
+        std::fs::write(&replaced, "before\n").unwrap();
+        let replaced = replaced.canonicalize().unwrap();
+        let kept = temp.path().join("kept.rs");
+        std::fs::write(&kept, "before\n").unwrap();
+        let kept = kept.canonicalize().unwrap();
+        let deleted_uri = client.ensure_synced(&deleted, "plaintext").unwrap();
+        let replaced_uri = client.ensure_synced(&replaced, "rust").unwrap();
+        let kept_uri = client.ensure_synced(&kept, "rust").unwrap();
+        // `rm source.txt` and a directory where a file was, as a `git mv`
+        // of a parent can leave; the agent keeps working on kept.rs.
+        std::fs::remove_file(&deleted).unwrap();
+        std::fs::remove_file(&replaced).unwrap();
+        std::fs::create_dir(&replaced).unwrap();
+        std::fs::write(&kept, "after\n").unwrap();
+        rt.block_on(client.ensure_open_documents_synced(Duration::from_secs(5)))
+            .unwrap();
+        let messages = frames(&client, &rt);
+        let uris = |method: &str| -> Vec<Value> {
+            messages
+                .iter()
+                .filter(|message| message["method"] == method)
+                .map(|message| message["params"]["textDocument"]["uri"].clone())
+                .collect()
+        };
+        assert_eq!(
+            uris("textDocument/didClose"),
+            [json!(replaced_uri), json!(deleted_uri)]
+        );
+        assert_eq!(uris("textDocument/didChange"), [json!(kept_uri)]);
+        // The next refactor starts from the surviving document alone.
+        rt.block_on(client.ensure_open_documents_synced(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(frames(&client, &rt).len(), messages.len());
+    }
+
+    #[test]
+    fn waiting_workspace_refresh_rejects_cancellation_timeout_and_changed_membership() {
+        for mode in [
+            "timeout",
+            "cancel",
+            "drop",
+            "reopen",
+            "membership",
+            "invalidate",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let rt = runtime();
+            let client = connect(
+                temp.path(),
+                json!({"textDocumentSync":{
+                    "openClose":true,"change":1,"save":true
+                }}),
+                &rt,
+            );
+            let path = source(temp.path(), "before");
+            let uri = client.ensure_synced(&path, "plaintext").unwrap();
+            frames(&client, &rt);
+            let paused = client.rpc.pause_outbound_for_test(2, 4096);
+            client.rpc.request("test/held", Value::Null).unwrap();
+            std::fs::write(&path, "after").unwrap();
+            let owner = AgentCx::for_request();
+            rt.block_on(async {
+                let timeout = if mode == "timeout" {
+                    Duration::from_millis(30)
+                } else {
+                    Duration::from_secs(5)
+                };
+                let mut syncing =
+                    Box::pin(owner.with_current(client.ensure_open_documents_synced(timeout)));
+                assert!(futures::poll!(syncing.as_mut()).is_pending());
+                assert!(
+                    client.open_docs.try_lock().is_ok(),
+                    "capacity waits release the document lock"
+                );
+                if mode == "drop" {
+                    drop(syncing);
+                    return;
+                }
+                if mode == "cancel" {
+                    owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel refresh"));
+                } else if matches!(mode, "reopen" | "membership" | "invalidate") {
+                    paused.drain();
+                    if mode == "membership" {
+                        let extra = temp.path().join("extra.txt");
+                        std::fs::write(&extra, "extra").unwrap();
+                        client.ensure_synced(&extra, "plaintext").unwrap();
+                    } else {
+                        client.invalidate(&uri);
+                        if mode == "reopen" {
+                            std::fs::write(&path, "before").unwrap();
+                            client.ensure_synced(&path, "plaintext").unwrap();
+                        }
+                    }
+                }
+                let error = syncing.await.unwrap_err().to_string();
+                let expected = match mode {
+                    "timeout" => "LSP_TIMEOUT",
+                    "cancel" => "LSP_CANCELLED",
+                    _ => "LSP_EDIT_CONFLICT",
+                };
+                assert!(error.contains(expected), "{mode}: {error}");
+            });
+            assert!(client.is_alive());
+            assert!(
+                !paused
+                    .drain()
+                    .iter()
+                    .any(|message| message["method"] == "textDocument/didChange")
+            );
+            rt.block_on(async {
+                let budget = RequestBudget::new(Duration::from_secs(1));
+                drop(budget.acquire(&client.request_lane).await.unwrap());
+            });
+        }
     }
 
     #[test]

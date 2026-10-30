@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 
 // ============================================================================
 // Provider Trait
@@ -41,6 +43,19 @@ pub trait Provider: Send + Sync {
     /// message with these rates; `None` leaves any provider-reported cost
     /// (e.g. OpenRouter's `usage.cost`) as the only source.
     fn model_cost(&self) -> Option<ModelCost> {
+        None
+    }
+
+    /// The session-tree budget guarding this provider, if one is attached.
+    /// Auxiliary requests inherit this handle instead of starting a fresh cap.
+    fn cost_budget(&self) -> Option<&crate::cost::CostBudget> {
+        None
+    }
+
+    /// Remove only the outer spend guard when rebinding a provider to a new
+    /// session. Transport, pricing, and authentication wrappers stay intact.
+    #[doc(hidden)]
+    fn unguarded_provider(&self) -> Option<Arc<dyn Provider>> {
         None
     }
 
@@ -77,6 +92,501 @@ pub trait Provider: Send + Sync {
                 self.api()
             ),
         ))
+    }
+}
+
+/// Apply the session's spending limit at the actual provider boundary. A
+/// replacement guard never nests with an old session's guard, so model and
+/// session changes cannot charge the same response twice.
+pub fn guard_with_cost_budget(
+    provider: Arc<dyn Provider>,
+    budget: crate::cost::CostBudget,
+) -> Arc<dyn Provider> {
+    let inner = provider.unguarded_provider().unwrap_or(provider);
+    Arc::new(CostGuardedProvider { inner, budget })
+}
+
+struct CostGuardedProvider {
+    inner: Arc<dyn Provider>,
+    budget: crate::cost::CostBudget,
+}
+
+#[async_trait]
+impl Provider for CostGuardedProvider {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn api(&self) -> &str {
+        self.inner.api()
+    }
+
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn model_cost(&self) -> Option<ModelCost> {
+        self.inner.model_cost()
+    }
+
+    fn cost_budget(&self) -> Option<&crate::cost::CostBudget> {
+        Some(&self.budget)
+    }
+
+    fn unguarded_provider(&self) -> Option<Arc<dyn Provider>> {
+        Some(Arc::clone(&self.inner))
+    }
+
+    async fn stream(
+        &self,
+        context: &Context<'_>,
+        options: &StreamOptions,
+    ) -> crate::error::Result<Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>>
+    {
+        let attempt = self.budget.start_attempt()?;
+        let accounting = CostAccountingOwner::new(CostAccounting {
+            attempt: Some(attempt),
+            rates: self.inner.model_cost(),
+            known_cost: 0.0,
+            settled: false,
+            failure: None,
+        });
+        let mut observed_options = options.clone();
+        observed_options.usage_observer = Some(accounting.observer());
+        CostMeteredSetup {
+            inner: Some(self.inner.stream(context, &observed_options)),
+            accounting: Some(accounting),
+        }
+        .await
+    }
+
+    async fn compact_native(
+        &self,
+        request_body: &serde_json::Value,
+        options: &StreamOptions,
+    ) -> crate::error::Result<serde_json::Value> {
+        let mut attempt = self.budget.start_attempt()?;
+        let response = self.inner.compact_native(request_body, options).await?;
+        if let Some(usage) = response.get("usage") {
+            let input = usage
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let cached = usage
+                .pointer("/input_tokens_details/cached_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .min(input);
+            let mut priced = crate::model::Usage {
+                input: input.saturating_sub(cached),
+                output: usage
+                    .get("output_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                cache_read: cached,
+                ..Default::default()
+            };
+            if let Some(cost) = usage.get("cost") {
+                priced.billing = Some(
+                    match cost
+                        .as_f64()
+                        .filter(|cost| cost.is_finite() && *cost >= 0.0)
+                    {
+                        Some(total) => crate::model::BillingUsage::ReportedTotal { total },
+                        None => crate::model::BillingUsage::Unavailable {
+                            reason: "Native compaction reported an invalid billed total"
+                                .to_string(),
+                        },
+                    },
+                );
+            }
+            let cost = match self
+                .inner
+                .model_cost()
+                .unwrap_or_default()
+                .price_usage(&mut priced)
+            {
+                Ok(()) => priced.cost.total,
+                Err(error) => {
+                    tracing::warn!(%error, "native compaction billing is unavailable");
+                    f64::NAN
+                }
+            };
+            if let Err(error) = attempt.finish(cost) {
+                tracing::warn!(%error, "native compaction spend accounting failed; budget quarantined");
+            }
+        }
+        Ok(response)
+    }
+}
+
+/// A provider can publish acknowledged cumulative usage without adding a
+/// public stream event. Only token/cost data crosses this boundary. The
+/// request owner closes the observer before returning or being dropped;
+/// retained clones cannot charge a later request or reopen settled billing.
+#[derive(Clone)]
+pub struct UsageObserver {
+    accounting: Arc<std::sync::Mutex<CostAccounting>>,
+}
+
+impl UsageObserver {
+    pub fn observe(&self, usage: &crate::model::Usage) -> crate::error::Result<()> {
+        self.accounting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(&mut usage.clone(), false)
+    }
+
+    /// A complete bill can replace a provisional estimate before the public
+    /// terminal event is consumed. Keep the attempt open for trailing usage
+    /// and source cleanup; its owner still performs the only settlement.
+    pub(crate) fn observe_authoritative(
+        &self,
+        usage: &mut crate::model::Usage,
+    ) -> crate::error::Result<()> {
+        self.accounting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe_snapshot(usage, false, true)
+    }
+}
+
+impl std::fmt::Debug for UsageObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("UsageObserver")
+    }
+}
+
+struct CostAccounting {
+    attempt: Option<crate::cost::CostAttempt>,
+    rates: Option<ModelCost>,
+    known_cost: f64,
+    settled: bool,
+    failure: Option<String>,
+}
+
+impl CostAccounting {
+    fn observe(
+        &mut self,
+        usage: &mut crate::model::Usage,
+        terminal: bool,
+    ) -> crate::error::Result<()> {
+        self.observe_snapshot(usage, terminal, terminal)
+    }
+
+    fn observe_snapshot(
+        &mut self,
+        usage: &mut crate::model::Usage,
+        terminal: bool,
+        authoritative: bool,
+    ) -> crate::error::Result<()> {
+        if self.settled {
+            return Ok(());
+        }
+        if let Some(error) = self.failure() {
+            return Err(error);
+        }
+        let result = self.observe_usage(usage, terminal, authoritative);
+        if let Err(error) = &result {
+            self.failure = Some(error.to_string());
+        }
+        if terminal {
+            // Install the authoritative bill and close under the same lock.
+            // A retained observer cannot race in another provisional amount
+            // between final pricing and settlement.
+            self.settle();
+        }
+        result
+    }
+
+    fn observe_usage(
+        &mut self,
+        usage: &mut crate::model::Usage,
+        terminal: bool,
+        authoritative: bool,
+    ) -> crate::error::Result<()> {
+        // Invalid numeric evidence must quarantine the account before any
+        // pricing fallback can erase it. NaN stays internal to the ledger;
+        // explicit failure metadata is safe to persist and replay.
+        if !usage.cost.total.is_finite() || usage.cost.total < 0.0 {
+            usage.billing = Some(crate::model::BillingUsage::Unavailable {
+                reason: "The provider reported an invalid billed total".to_string(),
+            });
+            usage.cost = crate::model::Cost::default();
+            self.known_cost = f64::NAN;
+            return self
+                .attempt
+                .as_mut()
+                .expect("active cost attempt")
+                .observe(f64::NAN);
+        }
+        let priced = if let Some(rates) = &self.rates {
+            rates.price_usage(usage)
+        } else if usage.billing.is_some() {
+            // An explicit bill or failure is meaningful even for an otherwise
+            // unpriced provider. Unknown audio rates still fail checked pricing.
+            ModelCost::default().price_usage(usage)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = priced {
+            self.known_cost = f64::NAN;
+            let _ = self
+                .attempt
+                .as_mut()
+                .expect("active cost attempt")
+                .observe(f64::NAN);
+            return Err(error);
+        }
+        if !usage.cost.total.is_finite() || usage.cost.total < 0.0 {
+            self.known_cost = f64::NAN;
+            return self
+                .attempt
+                .as_mut()
+                .expect("active cost attempt")
+                .observe(f64::NAN);
+        }
+        self.remember_cost(
+            usage.cost.total,
+            authoritative && (usage.cost.total > 0.0 || usage.has_explicit_billing()),
+        );
+        if terminal {
+            Ok(())
+        } else {
+            // The parent must own known partial usage before this stream can
+            // be interrupted or its child process reaped. Terminal billing
+            // replaces this estimate rather than charging it a second time.
+            self.attempt
+                .as_mut()
+                .expect("active cost attempt")
+                .observe(self.known_cost)
+        }
+    }
+
+    fn remember_cost(&mut self, cost: f64, authoritative_terminal: bool) {
+        if self.known_cost.is_finite() && (authoritative_terminal || cost > self.known_cost) {
+            self.known_cost = cost;
+        }
+    }
+
+    fn failure(&self) -> Option<crate::error::Error> {
+        self.failure.as_ref().map(|message| {
+            crate::error::Error::session(format!("model cost accounting failed: {message}"))
+        })
+    }
+
+    fn settle(&mut self) {
+        if !self.settled {
+            self.settled = true;
+            // Release remote accounting resources even if an adapter retains
+            // observer clones after the request owner has finished.
+            let mut attempt = self.attempt.take().expect("active cost attempt");
+            if let Err(error) = attempt.finish(self.known_cost) {
+                tracing::warn!(%error, "provider spend accounting failed; budget quarantined");
+            }
+        }
+    }
+}
+
+/// Exactly one owner settles the attempt, even when observer clones outlive it.
+struct CostAccountingOwner {
+    accounting: Arc<std::sync::Mutex<CostAccounting>>,
+}
+
+impl CostAccountingOwner {
+    fn new(accounting: CostAccounting) -> Self {
+        Self {
+            accounting: Arc::new(std::sync::Mutex::new(accounting)),
+        }
+    }
+
+    fn observer(&self) -> UsageObserver {
+        UsageObserver {
+            accounting: Arc::clone(&self.accounting),
+        }
+    }
+
+    fn observe(&self, usage: &mut crate::model::Usage, terminal: bool) -> crate::error::Result<()> {
+        self.accounting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(usage, terminal)
+    }
+
+    fn failure(&self) -> Option<crate::error::Error> {
+        self.accounting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .failure()
+    }
+
+    fn settle(&self) {
+        self.accounting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .settle();
+    }
+}
+
+impl Drop for CostAccountingOwner {
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
+
+type BoxedProviderStream = Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>;
+
+/// Drop the provider's setup future before the accounting owner. Its cleanup
+/// can still report usage, even when setup never produced a public stream.
+struct CostMeteredSetup<'a> {
+    inner: Option<
+        Pin<
+            Box<
+                dyn std::future::Future<Output = crate::error::Result<BoxedProviderStream>>
+                    + Send
+                    + 'a,
+            >,
+        >,
+    >,
+    accounting: Option<CostAccountingOwner>,
+}
+
+impl std::future::Future for CostMeteredSetup<'_> {
+    type Output = crate::error::Result<BoxedProviderStream>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let result = self
+            .inner
+            .as_mut()
+            .expect("active provider setup")
+            .as_mut()
+            .poll(cx);
+        if result.is_pending()
+            && self
+                .accounting
+                .as_ref()
+                .and_then(CostAccountingOwner::failure)
+                .is_none()
+        {
+            return Poll::Pending;
+        }
+        drop(self.inner.take());
+        let accounting = self
+            .accounting
+            .take()
+            .expect("provider setup accounting owner");
+        if let Some(error) = accounting.failure() {
+            // A ready stream may itself publish usage during cleanup.
+            drop(result);
+            drop(accounting);
+            return Poll::Ready(Err(error));
+        }
+        match result {
+            Poll::Ready(Ok(inner)) => Poll::Ready(Ok(Box::pin(CostMeteredStream {
+                inner: Some(inner),
+                accounting,
+            }))),
+            Poll::Ready(Err(error)) => {
+                drop(accounting);
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => {
+                unreachable!("pending setup without an accounting error returned above")
+            }
+        }
+    }
+}
+
+impl Drop for CostMeteredSetup<'_> {
+    fn drop(&mut self) {
+        drop(self.inner.take());
+        drop(self.accounting.take());
+    }
+}
+
+/// Owns accounting through source cleanup. Usage snapshots update the shared
+/// budget immediately, including frames that produce no public stream event.
+struct CostMeteredStream {
+    inner: Option<BoxedProviderStream>,
+    accounting: CostAccountingOwner,
+}
+
+impl Stream for CostMeteredStream {
+    type Item = crate::error::Result<StreamEvent>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        if self.inner.is_none() {
+            return Poll::Ready(None);
+        }
+        if let Some(error) = self.accounting.failure() {
+            drop(self.inner.take());
+            self.accounting.settle();
+            return Poll::Ready(Some(Err(error)));
+        }
+        let item = self
+            .inner
+            .as_mut()
+            .expect("active provider stream")
+            .as_mut()
+            .poll_next(cx);
+        match item {
+            Poll::Ready(Some(Ok(mut event))) => {
+                let terminal =
+                    matches!(&event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
+                if terminal {
+                    drop(self.inner.take());
+                }
+                let observed = match &mut event {
+                    StreamEvent::Start { partial } => {
+                        self.accounting.observe(&mut partial.usage, false)
+                    }
+                    StreamEvent::Done { message, .. } => {
+                        self.accounting.observe(&mut message.usage, true)
+                    }
+                    StreamEvent::Error { error, .. } => {
+                        self.accounting.observe(&mut error.usage, true)
+                    }
+                    _ => self.accounting.failure().map_or(Ok(()), Err),
+                };
+                if let Err(error) = observed {
+                    drop(self.inner.take());
+                    self.accounting.settle();
+                    return Poll::Ready(Some(Err(error)));
+                }
+                if terminal {
+                    self.accounting.settle();
+                }
+                Poll::Ready(Some(Ok(event)))
+            }
+            Poll::Ready(None) => {
+                drop(self.inner.take());
+                let error = self.accounting.failure();
+                self.accounting.settle();
+                Poll::Ready(error.map(Err))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                drop(self.inner.take());
+                let error = self.accounting.failure().unwrap_or(error);
+                self.accounting.settle();
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Pending => {
+                if let Some(error) = self.accounting.failure() {
+                    drop(self.inner.take());
+                    self.accounting.settle();
+                    Poll::Ready(Some(Err(error)))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
+impl Drop for CostMeteredStream {
+    fn drop(&mut self) {
+        drop(self.inner.take());
+        self.accounting.settle();
     }
 }
 
@@ -241,6 +751,11 @@ pub struct StreamOptions {
     pub thinking_budgets: Option<ThinkingBudgets>,
     /// Optional `before_provider_request` interceptor (gh #167 / bd-1q31s).
     pub before_provider_request: Option<BeforeProviderRequestHook>,
+    /// Report cumulative provider-acknowledged usage independently of public
+    /// stream events. Installed per attempt by the spending guard; providers
+    /// must not estimate usage from generated text or share it across requests.
+    #[doc(hidden)]
+    pub usage_observer: Option<UsageObserver>,
 }
 
 /// The `service_tier` value an OpenAI-shaped request to `provider` should
@@ -358,45 +873,192 @@ impl InputType {
     }
 }
 
-/// Model pricing per million tokens.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Audio prices per million billable tokens. An absent rate is unknown;
+/// `Some(0.0)` explicitly declares a free bucket. Unknown audio is never
+/// silently charged at the text rate.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AudioModelCost {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<f64>,
+}
+
+/// Model pricing per million tokens. Legacy fields price text; an explicit
+/// billing partition can additionally price audio without changing the token
+/// counts used for context-window management.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ModelCost {
     pub input: f64,
     pub output: f64,
     pub cache_read: f64,
     pub cache_write: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AudioModelCost>,
 }
 
 impl ModelCost {
-    /// True when at least one rate is non-zero, i.e. the catalog actually
-    /// knows this model's pricing.
+    /// Legacy zero text rates do not prove known pricing, but explicit audio
+    /// metadata must survive the provider wrapper even for a free model.
     #[must_use]
     pub fn is_priced(&self) -> bool {
         [self.input, self.output, self.cache_read, self.cache_write]
             .iter()
             .any(|rate| *rate > 0.0)
+            || self.audio.as_ref().is_some_and(|audio| {
+                [
+                    audio.input,
+                    audio.output,
+                    audio.cache_read,
+                    audio.cache_write,
+                ]
+                .iter()
+                .any(Option::is_some)
+            })
     }
 
-    /// Fill `usage.cost` from these per-million-token rates (gh #221).
+    /// Price the provider's billing evidence without confusing billable units
+    /// with context tokens. Explicit bills, including zero, are authoritative.
+    /// Legacy usage retains its established text-only pricing semantics.
     ///
-    /// The component costs always come from the catalog rates. A provider-
-    /// reported total (OpenRouter's `usage.cost`, the amount actually billed)
-    /// is authoritative and kept as `total`; otherwise `total` is the sum of
-    /// the components. Mirrors upstream pi's `calculateCost`.
-    #[allow(clippy::cast_precision_loss)] // Token counts within practical range won't lose precision
-    pub fn price_usage(&self, usage: &mut crate::model::Usage) {
-        let per_million = |rate: f64, tokens: u64| (rate / 1_000_000.0) * tokens as f64;
-        let provider_reported_total = usage.cost.total;
-        usage.cost.input = per_million(self.input, usage.input);
-        usage.cost.output = per_million(self.output, usage.output);
-        usage.cost.cache_read = per_million(self.cache_read, usage.cache_read);
-        usage.cost.cache_write = per_million(self.cache_write, usage.cache_write);
-        usage.cost.total = if provider_reported_total > 0.0 {
-            provider_reported_total
-        } else {
-            usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write
+    /// Missing or invalid accounting is an error and remains explicit in the
+    /// serializable usage record. The spend guard quarantines the account
+    /// while retaining known partial spend instead of inventing a zero bill.
+    pub fn price_usage(&self, usage: &mut crate::model::Usage) -> crate::error::Result<()> {
+        let priced = match usage.billing.as_ref() {
+            Some(crate::model::BillingUsage::Tokens {
+                text,
+                audio,
+                reported_total,
+            }) => self.price_billing_tokens(*text, *audio, *reported_total),
+            Some(crate::model::BillingUsage::ReportedTotal { total }) => Self::checked_bill(*total)
+                .map(|total| crate::model::Cost {
+                    total,
+                    ..Default::default()
+                }),
+            Some(crate::model::BillingUsage::Unavailable { reason }) => {
+                Err(crate::error::Error::session(format!(
+                    "model cost accounting is unavailable: {reason}"
+                )))
+            }
+            None => Self::checked_bill(usage.cost.total).and_then(|total| {
+                self.price_billing_tokens(
+                    crate::model::BillingTokenCounts {
+                        input: usage.input,
+                        output: usage.output,
+                        cache_read: usage.cache_read,
+                        cache_write: usage.cache_write,
+                    },
+                    crate::model::BillingTokenCounts::default(),
+                    (total > 0.0).then_some(total),
+                )
+            }),
         };
+        match priced {
+            Ok(cost) => {
+                usage.cost = cost;
+                Ok(())
+            }
+            Err(error) => {
+                if !matches!(
+                    usage.billing,
+                    Some(crate::model::BillingUsage::Unavailable { .. })
+                ) {
+                    usage.billing = Some(crate::model::BillingUsage::Unavailable {
+                        reason: error.to_string(),
+                    });
+                }
+                // Do not expose NaN/Infinity through session or RPC JSON.
+                if [
+                    usage.cost.input,
+                    usage.cost.output,
+                    usage.cost.cache_read,
+                    usage.cost.cache_write,
+                    usage.cost.total,
+                ]
+                .iter()
+                .any(|cost| !cost.is_finite() || *cost < 0.0)
+                {
+                    usage.cost = crate::model::Cost::default();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn checked_bill(total: f64) -> crate::error::Result<f64> {
+        if total.is_finite() && total >= 0.0 {
+            Ok(total)
+        } else {
+            Err(crate::error::Error::session(
+                "model cost accounting has an invalid billed total",
+            ))
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)] // Practical token counts fit precisely enough in f64.
+    fn price_bucket(rate: Option<f64>, tokens: u64) -> crate::error::Result<f64> {
+        if tokens == 0 {
+            return Ok(0.0);
+        }
+        let rate = rate.filter(|rate| rate.is_finite() && *rate >= 0.0)
+            .ok_or_else(|| crate::error::Error::session("model cost accounting requires a finite nonnegative rate for every used billing bucket"))?;
+        Self::checked_bill((rate / 1_000_000.0) * tokens as f64)
+    }
+
+    fn price_billing_tokens(
+        &self,
+        text: crate::model::BillingTokenCounts,
+        audio: crate::model::BillingTokenCounts,
+        reported_total: Option<f64>,
+    ) -> crate::error::Result<crate::model::Cost> {
+        let reported_total = reported_total.map(Self::checked_bill).transpose()?;
+        let audio_rates = self.audio.as_ref();
+        let components: crate::error::Result<_> = (|| {
+            let input = Self::price_bucket(Some(self.input), text.input)?
+                + Self::price_bucket(audio_rates.and_then(|rates| rates.input), audio.input)?;
+            let output = Self::price_bucket(Some(self.output), text.output)?
+                + Self::price_bucket(audio_rates.and_then(|rates| rates.output), audio.output)?;
+            let cache_read = Self::price_bucket(Some(self.cache_read), text.cache_read)?
+                + Self::price_bucket(
+                    audio_rates.and_then(|rates| rates.cache_read),
+                    audio.cache_read,
+                )?;
+            let cache_write = Self::price_bucket(Some(self.cache_write), text.cache_write)?
+                + Self::price_bucket(
+                    audio_rates.and_then(|rates| rates.cache_write),
+                    audio.cache_write,
+                )?;
+            let total = Self::checked_bill(input + output + cache_read + cache_write)?;
+            Ok(crate::model::Cost {
+                input,
+                output,
+                cache_read,
+                cache_write,
+                total,
+            })
+        })();
+        match (components, reported_total) {
+            (Ok(mut cost), reported_total) => {
+                if let Some(total) = reported_total {
+                    cost.total = total;
+                }
+                Ok(cost)
+            }
+            // A trustworthy bill can still enforce a cap when catalog rates
+            // cannot supply a trustworthy component breakdown.
+            (Err(_), Some(total)) => Ok(crate::model::Cost {
+                total,
+                ..Default::default()
+            }),
+            (Err(error), None) => Err(error),
+        }
     }
 }
 
@@ -568,6 +1230,610 @@ impl std::str::FromStr for KnownProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt as _;
+
+    struct SpendProbe {
+        calls: std::sync::atomic::AtomicUsize,
+        events: Vec<StreamEvent>,
+        rates: Option<ModelCost>,
+        native_cost: Option<serde_json::Value>,
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl Provider for SpendProbe {
+        fn name(&self) -> &str {
+            "spend-probe"
+        }
+        fn api(&self) -> &str {
+            "test"
+        }
+        fn model_id(&self) -> &str {
+            "metered"
+        }
+        fn model_cost(&self) -> Option<ModelCost> {
+            self.rates.clone()
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::iter(
+                self.events.clone().into_iter().map(Ok),
+            )))
+        }
+
+        async fn compact_native(
+            &self,
+            _request_body: &serde_json::Value,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<serde_json::Value> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut response = serde_json::json!({"usage": {
+                "input_tokens": 1_000_000,
+                "input_tokens_details": {"cached_tokens": 250_000},
+                "output_tokens": 500_000
+            }});
+            if let Some(cost) = &self.native_cost {
+                response["usage"]["cost"] = cost.clone();
+            }
+            Ok(response)
+        }
+    }
+
+    fn cost_message(cost: f64, input: u64) -> crate::model::AssistantMessage {
+        crate::model::AssistantMessage {
+            content: vec![],
+            api: "test".to_string(),
+            provider: "spend-probe".to_string(),
+            model: "metered".to_string(),
+            usage: crate::model::Usage {
+                input,
+                cost: crate::model::Cost {
+                    total: cost,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            stop_reason: crate::model::StopReason::Stop,
+            stop_details: None,
+            error_message: None,
+            timestamp: 0,
+        }
+    }
+
+    fn spend_probe(events: Vec<StreamEvent>, rates: Option<ModelCost>) -> Arc<SpendProbe> {
+        Arc::new(SpendProbe {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            events,
+            rates,
+            native_cost: None,
+        })
+    }
+
+    mod usage_observation {
+        use super::*;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone, Copy)]
+        enum Mode {
+            SetupPending,
+            SetupError,
+            Pending,
+            Error,
+            Eof,
+            Done,
+            Invalid,
+        }
+
+        struct DropUsage {
+            observer: UsageObserver,
+            cost: f64,
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl Drop for DropUsage {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+                let _ = self.observer.observe(&cost_message(self.cost, 0).usage);
+            }
+        }
+
+        struct Probe {
+            mode: Mode,
+            observer: Mutex<Option<UsageObserver>>,
+            drops: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Provider for Probe {
+            fn name(&self) -> &str {
+                "usage-probe"
+            }
+            fn api(&self) -> &str {
+                "test"
+            }
+            fn model_id(&self) -> &str {
+                "observed"
+            }
+
+            async fn stream(
+                &self,
+                _context: &Context<'_>,
+                options: &StreamOptions,
+            ) -> crate::error::Result<BoxedProviderStream> {
+                let observer = options
+                    .usage_observer
+                    .clone()
+                    .expect("per-attempt observer");
+                *self.observer.lock().unwrap() = Some(observer.clone());
+                observer.observe(&cost_message(0.5, 0).usage)?;
+                let setup = matches!(self.mode, Mode::SetupPending | Mode::SetupError);
+                let cleanup = DropUsage {
+                    observer,
+                    cost: if setup { 0.75 } else { 1.25 },
+                    drops: Arc::clone(&self.drops),
+                };
+                if setup {
+                    let _cleanup = cleanup;
+                    if matches!(self.mode, Mode::SetupPending) {
+                        std::future::pending::<()>().await;
+                    }
+                    return Err(crate::error::Error::api("setup failed"));
+                }
+                Ok(Box::pin(ObservedStream {
+                    mode: self.mode,
+                    cleanup,
+                }))
+            }
+        }
+
+        struct ObservedStream {
+            mode: Mode,
+            cleanup: DropUsage,
+        }
+
+        impl Stream for ObservedStream {
+            type Item = crate::error::Result<StreamEvent>;
+
+            fn poll_next(
+                self: Pin<&mut Self>,
+                _cx: &mut TaskContext<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                self.cleanup
+                    .observer
+                    .observe(&cost_message(1.0, 0).usage)
+                    .unwrap();
+                match self.mode {
+                    Mode::Pending => Poll::Pending,
+                    Mode::Error => Poll::Ready(Some(Err(crate::error::Error::api("wire failed")))),
+                    Mode::Eof => Poll::Ready(None),
+                    Mode::Done => Poll::Ready(Some(Ok(StreamEvent::Done {
+                        reason: crate::model::StopReason::Stop,
+                        message: cost_message(0.25, 0),
+                    }))),
+                    Mode::Invalid => {
+                        // Even an adapter that ignores observer failure must
+                        // not hide invalid acknowledged billing with Pending.
+                        let _ = self
+                            .cleanup
+                            .observer
+                            .observe(&cost_message(f64::NAN, 0).usage);
+                        Poll::Pending
+                    }
+                    Mode::SetupPending | Mode::SetupError => unreachable!("setup-only fixture"),
+                }
+            }
+        }
+
+        fn probe(mode: Mode) -> Arc<Probe> {
+            Arc::new(Probe {
+                mode,
+                observer: Mutex::new(None),
+                drops: Arc::new(AtomicUsize::new(0)),
+            })
+        }
+
+        fn assert_closed(probe: &Probe, budget: &crate::cost::CostBudget, cost: f64) {
+            assert_eq!(probe.drops.load(Ordering::SeqCst), 1);
+            assert!((budget.spent() - cost).abs() < f64::EPSILON);
+            assert_eq!(budget.snapshot().pending, 0.0);
+            let revision = budget.snapshot().revision;
+            let observer = probe.observer.lock().unwrap().clone().unwrap();
+            assert!(observer.accounting.lock().unwrap().attempt.is_none());
+            observer.observe(&cost_message(99.0, 0).usage).unwrap();
+            observer.observe(&cost_message(f64::NAN, 0).usage).unwrap();
+            assert_eq!(budget.snapshot().revision, revision);
+            assert!((budget.spent() - cost).abs() < f64::EPSILON);
+        }
+
+        #[test]
+        fn setup_cancellation_and_failure_keep_acknowledged_usage_and_close_observers() {
+            for mode in [Mode::SetupPending, Mode::SetupError] {
+                let budget = crate::cost::CostBudget::new(None, Some(0.4), 0.0).unwrap();
+                let probe = probe(mode);
+                let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+                let context = Context::default();
+                let options = StreamOptions::default();
+                let mut setup = Box::pin(provider.stream(&context, &options));
+                let mut cx = TaskContext::from_waker(futures::task::noop_waker_ref());
+                let result = std::future::Future::poll(setup.as_mut(), &mut cx);
+                if matches!(mode, Mode::SetupPending) {
+                    assert!(result.is_pending());
+                    assert_eq!(budget.snapshot().pending, 0.5);
+                    assert_eq!(probe.drops.load(Ordering::SeqCst), 0);
+                } else {
+                    assert!(matches!(result, Poll::Ready(Err(_))));
+                }
+                assert!(matches!(
+                    budget.admit(),
+                    Err(crate::error::Error::CostCap { .. })
+                ));
+                drop(setup);
+                assert_closed(&probe, &budget, 0.75);
+                assert!(matches!(
+                    budget.admit(),
+                    Err(crate::error::Error::CostCap { .. })
+                ));
+            }
+        }
+
+        #[test]
+        fn pending_failure_eof_and_terminal_cleanup_settle_once_after_source_drop() {
+            futures::executor::block_on(async {
+                for mode in [
+                    Mode::Pending,
+                    Mode::Error,
+                    Mode::Eof,
+                    Mode::Done,
+                    Mode::Invalid,
+                ] {
+                    let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+                    let probe = probe(mode);
+                    let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+                    let mut stream = provider
+                        .stream(&Context::default(), &StreamOptions::default())
+                        .await
+                        .unwrap();
+                    assert_eq!(budget.snapshot().pending, 0.5);
+                    let mut cx = TaskContext::from_waker(futures::task::noop_waker_ref());
+                    let result = stream.as_mut().poll_next(&mut cx);
+                    if matches!(mode, Mode::Pending) {
+                        assert!(result.is_pending());
+                        assert_eq!(budget.snapshot().pending, 1.0);
+                        assert!(budget.admit().is_err());
+                        assert_eq!(probe.drops.load(Ordering::SeqCst), 0);
+                    } else {
+                        assert_eq!(probe.drops.load(Ordering::SeqCst), 1);
+                        match mode {
+                            Mode::Done => assert!(matches!(
+                                result,
+                                Poll::Ready(Some(Ok(StreamEvent::Done { .. })))
+                            )),
+                            Mode::Eof => assert!(matches!(result, Poll::Ready(None))),
+                            _ => assert!(matches!(result, Poll::Ready(Some(Err(_))))),
+                        }
+                        assert!(matches!(
+                            stream.as_mut().poll_next(&mut cx),
+                            Poll::Ready(None)
+                        ));
+                    }
+                    drop(stream);
+                    let expected = match mode {
+                        Mode::Done => 0.25,
+                        Mode::Invalid => 1.0,
+                        _ => 1.25,
+                    };
+                    assert_closed(&probe, &budget, expected);
+                    match mode {
+                        Mode::Done => budget.admit().unwrap(),
+                        Mode::Invalid => assert!(matches!(
+                            budget.admit(),
+                            Err(crate::error::Error::Session(_))
+                        )),
+                        _ => assert!(matches!(
+                            budget.admit(),
+                            Err(crate::error::Error::CostCap { .. })
+                        )),
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn provider_cost_guard_refuses_next_attempt_and_prices_before_publishing() {
+        futures::executor::block_on(async {
+            let budget = crate::cost::CostBudget::new(Some(1.0), Some(3.0), 0.0).unwrap();
+            let probe = spend_probe(
+                vec![StreamEvent::Done {
+                    reason: crate::model::StopReason::Stop,
+                    message: cost_message(0.0, 1_000_000),
+                }],
+                Some(ModelCost {
+                    input: 2.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    audio: None,
+                }),
+            );
+            let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+            for expected in [2.0, 4.0] {
+                let mut stream = provider
+                    .stream(&Context::default(), &StreamOptions::default())
+                    .await
+                    .unwrap();
+                let StreamEvent::Done { message, .. } = stream.next().await.unwrap().unwrap()
+                else {
+                    panic!("terminal response");
+                };
+                assert!((message.usage.cost.total - 2.0).abs() < f64::EPSILON);
+                assert!((budget.spent() - expected).abs() < f64::EPSILON);
+                assert!(stream.next().await.is_none());
+            }
+            assert!(matches!(
+                provider
+                    .stream(&Context::default(), &StreamOptions::default())
+                    .await,
+                Err(crate::error::Error::CostCap { .. })
+            ));
+            assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert!(budget.take_warning().is_some());
+            assert!(budget.take_warning().is_none());
+        });
+    }
+
+    #[test]
+    fn terminal_error_and_duplicate_terminal_charge_known_response_once() {
+        futures::executor::block_on(async {
+            let budget = crate::cost::CostBudget::new(None, Some(5.0), 0.0).unwrap();
+            let mut failed = cost_message(0.75, 1_000_000);
+            failed.stop_reason = crate::model::StopReason::Error;
+            let probe = spend_probe(
+                vec![
+                    StreamEvent::Start {
+                        partial: cost_message(0.0, 1_000_000),
+                    },
+                    StreamEvent::Error {
+                        reason: crate::model::StopReason::Error,
+                        error: failed.clone(),
+                    },
+                    StreamEvent::Error {
+                        reason: crate::model::StopReason::Error,
+                        error: failed,
+                    },
+                ],
+                Some(ModelCost {
+                    input: 2.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    audio: None,
+                }),
+            );
+            let provider = guard_with_cost_budget(probe, budget.clone());
+            let mut stream = provider
+                .stream(&Context::default(), &StreamOptions::default())
+                .await
+                .unwrap();
+            while stream.next().await.is_some() {}
+            drop(stream);
+            assert!(
+                (budget.spent() - 0.75).abs() < f64::EPSILON,
+                "provider-reported bill wins over catalog and duplicate terminals"
+            );
+        });
+    }
+
+    #[test]
+    fn dropped_and_unterminated_streams_keep_only_reported_partial_usage() {
+        futures::executor::block_on(async {
+            for drain in [false, true] {
+                let budget = crate::cost::CostBudget::new(None, Some(5.0), 0.0).unwrap();
+                let provider = guard_with_cost_budget(
+                    spend_probe(
+                        vec![
+                            StreamEvent::Start {
+                                partial: cost_message(0.25, 0),
+                            },
+                            StreamEvent::TextDelta {
+                                content_index: 0,
+                                delta: "not a billing estimate".to_string(),
+                            },
+                        ],
+                        None,
+                    ),
+                    budget.clone(),
+                );
+                let mut stream = provider
+                    .stream(&Context::default(), &StreamOptions::default())
+                    .await
+                    .unwrap();
+                stream.next().await.unwrap().unwrap();
+                if drain {
+                    while stream.next().await.is_some() {}
+                }
+                drop(stream);
+                assert!((budget.spent() - 0.25).abs() < f64::EPSILON);
+            }
+        });
+    }
+
+    #[test]
+    fn rebinding_provider_replaces_the_previous_session_budget() {
+        futures::executor::block_on(async {
+            let old = crate::cost::CostBudget::new(None, Some(1.0), 1.0).unwrap();
+            let current = crate::cost::CostBudget::new(None, Some(5.0), 0.0).unwrap();
+            let provider = guard_with_cost_budget(
+                spend_probe(
+                    vec![StreamEvent::Done {
+                        reason: crate::model::StopReason::Stop,
+                        message: cost_message(0.5, 0),
+                    }],
+                    None,
+                ),
+                old.clone(),
+            );
+            let provider = guard_with_cost_budget(
+                guard_with_cost_budget(provider, current.clone()),
+                current.clone(),
+            );
+            let mut stream = provider
+                .stream(&Context::default(), &StreamOptions::default())
+                .await
+                .unwrap();
+            stream.next().await.unwrap().unwrap();
+            drop(stream);
+            assert!((old.spent() - 1.0).abs() < f64::EPSILON);
+            assert!((current.spent() - 0.5).abs() < f64::EPSILON);
+        });
+    }
+
+    #[test]
+    fn invalid_reported_cost_cannot_be_hidden_by_catalog_pricing() {
+        futures::executor::block_on(async {
+            for reported in [-1.0, f64::NAN, f64::INFINITY] {
+                for partial in [false, true] {
+                    let budget = crate::cost::CostBudget::new(None, Some(5.0), 0.0).unwrap();
+                    let mut events = Vec::new();
+                    if partial {
+                        events.push(StreamEvent::Start {
+                            partial: cost_message(reported, 1_000_000),
+                        });
+                    }
+                    events.push(StreamEvent::Done {
+                        reason: crate::model::StopReason::Stop,
+                        message: cost_message(if partial { 0.5 } else { reported }, 1_000_000),
+                    });
+                    let probe = spend_probe(
+                        events,
+                        Some(ModelCost {
+                            input: 2.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                            audio: None,
+                        }),
+                    );
+                    let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+                    let mut stream = provider
+                        .stream(&Context::default(), &StreamOptions::default())
+                        .await
+                        .unwrap();
+                    while stream.next().await.is_some() {}
+                    drop(stream);
+                    assert!(matches!(
+                        provider
+                            .stream(&Context::default(), &StreamOptions::default())
+                            .await,
+                        Err(crate::error::Error::Session(_))
+                    ));
+                    assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                    assert_eq!(
+                        budget.spent(),
+                        0.0,
+                        "invalid usage was not repriced as valid spend"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn native_compaction_quarantines_invalid_reported_cost_before_pricing() {
+        futures::executor::block_on(async {
+            for reported in [serde_json::json!(-1.0), serde_json::json!("invalid")] {
+                let budget = crate::cost::CostBudget::new(None, Some(5.0), 0.0).unwrap();
+                let mut probe = spend_probe(
+                    vec![],
+                    Some(ModelCost {
+                        input: 2.0,
+                        output: 4.0,
+                        cache_read: 1.0,
+                        cache_write: 0.0,
+                        audio: None,
+                    }),
+                );
+                Arc::get_mut(&mut probe).unwrap().native_cost = Some(reported);
+                let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+                provider
+                    .compact_native(&serde_json::json!({}), &StreamOptions::default())
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    provider
+                        .compact_native(&serde_json::json!({}), &StreamOptions::default())
+                        .await,
+                    Err(crate::error::Error::Session(_))
+                ));
+                assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(budget.spent(), 0.0);
+            }
+        });
+    }
+
+    #[test]
+    fn native_compaction_shares_admission_and_cache_aware_accounting() {
+        futures::executor::block_on(async {
+            let budget = crate::cost::CostBudget::new(None, Some(3.0), 0.0).unwrap();
+            let probe = spend_probe(
+                vec![],
+                Some(ModelCost {
+                    input: 2.0,
+                    output: 4.0,
+                    cache_read: 1.0,
+                    cache_write: 0.0,
+                    audio: None,
+                }),
+            );
+            let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+            let body = serde_json::json!({});
+            provider
+                .compact_native(&body, &StreamOptions::default())
+                .await
+                .unwrap();
+            assert!((budget.spent() - 3.75).abs() < f64::EPSILON);
+            assert!(matches!(
+                provider
+                    .compact_native(&body, &StreamOptions::default())
+                    .await,
+                Err(crate::error::Error::CostCap { .. })
+            ));
+            assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn native_compaction_preserves_an_explicit_zero_bill() {
+        futures::executor::block_on(async {
+            let budget = crate::cost::CostBudget::new(None, Some(0.1), 0.0).unwrap();
+            let mut probe = spend_probe(
+                vec![],
+                Some(ModelCost {
+                    input: 2.0,
+                    output: 4.0,
+                    cache_read: 1.0,
+                    ..Default::default()
+                }),
+            );
+            Arc::get_mut(&mut probe).unwrap().native_cost = Some(serde_json::json!(0));
+            let provider = guard_with_cost_budget(probe.clone(), budget.clone());
+            provider
+                .compact_native(&serde_json::json!({}), &StreamOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(budget.spent(), 0.0);
+            budget.admit().unwrap();
+            assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        });
+    }
 
     // ========================================================================
     // Api enum: FromStr + Display round-trips
@@ -751,6 +2017,7 @@ mod tests {
                 output: 15.0, // $15 per million output tokens
                 cache_read: 0.3,
                 cache_write: 3.75,
+                audio: None,
             },
             context_window: 200_000,
             max_tokens: 8192,
@@ -797,8 +2064,9 @@ mod tests {
             cache_write: 1000,
             total_tokens: 4500,
             cost: crate::model::Cost::default(),
+            billing: None,
         };
-        model.cost.price_usage(&mut usage);
+        model.cost.price_usage(&mut usage).unwrap();
         let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
         assert!(close(usage.cost.input, 0.003));
         assert!(close(usage.cost.output, 0.0075));
@@ -815,6 +2083,7 @@ mod tests {
                 output: 0.0,
                 cache_read: 0.0,
                 cache_write: 0.0,
+                audio: None,
             }
             .is_priced()
         );
@@ -832,15 +2101,172 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             total_tokens: 1500,
+            billing: None,
             cost: crate::model::Cost {
                 total: 0.0421,
                 ..crate::model::Cost::default()
             },
         };
-        model.cost.price_usage(&mut usage);
+        model.cost.price_usage(&mut usage).unwrap();
         assert!((usage.cost.total - 0.0421).abs() < 1e-12);
         assert!((usage.cost.input - 0.003).abs() < 1e-12);
         assert!((usage.cost.output - 0.0075).abs() < 1e-12);
+    }
+
+    #[test]
+    fn audio_pricing_uses_exclusive_billing_buckets_without_changing_context_counts() {
+        use crate::model::{BillingTokenCounts, BillingUsage, Usage};
+
+        let rates = ModelCost {
+            input: 2.5,
+            output: 10.0,
+            cache_read: 0.5,
+            cache_write: 1.0,
+            audio: Some(AudioModelCost {
+                input: Some(32.0),
+                output: Some(64.0),
+                cache_read: Some(4.0),
+                cache_write: Some(8.0),
+            }),
+        };
+        let mut usage = Usage {
+            input: 10_000,
+            output: 500,
+            cache_read: 20,
+            total_tokens: 10_520,
+            billing: Some(BillingUsage::Tokens {
+                text: BillingTokenCounts {
+                    input: 10,
+                    output: 3,
+                    cache_read: 2,
+                    cache_write: 1,
+                },
+                audio: BillingTokenCounts {
+                    input: 1000,
+                    output: 5,
+                    cache_read: 6,
+                    cache_write: 7,
+                },
+                reported_total: None,
+            }),
+            ..Default::default()
+        };
+        rates.price_usage(&mut usage).unwrap();
+        assert!((usage.cost.input - 0.032_025).abs() < 1e-12);
+        assert!((usage.cost.output - 0.000_35).abs() < 1e-12);
+        assert!((usage.cost.cache_read - 0.000_025).abs() < 1e-12);
+        assert!((usage.cost.cache_write - 0.000_057).abs() < 1e-12);
+        assert!((usage.cost.total - 0.032_457).abs() < 1e-12);
+        let first = serde_json::to_value(&usage).unwrap();
+        rates.price_usage(&mut usage).unwrap();
+        assert_eq!(serde_json::to_value(&usage).unwrap(), first);
+        assert_eq!(
+            (
+                usage.input,
+                usage.output,
+                usage.cache_read,
+                usage.total_tokens
+            ),
+            (10_000, 500, 20, 10_520)
+        );
+    }
+
+    #[test]
+    fn audio_pricing_distinguishes_unknown_rates_from_explicit_free_buckets() {
+        use crate::model::{BillingTokenCounts, BillingUsage, Usage};
+
+        let fresh_usage = || Usage {
+            billing: Some(BillingUsage::Tokens {
+                text: BillingTokenCounts::default(),
+                audio: BillingTokenCounts {
+                    input: 1000,
+                    ..Default::default()
+                },
+                reported_total: None,
+            }),
+            ..Default::default()
+        };
+        let mut unknown = fresh_usage();
+        assert!(ModelCost::default().price_usage(&mut unknown).is_err());
+        assert!(matches!(
+            unknown.billing,
+            Some(BillingUsage::Unavailable { .. })
+        ));
+        assert_eq!(unknown.cost.total, 0.0);
+        assert!(!serde_json::to_string(&unknown).unwrap().contains("NaN"));
+
+        let free = ModelCost {
+            audio: Some(AudioModelCost {
+                input: Some(0.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            free.is_priced(),
+            "explicitly free audio metadata reaches the provider"
+        );
+        let mut usage = fresh_usage();
+        free.price_usage(&mut usage).unwrap();
+        assert_eq!(usage.cost.total, 0.0);
+        assert!(usage.has_explicit_billing());
+        assert!(
+            serde_json::to_value(ModelCost::default())
+                .unwrap()
+                .get("audio")
+                .is_none()
+        );
+        let restored: ModelCost =
+            serde_json::from_value(serde_json::to_value(&free).unwrap()).unwrap();
+        assert_eq!(restored.audio.as_ref().unwrap().input, Some(0.0));
+        assert_eq!(restored.audio.as_ref().unwrap().cache_read, None);
+
+        usage.billing = Some(BillingUsage::Tokens {
+            text: BillingTokenCounts::default(),
+            audio: BillingTokenCounts {
+                cache_read: 1,
+                ..Default::default()
+            },
+            reported_total: None,
+        });
+        assert!(
+            free.price_usage(&mut usage).is_err(),
+            "unknown audio cache is not silently free"
+        );
+    }
+
+    #[test]
+    fn authoritative_billing_overrides_missing_rates_and_prior_estimates() {
+        use crate::model::{BillingTokenCounts, BillingUsage, Usage};
+
+        let mut usage = Usage {
+            input: 999,
+            billing: Some(BillingUsage::Tokens {
+                text: BillingTokenCounts::default(),
+                audio: BillingTokenCounts {
+                    input: 1000,
+                    ..Default::default()
+                },
+                reported_total: Some(0.0),
+            }),
+            ..Default::default()
+        };
+        usage.cost.total = 3.0;
+        ModelCost::default().price_usage(&mut usage).unwrap();
+        assert_eq!(usage.cost.total, 0.0);
+        ModelCost::default().price_usage(&mut usage).unwrap();
+        assert_eq!(usage.cost.total, 0.0);
+        usage.billing = Some(BillingUsage::ReportedTotal { total: 0.25 });
+        ModelCost::default().price_usage(&mut usage).unwrap();
+        assert_eq!(usage.cost.total, 0.25);
+        assert_eq!(usage.input, 999);
+        usage.billing = Some(BillingUsage::ReportedTotal { total: -1.0 });
+        assert!(ModelCost::default().price_usage(&mut usage).is_err());
+        assert!(matches!(
+            usage.billing,
+            Some(BillingUsage::Unavailable { .. })
+        ));
+        assert!(usage.cost.total.is_finite());
     }
 
     #[test]
@@ -987,6 +2413,7 @@ mod tests {
             output: 15.0,
             cache_read: 0.3,
             cache_write: 3.75,
+            audio: None,
         };
         let json = serde_json::to_string(&cost).unwrap();
         assert!(
@@ -1021,6 +2448,7 @@ mod tests {
                     output: rate,
                     cache_read: rate,
                     cache_write: rate,
+                    audio: None,
                 },
                 context_window: 128_000,
                 max_tokens: 8192,
@@ -1147,7 +2575,7 @@ mod tests {
                 cr in 0.0f64..1000.0,
                 cw in 0.0f64..1000.0,
             ) {
-                let cost = ModelCost { input, output, cache_read: cr, cache_write: cw };
+                let cost = ModelCost { input, output, cache_read: cr, cache_write: cw, audio: None };
                 let json = serde_json::to_string(&cost).unwrap();
                 let parsed: ModelCost = serde_json::from_str(&json).unwrap();
                 assert!((parsed.input - input).abs() < 1e-10);

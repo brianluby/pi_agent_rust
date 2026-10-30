@@ -35,6 +35,7 @@ use crate::model::{
 use crate::models::{ModelEntry, model_requires_configured_credential};
 use crate::plan::replayed_plan_mode;
 use crate::provider::InputType;
+#[cfg(test)]
 use crate::provider_metadata::provider_ids_match;
 use crate::providers;
 use crate::resources::ResourceLoader;
@@ -86,6 +87,32 @@ struct AskUiCloseGuard(crate::ask::AskTool);
 impl Drop for AskUiCloseGuard {
     fn drop(&mut self) {
         self.0.close_channel_ui();
+    }
+}
+
+/// Track only published cards. The same lock linearizes normal answers with
+/// cancellation observation, so an answered card gets no spurious cancel.
+#[derive(Default)]
+struct RpcAskBridgeState {
+    forwarded: HashSet<String>,
+    closed: bool,
+}
+
+impl RpcAskBridgeState {
+    fn prune(&mut self, ask: &crate::ask::AskTool, mut emit: impl FnMut(&str) -> bool) {
+        self.forwarded
+            .retain(|id| ask.channel_ui_request_is_pending(id) || !emit(id));
+    }
+}
+
+struct RpcAskBridgeCloseGuard(Arc<std::sync::Mutex<RpcAskBridgeState>>);
+
+impl Drop for RpcAskBridgeCloseGuard {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = true;
     }
 }
 
@@ -189,89 +216,147 @@ fn parse_optional_u32_field(parsed: &Value, field: &str) -> Result<Option<u32>> 
         .map_err(|_| Error::Validation(format!("{field} exceeds the maximum supported value")))
 }
 
+fn parse_mcp_auth_request(parsed: &Value, reauth: bool) -> Result<(String, Option<String>)> {
+    let server = parsed
+        .get("server")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty() && !name.contains(['\0', '\r', '\n']))
+        .ok_or_else(|| Error::validation("MCP server must be a nonempty, single-line string"))?;
+    let client_id = match parsed.get("clientId") {
+        None => None,
+        Some(Value::String(value))
+            if reauth && !value.trim().is_empty() && !value.contains(['\0', '\r', '\n']) =>
+        {
+            Some(value.clone())
+        }
+        Some(_) if !reauth => {
+            return Err(Error::validation("mcp_unauth does not accept clientId"));
+        }
+        Some(_) => {
+            return Err(Error::validation(
+                "MCP clientId must be a nonempty, single-line string",
+            ));
+        }
+    };
+    // Configuration keys are exact strings; never collapse spaces in a name.
+    Ok((server.to_string(), client_id))
+}
+
+fn parse_handoff_focus(parsed: &Value) -> Result<&str> {
+    // `customInstructions` is OMP's spelling, which `compact` also accepts.
+    let focus = match (parsed.get("focus"), parsed.get("customInstructions")) {
+        (None, None) => "",
+        (Some(Value::String(focus)), None) | (None, Some(Value::String(focus))) => focus,
+        (Some(_), Some(_)) => {
+            return Err(Error::validation(
+                "Handoff takes focus or customInstructions, not both",
+            ));
+        }
+        _ => return Err(Error::validation("Handoff focus must be a string")),
+    };
+    if focus.len() > 4096 || focus.contains('\0') {
+        return Err(Error::validation(
+            "Handoff focus must fit 4096 bytes and contain no NUL",
+        ));
+    }
+    Ok(focus)
+}
+
+/// Preserve caller budgets and capabilities without sharing its cancellation
+/// bit. A separate supervisor delivers cooperative abort without dropping work
+/// that may already own a durable Session transition.
+fn rpc_operation_owner(runtime: &RuntimeHandle, client_cx: &AgentCx) -> AgentCx {
+    use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
+
+    let capabilities = client_cx.capabilities();
+    let mut mask = CapMask::all();
+    for (allowed, restriction) in [
+        (
+            capabilities.spawn,
+            CapSet::<false, true, true, true, true>::MASK,
+        ),
+        (
+            capabilities.time,
+            CapSet::<true, false, true, true, true>::MASK,
+        ),
+        (
+            capabilities.entropy,
+            CapSet::<true, true, false, true, true>::MASK,
+        ),
+        (
+            capabilities.io,
+            CapSet::<true, true, true, false, true>::MASK,
+        ),
+        (
+            capabilities.remote,
+            CapSet::<true, true, true, true, false>::MASK,
+        ),
+    ] {
+        if !allowed {
+            mask = mask.intersect(restriction);
+        }
+    }
+    let _owner = runtime
+        .request_cx_with_budget(client_cx.budget())
+        .set_current_restricted();
+    let _restriction = asupersync::Cx::push_restriction(mask);
+    AgentCx::for_current_or_request()
+}
+
 /// Keep an accepted turn runnable until its terminal event and persistence
-/// finish. Client cancellation is cooperative: cancelling the ambient context
-/// used by its timers can otherwise park the turn before it can answer.
-async fn run_rpc_turn<F, Fut>(
+/// finish. Construct ownership before runtime admission: a rejected or never
+/// polled future must answer the client and release its streaming flag too.
+fn run_rpc_turn<F, Fut>(
     runtime: RuntimeHandle,
     client_cx: AgentCx,
     retry_abort: Arc<AtomicBool>,
     abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    is_streaming: Arc<AtomicBool>,
     turn: F,
-) where
-    F: FnOnce(AgentCx) -> Fut,
+) -> impl Future<Output = ()>
+where
+    F: FnOnce(AgentCx, TerminalAgentEndOnDrop) -> Fut,
     Fut: Future<Output = ()>,
 {
-    use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
-
-    let supervisor = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
-    let owner = {
-        // Preserve the client's budget and capability restrictions without
-        // sharing its cancellation bit. The supervisor retains a separate
-        // lifetime so it can deliver abort even while the work is pending.
-        let capabilities = client_cx.capabilities();
-        let mut mask = CapMask::all();
-        for (allowed, restriction) in [
-            (
-                capabilities.spawn,
-                CapSet::<false, true, true, true, true>::MASK,
-            ),
-            (
-                capabilities.time,
-                CapSet::<true, false, true, true, true>::MASK,
-            ),
-            (
-                capabilities.entropy,
-                CapSet::<true, true, false, true, true>::MASK,
-            ),
-            (
-                capabilities.io,
-                CapSet::<true, true, true, false, true>::MASK,
-            ),
-            (
-                capabilities.remote,
-                CapSet::<true, true, true, true, false>::MASK,
-            ),
-        ] {
-            if !allowed {
-                mask = mask.intersect(restriction);
-            }
-        }
-        let _owner = runtime
-            .request_cx_with_budget(client_cx.budget())
-            .set_current_restricted();
-        let _restriction = asupersync::Cx::push_restriction(mask);
-        AgentCx::for_current_or_request()
-    };
-    let future = owner.with_current(turn(owner.clone()));
-    supervisor
-        .with_current(async {
-            let cancellation = async {
-                loop {
-                    if client_cx.checkpoint().is_err() || owner.checkpoint().is_err() {
-                        retry_abort.store(true, Ordering::SeqCst);
-                        if let Ok(guard) =
-                            OwnedMutexGuard::lock(abort_handle_slot, &supervisor).await
-                            && let Some(handle) = guard.as_ref()
-                        {
-                            handle.abort();
+    let terminal_guard =
+        TerminalAgentEndOnDrop::for_accepted_turn(out_tx, client_cx.clone(), is_streaming);
+    async move {
+        let supervisor =
+            AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
+        let owner = rpc_operation_owner(&runtime, &client_cx);
+        // Move the same guard through the factory and into the turn body.
+        // There is no disarm/rearm interval, including a factory panic.
+        let future = owner.with_current(turn(owner.clone(), terminal_guard));
+        supervisor
+            .with_current(async {
+                let cancellation = async {
+                    loop {
+                        if client_cx.checkpoint().is_err() || owner.checkpoint().is_err() {
+                            retry_abort.store(true, Ordering::SeqCst);
+                            if let Ok(guard) =
+                                OwnedMutexGuard::lock(abort_handle_slot, &supervisor).await
+                                && let Some(handle) = guard.as_ref()
+                            {
+                                handle.abort();
+                            }
+                            break;
                         }
-                        break;
+                        supervisor.time().sleep(Duration::from_millis(25)).await;
                     }
-                    supervisor.time().sleep(Duration::from_millis(25)).await;
+                };
+                futures::pin_mut!(cancellation, future);
+                if let futures::future::Either::Left(((), pending_turn)) =
+                    futures::future::select(cancellation, future).await
+                {
+                    // Never drop the turn to cancel it: completed tool effects
+                    // still need to reach the durable transcript, and the client
+                    // still owns an accepted prompt awaiting agent_end.
+                    pending_turn.await;
                 }
-            };
-            futures::pin_mut!(cancellation, future);
-            if let futures::future::Either::Left(((), pending_turn)) =
-                futures::future::select(cancellation, future).await
-            {
-                // Never drop the turn to cancel it: completed tool effects
-                // still need to reach the durable transcript, and the client
-                // still owns an accepted prompt awaiting agent_end.
-                pending_turn.await;
-            }
-        })
-        .await;
+            })
+            .await;
+    }
 }
 
 fn normalize_command_type(command_type: &str) -> &str {
@@ -299,6 +384,7 @@ fn command_can_advance_rpc_session(command_type: &str) -> bool {
             | "steer"
             | "follow_up"
             | "set_plan_mode"
+            | "goal"
             | "approve_plan"
             | "reject_plan"
             | "set_model"
@@ -308,6 +394,7 @@ fn command_can_advance_rpc_session(command_type: &str) -> bool {
             | "set_session_name"
             | "bash"
             | "compact"
+            | "handoff"
             | "checkpoint"
             | "rewind"
             | "fresh"
@@ -360,6 +447,10 @@ fn command_payload_can_advance_rpc_session(
             parsed.get("provider").and_then(Value::as_str).is_some()
                 && parsed.get("modelId").and_then(Value::as_str).is_some()
         }
+        "goal" => parsed
+            .get("op")
+            .and_then(Value::as_str)
+            .is_some_and(|op| matches!(op, "create" | "resume" | "pause" | "drop")),
         "set_thinking_level" => parsed
             .get("level")
             .and_then(Value::as_str)
@@ -370,6 +461,7 @@ fn command_payload_can_advance_rpc_session(
             parse_optional_u32_field(parsed, "reserveTokens").is_ok()
                 && parse_optional_u32_field(parsed, "keepRecentTokens").is_ok()
         }
+        "handoff" => parse_handoff_focus(parsed).is_ok(),
         "switch_session" => parsed.get("sessionPath").and_then(Value::as_str).is_some(),
         "fork" => parsed.get("entryId").and_then(Value::as_str).is_some(),
         _ => true,
@@ -1240,6 +1332,7 @@ struct TerminalAgentEndOnDrop {
     out_tx: std::sync::mpsc::SyncSender<String>,
     cx: AgentCx,
     armed: bool,
+    is_streaming: Option<Arc<AtomicBool>>,
 }
 
 impl TerminalAgentEndOnDrop {
@@ -1248,7 +1341,18 @@ impl TerminalAgentEndOnDrop {
             out_tx,
             cx,
             armed: true,
+            is_streaming: None,
         }
+    }
+
+    fn for_accepted_turn(
+        out_tx: std::sync::mpsc::SyncSender<String>,
+        cx: AgentCx,
+        is_streaming: Arc<AtomicBool>,
+    ) -> Self {
+        let mut guard = Self::new(out_tx, cx);
+        guard.is_streaming = Some(is_streaming);
+        guard
     }
 
     /// The turn reached one of its own terminal emissions; stand down.
@@ -1259,23 +1363,390 @@ impl TerminalAgentEndOnDrop {
 
 impl Drop for TerminalAgentEndOnDrop {
     fn drop(&mut self) {
-        if !self.armed {
+        if self.armed {
+            // Same condition and wording as the in-loop checkpoint break.
+            // Other premature endings are defects, not successful cancellation.
+            let error = if self.cx.is_cancel_requested() {
+                "Retry aborted"
+            } else {
+                "Turn ended without a terminal event"
+            };
+            let _ = self.out_tx.send(event(&json!({
+                "type": "agent_end",
+                "messages": [],
+                "error": error,
+            })));
+        }
+        // Keep EOF draining active until the terminal frame is queued, even
+        // when runtime admission rejected the future before its first poll.
+        if let Some(is_streaming) = &self.is_streaming {
+            is_streaming.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// An operator auth request owns its response and maintenance admission before
+/// runtime submission, including rejection and a future dropped before polling.
+struct RpcMcpAuthCompletion {
+    id: Option<String>,
+    command: &'static str,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    is_compacting: Arc<AtomicBool>,
+    abort: crate::agent::AbortSignal,
+    reconcile: Option<Box<dyn FnOnce() + Send>>,
+    answered: bool,
+}
+
+impl RpcMcpAuthCompletion {
+    fn finish(&mut self, result: Result<Value>) {
+        if self.answered {
             return;
         }
-        // Same condition and same wording as the in-loop checkpoint break, so
-        // a client cannot tell whether the turn observed its cancellation or
-        // was ended by it — only that it ended. Anything else reaching here is
-        // a real defect and says so rather than masquerading as a cancel.
-        let error = if self.cx.is_cancel_requested() {
-            "Retry aborted"
-        } else {
-            "Turn ended without a terminal event"
+        // Logout may already have removed credentials when cancellation or a
+        // reconnect error wins. Publish that catalog before releasing admission.
+        if let Some(reconcile) = self.reconcile.take() {
+            reconcile();
+        }
+        let response = match result {
+            Ok(data) => response_ok(self.id.clone(), self.command, Some(data)),
+            Err(error) => response_error_with_hints(self.id.clone(), self.command, &error),
         };
-        let _ = self.out_tx.send(event(&json!({
-            "type": "agent_end",
-            "messages": [],
-            "error": error,
-        })));
+        let _ = self.out_tx.send(response);
+        self.answered = true;
+    }
+}
+
+impl Drop for RpcMcpAuthCompletion {
+    fn drop(&mut self) {
+        if !self.answered {
+            let error = if self.abort.is_aborted() {
+                Error::Aborted
+            } else {
+                Error::session("MCP authentication ended without a terminal response")
+            };
+            self.finish(Err(error));
+        }
+        self.is_compacting.store(false, Ordering::SeqCst);
+    }
+}
+
+fn run_rpc_mcp_auth(
+    runtime: RuntimeHandle,
+    client_cx: AgentCx,
+    session: Arc<Mutex<AgentSession>>,
+    id: Option<String>,
+    reauth: bool,
+    server: String,
+    client_id: Option<String>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    is_compacting: Arc<AtomicBool>,
+    retry_abort: Arc<AtomicBool>,
+    abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
+) -> impl Future<Output = ()> {
+    let command = if reauth { "mcp_reauth" } else { "mcp_unauth" };
+    let (abort_handle, abort_signal) = AbortHandle::new();
+    let mut completion = RpcMcpAuthCompletion {
+        id: id.clone(),
+        command,
+        out_tx: out_tx.clone(),
+        is_compacting,
+        abort: abort_signal.clone(),
+        reconcile: None,
+        answered: false,
+    };
+    async move {
+        let supervisor =
+            AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
+        let owner = rpc_operation_owner(&runtime, &client_cx);
+        let result: Result<Value> = async {
+            {
+                let mut slot = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &supervisor)
+                    .await
+                    .map_err(|err| Error::session(format!("abort lock failed: {err}")))?;
+                if retry_abort.load(Ordering::SeqCst) {
+                    abort_handle.abort();
+                }
+                *slot = Some(abort_handle.clone());
+            }
+            if abort_signal.is_aborted() || client_cx.checkpoint().is_err() {
+                return Err(Error::Aborted);
+            }
+            let (manager, shared_tools) = {
+                let guard = OwnedMutexGuard::lock(session, &owner)
+                    .await
+                    .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                let manager = guard.mcp_manager().ok_or_else(|| {
+                    Error::validation("MCP discovery is disabled for this session")
+                })?;
+                (manager, guard.agent.shared_tools())
+            };
+            let cleanup_manager = Arc::clone(&manager);
+            completion.reconcile = Some(Box::new(move || {
+                crate::mcp::reconcile_tools(&cleanup_manager, &shared_tools);
+            }));
+            // The browser wait never holds the outer AgentSession mutex, so
+            // control commands and the independent abort lane stay responsive.
+            let output_failed = Arc::new(AtomicBool::new(false));
+            let callback_failed = Arc::clone(&output_failed);
+            let callback_owner = owner.clone();
+            let callback_server = server.clone();
+            let on_url: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |url| {
+                let mut frame = json!({
+                    "type": "mcp_auth_url",
+                    "command": command,
+                    "server": callback_server,
+                    "url": url,
+                });
+                if let Some(id) = &id {
+                    frame["id"] = Value::String(id.clone());
+                }
+                if out_tx.try_send(event(&frame)).is_err() {
+                    callback_failed.store(true, Ordering::Release);
+                    callback_owner.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("MCP sign-in URL could not be delivered"),
+                    );
+                }
+            });
+            let work = owner.with_current(async {
+                if reauth {
+                    manager.reauthenticate(&server, client_id, on_url).await
+                } else {
+                    manager.unauthenticate(&server).await
+                }
+            });
+            let cancelled = async {
+                loop {
+                    if output_failed.load(Ordering::Acquire) {
+                        return Error::tool(
+                            "mcp",
+                            "[MCP_AUTH_OUTPUT_FAILED] sign-in URL could not be delivered",
+                        );
+                    }
+                    if abort_signal.is_aborted()
+                        || retry_abort.load(Ordering::SeqCst)
+                        || client_cx.checkpoint().is_err()
+                        || owner.checkpoint().is_err()
+                    {
+                        abort_handle.abort();
+                        return Error::Aborted;
+                    }
+                    supervisor.time().sleep(Duration::from_millis(10)).await;
+                }
+            };
+            let outcome = supervisor
+                .with_current(async {
+                    match futures::future::select(Box::pin(cancelled), Box::pin(work)).await {
+                        futures::future::Either::Left((error, pending)) => {
+                            drop(pending);
+                            Err(error)
+                        }
+                        futures::future::Either::Right((result, _)) => result,
+                    }
+                })
+                .await;
+            outcome.map(|()| json!({"server": server, "authenticated": reauth}))
+        }
+        .await;
+        // Clear the previous handle before the terminal response makes this
+        // maintenance lane available for another request.
+        if let Ok(mut slot) = OwnedMutexGuard::lock(abort_handle_slot, &supervisor).await {
+            *slot = None;
+        }
+        completion.finish(result);
+    }
+}
+
+#[derive(Default)]
+struct RpcHandoffObservation {
+    started: bool,
+    ended: bool,
+    result: Option<Value>,
+}
+
+/// Own a maintenance request before spawning it. Handoff has one terminal RPC
+/// response, not an agent_end (there is no accepted user prompt).
+struct RpcHandoffCompletion {
+    id: Option<String>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    is_compacting: Arc<AtomicBool>,
+    observation: Arc<std::sync::Mutex<RpcHandoffObservation>>,
+    abort: crate::agent::AbortSignal,
+    answered: bool,
+}
+
+impl RpcHandoffCompletion {
+    fn finish(&mut self, result: Result<Value>) {
+        if self.answered {
+            return;
+        }
+        let missing_end = {
+            let mut observed = self
+                .observation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let missing = observed.started && !observed.ended;
+            observed.ended |= missing;
+            missing
+        };
+        if missing_end {
+            let _ = self.out_tx.send(agent_event(AgentEvent::AutoCompactionEnd {
+                result: None,
+                aborted: self.abort.is_aborted(),
+                will_retry: false,
+                error_message: result.as_ref().err().map(ToString::to_string),
+            }));
+        }
+        let response = match result {
+            Ok(data) => response_ok(self.id.clone(), "handoff", Some(data)),
+            Err(error) => response_error_with_hints(self.id.clone(), "handoff", &error),
+        };
+        let _ = self.out_tx.send(response);
+        self.answered = true;
+    }
+}
+
+impl Drop for RpcHandoffCompletion {
+    fn drop(&mut self) {
+        if !self.answered {
+            let error = if self.abort.is_aborted() {
+                Error::Aborted
+            } else {
+                Error::session("Handoff ended without a terminal response")
+            };
+            self.finish(Err(error));
+        }
+        // EOF and subsequent admission may proceed only after the response is
+        // queued, including rejection by the runtime before the first poll.
+        self.is_compacting.store(false, Ordering::SeqCst);
+    }
+}
+
+fn run_rpc_handoff(
+    runtime: RuntimeHandle,
+    client_cx: AgentCx,
+    session: Arc<Mutex<AgentSession>>,
+    id: Option<String>,
+    focus: String,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    output: RpcOutput,
+    is_compacting: Arc<AtomicBool>,
+    retry_abort: Arc<AtomicBool>,
+    abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
+) -> impl Future<Output = ()> {
+    let observation = Arc::new(std::sync::Mutex::new(RpcHandoffObservation::default()));
+    let (abort_handle, abort_signal) = AbortHandle::new();
+    let mut completion = RpcHandoffCompletion {
+        id,
+        out_tx: out_tx.clone(),
+        is_compacting,
+        observation: Arc::clone(&observation),
+        abort: abort_signal.clone(),
+        answered: false,
+    };
+    async move {
+        let supervisor =
+            AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
+        let owner = rpc_operation_owner(&runtime, &client_cx);
+        let future = owner.with_current(async {
+            let result: Result<Value> = async {
+                {
+                    let mut slot =
+                        OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &supervisor)
+                            .await
+                            .map_err(|err| Error::session(format!("abort lock failed: {err}")))?;
+                    // An abort frame can arrive after admission but before
+                    // this task starts. Installation cannot erase that abort.
+                    if retry_abort.load(Ordering::SeqCst) {
+                        abort_handle.abort();
+                    }
+                    *slot = Some(abort_handle.clone());
+                }
+                if abort_signal.is_aborted() {
+                    return Err(Error::Aborted);
+                }
+                let mut guard = OwnedMutexGuard::lock(session, &owner)
+                    .await
+                    .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                let events = rpc_agent_event_handler(
+                    out_tx,
+                    runtime.clone(),
+                    guard
+                        .extensions
+                        .as_ref()
+                        .map(|region| region.manager().clone()),
+                    None,
+                    false,
+                    output,
+                );
+                let observed_events = Arc::clone(&observation);
+                guard
+                    .handoff_now(&focus, &abort_signal, move |event| {
+                        {
+                            let mut observed = observed_events
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            match &event {
+                                AgentEvent::AutoCompactionStart { .. } => observed.started = true,
+                                AgentEvent::AutoCompactionEnd { result, .. } => {
+                                    observed.ended = true;
+                                    observed.result.clone_from(result);
+                                }
+                                _ => {}
+                            }
+                        }
+                        events(event);
+                    })
+                    .await?;
+                // Installation is durable. Refresh under the independent
+                // cleanup context so a late abort cannot leave recovery and
+                // idle readers comparing the old Agent to the new Session.
+                let messages = guard
+                    .session
+                    .lock(supervisor.cx())
+                    .await
+                    .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?
+                    .to_messages_for_current_path();
+                guard.agent.replace_messages(messages);
+                observation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .result
+                    .clone()
+                    .ok_or_else(|| {
+                        Error::session("Handoff completed without an installation result")
+                    })
+            }
+            .await;
+            // Clear the old abort lane before releasing admission. Otherwise
+            // a finishing handoff could erase the following turn's handle.
+            if let Ok(mut slot) = OwnedMutexGuard::lock(abort_handle_slot, &supervisor).await {
+                *slot = None;
+            }
+            completion.finish(result);
+        });
+        supervisor
+            .with_current(async {
+                let cancellation = async {
+                    loop {
+                        if client_cx.checkpoint().is_err() || owner.checkpoint().is_err() {
+                            retry_abort.store(true, Ordering::SeqCst);
+                            abort_handle.abort();
+                            break;
+                        }
+                        supervisor.time().sleep(Duration::from_millis(25)).await;
+                    }
+                };
+                futures::pin_mut!(cancellation, future);
+                if let futures::future::Either::Left(((), pending)) =
+                    futures::future::select(cancellation, future).await
+                {
+                    // Cancellation requests cooperation; it never drops a
+                    // future that may be writing the handoff transaction.
+                    pending.await;
+                }
+            })
+            .await;
     }
 }
 
@@ -1453,6 +1924,7 @@ impl RpcSharedState {
         &mut self,
         session: &Session,
         messages: &[Message],
+        is_authored: impl Fn(usize) -> bool,
     ) -> Result<()> {
         let session_id = session.header.id.clone();
         let base_leaf_id = session.leaf_id().map(str::to_string);
@@ -1470,8 +1942,10 @@ impl RpcSharedState {
                     "live completed-tool transcript changed during terminal recovery",
                 ));
             }
-            for (existing, message) in staged.entries.iter().zip(messages) {
-                if serde_json::to_vec(existing.message())? != serde_json::to_vec(message)? {
+            for (index, (existing, message)) in staged.entries.iter().zip(messages).enumerate() {
+                if serde_json::to_vec(existing.message())? != serde_json::to_vec(message)?
+                    || existing.keyword_scan_source().is_some() != is_authored(index)
+                {
                     return Err(Error::session(
                         "live completed-tool transcript changed during terminal recovery",
                     ));
@@ -1486,7 +1960,17 @@ impl RpcSharedState {
                 entries: messages
                     .iter()
                     .cloned()
-                    .map(QueuedAgentMessage::generated)
+                    .enumerate()
+                    .map(|(index, message)| {
+                        if is_authored(index) {
+                            // This envelope is only persisted, never scanned or
+                            // delivered again. Retain authorship without copying
+                            // the original input's keyword source into recovery.
+                            QueuedAgentMessage::authored(message, "")
+                        } else {
+                            QueuedAgentMessage::generated(message)
+                        }
+                    })
                     .collect(),
             });
         }
@@ -1991,18 +2475,30 @@ pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result
     clippy::significant_drop_in_scrutinee
 )]
 pub async fn run(
-    session: AgentSession,
+    mut session: AgentSession,
     mut options: RpcOptions,
     mut in_rx: mpsc::Receiver<String>,
     out_tx: std::sync::mpsc::SyncSender<String>,
 ) -> Result<()> {
     let cx = AgentCx::for_current_or_request();
+    // The available list can omit unready declared providers. Retain the full
+    // catalog and admit option-only entries without replacing registry routes.
+    // This snapshot also lets get_state avoid the outer lock held by a stream.
+    let model_registry = session.model_registry().cloned().map(|mut registry| {
+        registry.merge_missing_entries(options.available_models.clone());
+        registry
+    });
+    if let Some(registry) = &model_registry {
+        session.set_model_registry(registry.clone());
+    }
     let requested_cwd = options
         .working_directory
         .clone()
         .map_or_else(std::env::current_dir, Ok)?;
     let runtime_cwd = crate::workspace::validate_new_root(&requested_cwd)?;
     options.auth.set_command_working_directory(&runtime_cwd)?;
+    session.set_auth_storage(options.auth.clone());
+    session.set_recovery_cli_api_key(options.cli_api_key.clone());
     let session_handle = Arc::clone(&session.session);
     let provider_admission = session.provider_admission_gate();
     let session = Arc::new(Mutex::new(session));
@@ -2044,7 +2540,13 @@ pub async fn run(
             );
             replayed_plan_mode(&inner)
         };
+        // `--prewalk-into` armed this same session before the server started.
+        // The reset clears it with the other session-scoped state, so re-arm it.
+        let armed_prewalk = guard.agent.prewalk_target().cloned();
         guard.agent.reset_session_scoped_state(initial_plan_mode);
+        if let Some(target) = armed_prewalk {
+            guard.arm_prewalk(target).await?;
+        }
         guard.set_queue_modes(
             options.config.steering_queue_mode(),
             options.config.follow_up_queue_mode(),
@@ -2126,19 +2628,66 @@ pub async fn run(
     // an `ask_response` command. Response routing is id-keyed through the
     // AskTool's own pending map (with its built-in wait budget), so no
     // active/queue ordering state is needed here.
+    let ask_bridge_state = Arc::new(std::sync::Mutex::new(RpcAskBridgeState::default()));
+    let _ask_bridge_close = RpcAskBridgeCloseGuard(Arc::clone(&ask_bridge_state));
     if let Some(ref ask) = options.ask_tool {
         let (ask_ui_tx, mut ask_ui_rx) =
             asupersync::channel::mpsc::channel::<crate::ask::AskUiRequest>(4);
         ask.install_channel_ui(ask_ui_tx);
         let ask_forwarder = ask.clone();
         let out_tx_ask = out_tx.clone();
+        let bridge = Arc::clone(&ask_bridge_state);
         options.runtime_handle.spawn(async move {
             let cx = AgentCx::for_request();
-            while let Ok(request) = ask_ui_rx.recv(&cx).await {
+            loop {
+                {
+                    let mut state = bridge
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if state.closed {
+                        break;
+                    }
+                    state.prune(&ask_forwarder, |id| {
+                        out_tx_ask
+                            .try_send(event(&json!({"type":"ask_request_cancelled", "id":id})))
+                            .is_ok()
+                    });
+                }
+                let request = match asupersync::time::timeout(
+                    wall_now(),
+                    Duration::from_millis(50),
+                    ask_ui_rx.recv(&cx),
+                )
+                .await
+                {
+                    Ok(Ok(request)) => request,
+                    Ok(Err(_)) => break,
+                    Err(_) => continue,
+                };
+                let mut state = bridge
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.closed {
+                    break;
+                }
+                // Refuse an unreachable card instead of retaining unbounded
+                // IDs when a client cannot drain cancellation notifications.
+                if state.forwarded.len() >= 256 {
+                    ask_forwarder.respond_ui(
+                        &request.id,
+                        crate::ask::AskResponse {
+                            answers: Vec::new(),
+                            dismissed: true,
+                        },
+                    );
+                    continue;
+                }
                 let frame = event(&ask_request_rpc_event(&request));
-                ask_forwarder.try_forward_channel_ui_request(&request.id, || {
+                if ask_forwarder.try_forward_channel_ui_request(&request.id, || {
                     out_tx_ask.try_send(frame).is_ok()
-                });
+                }) {
+                    state.forwarded.insert(request.id);
+                }
             }
         });
     }
@@ -2283,6 +2832,30 @@ pub async fn run(
         } else {
             Vec::new()
         };
+
+        if command_type == "handoff"
+            && let Err(err) = parse_handoff_focus(&parsed)
+        {
+            let _ = out_tx.send(response_error_with_hints(id, "handoff", &err));
+            continue;
+        }
+
+        // These commands acquire the outer AgentSession lock. Waiting for a
+        // maintenance task here would stop the dispatcher from receiving the
+        // abort or extension UI reply that task may need to finish.
+        if is_compacting.load(Ordering::SeqCst)
+            && matches!(
+                command_type,
+                "get_session_stats" | "export_html" | "set_steering_mode" | "set_follow_up_mode"
+            )
+        {
+            let _ = out_tx.send(response_error(
+                id,
+                command_type,
+                format!("Agent is currently compacting; wait before running {command_type}"),
+            ));
+            continue;
+        }
 
         if command_type == "retry"
             && rpc_turn_phase(&is_streaming, &is_compacting) == RpcTurnPhase::Idle
@@ -2583,13 +3156,15 @@ pub async fn run(
                     let command_runtime = runtime_handle.clone();
                     let retry_abort = Arc::clone(&retry_abort);
                     let command_output = output.for_turn();
-                    runtime_handle.spawn(run_rpc_turn(
+                    let _ = runtime_handle.try_spawn(run_rpc_turn(
                         runtime_handle.clone(),
                         cx.clone(),
                         Arc::clone(&retry_abort),
                         Arc::clone(&abort_handle_slot),
-                        move |command_cx| async move {
-                            run_extension_command(
+                        out_tx.clone(),
+                        Arc::clone(&is_streaming),
+                        move |command_cx, terminal_guard| async move {
+                            run_extension_command_owned(
                                 session,
                                 is_streaming,
                                 abort_handle_slot,
@@ -2600,6 +3175,7 @@ pub async fn run(
                                 args,
                                 command_cx,
                                 command_output,
+                                terminal_guard,
                             )
                             .await;
                         },
@@ -2608,13 +3184,15 @@ pub async fn run(
                     let retry_abort = retry_abort.clone();
                     let options = options.clone();
                     let expanded = options.resources.expand_input(&message);
-                    runtime_handle.spawn(run_rpc_turn(
+                    let _ = runtime_handle.try_spawn(run_rpc_turn(
                         runtime_handle.clone(),
                         cx.clone(),
                         Arc::clone(&retry_abort),
                         Arc::clone(&abort_handle_slot),
-                        move |prompt_cx| async move {
-                            run_prompt_with_retry(
+                        out_tx.clone(),
+                        Arc::clone(&is_streaming),
+                        move |prompt_cx, terminal_guard| async move {
+                            run_prompt_with_retry_owned(
                                 session,
                                 shared_state,
                                 is_streaming,
@@ -2628,6 +3206,7 @@ pub async fn run(
                                 Some(message),
                                 attachments,
                                 prompt_cx,
+                                terminal_guard,
                             )
                             .await;
                         },
@@ -2729,13 +3308,15 @@ pub async fn run(
                 let options = options.clone();
                 let expanded = expanded.clone();
                 let runtime_handle = options.runtime_handle.clone();
-                runtime_handle.spawn(run_rpc_turn(
+                let _ = runtime_handle.try_spawn(run_rpc_turn(
                     runtime_handle.clone(),
                     cx.clone(),
                     Arc::clone(&retry_abort),
                     Arc::clone(&abort_handle_slot),
-                    move |prompt_cx| async move {
-                        run_prompt_with_retry(
+                    out_tx.clone(),
+                    Arc::clone(&is_streaming),
+                    move |prompt_cx, terminal_guard| async move {
+                        run_prompt_with_retry_owned(
                             session,
                             shared_state,
                             is_streaming,
@@ -2749,6 +3330,7 @@ pub async fn run(
                             Some(message),
                             attachments,
                             prompt_cx,
+                            terminal_guard,
                         )
                         .await;
                     },
@@ -2851,13 +3433,15 @@ pub async fn run(
                 let options = options.clone();
                 let expanded = expanded.clone();
                 let runtime_handle = options.runtime_handle.clone();
-                runtime_handle.spawn(run_rpc_turn(
+                let _ = runtime_handle.try_spawn(run_rpc_turn(
                     runtime_handle.clone(),
                     cx.clone(),
                     Arc::clone(&retry_abort),
                     Arc::clone(&abort_handle_slot),
-                    move |prompt_cx| async move {
-                        run_prompt_with_retry(
+                    out_tx.clone(),
+                    Arc::clone(&is_streaming),
+                    move |prompt_cx, terminal_guard| async move {
+                        run_prompt_with_retry_owned(
                             session,
                             shared_state,
                             is_streaming,
@@ -2871,6 +3455,7 @@ pub async fn run(
                             Some(message),
                             attachments,
                             prompt_cx,
+                            terminal_guard,
                         )
                         .await;
                     },
@@ -2888,6 +3473,51 @@ pub async fn run(
                     handle.abort();
                 }
                 let _ = out_tx.send(response_ok(id, "abort", None));
+            }
+
+            "goal" => {
+                let op = parsed.get("op").and_then(Value::as_str);
+                if op == Some("get") {
+                    let result = {
+                        let inner = OwnedMutexGuard::lock(Arc::clone(&session_handle), &cx)
+                            .await
+                            .map_err(|err| {
+                                Error::session(format!("inner session lock failed: {err}"))
+                            })?;
+                        crate::goal::rpc_goal_state(&inner)
+                    };
+                    match result {
+                        Ok(data) => {
+                            let _ = out_tx.send(response_ok(id, "goal", Some(data)));
+                        }
+                        Err(error) => {
+                            let _ = out_tx.send(response_error_with_hints(id, "goal", &error));
+                        }
+                    }
+                    continue;
+                }
+                if rpc_turn_phase(&is_streaming, &is_compacting) != RpcTurnPhase::Idle {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "goal",
+                        "Goal lifecycle changes require an idle RPC session".to_string(),
+                    ));
+                    continue;
+                }
+                let result = {
+                    let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    crate::goal::rpc_goal_command(&mut guard, &cx, &parsed).await
+                };
+                match result {
+                    Ok(data) => {
+                        let _ = out_tx.send(response_ok(id, "goal", Some(data)));
+                    }
+                    Err(error) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "goal", &error));
+                    }
+                }
             }
 
             "set_plan_mode" => {
@@ -3061,7 +3691,10 @@ pub async fn run(
                         })?;
                     session_state(
                         &inner_session,
-                        &options,
+                        model_registry.as_ref().map_or(
+                            options.available_models.as_slice(),
+                            crate::models::ModelRegistry::models,
+                        ),
                         &snapshot,
                         is_streaming.load(Ordering::SeqCst),
                         is_compacting.load(Ordering::SeqCst),
@@ -3147,37 +3780,29 @@ pub async fn run(
                     continue;
                 };
 
-                let Some(entry) = options
-                    .available_models
-                    .iter()
-                    .find(|m| {
-                        provider_ids_match(&m.model.provider, provider)
-                            && m.model.id.eq_ignore_ascii_case(model_id)
-                    })
-                    .cloned()
-                else {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "set_model",
-                        format!("Model not found: {provider}/{model_id}"),
-                    ));
-                    continue;
-                };
-
-                let key = resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &entry);
-                if model_requires_configured_credential(&entry) && key.is_none() {
-                    let err = Error::auth(format!(
-                        "Missing credentials for {}/{}",
-                        entry.model.provider, entry.model.id
-                    ));
-                    let _ = out_tx.send(response_error_with_hints(id, "set_model", &err));
-                    continue;
-                }
-
-                let result: Result<()> = async {
+                let result: Result<ModelEntry> = async {
                     let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    let entry = model_entry_for_provider_and_id(
+                        provider,
+                        model_id,
+                        rpc_model_catalog(&guard, &options),
+                    )
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::validation(format!(
+                            "Model not found: {provider}/{model_id}. Use get_available_models to choose a registered provider/model."
+                        ))
+                    })?;
+                    let key =
+                        resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &entry)?;
+                    if model_requires_configured_credential(&entry) && key.is_none() {
+                        return Err(Error::auth(format!(
+                            "Missing credentials for {}/{}",
+                            entry.model.provider, entry.model.id
+                        )));
+                    }
                     let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                         .await
                         .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
@@ -3225,12 +3850,12 @@ pub async fn run(
                     }
                     state.clear_failover_lifecycle();
                     state.provider_admission.clear();
-                    Ok(())
+                    Ok(entry)
                 }
                 .await;
 
                 match result {
-                    Ok(()) => {
+                    Ok(entry) => {
                         let _ = out_tx.send(response_ok(
                             id,
                             "set_model",
@@ -3317,7 +3942,7 @@ pub async fn run(
                         &inner_session,
                         &runtime_provider,
                         &runtime_model_id,
-                        &options,
+                        rpc_model_catalog(&guard, &options),
                     )
                     .map_or(level, |entry| entry.clamp_thinking_level(level))
                 };
@@ -3358,7 +3983,7 @@ pub async fn run(
                             &inner_session,
                             &runtime_provider,
                             &runtime_model_id,
-                            &options,
+                            rpc_model_catalog(&guard, &options),
                         )
                         .cloned()
                     };
@@ -3640,9 +4265,25 @@ pub async fn run(
                 let runtime_handle = options.runtime_handle.clone();
                 let bash_cx = cx.clone();
                 let cwd = runtime_cwd.clone();
+                let extensions = rpc_extension_manager.clone();
 
                 runtime_handle.spawn(async move {
-                    let result = run_bash_rpc(&cwd, &command, abort_rx).await;
+                    // A `user_bash` hook may run the command itself (OMP's
+                    // bash runner consults it for every user command).
+                    let hooked = match &extensions {
+                        Some(manager) => manager.dispatch_user_bash(&command, false, &cwd).await,
+                        None => None,
+                    };
+                    let result = match hooked {
+                        Some(result) => Ok(BashRpcResult {
+                            output: result.output,
+                            exit_code: result.exit_code,
+                            cancelled: result.cancelled,
+                            truncated: result.truncated,
+                            full_output_path: result.full_output_path,
+                        }),
+                        None => run_bash_rpc(&cwd, &command, abort_rx).await,
+                    };
 
                     let response = match result {
                         Ok(result) => {
@@ -3914,6 +4555,99 @@ pub async fn run(
                 let _ = out_tx.send(response_ok(id, "abort_bash", None));
             }
 
+            "mcp_reauth" | "mcp_unauth" => {
+                let reauth = command_type == "mcp_reauth";
+                let (server, client_id) = match parse_mcp_auth_request(&parsed, reauth) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let _ = out_tx.send(response_error_with_hints(id, command_type, &error));
+                        continue;
+                    }
+                };
+                let bash_running = OwnedMutexGuard::lock(Arc::clone(&bash_state), &cx)
+                    .await
+                    .map_err(|err| Error::session(format!("bash state lock failed: {err}")))?
+                    .is_some();
+                let admitted = {
+                    let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
+                    if !bash_running
+                        && rpc_turn_phase(&is_streaming, &is_compacting) == RpcTurnPhase::Idle
+                    {
+                        retry_abort.store(false, Ordering::SeqCst);
+                        is_compacting.store(true, Ordering::SeqCst);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !admitted {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        command_type,
+                        "MCP authentication needs an idle session",
+                    ));
+                    continue;
+                }
+                // These operator commands change external credentials and the
+                // tool catalog, without advancing or recovering a model turn.
+                let task = run_rpc_mcp_auth(
+                    options.runtime_handle.clone(),
+                    cx.clone(),
+                    Arc::clone(&session),
+                    id,
+                    reauth,
+                    server,
+                    client_id,
+                    out_tx.clone(),
+                    Arc::clone(&is_compacting),
+                    Arc::clone(&retry_abort),
+                    Arc::clone(&abort_handle),
+                );
+                let _ = options.runtime_handle.try_spawn(task);
+            }
+            "handoff" => {
+                let focus = parse_handoff_focus(&parsed)?.to_string();
+                let bash_running = OwnedMutexGuard::lock(Arc::clone(&bash_state), &cx)
+                    .await
+                    .map_err(|err| Error::session(format!("bash state lock failed: {err}")))?
+                    .is_some();
+                let admitted = {
+                    let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
+                    if !bash_running
+                        && rpc_turn_phase(&is_streaming, &is_compacting) == RpcTurnPhase::Idle
+                    {
+                        retry_abort.store(false, Ordering::SeqCst);
+                        is_compacting.store(true, Ordering::SeqCst);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !admitted {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "handoff",
+                        "Wait for the current turn, compaction, or bash command before handing off",
+                    ));
+                    continue;
+                }
+                // Admission owns both terminal response and busy flag before
+                // try_spawn, including rejection or an unpolled task.
+                let task = run_rpc_handoff(
+                    options.runtime_handle.clone(),
+                    cx.clone(),
+                    Arc::clone(&session),
+                    id,
+                    focus,
+                    out_tx.clone(),
+                    output.for_turn(),
+                    Arc::clone(&is_compacting),
+                    Arc::clone(&retry_abort),
+                    Arc::clone(&abort_handle),
+                );
+                let _ = options.runtime_handle.try_spawn(task);
+            }
+
             "compact" => {
                 if rpc_turn_phase(&is_streaming, &is_compacting) != RpcTurnPhase::Idle {
                     let _ = out_tx.send(response_error(
@@ -3982,11 +4716,17 @@ pub async fn run(
                         ..Default::default()
                     };
 
-                    let prep = prepare_compaction(&path_entries, settings).ok_or_else(|| {
-                        Error::session(
-                            "Compaction not available (already compacted or missing IDs)",
-                        )
-                    })?;
+                    // A requested compaction ignores the automatic threshold
+                    // but still honors a disabled configuration.
+                    let enabled = settings.enabled;
+                    let prep = enabled
+                        .then(|| crate::compaction::prepare_manual_compaction(&path_entries, settings))
+                        .flatten()
+                        .ok_or_else(|| {
+                            Error::session(
+                                "Compaction not available (disabled, already compacted, or too little history)",
+                            )
+                        })?;
 
                     let privacy = guard.agent.compaction_privacy();
                     let compact_res = compact(
@@ -4387,13 +5127,15 @@ pub async fn run(
                 let retry_abort = retry_abort.clone();
                 let options = options.clone();
                 let runtime_handle = options.runtime_handle.clone();
-                runtime_handle.spawn(run_rpc_turn(
+                let _ = runtime_handle.try_spawn(run_rpc_turn(
                     runtime_handle.clone(),
                     cx.clone(),
                     Arc::clone(&retry_abort),
                     Arc::clone(&abort_handle_slot),
-                    move |prompt_cx| async move {
-                        run_prompt_with_retry(
+                    out_tx.clone(),
+                    Arc::clone(&is_streaming),
+                    move |prompt_cx, terminal_guard| async move {
+                        run_prompt_with_retry_owned(
                             session,
                             shared_state,
                             is_streaming,
@@ -4411,6 +5153,7 @@ pub async fn run(
                             Some(String::new()),
                             attachments,
                             prompt_cx,
+                            terminal_guard,
                         )
                         .await;
                     },
@@ -4520,6 +5263,7 @@ pub async fn run(
                         .clone_from(&thinking_level);
 
                     let session_id = new_session.header.id.clone();
+                    let cost_budget = guard.agent.replacement_cost_budget(&new_session, false)?;
                     guard.invalidate_background_compaction();
                     state.provider_admission.ensure_allowed()?;
                     {
@@ -4529,10 +5273,23 @@ pub async fn run(
                             .map_err(|err| {
                                 Error::session(format!("inner session lock failed: {err}"))
                             })?;
+                        if let Some(budget) = guard.agent.cost_budget() {
+                            budget.checkpoint(&mut inner_session)?;
+                            if guard.save_enabled() {
+                                crate::agent::persist_session_mutations(
+                                    &mut inner_session,
+                                    &guard.provider_admission_gate(),
+                                    crate::session::AutosaveFlushTrigger::Manual,
+                                )
+                                .await?;
+                                budget.retire_session(&inner_session, cx.cx())?;
+                            }
+                        }
                         *inner_session = new_session;
                         session_transition_permit.commit_session_change();
                         state.output.clear_session();
                     }
+                    guard.agent.set_cost_budget(cost_budget);
                     guard.agent.clear_messages();
                     crate::app::rebind_stream_options_session(
                         guard.agent.stream_options_mut(),
@@ -4710,29 +5467,22 @@ pub async fn run(
                                         provider.model_id().to_string(),
                                     )
                                 });
-                            let entry = model_entry_for_provider_and_id(
+                            let entry = crate::models::resolve_model_entry(
+                                rpc_model_catalog(&guard, &options),
                                 &requested_model.0,
                                 &requested_model.1,
-                                &options,
                             )
-                                .cloned()
-                                .or_else(|| {
-                                    crate::models::ad_hoc_model_entry(
-                                        &requested_model.0,
-                                        &requested_model.1,
-                                    )
-                                })
-                                .ok_or_else(|| {
-                                    Error::validation(format!(
-                                        "Unable to switch Session runtime to {}/{}",
-                                        requested_model.0, requested_model.1
-                                    ))
-                                })?;
+                            .ok_or_else(|| {
+                                Error::validation(format!(
+                                    "Unable to switch Session runtime to {}/{}. Use get_available_models to inspect registered provider/model pairs.",
+                                    requested_model.0, requested_model.1
+                                ))
+                            })?;
                             let key = resolve_model_key(
                                 options.cli_api_key.as_deref(),
                                 &options.auth,
                                 &entry,
-                            );
+                            )?;
                             if model_requires_configured_credential(&entry) && key.is_none() {
                                 return Err(Error::auth(format!(
                                     "Missing credentials for resumed Session model {}/{}",
@@ -4762,9 +5512,32 @@ pub async fn run(
                                 })?;
                             let previous_session_file =
                                 inner_session.path.as_ref().map(|p| p.display().to_string());
+                            let preserve_cost = inner_session.header.id == new_session.header.id;
+                            let retiring_session =
+                                !crate::cost::same_session_target(&inner_session, &new_session);
+                            let cost_budget = guard
+                                .agent
+                                .replacement_cost_budget(&new_session, preserve_cost)?;
+                            if let Some(budget) = guard.agent.cost_budget() {
+                                if preserve_cost {
+                                    budget.checkpoint(&mut new_session)?;
+                                }
+                                if retiring_session {
+                                    budget.checkpoint(&mut inner_session)?;
+                                    if guard.save_enabled() {
+                                        crate::agent::persist_session_mutations(
+                                            &mut inner_session,
+                                            &guard.provider_admission_gate(),
+                                            crate::session::AutosaveFlushTrigger::Manual,
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            }
                             guard.invalidate_background_compaction();
                             state.provider_admission.ensure_allowed()?;
-                            if guard.save_enabled() && normalization_changed
+                            if guard.save_enabled()
+                                && (normalization_changed || (preserve_cost && cost_budget.is_some()))
                                 && let Err(first_err) = new_session.save().await
                                     && let Err(retry_err) = new_session.save().await
                                 {
@@ -4777,6 +5550,12 @@ pub async fn run(
                             let messages = new_session.to_messages_for_current_path();
                             let session_id = new_session.header.id.clone();
 
+                            if retiring_session
+                                && guard.save_enabled()
+                                && let Some(budget) = guard.agent.cost_budget()
+                            {
+                                budget.retire_session(&inner_session, cx.cx())?;
+                            }
                             state.reconstruct_failover_from_session(
                                 &new_session,
                                 options.config.failover_cooldown_secs(),
@@ -4786,6 +5565,7 @@ pub async fn run(
                             session_transition_permit.commit_session_change();
                             state.output.clear_session();
                             drop(inner_session);
+                            guard.agent.set_cost_budget(cost_budget);
                             guard.agent.replace_messages(messages);
                             crate::app::rebind_stream_options_session(
                                 guard.agent.stream_options_mut(),
@@ -4982,21 +5762,14 @@ pub async fn run(
                                     provider.model_id().to_string(),
                                 )
                             });
-                        let entry = model_entry_for_provider_and_id(
+                        let entry = crate::models::resolve_model_entry(
+                            rpc_model_catalog(&guard, &options),
                             &requested_model.0,
                             &requested_model.1,
-                            &options,
                         )
-                        .cloned()
-                        .or_else(|| {
-                            crate::models::ad_hoc_model_entry(
-                                &requested_model.0,
-                                &requested_model.1,
-                            )
-                        })
                         .ok_or_else(|| {
                             Error::validation(format!(
-                                "Unable to install forked Session runtime {}/{}",
+                                "Unable to install forked Session runtime {}/{}. Use get_available_models to inspect registered provider/model pairs.",
                                 requested_model.0, requested_model.1
                             ))
                         })?;
@@ -5004,7 +5777,7 @@ pub async fn run(
                             options.cli_api_key.as_deref(),
                             &options.auth,
                             &entry,
-                        );
+                        )?;
                         if model_requires_configured_credential(&entry) && key.is_none() {
                             return Err(Error::auth(format!(
                                 "Missing credentials for forked Session model {}/{}",
@@ -5038,6 +5811,18 @@ pub async fn run(
                         }
                         guard.invalidate_background_compaction();
                         state.provider_admission.ensure_allowed()?;
+                        if let Some(budget) = guard.agent.cost_budget() {
+                            budget.checkpoint(&mut inner)?;
+                            if save_enabled {
+                                crate::agent::persist_session_mutations(
+                                    &mut inner,
+                                    &guard.provider_admission_gate(),
+                                    crate::session::AutosaveFlushTrigger::Manual,
+                                )
+                                .await?;
+                            }
+                            budget.checkpoint(&mut new_session)?;
+                        }
                         if save_enabled
                             && let Err(first_err) = new_session.save().await
                                 && let Err(retry_err) = new_session.save().await
@@ -5050,6 +5835,9 @@ pub async fn run(
                         let target_plan_mode = replayed_plan_mode(&new_session);
                         let messages = new_session.to_messages_for_current_path();
                         let session_id = new_session.header.id.clone();
+                        if save_enabled && let Some(budget) = guard.agent.cost_budget() {
+                            budget.retire_session(&inner, cx.cx())?;
+                        }
                         state.reconstruct_failover_from_session(
                             &new_session,
                             options.config.failover_cooldown_secs(),
@@ -5176,7 +5964,13 @@ pub async fn run(
                 };
                 match rpc_parse_ask_response(&parsed) {
                     Ok((request_id, response)) => {
-                        let resolved = ask.respond_ui(&request_id, response);
+                        let resolved = {
+                            let mut state = ask_bridge_state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            state.forwarded.remove(&request_id);
+                            ask.respond_ui(&request_id, response)
+                        };
                         let _ = out_tx.send(response_ok(
                             id,
                             "ask_response",
@@ -5545,7 +6339,12 @@ async fn preserve_terminal_rpc_state(
     }
     let completed_tool_transcript =
         completed_live_tool_effect_suffix(&inner, guard.agent.messages())?;
-    state.stage_completed_tool_transcript(&inner, &completed_tool_transcript)?;
+    let completed_message_start = inner.to_messages_for_current_path().len();
+    state.stage_completed_tool_transcript(&inner, &completed_tool_transcript, |index| {
+        guard
+            .agent
+            .is_authored_queue_delivery(completed_message_start + index)
+    })?;
     let completed_tool_transcript_count = state.completed_tool_transcript_entries().len();
     if completed_tool_transcript_count == 0
         && (input_preservation == RpcInputPreservation::LeaveForNextAgentTurn
@@ -5578,6 +6377,8 @@ async fn preserve_terminal_rpc_state(
     // the candidate flush, retry sees the original queues and reuses their
     // stable entry metadata against the pinned persistence target.
     let mut candidate = inner.clone();
+    let reset_advisor_on_authored_input = guard.advisor.is_some();
+    let track_memory_inputs = guard.memory_enabled();
     let mut parent_id = candidate.leaf_id().map(str::to_string);
     for delivery in state.completed_tool_transcript_entries() {
         let message = delivery.message().clone();
@@ -5590,6 +6391,18 @@ async fn preserve_terminal_rpc_state(
             &timestamp,
             bound_parent_id.as_deref(),
         )?;
+        if reset_advisor_on_authored_input && delivery.keyword_scan_source().is_some() {
+            parent_id = Some(crate::agent::append_advisor_input_reset(
+                &mut candidate,
+                &entry_id,
+            )?);
+        }
+        if track_memory_inputs && delivery.keyword_scan_source().is_some() {
+            parent_id = Some(crate::memory::extraction::record_authored_input(
+                &mut candidate,
+                &entry_id,
+            )?);
+        }
     }
     if input_preservation == RpcInputPreservation::Include {
         let in_flight = state.in_flight_in_lease_order();
@@ -5613,6 +6426,19 @@ async fn preserve_terminal_rpc_state(
                 &timestamp,
                 bound_parent_id.as_deref(),
             )?;
+            if reset_advisor_on_authored_input && in_flight.delivery.keyword_scan_source().is_some()
+            {
+                parent_id = Some(crate::agent::append_advisor_input_reset(
+                    &mut candidate,
+                    &entry_id,
+                )?);
+            }
+            if track_memory_inputs && in_flight.delivery.keyword_scan_source().is_some() {
+                parent_id = Some(crate::memory::extraction::record_authored_input(
+                    &mut candidate,
+                    &entry_id,
+                )?);
+            }
         }
         for delivery in state.steering.iter_mut().chain(&mut state.follow_up) {
             let message = delivery.message().clone();
@@ -5625,6 +6451,18 @@ async fn preserve_terminal_rpc_state(
                 &timestamp,
                 bound_parent_id.as_deref(),
             )?;
+            if reset_advisor_on_authored_input && delivery.keyword_scan_source().is_some() {
+                parent_id = Some(crate::agent::append_advisor_input_reset(
+                    &mut candidate,
+                    &entry_id,
+                )?);
+            }
+            if track_memory_inputs && delivery.keyword_scan_source().is_some() {
+                parent_id = Some(crate::memory::extraction::record_authored_input(
+                    &mut candidate,
+                    &entry_id,
+                )?);
+            }
         }
     }
 
@@ -5771,7 +6609,15 @@ async fn flush_rpc_session_on_shutdown(
     let mut inner = OwnedMutexGuard::lock(session_store, cx)
         .await
         .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-    inner.flush_autosave_on_shutdown().await
+    if let Some(budget) = guard.agent.cost_budget() {
+        budget.checkpoint(&mut inner)?;
+        inner
+            .flush_autosave(crate::session::AutosaveFlushTrigger::Shutdown)
+            .await?;
+        budget.retire_session(&inner, cx.cx())
+    } else {
+        inner.flush_autosave_on_shutdown().await
+    }
 }
 
 async fn acknowledge_durable_rpc_in_flight(
@@ -5870,8 +6716,8 @@ async fn restore_rpc_retry_tail(
         .await
 }
 
-#[allow(clippy::too_many_lines)]
-async fn run_prompt_with_retry(
+#[cfg(test)]
+fn run_prompt_with_retry(
     session: Arc<Mutex<AgentSession>>,
     shared_state: Arc<Mutex<RpcSharedState>>,
     is_streaming: Arc<AtomicBool>,
@@ -5885,13 +6731,53 @@ async fn run_prompt_with_retry(
     keyword_scan_source: Option<String>,
     attachments: Vec<ContentBlock>,
     cx: AgentCx,
+) -> impl Future<Output = ()> {
+    let terminal_guard = TerminalAgentEndOnDrop::for_accepted_turn(
+        out_tx.clone(),
+        cx.clone(),
+        Arc::clone(&is_streaming),
+    );
+    run_prompt_with_retry_owned(
+        session,
+        shared_state,
+        is_streaming,
+        is_compacting,
+        turn_phase_linearizer,
+        abort_handle_slot,
+        out_tx,
+        retry_abort,
+        options,
+        message,
+        keyword_scan_source,
+        attachments,
+        cx,
+        terminal_guard,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_prompt_with_retry_owned(
+    session: Arc<Mutex<AgentSession>>,
+    shared_state: Arc<Mutex<RpcSharedState>>,
+    is_streaming: Arc<AtomicBool>,
+    is_compacting: Arc<AtomicBool>,
+    turn_phase_linearizer: Arc<std::sync::Mutex<()>>,
+    abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    retry_abort: Arc<AtomicBool>,
+    options: RpcOptions,
+    message: String,
+    keyword_scan_source: Option<String>,
+    attachments: Vec<ContentBlock>,
+    cx: AgentCx,
+    terminal_guard: TerminalAgentEndOnDrop,
 ) {
     is_streaming.store(true, Ordering::SeqCst);
     let _streaming_guard = ClearFlagOnDrop(Arc::clone(&is_streaming));
     let _compacting_handoff_guard = ClearFlagOnDrop(Arc::clone(&is_compacting));
-    // The prompt was accepted before this task started. Cover its first
-    // await as well as provider execution, persistence and retry cleanup.
-    let mut terminal_guard = TerminalAgentEndOnDrop::new(out_tx.clone(), cx.clone());
+    // Keep this local after both activity guards so an unwinding turn queues
+    // its terminal frame before either flag allows EOF draining to finish.
+    let mut terminal_guard = terminal_guard;
 
     let initial_state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx).await;
     let (provider_reentry_blocked, output) = match initial_state {
@@ -5923,8 +6809,18 @@ async fn run_prompt_with_retry(
     }
 
     let max_retries = options.config.retry_max_retries();
+    let recovery_policy = crate::failover::RetryPolicy {
+        max_retries,
+        max_failovers_per_turn: options.config.max_failovers_per_turn(),
+        model_fallback: options.config.model_fallback_enabled(),
+        fallback_on: options.config.retry_fallback_on(),
+        base_delay_ms: options.config.retry_base_delay_ms(),
+        max_delay_ms: options.config.retry_max_delay_ms(),
+    };
     let mut retry_count: u32 = 0;
     let mut failovers_this_turn: u32 = 0;
+    let recovery_events = rpc_recovery_events(out_tx.clone());
+    let mut prewalk_turn = None;
     // Distinct from retry_count: a failover resets the retry BUDGET but must
     // never replay the first attempt (which would re-add the user message and
     // re-execute completed tool cycles — pi_agent_rust#125 semantics).
@@ -5940,6 +6836,9 @@ async fn run_prompt_with_retry(
     let mut stopped_at_time_cap = false;
     let mut final_error: Option<String> = None;
     let mut final_error_hints: Option<Value> = None;
+    let mut final_cost_cap: Option<Value> = None;
+    let mut pending_recovery_error: Option<Error> = None;
+    let mut terminal_quota_credential: Option<(String, String, String)> = None;
 
     loop {
         if retry_abort.load(Ordering::SeqCst) || cx.checkpoint().is_err() {
@@ -5949,6 +6848,7 @@ async fn run_prompt_with_retry(
         }
 
         let (abort_handle, abort_signal) = AbortHandle::new();
+        let handoff_abort = abort_signal.clone();
         if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
             // Cancellation may win while acquiring the slot, before the
             // monitor can find this attempt's handle. Publish and recheck
@@ -5968,7 +6868,12 @@ async fn run_prompt_with_retry(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 
-        let result = {
+        let (result, prewalk_pending) = if let Some(error) = pending_recovery_error.take() {
+            // Credential exhaustion follows a durable rewind but admits no
+            // new provider request. Classify it through the same bounded
+            // fallback path as an ordinary attempt failure.
+            (Err(error), false)
+        } else {
             let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                 Ok(guard) => guard,
                 Err(err) => {
@@ -5977,6 +6882,7 @@ async fn run_prompt_with_retry(
                     break;
                 }
             };
+            guard.set_recovery_cli_api_key(options.cli_api_key.clone());
             let extensions = guard.extensions.as_ref().map(|r| r.manager().clone());
             // Servers an extension registered after startup (`registerMcpServer`
             // from a later callback) reach the session-owned MCP manager at the
@@ -5996,7 +6902,7 @@ async fn run_prompt_with_retry(
                 output.clone(),
             );
 
-            if first_attempt_done {
+            let result = if first_attempt_done {
                 // Retry: resume the turn from the last completed state instead of
                 // replaying it from the user message. The incomplete output of the
                 // failed request was stripped via `revert_incomplete_response`
@@ -6049,6 +6955,7 @@ async fn run_prompt_with_retry(
             } else {
                 // First attempt: add the user message and run the turn.
                 first_attempt_done = true;
+                prewalk_turn = Some(guard.begin_prewalk_turn());
                 turn_system_prompt = guard.agent.system_prompt().map(str::to_string);
                 guard
                     .agent
@@ -6073,13 +6980,59 @@ async fn run_prompt_with_retry(
                         )
                         .await
                 }
-            }
+            };
+            (result, guard.prewalk_handoff_pending())
         };
         let durability_cx = AgentCx::for_request();
         let result = finish_rpc_turn_durability(
             result,
             acknowledge_durable_rpc_in_flight(&session, &shared_state, &durability_cx).await,
         );
+
+        if result.is_ok() && prewalk_pending {
+            let transition = async {
+                let owner = prewalk_turn
+                    .as_ref()
+                    .ok_or_else(|| Error::session("Prewalk turn ownership is unavailable"))?;
+                let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                    .await
+                    .map_err(|error| {
+                        Error::session(format!("prewalk session lock failed: {error}"))
+                    })?;
+                recovery_events.finish(true, None);
+                retry_count = 0;
+                if let Some(target) = guard
+                    .complete_prewalk_handoff(owner, Some(&handoff_abort))
+                    .await?
+                {
+                    let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
+                        .await
+                        .map_err(|error| {
+                            Error::session(format!("prewalk state lock failed: {error}"))
+                        })?;
+                    state.clear_failover_lifecycle();
+                    drop(state);
+                    let _ = out_tx.send(output.event_line(&AgentEvent::PrewalkSwitched {
+                        provider: target.provider,
+                        model: target.model,
+                        thinking: target.thinking.unwrap_or_default(),
+                    }));
+                }
+                Ok::<(), Error>(())
+            }
+            .await;
+            if let Err(error) = transition {
+                final_error = Some(error.to_string());
+                final_error_hints = Some(error_hints_value(&error));
+                break;
+            }
+            // Keep accepting live steering: the next native attempt consumes
+            // the same durable transcript and original budgets. No retry tail
+            // rewind, second authored prompt, or finalization phase occurs.
+            final_error = None;
+            final_error_hints = None;
+            continue;
+        }
 
         if matches!(
             &result,
@@ -6102,6 +7055,16 @@ async fn run_prompt_with_retry(
             Ok(message) if message.stop_reason == StopReason::Error
         );
         let mut quota_credential: Option<(String, String)> = None;
+        let progress = crate::failover::TurnProgress {
+            retry_count,
+            failovers_this_turn,
+            stream_can_retry: true,
+        };
+        let recovery_decision;
+        let rate_limited = crate::failover::is_credential_rate_limit(match &result {
+            Ok(message) => crate::failover::TurnOutcome::Completed(message),
+            Err(error) => crate::failover::TurnOutcome::Failed(error),
+        });
 
         match result {
             Ok(message) => {
@@ -6122,37 +7085,31 @@ async fn run_prompt_with_retry(
                     if message.stop_reason == StopReason::Aborted {
                         break;
                     }
-                    // Check if this error is retryable. Context overflow and
-                    // auth failures should NOT be retried.
-                    if let Some(ref err_msg) = final_error {
-                        let context_window = if let Ok(guard) =
-                            OwnedMutexGuard::lock(Arc::clone(&session), &cx).await
-                        {
-                            let runtime_provider = guard.agent.provider().name().to_string();
-                            let runtime_model_id = guard.agent.provider().model_id().to_string();
-                            let session_store = Arc::clone(&guard.session);
-                            let inner_session =
-                                OwnedMutexGuard::lock(session_store, &cx).await.ok();
-                            inner_session.and_then(|inner| {
-                                current_or_runtime_model_entry(
-                                    &inner,
-                                    &runtime_provider,
-                                    &runtime_model_id,
-                                    &options,
-                                )
-                                .map(|e| e.model.context_window)
-                            })
-                        } else {
-                            None
-                        };
-                        if !crate::error::is_retryable_error(
-                            err_msg,
-                            Some(message.usage.input),
-                            context_window,
-                        ) {
-                            break;
-                        }
-                    }
+                    let context_window = if let Ok(guard) =
+                        OwnedMutexGuard::lock(Arc::clone(&session), &cx).await
+                    {
+                        let runtime_provider = guard.agent.provider().name().to_string();
+                        let runtime_model_id = guard.agent.provider().model_id().to_string();
+                        let session_store = Arc::clone(&guard.session);
+                        let inner_session = OwnedMutexGuard::lock(session_store, &cx).await.ok();
+                        inner_session.and_then(|inner| {
+                            current_or_runtime_model_entry(
+                                &inner,
+                                &runtime_provider,
+                                &runtime_model_id,
+                                rpc_model_catalog(&guard, &options),
+                            )
+                            .map(|e| e.model.context_window)
+                        })
+                    } else {
+                        None
+                    };
+                    recovery_decision = crate::failover::decide(
+                        crate::failover::TurnOutcome::Completed(&message),
+                        &progress,
+                        &recovery_policy,
+                        context_window,
+                    );
                 } else {
                     let internally_staged_follow_up =
                         match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
@@ -6201,53 +7158,71 @@ async fn run_prompt_with_retry(
             }
             Err(err) => {
                 let err_str = err.to_string();
-                // `call_error_is_retryable` refuses a session-persistence
-                // failure first (bd-8188r), then classifies from the TYPED
-                // error before its flattened prose (pi_agent_rust#118). Print
-                // mode inlined the same two checks until bd-u2qv4.
-                if !crate::failover::call_error_is_retryable(&err) {
-                    final_error = Some(err_str);
-                    final_error_hints = Some(error_hints_value(&err));
-                    break;
-                }
+                final_cost_cap = cost_cap_value(&err);
+                // Keep typed provider errors and terminal refusals in the
+                // same policy as SDK/print. Account exhaustion may permit a
+                // different model even when retrying this one cannot help.
+                recovery_decision = crate::failover::decide(
+                    crate::failover::TurnOutcome::Failed(&err),
+                    &progress,
+                    &recovery_policy,
+                    None,
+                );
                 final_error = Some(err_str.clone());
                 final_error_hints = Some(error_hints_value(&err));
-                if crate::failover::classify_failover(&err_str)
-                    == Some(crate::failover::FailoverClass::Quota)
-                {
-                    let guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
-                        Ok(guard) => guard,
-                        Err(lock_err) => {
-                            let restore_err = Error::session(format!(
-                                "retry credential snapshot session lock failed: {lock_err}"
-                            ));
-                            final_error = Some(restore_err.to_string());
-                            final_error_hints = Some(error_hints_value(&restore_err));
-                            break;
-                        }
-                    };
-                    let provider = guard.agent.provider();
-                    let provider_name = provider.name().to_string();
-                    if let Some(key) = guard.agent.stream_options().api_key.clone() {
-                        quota_credential = Some((provider_name, key));
-                    }
-                }
             }
         }
+
+        // SSE error messages and setup errors describe the same failed
+        // credential. Capture it before the backoff callback can run.
+        if rate_limited {
+            let guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
+                Ok(guard) => guard,
+                Err(lock_err) => {
+                    let error = Error::session(format!(
+                        "retry credential snapshot session lock failed: {lock_err}"
+                    ));
+                    final_error = Some(error.to_string());
+                    final_error_hints = Some(error_hints_value(&error));
+                    break;
+                }
+            };
+            let provider = guard.agent.provider().name().to_string();
+            if !guard
+                .recovery_api_key_override(&provider, options.cli_api_key.as_deref())
+                .is_some_and(|key| !key.trim().is_empty())
+                && let Some(key) = guard.agent.stream_options().api_key.clone()
+            {
+                quota_credential = Some((provider, key));
+            }
+        }
+        terminal_quota_credential = quota_credential.as_ref().and_then(|(provider, key)| {
+            final_error
+                .as_ref()
+                .map(|error| (provider.clone(), key.clone(), error.clone()))
+        });
 
         let retry_enabled = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
             .await
             .is_ok_and(|state| state.auto_retry_enabled);
-        if !retry_enabled || retry_count >= max_retries {
-            // Failover (bd-cv653.3.2): the same-model retry budget is spent.
-            // If the error class is failover-eligible and a chain entry
-            // remains, swap providers and continue the turn there. The
-            // per-turn cap bounds total failover cost.
+        if !retry_enabled
+            || matches!(
+                recovery_decision,
+                crate::failover::TurnDecision::Finish { .. }
+                    | crate::failover::TurnDecision::Terminal(_)
+            )
+        {
+            break;
+        }
+        if recovery_decision == crate::failover::TurnDecision::FailOver {
+            // The shared policy has exhausted same-model retry or recognized
+            // an account limit that only another model could recover from.
+            // The chain walk still owns credential and transition admission.
             let failover_result = if failovers_this_turn < options.config.max_failovers_per_turn() {
                 try_failover_to_next_chain_entry(
                     Arc::clone(&session),
                     Arc::clone(&shared_state),
-                    out_tx.clone(),
+                    &recovery_events,
                     &options,
                     final_error.as_deref(),
                     require_incomplete_tail,
@@ -6261,20 +7236,13 @@ async fn run_prompt_with_retry(
             };
             match failover_result {
                 Ok(true) => {
-                    if let Some((provider_name, key)) = quota_credential.as_ref() {
-                        crate::auth::report_provider_rate_limit(provider_name, key);
-                    }
                     retry_count = 0;
                     failovers_this_turn += 1;
                     final_error = None;
                     final_error_hints = None;
                     continue;
                 }
-                Ok(false) => {
-                    if let Some((provider_name, key)) = quota_credential.as_ref() {
-                        crate::auth::report_provider_rate_limit(provider_name, key);
-                    }
-                }
+                Ok(false) => {}
                 Err(restore_err) => {
                     let transition_error = restore_err.to_string();
                     final_error = Some(final_error.take().map_or_else(
@@ -6294,12 +7262,12 @@ async fn run_prompt_with_retry(
         let error_message = final_error
             .clone()
             .unwrap_or_else(|| "Request error".to_string());
-        let _ = out_tx.send(agent_event(AgentEvent::AutoRetryStart {
+        recovery_events.emit(AgentEvent::AutoRetryStart {
             attempt: retry_count,
             max_attempts: max_retries,
             delay_ms: u64::from(delay_ms),
             error_message,
-        }));
+        });
 
         let delay = Duration::from_millis(delay_ms as u64);
         let start = std::time::Instant::now();
@@ -6367,56 +7335,27 @@ async fn run_prompt_with_retry(
             final_error_hints = Some(error_hints_value(&admission_err));
             break;
         }
-        // Rotation bookkeeping and key replacement are one admission-bound
-        // mutation. Tail restoration must succeed before either can occur,
-        // and no provider call may observe the backed-off key in between.
-        if let Some((provider_name, key)) = quota_credential.as_ref() {
-            crate::auth::report_provider_rate_limit(provider_name, key);
+        if retry_abort.load(Ordering::SeqCst) || cx.checkpoint().is_err() {
+            final_error = Some("Retry aborted".to_string());
+            final_error_hints = None;
+            break;
         }
-        // Credential rotation (bd-cv653.3.2): re-resolve the key so a
-        // backed-off credential rotates on the retry. CLI-pinned keys
-        // never rotate.
-        if options.cli_api_key.is_none() {
-            let provider_name = guard.agent.provider().name().to_string();
-            if let Some(fresh) = options.auth.resolve_api_key(&provider_name, None) {
-                let changed =
-                    guard.agent.stream_options().api_key.as_deref() != Some(fresh.as_str());
-                if changed {
-                    guard.agent.stream_options_mut().api_key = Some(fresh);
-                    guard.refresh_extension_completion_host_state();
-                }
-            }
+        if let Some((provider, key)) = quota_credential.as_ref()
+            && let Err(error) =
+                guard.rotate_rate_limited_credential(provider, key, options.cli_api_key.as_deref())
+        {
+            pending_recovery_error = Some(error);
         }
     }
 
-    if retry_count > 0 {
-        let _ = out_tx.send(agent_event(AgentEvent::AutoRetryEnd {
-            success,
-            attempt: retry_count,
-            final_error: if success { None } else { final_error.clone() },
-        }));
+    let completion_cx = AgentCx::for_request();
+    if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), &completion_cx).await {
+        guard.finish_prewalk_turn(!success);
     }
-
-    // Failover lifecycle (bd-2vmu6.1): a turn that swapped to a fallback chain
-    // entry closes its `FailoverStart` here, before the terminal `agent_end`,
-    // whether the fallback succeeded, failed, or was aborted. Restoring the
-    // primary after cooldown is a separate lifecycle (`restoredPrimary: true`
-    // from `maybe_restore_primary`). The turn context may already be
-    // cancelled, so the shared state is read with a fresh request context.
-    if failovers_this_turn > 0 {
-        let lifecycle_cx = AgentCx::for_request();
-        let (provider, model) = OwnedMutexGuard::lock(Arc::clone(&shared_state), &lifecycle_cx)
-            .await
-            .map_or_else(
-                |_| (String::new(), String::new()),
-                |state| state.active_failover_model.clone().unwrap_or_default(),
-            );
-        let _ = out_tx.send(agent_event(AgentEvent::FailoverEnd {
-            success,
-            provider,
-            model,
-            restored_primary: false,
-        }));
+    if let Ok(mut guard) =
+        OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &completion_cx).await
+    {
+        *guard = None;
     }
 
     if !success {
@@ -6457,6 +7396,18 @@ async fn run_prompt_with_retry(
                 |terminal| format!("{terminal}; {preservation_error}"),
             ));
         }
+        if !preservation_quarantined
+            && let Some((provider, key, original_error)) = terminal_quota_credential.as_ref()
+            && final_error.as_ref() == Some(original_error)
+            && let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), &preservation_cx).await
+            && let Err(error) = guard.record_terminal_rate_limited_credential(provider, key)
+        {
+            final_error = Some(error.to_string());
+            final_error_hints = Some(error_hints_value(&error));
+        }
+        // Close every announced attempt with the final durable outcome,
+        // including terminal exhaustion when no fallback could be installed.
+        recovery_events.finish(false, final_error.clone());
         // Emit the terminal event BEFORE clearing is_streaming: the stdin-EOF
         // drain only guarantees flush-before-shutdown for events queued while
         // a flag is still set (gh #137).
@@ -6477,12 +7428,18 @@ async fn run_prompt_with_retry(
         if let Some(hints) = final_error_hints {
             payload["errorHints"] = hints;
         }
+        if let Some(cap) = final_cost_cap {
+            payload["errorCode"] = json!("cost_cap");
+            payload["retryable"] = json!(false);
+            payload["costCap"] = cap;
+        }
         terminal_guard.disarm();
         let _ = out_tx.send(event(&payload));
         is_streaming.store(false, Ordering::SeqCst);
         return;
     }
 
+    recovery_events.finish(true, None);
     let terminal_messages = deferred_agent_end
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -6557,7 +7514,7 @@ async fn sync_runtime_before_rpc_ack(
 async fn reconcile_rpc_failover_state(
     guard: &AgentSession,
     state: &mut RpcSharedState,
-    configured_cooldown_secs: u64,
+    options: &RpcOptions,
     cx: &AgentCx,
 ) -> Result<bool> {
     let inner = guard
@@ -6570,10 +7527,19 @@ async fn reconcile_rpc_failover_state(
         inner
             .effective_model_for_current_path()
             .is_none_or(|(provider, model)| {
-                provider_ids_match(runtime.name(), &provider)
-                    && runtime.model_id().eq_ignore_ascii_case(&model)
+                crate::models::model_identities_match(
+                    rpc_model_catalog(guard, options),
+                    runtime.name(),
+                    runtime.model_id(),
+                    &provider,
+                    &model,
+                )
             });
-    state.reconstruct_failover_from_session(&inner, configured_cooldown_secs, chrono::Utc::now());
+    state.reconstruct_failover_from_session(
+        &inner,
+        options.config.failover_cooldown_secs(),
+        chrono::Utc::now(),
+    );
     Ok(runtime_matches_session)
 }
 
@@ -6602,14 +7568,7 @@ async fn maybe_restore_primary(
         .map_err(|err| Error::session(format!("primary restore state lock failed: {err}")))?;
     state.bind_provider_admission(guard.provider_admission_gate());
     state.ensure_session_advancement_allowed()?;
-    if !reconcile_rpc_failover_state(
-        &guard,
-        &mut state,
-        options.config.failover_cooldown_secs(),
-        cx,
-    )
-    .await?
-    {
+    if !reconcile_rpc_failover_state(&guard, &mut state, options, cx).await? {
         return Ok(());
     }
     let Some((active_provider, active_model)) = state.active_failover_model.clone() else {
@@ -6665,6 +7624,14 @@ async fn maybe_restore_primary(
     Ok(())
 }
 
+fn rpc_recovery_events(
+    out_tx: std::sync::mpsc::SyncSender<String>,
+) -> crate::failover::RecoveryEventStream {
+    crate::failover::RecoveryEventStream::new(move |event| {
+        let _ = out_tx.send(agent_event(event));
+    })
+}
+
 /// Failover walk (bd-cv653.3.2): classify the terminal error; if it is
 /// failover-eligible, resolve the next chain entry, swap the provider in the
 /// session's agent, emit FailoverStart, and record the cooldown + audit entry.
@@ -6672,7 +7639,7 @@ async fn maybe_restore_primary(
 async fn try_failover_to_next_chain_entry(
     session: Arc<Mutex<AgentSession>>,
     shared_state: Arc<Mutex<RpcSharedState>>,
-    out_tx: std::sync::mpsc::SyncSender<String>,
+    recovery_events: &crate::failover::RecoveryEventStream,
     options: &RpcOptions,
     error_text: Option<&str>,
     require_incomplete_tail: bool,
@@ -6683,6 +7650,11 @@ async fn try_failover_to_next_chain_entry(
     let Some(error_text) = error_text else {
         return Ok(false);
     };
+    if !options.config.model_fallback_enabled()
+        || !options.config.retry_fallback_on().allows(error_text)
+    {
+        return Ok(false);
+    }
     let Some(class) = crate::failover::classify_failover(error_text) else {
         return Ok(false); // auth/loud errors never fail over
     };
@@ -6709,14 +7681,7 @@ async fn try_failover_to_next_chain_entry(
         .map_err(|err| Error::session(format!("failover state lock failed: {err}")))?;
     state.bind_provider_admission(guard.provider_admission_gate());
     state.ensure_session_advancement_allowed()?;
-    if !reconcile_rpc_failover_state(
-        &guard,
-        &mut state,
-        options.config.failover_cooldown_secs(),
-        cx,
-    )
-    .await?
-    {
+    if !reconcile_rpc_failover_state(&guard, &mut state, options, cx).await? {
         return Ok(false);
     }
     let provider = guard.agent.provider();
@@ -6736,8 +7701,13 @@ async fn try_failover_to_next_chain_entry(
                 .unwrap_or_default(),
         },
         (Some((active_provider, active_model)), Some(primary))
-            if crate::provider_metadata::provider_ids_match(&current_provider, active_provider)
-                && current_model.eq_ignore_ascii_case(active_model) =>
+            if crate::models::model_identities_match(
+                rpc_model_catalog(&guard, options),
+                &current_provider,
+                &current_model,
+                active_provider,
+                active_model,
+            ) =>
         {
             primary.clone()
         }
@@ -6761,11 +7731,11 @@ async fn try_failover_to_next_chain_entry(
     // A fallback chain belongs to the original primary identity. Once the
     // first entry is active, resolving from the live fallback would make an
     // exact primary chain disappear and prevent later entries from running.
-    let Some(chain) = crate::failover::chain_for(
+    let Some(chain) = guard.resolve_fallback_chain(
         chains,
-        "default",
         &primary_model.provider,
         &primary_model.model_id,
+        rpc_model_catalog(&guard, options),
     ) else {
         return Ok(false);
     };
@@ -6830,7 +7800,7 @@ async fn try_failover_to_next_chain_entry(
     state.failover_cooldown = Some(cooldown);
     state.provider_admission.clear();
 
-    let event = agent_event(AgentEvent::FailoverStart {
+    let event = AgentEvent::FailoverStart {
         from_provider: committed.from_provider.clone(),
         from_model: committed.from_model.clone(),
         to_provider: committed.to_provider.clone(),
@@ -6840,23 +7810,24 @@ async fn try_failover_to_next_chain_entry(
         // (swaps_so_far + 1)-th of `retry.maxFailoversPerTurn` (bd-oqo03).
         attempt: swaps_so_far.saturating_add(1),
         chain_index: u32::try_from(committed.entry_index).unwrap_or(u32::MAX),
-    });
+    };
     drop(state);
     drop(session_action_permit);
     drop(provider_authority);
     drop(guard);
     if let Some(attempt) = retry_attempt_to_end {
-        let _ = out_tx.send(agent_event(AgentEvent::AutoRetryEnd {
+        recovery_events.emit(AgentEvent::AutoRetryEnd {
             success: false,
             attempt,
             final_error: Some(error_text.to_string()),
-        }));
+        });
     }
-    let _ = out_tx.send(event);
+    recovery_events.emit(event);
     Ok(true)
 }
 
-async fn run_extension_command(
+#[cfg(test)]
+fn run_extension_command(
     session: Arc<Mutex<AgentSession>>,
     is_streaming: Arc<AtomicBool>,
     abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
@@ -6867,10 +7838,43 @@ async fn run_extension_command(
     args: String,
     cx: AgentCx,
     output: RpcOutput,
+) -> impl Future<Output = ()> {
+    let terminal_guard = TerminalAgentEndOnDrop::for_accepted_turn(
+        out_tx.clone(),
+        cx.clone(),
+        Arc::clone(&is_streaming),
+    );
+    run_extension_command_owned(
+        session,
+        is_streaming,
+        abort_handle_slot,
+        retry_abort,
+        out_tx,
+        runtime_handle,
+        command_name,
+        args,
+        cx,
+        output,
+        terminal_guard,
+    )
+}
+
+async fn run_extension_command_owned(
+    session: Arc<Mutex<AgentSession>>,
+    is_streaming: Arc<AtomicBool>,
+    abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
+    retry_abort: Arc<AtomicBool>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    runtime_handle: RuntimeHandle,
+    command_name: String,
+    args: String,
+    cx: AgentCx,
+    output: RpcOutput,
+    terminal_guard: TerminalAgentEndOnDrop,
 ) {
     is_streaming.store(true, Ordering::SeqCst);
     let _streaming_guard = ClearFlagOnDrop(Arc::clone(&is_streaming));
-    let mut terminal_guard = TerminalAgentEndOnDrop::new(out_tx.clone(), cx.clone());
+    let mut terminal_guard = terminal_guard;
 
     let (abort_handle, abort_signal) = AbortHandle::new();
     if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
@@ -6956,6 +7960,11 @@ async fn run_extension_command(
     if let Err(err) = result {
         payload["error"] = Value::String(err.to_string());
         payload["errorHints"] = error_hints_value(&err);
+        if let Some(cap) = cost_cap_value(&err) {
+            payload["errorCode"] = json!("cost_cap");
+            payload["retryable"] = json!(false);
+            payload["costCap"] = cap;
+        }
     }
     terminal_guard.disarm();
     let _ = out_tx.send(event(&payload));
@@ -7005,7 +8014,19 @@ fn response_error_with_hints(id: Option<String>, command: &str, error: &Error) -
     if let Some(id) = id {
         resp["id"] = Value::String(id);
     }
+    if let Some(cap) = cost_cap_value(error) {
+        resp["errorCode"] = json!("cost_cap");
+        resp["retryable"] = json!(false);
+        resp["costCap"] = cap;
+    }
     resp.to_string()
+}
+
+fn cost_cap_value(error: &Error) -> Option<Value> {
+    let Error::CostCap { spent, cap } = error else {
+        return None;
+    };
+    Some(json!({ "spent": spent, "cap": cap }))
 }
 
 fn event(value: &Value) -> String {
@@ -8578,6 +9599,118 @@ mod retry_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn rpc_recovery_controls_block_fallback_before_model_or_transcript_changes() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            for transport_error in [false, true] {
+                for (enabled, model_fallback, filter) in [
+                    (false, true, crate::failover::FallbackOn::Any),
+                    (true, false, crate::failover::FallbackOn::Any),
+                    (true, true, crate::failover::FallbackOn::UsageLimit),
+                ] {
+                    let provider = Arc::new(FlakyProvider {
+                        transport_error,
+                        ..FlakyProvider::new()
+                    });
+                    let agent = Agent::new(
+                        Arc::clone(&provider) as Arc<dyn Provider>,
+                        ToolRegistry::new(&[], Path::new("."), None),
+                        AgentConfig::default(),
+                    );
+                    let store = Arc::new(Mutex::new(Session::in_memory()));
+                    let session = Arc::new(Mutex::new(AgentSession::new(
+                        agent,
+                        Arc::clone(&store),
+                        false,
+                        crate::compaction::ResolvedCompactionSettings::default(),
+                    )));
+                    let config = Config {
+                        retry: Some(crate::config::RetrySettings {
+                            enabled: Some(enabled),
+                            model_fallback: Some(model_fallback),
+                            fallback_on: Some(filter),
+                            max_retries: Some(0),
+                            base_delay_ms: Some(0),
+                            max_delay_ms: Some(0),
+                            fallback_chains: Some(HashMap::from([(
+                                "default".to_string(),
+                                vec!["openai/blocked-fallback".to_string()],
+                            )])),
+                            ..Default::default()
+                        }),
+                        ..Config::default()
+                    };
+                    let mut shared = RpcSharedState::new(&config);
+                    shared.auto_compaction_enabled = false;
+                    let shared = Arc::new(Mutex::new(shared));
+                    let mut fallback = dummy_entry("blocked-fallback", false);
+                    fallback.model.provider = "openai".to_string();
+                    fallback.model.api = "openai-completions".to_string();
+                    fallback.model.base_url = "http://127.0.0.1:0/v1".to_string();
+                    fallback.api_key = Some("fixture-key".to_string());
+                    let options = RpcOptions {
+                        config,
+                        working_directory: None,
+                        resources: ResourceLoader::empty(false),
+                        available_models: vec![fallback],
+                        scoped_models: Vec::new(),
+                        cli_api_key: Some("fixture-key".to_string()),
+                        auth: AuthStorage::empty_at(PathBuf::from("unused-rpc-filter-auth.json")),
+                        runtime_handle: runtime_handle.clone(),
+                        ask_tool: None,
+                    };
+                    let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+                    run_prompt_with_retry(
+                        Arc::clone(&session),
+                        Arc::clone(&shared),
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(std::sync::Mutex::new(())),
+                        Arc::new(Mutex::new(None)),
+                        out_tx,
+                        Arc::new(AtomicBool::new(false)),
+                        options,
+                        "keep the selected model".to_string(),
+                        None,
+                        Vec::new(),
+                        AgentCx::for_request(),
+                    )
+                    .await;
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                    let events: Vec<Value> = out_rx
+                        .try_iter()
+                        .map(|line| serde_json::from_str(&line).expect("event"))
+                        .collect();
+                    assert!(!events.iter().any(|event| {
+                        matches!(
+                            event["type"].as_str(),
+                            Some("failover_start" | "auto_retry_start")
+                        )
+                    }));
+                    let cx = AgentCx::for_request();
+                    let guard = session.lock(&cx).await.expect("session");
+                    assert_eq!(guard.agent.provider().model_id(), "test-model");
+                    drop(guard);
+                    let state = shared.lock(&cx).await.expect("state");
+                    assert!(state.failover_primary.is_none());
+                    assert!(state.active_failover_model.is_none());
+                    drop(state);
+                    let stored = store.lock(cx.cx()).await.expect("stored session");
+                    assert!(!stored.entries.iter().any(|entry| matches!(
+                        entry,
+                        SessionEntry::ModelChange(change) if change.role.as_deref() == Some("failover")
+                    )));
+                }
+            }
+        });
+    }
+
+    #[test]
     #[allow(clippy::await_holding_lock)]
     fn rpc_auto_retry_retries_then_succeeds_with_native_media() {
         let runtime = asupersync::runtime::RuntimeBuilder::new()
@@ -8974,6 +10107,7 @@ mod retry_tests {
                     reasoning: false,
                     input: vec![InputType::Text],
                     cost: ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,
@@ -9068,6 +10202,129 @@ mod retry_tests {
         });
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn rpc_failover_policy_uses_full_catalog_before_ready_models() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            let entry = |provider: &str, model_id: &str| {
+                let mut entry = dummy_entry(model_id, false);
+                entry.model.provider = provider.to_string();
+                entry.model.api = "openai-completions".to_string();
+                entry.model.base_url = format!("https://{provider}.example.test/v1");
+                entry.api_key = Some("routing-fixture-key".to_string());
+                entry.auth_header = true;
+                entry
+            };
+            for (provider, other_provider) in
+                [("openrouter", "open-router"), ("open-router", "openrouter")]
+            {
+                for reverse in [false, true] {
+                    for own_policy in [false, true] {
+                        let primary = entry(provider, "vendor/shared");
+                        let mut other = entry(other_provider, "vendor/shared");
+                        other.api_key = None;
+                        let fallback = entry("pi268-rescue", "fallback");
+                        let mut catalog = vec![primary.clone(), other, fallback.clone()];
+                        if reverse {
+                            catalog.reverse();
+                        }
+                        let agent = Agent::new(
+                            providers::create_provider(&primary, None).expect("provider"),
+                            ToolRegistry::new(&[], Path::new("."), None),
+                            AgentConfig::default(),
+                        );
+                        let mut stored = Session::in_memory();
+                        stored.set_model_header(
+                            Some(provider.to_string()),
+                            Some("vendor/shared".to_string()),
+                            None,
+                        );
+                        let store = Arc::new(Mutex::new(stored));
+                        let mut agent_session = AgentSession::new(
+                            agent,
+                            Arc::clone(&store),
+                            false,
+                            crate::compaction::ResolvedCompactionSettings::default(),
+                        );
+                        agent_session.set_model_registry(
+                            crate::models::ModelRegistry::from_entries_for_tests(catalog),
+                        );
+                        let session = Arc::new(Mutex::new(agent_session));
+                        let policy_provider = if own_policy { provider } else { other_provider };
+                        let config = Config {
+                            retry: Some(crate::config::RetrySettings {
+                                fallback_chains: Some(HashMap::from([(
+                                    format!(" {policy_provider} / VENDOR/SHARED "),
+                                    vec!["pi268-rescue/fallback".to_string()],
+                                )])),
+                                ..Default::default()
+                            }),
+                            ..Config::default()
+                        };
+                        let state = Arc::new(Mutex::new(RpcSharedState::new(&config)));
+                        let options = RpcOptions {
+                            config,
+                            working_directory: None,
+                            resources: ResourceLoader::empty(false),
+                            available_models: vec![primary, fallback],
+                            scoped_models: Vec::new(),
+                            cli_api_key: None,
+                            auth: AuthStorage::empty_at(PathBuf::from("pi268-policy-auth.json")),
+                            runtime_handle: runtime_handle.clone(),
+                            ask_tool: None,
+                        };
+                        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);
+                        let cx = AgentCx::for_request();
+                        let swapped = try_failover_to_next_chain_entry(
+                            Arc::clone(&session),
+                            Arc::clone(&state),
+                            &rpc_recovery_events(out_tx),
+                            &options,
+                            Some("503 service unavailable"),
+                            false,
+                            None,
+                            0,
+                            &cx,
+                        )
+                        .await
+                        .expect("resolve policy");
+                        assert_eq!(swapped, own_policy);
+                        let guard = session.lock(&cx).await.expect("agent session");
+                        let expected = if own_policy { "pi268-rescue" } else { provider };
+                        assert_eq!(guard.agent.provider().name(), expected);
+                        drop(guard);
+                        let stored = store.lock(cx.cx()).await.expect("stored session");
+                        assert_eq!(stored.header.provider.as_deref(), Some(expected));
+                        if own_policy {
+                            let events: Vec<Value> = out_rx
+                                .try_iter()
+                                .map(|line| serde_json::from_str(&line).expect("event JSON"))
+                                .collect();
+                            assert_eq!(events.len(), 1);
+                            assert_eq!(events[0]["type"], "failover_start");
+                            assert_eq!(events[0]["toProvider"], "pi268-rescue");
+                        } else {
+                            assert!(stored.entries.is_empty());
+                            assert!(out_rx.try_recv().is_err());
+                            assert!(
+                                state
+                                    .lock(&cx)
+                                    .await
+                                    .expect("state")
+                                    .failover_primary
+                                    .is_none()
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// bd-oqo03.1 (RPC side): a chain that names the live model first, then a
     /// duplicate, must not install a phantom swap or spend the walk on it; the
     /// first real fallback is installed with exactly one `FailoverStart`.
@@ -9104,6 +10361,7 @@ mod retry_tests {
                     reasoning: false,
                     input: vec![InputType::Text],
                     cost: ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,
@@ -9162,7 +10420,7 @@ mod retry_tests {
                 try_failover_to_next_chain_entry(
                     Arc::clone(&session),
                     Arc::clone(&shared_state),
-                    out_tx,
+                    &rpc_recovery_events(out_tx),
                     &options,
                     Some("server error"),
                     false,
@@ -9214,7 +10472,7 @@ mod retry_tests {
                 !try_failover_to_next_chain_entry(
                     Arc::clone(&session),
                     Arc::clone(&shared_state),
-                    exhausted_tx,
+                    &rpc_recovery_events(exhausted_tx),
                     &options,
                     Some("server error"),
                     false,
@@ -9283,6 +10541,7 @@ mod retry_tests {
                     reasoning: false,
                     input: vec![InputType::Text],
                     cost: ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,
@@ -9332,7 +10591,7 @@ mod retry_tests {
                 try_failover_to_next_chain_entry(
                     Arc::clone(&session),
                     Arc::clone(&shared_state),
-                    out_tx.clone(),
+                    &rpc_recovery_events(out_tx.clone()),
                     &options,
                     Some("server error"),
                     false,
@@ -9350,7 +10609,7 @@ mod retry_tests {
                 try_failover_to_next_chain_entry(
                     Arc::clone(&session),
                     Arc::clone(&shared_state),
-                    out_tx,
+                    &rpc_recovery_events(out_tx),
                     &options,
                     Some("server error"),
                     false,
@@ -9422,6 +10681,7 @@ mod retry_tests {
                     reasoning: false,
                     input: vec![InputType::Text],
                     cost: ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,
@@ -9468,7 +10728,7 @@ mod retry_tests {
             let err = try_failover_to_next_chain_entry(
                 Arc::clone(&session),
                 Arc::clone(&shared_state),
-                out_tx.clone(),
+                &rpc_recovery_events(out_tx.clone()),
                 &options,
                 Some("server error"),
                 true,
@@ -9549,11 +10809,23 @@ mod retry_tests {
             drop(inner);
             drop(guard);
 
+            let recovery_events = rpc_recovery_events(out_tx);
+            recovery_events.emit(AgentEvent::AutoRetryStart {
+                attempt: 2,
+                max_attempts: 2,
+                delay_ms: 0,
+                error_message: "server error".to_string(),
+            });
+            let retry_start: Value =
+                serde_json::from_str(&out_rx.try_recv().expect("auto_retry_start event"))
+                    .expect("retry-start event JSON");
+            assert_eq!(retry_start["type"], "auto_retry_start");
+
             assert!(
                 try_failover_to_next_chain_entry(
                     Arc::clone(&session),
                     Arc::clone(&shared_state),
-                    out_tx,
+                    &recovery_events,
                     &options,
                     Some("server error"),
                     true,
@@ -10099,7 +11371,7 @@ mod retry_tests {
                 try_failover_to_next_chain_entry(
                     Arc::clone(&fixture.session),
                     Arc::clone(&fixture.state),
-                    out_tx,
+                    &rpc_recovery_events(out_tx),
                     &fixture.options,
                     Some("503 service unavailable"),
                     false,
@@ -10187,7 +11459,7 @@ mod retry_tests {
                 !try_failover_to_next_chain_entry(
                     Arc::clone(&fixture.session),
                     Arc::clone(&fixture.state),
-                    out_tx.clone(),
+                    &rpc_recovery_events(out_tx.clone()),
                     &fixture.options,
                     Some("503 service unavailable"),
                     false,
@@ -10310,6 +11582,7 @@ mod retry_tests {
                         reasoning: false,
                         input: vec![InputType::Text],
                         cost: ModelCost {
+                            audio: None,
                             input: 0.0,
                             output: 0.0,
                             cache_read: 0.0,
@@ -10446,7 +11719,7 @@ mod retry_tests {
                 try_failover_to_next_chain_entry(
                     Arc::clone(&session),
                     Arc::clone(&shared_state),
-                    out_tx.clone(),
+                    &rpc_recovery_events(out_tx.clone()),
                     &options,
                     Some("server error"),
                     true,
@@ -10513,7 +11786,7 @@ mod retry_tests {
                 try_failover_to_next_chain_entry(
                     Arc::clone(&session),
                     Arc::clone(&shared_state),
-                    out_tx.clone(),
+                    &rpc_recovery_events(out_tx.clone()),
                     &options,
                     Some("server error"),
                     true,
@@ -10707,6 +11980,7 @@ mod retry_tests {
                         reasoning: false,
                         input: vec![InputType::Text],
                         cost: ModelCost {
+                            audio: None,
                             input: 0.0,
                             output: 0.0,
                             cache_read: 0.0,
@@ -10837,7 +12111,7 @@ mod retry_tests {
                     try_failover_to_next_chain_entry(
                         Arc::clone(&session),
                         Arc::clone(&shared_state),
-                        out_tx,
+                        &rpc_recovery_events(out_tx),
                         &options,
                         Some("server error"),
                         true,
@@ -11044,6 +12318,7 @@ mod retry_tests {
                         reasoning: false,
                         input: vec![InputType::Text],
                         cost: ModelCost {
+                            audio: None,
                             input: 0.0,
                             output: 0.0,
                             cache_read: 0.0,
@@ -11157,7 +12432,7 @@ mod retry_tests {
                     try_failover_to_next_chain_entry(
                         Arc::clone(&session),
                         Arc::clone(&shared_state),
-                        out_tx,
+                        &rpc_recovery_events(out_tx),
                         &options,
                         Some("server error"),
                         true,
@@ -12095,12 +13370,17 @@ mod retry_tests {
             let temp = tempfile::tempdir().expect("tempdir");
             let forbidden_path = temp.path().join("must-not-write.txt");
             let turn_path = forbidden_path.clone();
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+            let streaming = Arc::new(AtomicBool::new(true));
             let task = handle.spawn(run_rpc_turn(
                 handle.clone(),
                 client.clone(),
                 Arc::clone(&retry_abort),
                 Arc::new(Mutex::new(Some(abort_handle))),
-                move |owner| async move {
+                out_tx,
+                Arc::clone(&streaming),
+                move |owner, terminal_guard| async move {
+                    let _terminal_guard = terminal_guard;
                     assert_eq!(owner.capabilities(), expected_capabilities);
                     assert_eq!(
                         AgentCx::for_current_or_request().budget().deadline,
@@ -12125,6 +13405,14 @@ mod retry_tests {
                 .expect("cancelled turn must drain");
             assert!(retry_abort.load(Ordering::SeqCst));
             assert!(finished.load(Ordering::SeqCst));
+            assert!(!streaming.load(Ordering::SeqCst));
+            let terminal: Vec<Value> = out_rx
+                .try_iter()
+                .map(|line| serde_json::from_str(&line).expect("RPC event"))
+                .collect();
+            assert_eq!(terminal.len(), 1);
+            assert_eq!(terminal[0]["type"], "agent_end");
+            assert_eq!(terminal[0]["error"], "Retry aborted");
             assert!(!forbidden_path.exists());
         });
     }
@@ -12498,6 +13786,184 @@ mod retry_tests {
                 "provider.stream must remain unreachable after admission failure"
             );
         });
+    }
+
+    #[test]
+    fn rpc_never_polled_accepted_turn_releases_streaming_and_answers_once() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for cancelled in [false, true] {
+            let client = AgentCx::for_testing();
+            client.set_cancel_requested(cancelled);
+            let streaming = Arc::new(AtomicBool::new(true));
+            let entered = Arc::new(AtomicBool::new(false));
+            let entered_turn = Arc::clone(&entered);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+            let turn = run_rpc_turn(
+                runtime.handle(),
+                client,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(None)),
+                out_tx.clone(),
+                Arc::clone(&streaming),
+                move |_, terminal_guard| async move {
+                    let _terminal_guard = terminal_guard;
+                    entered_turn.store(true, Ordering::SeqCst);
+                },
+            );
+
+            // Construction already owns the accepted response, even though
+            // neither the supervisor nor the turn factory has been polled.
+            drop(turn);
+            assert!(!entered.load(Ordering::SeqCst));
+            assert!(!streaming.load(Ordering::SeqCst));
+            let frame = out_rx.try_recv().expect("terminal frame");
+            let terminal: Value = serde_json::from_str(&frame).expect("RPC event");
+            assert_eq!(terminal["type"], "agent_end");
+            assert_eq!(terminal["messages"], json!([]));
+            assert_eq!(
+                terminal["error"],
+                if cancelled {
+                    "Retry aborted"
+                } else {
+                    "Turn ended without a terminal event"
+                }
+            );
+            assert!(
+                matches!(out_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+                "a never-polled accepted turn must answer exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_rejected_runtime_admission_releases_streaming_and_answers_once() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle();
+        let streaming = Arc::new(AtomicBool::new(true));
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_turn = Arc::clone(&entered);
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+        let turn = run_rpc_turn(
+            handle.clone(),
+            AgentCx::for_testing(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+            out_tx.clone(),
+            Arc::clone(&streaming),
+            move |_, terminal_guard| async move {
+                let _terminal_guard = terminal_guard;
+                entered_turn.store(true, Ordering::SeqCst);
+            },
+        );
+
+        // The real runtime closes new admission synchronously, while this
+        // retained handle remains available to report the rejection.
+        runtime.shutdown_background();
+        assert!(handle.try_spawn(turn).is_err());
+        assert!(!entered.load(Ordering::SeqCst));
+        assert!(!streaming.load(Ordering::SeqCst));
+        let terminal: Value =
+            serde_json::from_str(&out_rx.try_recv().expect("terminal frame")).expect("RPC event");
+        assert_eq!(terminal["type"], "agent_end");
+        assert_eq!(terminal["error"], "Turn ended without a terminal event");
+        assert!(
+            matches!(out_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "runtime admission rejection must answer exactly once"
+        );
+        drop(out_tx);
+    }
+
+    #[test]
+    fn rpc_accepted_turn_handoff_keeps_one_guard_on_drop_or_unwind() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        for panic_in_body in [false, true] {
+            let streaming = Arc::new(AtomicBool::new(true));
+            let entered = Arc::new(AtomicBool::new(false));
+            let entered_turn = Arc::clone(&entered);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+            let mut turn = Box::pin(run_rpc_turn(
+                runtime.handle(),
+                AgentCx::for_testing(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(None)),
+                out_tx.clone(),
+                Arc::clone(&streaming),
+                move |_, terminal_guard| async move {
+                    let _terminal_guard = terminal_guard;
+                    entered_turn.store(true, Ordering::SeqCst);
+                    assert!(!panic_in_body, "intentional accepted-turn panic");
+                    futures::future::pending::<()>().await;
+                },
+            ));
+            let mut task = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            let result = {
+                let _panic_guard = crate::crash::SuppressPanicHook::new();
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    turn.as_mut().poll(&mut task)
+                }))
+            };
+            if panic_in_body {
+                assert!(result.is_err(), "the turn body must unwind");
+            } else {
+                assert!(result.expect("poll turn").is_pending());
+            }
+            assert!(entered.load(Ordering::SeqCst));
+            drop(turn);
+
+            assert!(!streaming.load(Ordering::SeqCst));
+            let frame = out_rx.try_recv().expect("terminal frame");
+            let terminal: Value = serde_json::from_str(&frame).expect("RPC event");
+            assert_eq!(terminal["type"], "agent_end");
+            assert!(
+                matches!(out_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+                "handoff must not leave a second terminal guard behind"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_accepted_turn_factory_unwind_releases_its_owned_response() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let streaming = Arc::new(AtomicBool::new(true));
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+        let mut turn = Box::pin(run_rpc_turn(
+            runtime.handle(),
+            AgentCx::for_testing(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(None)),
+            out_tx.clone(),
+            Arc::clone(&streaming),
+            |_, terminal_guard| -> std::future::Ready<()> {
+                let _terminal_guard = terminal_guard;
+                panic!("intentional turn-factory panic");
+            },
+        ));
+        let mut task = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        let result = {
+            let _panic_guard = crate::crash::SuppressPanicHook::new();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                turn.as_mut().poll(&mut task)
+            }))
+        };
+        assert!(result.is_err());
+        drop(turn);
+        assert!(!streaming.load(Ordering::SeqCst));
+        let terminal: Value =
+            serde_json::from_str(&out_rx.try_recv().expect("terminal frame")).expect("RPC event");
+        assert_eq!(terminal["type"], "agent_end");
+        assert!(
+            matches!(out_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "factory unwind must answer exactly once"
+        );
+        drop(out_tx);
     }
 
     /// A turn that ends without sending its own terminal frame must still
@@ -13957,7 +15423,7 @@ async fn maybe_auto_compact(
                 &inner_session,
                 &runtime_provider,
                 &runtime_model_id,
-                &options,
+                rpc_model_catalog(&guard, &options),
             ) else {
                 return;
             };
@@ -14184,23 +15650,22 @@ fn rpc_model_from_entry(entry: &ModelEntry) -> Value {
 
 fn session_state(
     session: &crate::session::Session,
-    options: &RpcOptions,
+    models: &[ModelEntry],
     snapshot: &RpcStateSnapshot,
     is_streaming: bool,
     is_compacting: bool,
 ) -> Value {
-    let model = session
+    let model_entry = session
         .header
         .provider
         .as_deref()
         .zip(session.header.model_id.as_deref())
         .and_then(|(provider, model_id)| {
-            options.available_models.iter().find(|m| {
-                provider_ids_match(&m.model.provider, provider)
-                    && m.model.id.eq_ignore_ascii_case(model_id)
-            })
-        })
-        .map(rpc_model_from_entry);
+            model_entry_for_provider_and_id(provider, model_id, models)
+        });
+    let model = model_entry.map(rpc_model_from_entry);
+    let context_tokens =
+        crate::compaction::estimate_model_context_tokens(&session.to_messages_for_current_path());
 
     let message_count = session
         .entries_for_current_path()
@@ -14267,6 +15732,13 @@ fn session_state(
     state.insert(
         "messageCount".to_string(),
         Value::Number(message_count.into()),
+    );
+    state.insert("contextTokens".to_string(), Value::from(context_tokens));
+    state.insert(
+        "contextWindow".to_string(),
+        model_entry
+            .filter(|entry| entry.model.context_window > 0)
+            .map_or(Value::Null, |entry| Value::from(entry.model.context_window)),
     );
     state.insert(
         "pendingMessageCount".to_string(),
@@ -15336,7 +16808,7 @@ pub(crate) fn resolve_model_key(
     cli_api_key: Option<&str>,
     auth: &AuthStorage,
     entry: &ModelEntry,
-) -> Option<String> {
+) -> Result<Option<String>> {
     crate::models::resolve_model_key(cli_api_key, auth, entry)
 }
 
@@ -15396,32 +16868,37 @@ fn normalize_resumed_session_model(
     )
 }
 
+fn rpc_model_catalog<'a>(guard: &'a AgentSession, options: &'a RpcOptions) -> &'a [ModelEntry] {
+    guard.model_registry().map_or(
+        options.available_models.as_slice(),
+        crate::models::ModelRegistry::models,
+    )
+}
+
 fn current_model_entry<'a>(
     session: &crate::session::Session,
-    options: &'a RpcOptions,
+    models: &'a [ModelEntry],
 ) -> Option<&'a ModelEntry> {
     let (provider, model_id) = session.effective_model_for_current_path()?;
-    model_entry_for_provider_and_id(&provider, &model_id, options)
+    model_entry_for_provider_and_id(&provider, &model_id, models)
 }
 
 fn current_or_runtime_model_entry<'a>(
     session: &crate::session::Session,
     runtime_provider: &str,
     runtime_model_id: &str,
-    options: &'a RpcOptions,
+    models: &'a [ModelEntry],
 ) -> Option<&'a ModelEntry> {
-    current_model_entry(session, options)
-        .or_else(|| model_entry_for_provider_and_id(runtime_provider, runtime_model_id, options))
+    current_model_entry(session, models)
+        .or_else(|| model_entry_for_provider_and_id(runtime_provider, runtime_model_id, models))
 }
 
 fn model_entry_for_provider_and_id<'a>(
     provider: &str,
     model_id: &str,
-    options: &'a RpcOptions,
+    models: &'a [ModelEntry],
 ) -> Option<&'a ModelEntry> {
-    options.available_models.iter().find(|m| {
-        provider_ids_match(&m.model.provider, provider) && m.model.id.eq_ignore_ascii_case(model_id)
-    })
+    crate::models::find_model_entry(models, provider, model_id)
 }
 
 async fn apply_thinking_level(
@@ -15488,6 +16965,7 @@ async fn apply_thinking_level_for_session(
     }
     *inner_session = candidate;
     guard.agent.stream_options_mut().thinking_level = Some(level);
+    guard.agent.disarm_prewalk();
     guard.refresh_extension_completion_host_state();
     if changed {
         state.provider_admission.clear();
@@ -15544,6 +17022,7 @@ async fn apply_model_change(
         return Err(Error::session_persistence(reason));
     }
     *inner_session = candidate;
+    guard.agent.disarm_prewalk();
     Ok(provider_transition)
 }
 
@@ -15625,7 +17104,7 @@ async fn cycle_model_for_rpc(
             &inner_session,
             &runtime_provider,
             &runtime_model_id,
-            options,
+            rpc_model_catalog(guard, options),
         )
         .map_or_else(
             || {
@@ -15644,18 +17123,32 @@ async fn cycle_model_for_rpc(
     };
 
     let current_index = candidates.iter().position(|entry| {
-        current_provider
+        current_provider.as_deref().is_some_and(|provider| {
+            provider
+                .trim()
+                .eq_ignore_ascii_case(entry.model.provider.trim())
+        }) && current_model_id
             .as_deref()
-            .is_some_and(|provider| provider_ids_match(provider, &entry.model.provider))
-            && current_model_id
-                .as_deref()
-                .is_some_and(|model_id| model_id.eq_ignore_ascii_case(&entry.model.id))
+            .is_some_and(|model_id| model_id.eq_ignore_ascii_case(&entry.model.id))
     });
 
     let next_index = current_index.map_or(0, |idx| (idx + 1) % candidates.len());
 
-    let next_entry = candidates[next_index].clone();
-    let key = resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &next_entry);
+    // Candidate lists admit identities and determine cycling order. The full
+    // catalog owns their current route, credentials and provider metadata.
+    let candidate = &candidates[next_index];
+    let next_entry = crate::models::resolve_model_entry(
+        rpc_model_catalog(guard, options),
+        &candidate.model.provider,
+        &candidate.model.id,
+    )
+    .ok_or_else(|| {
+        Error::validation(format!(
+            "Model not found: {}/{}. Use get_available_models to choose a registered provider/model before cycling.",
+            candidate.model.provider, candidate.model.id
+        ))
+    })?;
+    let key = resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &next_entry)?;
     if model_requires_configured_credential(&next_entry) && key.is_none() {
         return Err(Error::auth(format!(
             "Missing credentials for {}/{}",
@@ -15746,6 +17239,39 @@ mod tests {
     const RPC_OUTPUT_PRESSURE_SCHEMA_V1: &str = "pi.rpc_output_pressure.v1";
     const RPC_OUTPUT_PRESSURE_DEBUG_BUDGET_US: u64 = 50_000;
 
+    #[test]
+    fn cost_cap_response_is_nonretryable_and_preserves_numeric_budget_details() {
+        let response = response_error_with_hints(
+            Some("budget-request".to_string()),
+            "prompt",
+            &Error::CostCap {
+                spent: 2.75,
+                cap: 2.5,
+            },
+        );
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], "budget-request");
+        assert_eq!(response["success"], false);
+        assert_eq!(response["errorCode"], "cost_cap");
+        assert_eq!(response["retryable"], false);
+        assert_eq!(response["costCap"], json!({"spent": 2.75, "cap": 2.5}));
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("next model request was not sent")
+        );
+        let warning: Value = serde_json::from_str(&agent_event(AgentEvent::CostWarning {
+            spent: 2.25,
+            threshold: 2.0,
+            message: "Session spend warning".to_string(),
+        }))
+        .unwrap();
+        assert_eq!(warning["type"], "cost_warning");
+        assert_eq!(warning["spent"], 2.25);
+        assert!(cost_cap_value(&Error::api("unrelated failure")).is_none());
+    }
+
     // -----------------------------------------------------------------------
     // Helper builders
     // -----------------------------------------------------------------------
@@ -15760,6 +17286,7 @@ mod tests {
             reasoning,
             input: vec![InputType::Text],
             cost: ModelCost {
+                audio: None,
                 input: 3.0,
                 output: 15.0,
                 cache_read: 0.3,
@@ -16056,6 +17583,565 @@ mod tests {
             timestamp: Some(0),
         });
         session
+    }
+
+    fn handoff_agent_session(
+        stored: Session,
+        save_enabled: bool,
+        provider: Arc<dyn Provider>,
+    ) -> AgentSession {
+        let mut agent = Agent::new(
+            provider,
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        agent.replace_messages(stored.to_messages_for_current_path());
+        AgentSession::new(
+            agent,
+            Arc::new(asupersync::sync::Mutex::new(stored)),
+            save_enabled,
+            ResolvedCompactionSettings {
+                enabled: false,
+                keep_recent_tokens: 1,
+                ..ResolvedCompactionSettings::default()
+            },
+        )
+    }
+
+    #[test]
+    fn rpc_handoff_survives_eof_and_installs_one_durable_native_result() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut stored = seed_auto_compaction_session(Session::create_with_dir(Some(
+                temp.path().join("sessions"),
+            )));
+            let kept = stored.append_message(SessionMessage::User {
+                content: UserContent::Blocks(vec![
+                    ContentBlock::Text(TextContent::new("continue with this attachment")),
+                    ContentBlock::Image(ImageContent {
+                        data: "aW1hZ2U=".to_string(),
+                        mime_type: "image/png".to_string(),
+                    }),
+                ]),
+                timestamp: Some(42),
+            });
+            stored.save().await.unwrap();
+            let path = stored.path.clone().unwrap();
+            let id = stored.header.id.clone();
+            let current =
+                serde_json::to_value(stored.to_messages_for_current_path().last().unwrap())
+                    .unwrap();
+            let agent_session =
+                handoff_agent_session(stored, true, Arc::new(CompactionSummaryProvider));
+            let inner = Arc::clone(&agent_session.session);
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = mpsc::channel(4);
+            in_tx
+                .send(
+                    &asupersync::Cx::for_testing(),
+                    json!({"id": "handoff-1", "type": "handoff", "focus": "retain native media"})
+                        .to_string(),
+                )
+                .await
+                .unwrap();
+            drop(in_tx);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(32);
+            // EOF must drain maintenance through its response and then compare
+            // the refreshed Agent with the installed Session successfully.
+            Box::pin(run(agent_session, options, in_rx, out_tx))
+                .await
+                .expect("handoff and terminal recovery complete");
+            let events = out_rx
+                .try_iter()
+                .map(|line| parse_response(&line))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "auto_compaction_start")
+                    .count(),
+                1,
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "auto_compaction_end")
+                    .count(),
+                1,
+            );
+            assert!(events.iter().all(|event| event["type"] != "agent_end"));
+            let responses = events
+                .iter()
+                .filter(|event| event["type"] == "response")
+                .collect::<Vec<_>>();
+            assert_eq!(responses.len(), 1);
+            let response = responses[0];
+            assert_ok(response, "handoff");
+            assert_eq!(response["id"], "handoff-1");
+            assert_eq!(response["data"]["firstKeptEntryId"], kept);
+            assert_eq!(response["data"]["details"]["mode"], "handoff");
+            assert_eq!(events.last().unwrap()["type"], "response");
+            let cx = AgentCx::for_request();
+            let live = inner.lock(cx.cx()).await.unwrap();
+            assert_eq!(live.header.id, id);
+            assert_eq!(live.path.as_ref(), Some(&path));
+            assert_eq!(
+                serde_json::to_value(live.to_messages_for_current_path().last()).unwrap(),
+                current,
+            );
+            let installed = live.to_messages_for_current_path();
+            drop(live);
+            let reopened = Session::open(path.to_str().unwrap()).await.unwrap();
+            assert_eq!(reopened.header.id, id);
+            // The summary is re-stamped on every projection; the authored tail
+            // keeps its timestamp, as in `rpc_recovery_message_fingerprint`.
+            let (installed, durable) = reopened.current_path_comparison_values(&installed);
+            assert_eq!(durable, installed);
+            assert_eq!(
+                reopened
+                    .entries
+                    .iter()
+                    .filter(|entry| matches!(entry, SessionEntry::Compaction(_)))
+                    .count(),
+                1,
+            );
+        }));
+    }
+
+    #[test]
+    fn rpc_handoff_keeps_control_dispatch_live_and_rejects_busy_mutation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let temp = tempfile::tempdir().unwrap();
+            let (entered_tx, mut entered_rx) = oneshot::channel();
+            let (_gate_tx, gate_rx) = oneshot::channel();
+            let provider = Arc::new(GatedAutoCompactionProvider {
+                calls: Arc::new(AtomicUsize::new(1)),
+                compaction_entered: Mutex::new(Some(entered_tx)),
+                compaction_gate: Mutex::new(Some(gate_rx)),
+            });
+            let agent_session = handoff_agent_session(
+                seed_auto_compaction_session(Session::in_memory()),
+                false,
+                provider,
+            );
+            let inner = Arc::clone(&agent_session.session);
+            let before = serde_json::to_value(inner.try_lock().unwrap().entries.clone()).unwrap();
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let (in_tx, in_rx) = mpsc::channel(8);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(64);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let client = async {
+                let cx = asupersync::Cx::for_testing();
+                in_tx
+                    .send(&cx, json!({"id": "h", "type": "handoff"}).to_string())
+                    .await
+                    .unwrap();
+                asupersync::time::timeout(
+                    wall_now(),
+                    Duration::from_secs(10),
+                    entered_rx.recv(&cx),
+                )
+                .await
+                .expect("handoff provider starts")
+                .unwrap();
+                let state = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"state","type":"get_state"}"#,
+                    "state during handoff",
+                )
+                .await;
+                assert_ok(&state, "get_state");
+                assert_eq!(state["data"]["isCompacting"], true);
+                assert_eq!(state["data"]["isStreaming"], false);
+                assert!(state["data"]["contextTokens"].as_u64().unwrap() > 0);
+                for command in [
+                    json!({"id": "busy-prompt", "type": "prompt", "message": "must not enter"}),
+                    json!({"id": "busy-handoff", "type": "handoff"}),
+                    json!({"id": "busy-stats", "type": "get_session_stats"}),
+                    json!({"id": "busy-mode", "type": "set_steering_mode", "mode": "all"}),
+                ] {
+                    let response =
+                        send_recv(&in_tx, &out_rx, &command.to_string(), "busy command").await;
+                    assert_err(&response, command["type"].as_str().unwrap());
+                }
+                let abort = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"abort","type":"abort"}"#,
+                    "abort handoff",
+                )
+                .await;
+                assert_ok(&abort, "abort");
+                let mut ended = false;
+                let handoff = loop {
+                    let frame = parse_response(
+                        &recv_line(&out_rx, "handoff terminal failure")
+                            .await
+                            .unwrap(),
+                    );
+                    match frame["type"].as_str() {
+                        Some("auto_compaction_end") => {
+                            assert!(!ended, "one lifecycle end per handoff");
+                            assert_eq!(frame["aborted"], true);
+                            ended = true;
+                        }
+                        Some("response") => break frame,
+                        Some("agent_end") => panic!("handoff cannot invent a prompt terminal"),
+                        _ => {}
+                    }
+                };
+                assert!(ended, "compaction end precedes the terminal response");
+                assert_err(&handoff, "handoff");
+                assert_eq!(handoff["id"], "h");
+                let state = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"id":"idle","type":"get_state"}"#,
+                    "idle after cancellation",
+                )
+                .await;
+                assert_eq!(state["data"]["isCompacting"], false);
+                drop(in_tx);
+            };
+            let (result, ()) =
+                futures::future::join(Box::pin(run(agent_session, options, in_rx, out_tx)), client)
+                    .await;
+            result.expect("cancelled handoff does not poison the session");
+            assert_eq!(
+                serde_json::to_value(inner.try_lock().unwrap().entries.clone()).unwrap(),
+                before,
+            );
+            assert!(
+                out_rx
+                    .lock()
+                    .unwrap()
+                    .try_iter()
+                    .all(|line| parse_response(&line)["type"] != "agent_end")
+            );
+        }));
+    }
+
+    #[test]
+    fn rpc_mcp_auth_validates_native_fields_without_normalizing_names() {
+        assert_eq!(
+            parse_mcp_auth_request(
+                &json!({"server": "remote  service", "clientId": "native-public-client"}),
+                true,
+            )
+            .unwrap(),
+            (
+                "remote  service".to_string(),
+                Some("native-public-client".to_string())
+            ),
+        );
+        assert_eq!(
+            parse_mcp_auth_request(&json!({"server": "日本語 server"}), false).unwrap(),
+            ("日本語 server".to_string(), None),
+        );
+        for invalid in [
+            json!({}),
+            json!({"server": null}),
+            json!({"server": 42}),
+            json!({"server": ""}),
+            json!({"server": " \t "}),
+            json!({"server": "remote\nservice"}),
+            json!({"server": "remote\u{0}service"}),
+            json!({"server": "remote", "clientId": null}),
+            json!({"server": "remote", "clientId": 42}),
+            json!({"server": "remote", "clientId": ""}),
+            json!({"server": "remote", "clientId": "client\rid"}),
+        ] {
+            assert!(parse_mcp_auth_request(&invalid, true).is_err(), "{invalid}");
+        }
+        assert!(
+            parse_mcp_auth_request(
+                &json!({"server": "remote", "clientId": "public-client"}),
+                false,
+            )
+            .is_err()
+        );
+        for command in ["mcp_reauth", "mcp_unauth"] {
+            assert!(!command_resumes_rpc_agent(command, &json!({}), None));
+            assert!(!command_can_queue_while_rpc_agent_streams(command));
+        }
+    }
+
+    #[test]
+    fn rpc_unpolled_mcp_auth_answers_once_and_releases_admission() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for reauth in [true, false] {
+            let session =
+                handoff_agent_session(Session::in_memory(), false, Arc::new(NoopProvider));
+            let compacting = Arc::new(AtomicBool::new(true));
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+            let future = run_rpc_mcp_auth(
+                runtime.handle(),
+                AgentCx::for_testing(),
+                Arc::new(asupersync::sync::Mutex::new(session)),
+                Some("not-polled".to_string()),
+                reauth,
+                "remote  service".to_string(),
+                None,
+                out_tx,
+                Arc::clone(&compacting),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(asupersync::sync::Mutex::new(None)),
+            );
+            drop(future);
+            assert!(!compacting.load(Ordering::SeqCst));
+            let frames = out_rx
+                .try_iter()
+                .map(|line| parse_response(&line))
+                .collect::<Vec<_>>();
+            assert_eq!(frames.len(), 1);
+            assert_err(&frames[0], if reauth { "mcp_reauth" } else { "mcp_unauth" });
+            assert_eq!(frames[0]["id"], "not-polled");
+        }
+    }
+
+    #[test]
+    fn rpc_mcp_auth_honors_abort_between_admission_and_task_start() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            let session =
+                handoff_agent_session(Session::in_memory(), false, Arc::new(NoopProvider));
+            let compacting = Arc::new(AtomicBool::new(true));
+            let abort_slot = Arc::new(asupersync::sync::Mutex::new(None));
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+            run_rpc_mcp_auth(
+                runtime_handle,
+                AgentCx::for_testing(),
+                Arc::new(asupersync::sync::Mutex::new(session)),
+                Some("already-aborted".to_string()),
+                true,
+                "remote".to_string(),
+                None,
+                out_tx,
+                Arc::clone(&compacting),
+                Arc::new(AtomicBool::new(true)),
+                Arc::clone(&abort_slot),
+            )
+            .await;
+            assert!(!compacting.load(Ordering::SeqCst));
+            assert!(abort_slot.try_lock().unwrap().is_none());
+            let frames = out_rx
+                .try_iter()
+                .map(|line| parse_response(&line))
+                .collect::<Vec<_>>();
+            assert_eq!(frames.len(), 1);
+            assert_err(&frames[0], "mcp_reauth");
+            assert!(
+                frames[0]["error"]
+                    .as_str()
+                    .unwrap()
+                    .to_lowercase()
+                    .contains("abort")
+            );
+            assert_eq!(frames[0]["id"], "already-aborted");
+        }));
+    }
+
+    #[test]
+    fn rpc_mcp_auth_disabled_discovery_drains_eof_without_a_model_turn() {
+        for command in ["mcp_reauth", "mcp_unauth"] {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+                .build()
+                .expect("runtime");
+            let runtime_handle = runtime.handle();
+            runtime.block_on(Box::pin(async move {
+                let temp = tempfile::tempdir().unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let provider = Arc::new(GatedAutoCompactionProvider {
+                    calls: Arc::clone(&calls),
+                    compaction_entered: Mutex::new(None),
+                    compaction_gate: Mutex::new(None),
+                });
+                let session = handoff_agent_session(Session::in_memory(), false, provider);
+                let inner = Arc::clone(&session.session);
+                let options =
+                    build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+                let (in_tx, in_rx) = mpsc::channel(4);
+                in_tx
+                    .send(
+                        &asupersync::Cx::for_testing(),
+                        json!({"id": "auth", "type": command, "server": "remote  service"})
+                            .to_string(),
+                    )
+                    .await
+                    .unwrap();
+                drop(in_tx);
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel(32);
+                Box::pin(run(session, options, in_rx, out_tx))
+                    .await
+                    .expect("failed auth is returned as an RPC response");
+                let frames = out_rx
+                    .try_iter()
+                    .map(|line| parse_response(&line))
+                    .collect::<Vec<_>>();
+                assert_eq!(frames.len(), 1, "operator auth emits no agent lifecycle");
+                assert_err(&frames[0], command);
+                assert_eq!(frames[0]["id"], "auth");
+                assert!(
+                    frames[0]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("MCP discovery is disabled")
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                assert!(inner.try_lock().unwrap().entries.is_empty());
+            }));
+        }
+    }
+
+    #[test]
+    fn rpc_unpolled_handoff_answers_once_and_releases_admission() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let session = handoff_agent_session(Session::in_memory(), false, Arc::new(NoopProvider));
+        let compacting = Arc::new(AtomicBool::new(true));
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel(8);
+        let future = run_rpc_handoff(
+            runtime.handle(),
+            AgentCx::for_testing(),
+            Arc::new(asupersync::sync::Mutex::new(session)),
+            Some("not-polled".to_string()),
+            String::new(),
+            out_tx,
+            RpcOutput::default().for_turn(),
+            Arc::clone(&compacting),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(asupersync::sync::Mutex::new(None)),
+        );
+        drop(future);
+        assert!(!compacting.load(Ordering::SeqCst));
+        let frames = out_rx
+            .try_iter()
+            .map(|line| parse_response(&line))
+            .collect::<Vec<_>>();
+        assert_eq!(frames.len(), 1);
+        assert_err(&frames[0], "handoff");
+        assert_eq!(frames[0]["id"], "not-polled");
+    }
+
+    #[test]
+    fn rpc_handoff_provider_and_persistence_failures_never_report_success() {
+        for persistence_failure in [false, true] {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+                .build()
+                .expect("runtime");
+            let runtime_handle = runtime.handle();
+            runtime.block_on(Box::pin(async move {
+                let temp = tempfile::tempdir().unwrap();
+                let mut stored = seed_auto_compaction_session(Session::in_memory());
+                if persistence_failure {
+                    let blocked = temp.path().join("session-is-a-directory.jsonl");
+                    std::fs::create_dir(&blocked).unwrap();
+                    stored.path = Some(blocked);
+                }
+                let before = serde_json::to_value(&stored.entries).unwrap();
+                let provider: Arc<dyn Provider> = if persistence_failure {
+                    Arc::new(CompactionSummaryProvider)
+                } else {
+                    // Empty terminal content must fail strict native synthesis.
+                    Arc::new(NoopProvider)
+                };
+                let agent_session = handoff_agent_session(stored, persistence_failure, provider);
+                let inner = Arc::clone(&agent_session.session);
+                let gate = agent_session.provider_admission_gate();
+                let options =
+                    build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+                let (in_tx, in_rx) = mpsc::channel(4);
+                in_tx
+                    .send(
+                        &asupersync::Cx::for_testing(),
+                        r#"{"id":"failed","type":"handoff"}"#.to_string(),
+                    )
+                    .await
+                    .unwrap();
+                drop(in_tx);
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel(32);
+                let result = Box::pin(run(agent_session, options, in_rx, out_tx)).await;
+                if persistence_failure {
+                    assert!(result.is_err(), "EOF must surface the durability fence");
+                    assert!(gate.ensure_allowed().unwrap_err().is_session_persistence());
+                } else {
+                    result.expect("failed synthesis leaves ordinary session use available");
+                    gate.ensure_allowed().unwrap();
+                }
+                let events = out_rx
+                    .try_iter()
+                    .map(|line| parse_response(&line))
+                    .collect::<Vec<_>>();
+                let responses = events
+                    .iter()
+                    .filter(|event| event["type"] == "response")
+                    .collect::<Vec<_>>();
+                assert_eq!(responses.len(), 1);
+                assert_err(responses[0], "handoff");
+                assert!(responses[0]["errorHints"].is_object());
+                assert!(events.iter().all(|event| event["type"] != "agent_end"));
+                assert!(
+                    events
+                        .iter()
+                        .filter(|event| event["type"] == "auto_compaction_end")
+                        .all(|event| event.get("result").is_none_or(Value::is_null))
+                );
+                assert_eq!(
+                    serde_json::to_value(&inner.try_lock().unwrap().entries).unwrap(),
+                    before,
+                );
+            }));
+        }
+    }
+
+    #[test]
+    fn handoff_payload_validation_precedes_session_recovery() {
+        assert_eq!(parse_handoff_focus(&json!({})).unwrap(), "");
+        assert_eq!(
+            parse_handoff_focus(&json!({"focus": "日本語"})).unwrap(),
+            "日本語",
+        );
+        assert_eq!(
+            parse_handoff_focus(&json!({"customInstructions": "keep the plan"})).unwrap(),
+            "keep the plan",
+        );
+        assert!(parse_handoff_focus(&json!({"focus": "é".repeat(2048)})).is_ok());
+        for invalid in [
+            json!({"focus": null}),
+            json!({"focus": 42}),
+            json!({"customInstructions": 42}),
+            json!({"focus": "one", "customInstructions": "two"}),
+            json!({"focus": "no\u{0}nul"}),
+            json!({"focus": "é".repeat(2049)}),
+        ] {
+            assert!(parse_handoff_focus(&invalid).is_err());
+            assert!(!command_payload_can_advance_rpc_session(
+                "handoff", &invalid, None,
+            ));
+        }
+        assert!(command_can_advance_rpc_session("handoff"));
+        assert!(!command_resumes_rpc_agent("handoff", &json!({}), None));
+        assert!(!command_can_queue_while_rpc_agent_streams("handoff"));
     }
 
     async fn run_auto_compaction_persistence_case(
@@ -17492,7 +19578,7 @@ export default function init(pi) {
         );
 
         assert_eq!(
-            resolve_model_key(None, &auth, &entry).as_deref(),
+            resolve_model_key(None, &auth, &entry).unwrap().as_deref(),
             Some("stored-auth-key")
         );
     }
@@ -17517,7 +19603,7 @@ export default function init(pi) {
         );
 
         assert_eq!(
-            resolve_model_key(None, &auth, &entry).as_deref(),
+            resolve_model_key(None, &auth, &entry).unwrap().as_deref(),
             Some("stored-auth-key")
         );
     }
@@ -17540,7 +19626,9 @@ export default function init(pi) {
         );
 
         assert_eq!(
-            resolve_model_key(Some("cli-override-key"), &auth, &entry).as_deref(),
+            resolve_model_key(Some("cli-override-key"), &auth, &entry)
+                .unwrap()
+                .as_deref(),
             Some("cli-override-key")
         );
     }
@@ -22296,6 +24384,253 @@ export default function init(pi) {
         });
     }
 
+    fn terminal_advisor_counts(session: &Session) -> Vec<u64> {
+        session
+            .entries_for_current_path()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                SessionEntry::Custom(custom) if custom.custom_type == "advisor_continuation" => {
+                    custom
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("count"))
+                        .and_then(Value::as_u64)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn terminal_advisor_budget_reset_requires_authored_input_and_successful_save() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            for (authored, leased) in [(true, false), (true, true), (false, false), (false, true)] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let mut stored = Session::create_with_dir(Some(temp.path().join("sessions")));
+                stored.append_model_message(build_user_message("previous task", &[]));
+                stored.append_custom_entry(
+                    "advisor_continuation".to_string(),
+                    Some(json!({"count": 2})),
+                );
+                stored.save().await.expect("save exhausted budget");
+                let path = stored.path.clone().expect("saved path");
+                let baseline = stored.entries.len();
+                let inner_session = Arc::new(asupersync::sync::Mutex::new(stored));
+                let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
+                let agent = Agent::new(
+                    Arc::clone(&provider),
+                    ToolRegistry::new(&[], temp.path(), None),
+                    AgentConfig::default(),
+                );
+                let mut agent_session = AgentSession::new(
+                    agent,
+                    Arc::clone(&inner_session),
+                    true,
+                    crate::compaction::ResolvedCompactionSettings::default(),
+                );
+                agent_session.advisor = Some(crate::advisor::AdvisorRuntime::new(
+                    provider,
+                    "test/noop".to_string(),
+                ));
+                let session = Arc::new(asupersync::sync::Mutex::new(agent_session));
+                let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                    &Config::default(),
+                )));
+                let cx = AgentCx::for_request();
+                {
+                    let mut state = shared_state.lock(&cx).await.expect("queue state");
+                    let message = build_user_message("same queued payload", &[]);
+                    let delivery = if authored {
+                        QueuedAgentMessage::authored(message, "")
+                    } else {
+                        QueuedAgentMessage::generated(message)
+                    };
+                    state.push_follow_up(delivery).expect("accepted input");
+                    if leased {
+                        assert_eq!(state.lease_follow_up_for_fetch(baseline).len(), 1);
+                    }
+                }
+                inner_session.lock(&cx).await.expect("fault target").path =
+                    Some(temp.path().to_path_buf());
+                assert!(
+                    preserve_terminal_rpc_input(&session, &shared_state, &cx)
+                        .await
+                        .is_err(),
+                    "a directory cannot publish the candidate"
+                );
+                {
+                    let mut inner = inner_session.lock(&cx).await.expect("failed live state");
+                    assert_eq!(terminal_advisor_counts(&inner), vec![2]);
+                    assert_eq!(inner.entries.len(), baseline);
+                    inner.path = Some(path.clone());
+                }
+                assert_eq!(
+                    shared_state
+                        .lock(&cx)
+                        .await
+                        .expect("retained queue")
+                        .pending_count(),
+                    1
+                );
+                assert_eq!(
+                    preserve_terminal_rpc_input(&session, &shared_state, &cx)
+                        .await
+                        .expect("retry terminal persistence"),
+                    1
+                );
+                let reopened = Session::open(path.to_string_lossy().as_ref())
+                    .await
+                    .expect("reopen recovered input");
+                assert_eq!(
+                    terminal_advisor_counts(&reopened),
+                    if authored { vec![2, 0] } else { vec![2] }
+                );
+                assert_eq!(
+                    reopened.to_messages_for_current_path().len(),
+                    2,
+                    "the retry must publish the queued message only once"
+                );
+                assert_eq!(
+                    preserve_terminal_rpc_input(&session, &shared_state, &cx)
+                        .await
+                        .expect("repeat terminal reconciliation"),
+                    0
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn terminal_tool_transcript_retains_authored_delivery_provenance() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            for authored in [true, false] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let mut stored = Session::create_with_dir(Some(temp.path().join("sessions")));
+                stored.append_model_message(build_user_message("previous task", &[]));
+                stored.append_custom_entry(
+                    "advisor_continuation".to_string(),
+                    Some(json!({"count": 2})),
+                );
+                stored.save().await.expect("save exhausted budget");
+                let path = stored.path.clone().expect("saved path");
+                let baseline = stored.entries.len();
+                let history = stored.to_messages_for_current_path();
+                let delivered_index = history.len();
+                let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                    &Config::default(),
+                )));
+                let cx = AgentCx::for_request();
+                let leased = {
+                    let mut state = shared_state.lock(&cx).await.expect("queue state");
+                    let message = build_user_message("queued task with a completed effect", &[]);
+                    let delivery = if authored {
+                        QueuedAgentMessage::authored(message, "")
+                    } else {
+                        QueuedAgentMessage::generated(message)
+                    };
+                    state.push_steering(delivery).expect("accept steering");
+                    state.lease_steering(baseline)
+                };
+                let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
+                let mut agent = Agent::new(
+                    Arc::clone(&provider),
+                    ToolRegistry::new(&[], temp.path(), None),
+                    AgentConfig::default(),
+                );
+                agent.replace_messages(history);
+                let delivery = Arc::new(std::sync::Mutex::new(Some(leased)));
+                agent.register_message_fetchers(
+                    Some(Arc::new(move || {
+                        let delivery = Arc::clone(&delivery);
+                        Box::pin(async move {
+                            delivery
+                                .lock()
+                                .expect("leased input")
+                                .take()
+                                .unwrap_or_default()
+                        })
+                    })),
+                    None,
+                );
+                // Exercise the real queue-delivery boundary without admitting a
+                // provider. Build the closed tool suffix that terminal recovery
+                // may inherit when an outer task is dropped before its save.
+                let (handle, signal) = crate::agent::AbortHandle::new();
+                handle.abort();
+                let aborted = agent
+                    .run_continue_with_abort(Some(signal), |_| {})
+                    .await
+                    .expect("aborted queue delivery");
+                assert_eq!(aborted.stop_reason, StopReason::Aborted);
+                assert_eq!(agent.is_authored_queue_delivery(delivered_index), authored);
+                agent.truncate_messages(agent.messages().len() - 1);
+                agent.add_message(Message::Assistant(Arc::new(AssistantMessage {
+                    content: vec![ContentBlock::ToolCall(ToolCall {
+                        id: "completed-effect".to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({"path": "fixture.txt"}),
+                        thought_signature: None,
+                    })],
+                    stop_reason: StopReason::ToolUse,
+                    ..AssistantMessage::default()
+                })));
+                agent.add_message(Message::ToolResult(Arc::new(
+                    crate::model::ToolResultMessage {
+                        tool_call_id: "completed-effect".to_string(),
+                        tool_name: "read".to_string(),
+                        content: vec![ContentBlock::Text(TextContent::new("completed output"))],
+                        details: None,
+                        is_error: false,
+                        timestamp: 2,
+                    },
+                )));
+                let inner_session = Arc::new(asupersync::sync::Mutex::new(stored));
+                let mut agent_session = AgentSession::new(
+                    agent,
+                    inner_session,
+                    true,
+                    crate::compaction::ResolvedCompactionSettings::default(),
+                );
+                agent_session.advisor = Some(crate::advisor::AdvisorRuntime::new(
+                    provider,
+                    "test/noop".to_string(),
+                ));
+                let session = Arc::new(asupersync::sync::Mutex::new(agent_session));
+                assert_eq!(
+                    preserve_terminal_rpc_input(&session, &shared_state, &cx)
+                        .await
+                        .expect("preserve completed tool transcript and input lease"),
+                    4
+                );
+                let reopened = Session::open(path.to_string_lossy().as_ref())
+                    .await
+                    .expect("reopen terminal tool transcript");
+                assert_eq!(
+                    terminal_advisor_counts(&reopened),
+                    if authored { vec![2, 0] } else { vec![2] }
+                );
+                let messages = reopened.to_messages_for_current_path();
+                assert_eq!(messages.len(), 4, "one input and one completed tool pair");
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|message| matches!(message, Message::User(_)))
+                        .count(),
+                    2,
+                    "the in-flight lease must not duplicate its recovered user message"
+                );
+            }
+        });
+    }
+
     #[test]
     fn terminal_recovery_preserves_completed_tool_effects_after_task_drop() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -22616,12 +24951,12 @@ export default function init(pi) {
         ))];
         let mut state = RpcSharedState::new(&Config::default());
         state
-            .stage_completed_tool_transcript(&session, &recorded)
+            .stage_completed_tool_transcript(&session, &recorded, |_| false)
             .expect("stage recovery transcript");
         session.append_custom_entry("drift".to_string(), Some(json!({"changed": true})));
 
         let err = state
-            .stage_completed_tool_transcript(&session, &recorded)
+            .stage_completed_tool_transcript(&session, &recorded, |_| false)
             .expect_err("session-base drift must fail closed");
         assert!(err.to_string().contains("session base changed"));
     }
@@ -22782,6 +25117,7 @@ export default function init(pi) {
 
     fn assert_terminal_queue_persistence_replay_reuses_stable_entry_identity(
         store_kind: crate::session::SessionStoreKind,
+        advisor_enabled: bool,
     ) {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -22820,6 +25156,12 @@ export default function init(pi) {
                             &timestamp,
                             bound_parent_id.as_deref(),
                         )?;
+                        if advisor_enabled && delivery.keyword_scan_source().is_some() {
+                            parent_id = Some(crate::agent::append_advisor_input_reset(
+                                candidate,
+                                &entry_id,
+                            )?);
+                        }
                     }
                     Ok(())
                 };
@@ -22849,9 +25191,20 @@ export default function init(pi) {
                 .expect("reopen replayed session");
             assert_eq!(
                 reopened.entries.len(),
-                4,
+                if advisor_enabled { 6 } else { 4 },
                 "cancelled-writer replay must not retain a duplicate durable branch"
             );
+            let reset_count = reopened
+                .entries
+                .iter()
+                .filter(|entry| matches!(
+                    entry,
+                    SessionEntry::Custom(custom)
+                        if custom.custom_type == "advisor_continuation"
+                            && custom.data.as_ref().and_then(|data| data.get("count")) == Some(&json!(0))
+                ))
+                .count();
+            assert_eq!(reset_count, if advisor_enabled { 2 } else { 0 });
             let later_branch_count = reopened
                 .entries
                 .iter()
@@ -22893,6 +25246,15 @@ export default function init(pi) {
     fn terminal_jsonl_queue_replay_reuses_stable_entry_identity() {
         assert_terminal_queue_persistence_replay_reuses_stable_entry_identity(
             crate::session::SessionStoreKind::Jsonl,
+            false,
+        );
+    }
+
+    #[test]
+    fn terminal_jsonl_advisor_reset_replay_reuses_stable_entry_identity() {
+        assert_terminal_queue_persistence_replay_reuses_stable_entry_identity(
+            crate::session::SessionStoreKind::Jsonl,
+            true,
         );
     }
 
@@ -22901,6 +25263,16 @@ export default function init(pi) {
     fn terminal_sqlite_queue_replay_reuses_stable_entry_identity() {
         assert_terminal_queue_persistence_replay_reuses_stable_entry_identity(
             crate::session::SessionStoreKind::Sqlite,
+            false,
+        );
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    #[test]
+    fn terminal_sqlite_advisor_reset_replay_reuses_stable_entry_identity() {
+        assert_terminal_queue_persistence_replay_reuses_stable_entry_identity(
+            crate::session::SessionStoreKind::Sqlite,
+            true,
         );
     }
 
@@ -23322,9 +25694,10 @@ export default function init(pi) {
         let runtime_handle = runtime.handle();
 
         runtime.block_on(async move {
-            let (events, session, metrics_before, _provider_admission) =
-                run_auto_compaction_persistence_case(Session::in_memory(), false, runtime_handle)
-                    .await;
+            let (events, session, metrics_before, _provider_admission) = Box::pin(
+                run_auto_compaction_persistence_case(Session::in_memory(), false, runtime_handle),
+            )
+            .await;
             let end = events
                 .iter()
                 .find(|event| event["type"] == "auto_compaction_end")
@@ -23379,8 +25752,10 @@ export default function init(pi) {
         runtime.block_on(async move {
             let session_root = tempfile::tempdir().expect("tempdir");
             let session = Session::create_with_dir(Some(session_root.path().to_path_buf()));
-            let (events, session, metrics_before, _provider_admission) =
-                run_auto_compaction_persistence_case(session, true, runtime_handle).await;
+            let (events, session, metrics_before, _provider_admission) = Box::pin(
+                run_auto_compaction_persistence_case(session, true, runtime_handle),
+            )
+            .await;
             let end = events
                 .iter()
                 .find(|event| event["type"] == "auto_compaction_end")
@@ -23438,7 +25813,7 @@ export default function init(pi) {
             std::fs::write(&blocked_session_dir, b"blocked").expect("write path blocker");
             let session = Session::create_with_dir(Some(blocked_session_dir));
             let (events, session, metrics_before, provider_admission) =
-                run_auto_compaction_persistence_case(session, true, runtime_handle).await;
+                Box::pin(run_auto_compaction_persistence_case(session, true, runtime_handle)).await;
             let end = events
                 .iter()
                 .find(|event| event["type"] == "auto_compaction_end")
@@ -24447,7 +26822,8 @@ export default function init(pi) {
         session.header.provider = Some("open-router".to_string());
         session.header.model_id = Some("GPT-4O-MINI".to_string());
 
-        let resolved = current_model_entry(&session, &options).expect("resolve aliased model");
+        let resolved = current_model_entry(&session, &options.available_models)
+            .expect("resolve aliased model");
         assert_eq!(resolved.model.provider, "openrouter");
         assert_eq!(resolved.model.id, "gpt-4o-mini");
     }
@@ -24508,9 +26884,13 @@ export default function init(pi) {
         session.header.provider = Some("missing-provider".to_string());
         session.header.model_id = Some("missing-model".to_string());
 
-        let resolved =
-            current_or_runtime_model_entry(&session, "test-provider", "test-model", &options)
-                .expect("resolve runtime fallback");
+        let resolved = current_or_runtime_model_entry(
+            &session,
+            "test-provider",
+            "test-model",
+            &options.available_models,
+        )
+        .expect("resolve runtime fallback");
         assert_eq!(resolved.model.provider, "test-provider");
         assert_eq!(resolved.model.id, "test-model");
         assert_eq!(
@@ -24543,6 +26923,7 @@ export default function init(pi) {
                     reasoning: true,
                     input: vec![InputType::Text],
                     cost: ModelCost {
+                        audio: None,
                         input: 0.0,
                         output: 0.0,
                         cache_read: 0.0,
@@ -24606,6 +26987,108 @@ export default function init(pi) {
                 session.header.model_id.as_deref(),
                 Some(current.model.id.as_str())
             );
+        });
+    }
+
+    #[test]
+    fn cycle_model_for_rpc_uses_authoritative_route_and_stream_metadata() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            for reverse in [false, true] {
+                for (provider, key) in [
+                    ("acme-route", Some("authoritative-key")),
+                    ("acme-cycle", None),
+                ] {
+                    let temp = tempfile::tempdir().expect("tempdir");
+                    let mut current = dummy_entry("shared", false);
+                    current.model.provider = "openrouter".to_string();
+                    current.model.api = "openai-completions".to_string();
+                    current.model.base_url = "https://current.example.test/v1".to_string();
+                    current.api_key = Some("current-key".to_string());
+                    current.auth_header = true;
+                    let mut next = current.clone();
+                    next.model.provider = provider.to_string();
+                    next.model.base_url = "https://authoritative.example.test/v1".to_string();
+                    next.model.max_tokens = 4321;
+                    next.api_key = key.map(str::to_string);
+                    next.headers
+                        .insert("x-route".to_string(), "authoritative".to_string());
+                    let mut catalog = vec![current.clone(), next.clone()];
+                    let mut stale = next.clone();
+                    stale.model.base_url = "https://stale.example.test/v1".to_string();
+                    stale.model.max_tokens = 1234;
+                    stale.api_key = Some("stale-key".to_string());
+                    stale
+                        .headers
+                        .insert("x-route".to_string(), "stale".to_string());
+                    let mut candidates = vec![current.clone(), stale];
+                    if reverse {
+                        catalog.reverse();
+                        candidates.reverse();
+                    }
+                    let mut stored = Session::in_memory();
+                    stored.header.provider = Some(current.model.provider.clone());
+                    stored.header.model_id = Some(current.model.id.clone());
+                    let running = crate::providers::create_provider(&current, None)
+                        .expect("current provider");
+                    let mut agent_session =
+                        build_test_agent_session_with_provider(stored, Arc::clone(&running));
+                    agent_session.set_model_registry(
+                        crate::models::ModelRegistry::from_entries_for_tests(catalog),
+                    );
+                    let mut options =
+                        build_test_rpc_options(&handle, temp.path().join("auth.json"));
+                    options.available_models = candidates;
+                    let mut state = RpcSharedState::new(&options.config);
+                    let result =
+                        cycle_model_for_rpc(&mut agent_session, &mut state, &options).await;
+
+                    if key.is_none() {
+                        let error = result.expect_err("stale credentials cannot admit the model");
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("Missing credentials for acme-cycle")
+                        );
+                        assert!(Arc::ptr_eq(&running, &agent_session.agent.provider()));
+                        assert!(agent_session.agent.stream_options().api_key.is_none());
+                        assert!(agent_session.agent.stream_options().headers.is_empty());
+                        let stored = agent_session
+                            .session
+                            .lock(&AgentCx::for_request())
+                            .await
+                            .expect("session lock");
+                        assert!(stored.entries.is_empty());
+                        assert_eq!(stored.header.provider.as_deref(), Some("openrouter"));
+                        continue;
+                    }
+
+                    let (selected, _, scoped) = result
+                        .expect("cycle authoritative destination")
+                        .expect("second candidate");
+                    assert!(!scoped);
+                    assert_eq!(selected.model.provider, next.model.provider);
+                    assert_eq!(selected.model.base_url, next.model.base_url);
+                    assert_eq!(selected.api_key, next.api_key);
+                    assert_eq!(selected.headers, next.headers);
+                    assert_eq!(agent_session.agent.provider().name(), provider);
+                    let stream = agent_session.agent.stream_options();
+                    assert_eq!(stream.api_key, next.api_key);
+                    assert_eq!(stream.headers, next.headers);
+                    assert_eq!(stream.max_tokens, Some(next.model.max_tokens));
+                    let stored = agent_session
+                        .session
+                        .lock(&AgentCx::for_request())
+                        .await
+                        .expect("session lock");
+                    assert_eq!(stored.header.provider.as_deref(), Some(provider));
+                    assert_eq!(stored.header.model_id.as_deref(), Some("shared"));
+                }
+            }
         });
     }
 
@@ -24927,6 +27410,274 @@ export default function init(pi) {
     }
 
     #[test]
+    fn rpc_set_model_and_cycle_keep_declared_provider_routes() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            for reverse in [false, true] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let mut shared = ["openrouter", "open-router"]
+                    .into_iter()
+                    .map(|provider| {
+                        let mut entry = dummy_entry("shared", false);
+                        entry.model.provider = provider.to_string();
+                        entry.model.api = "openai-completions".to_string();
+                        entry.model.base_url =
+                            format!("https://authoritative-{provider}.example.test/v1");
+                        entry.api_key = Some(format!("authoritative-{provider}-key"));
+                        entry
+                            .headers
+                            .insert("x-route".to_string(), format!("authoritative-{provider}"));
+                        entry.auth_header = true;
+                        entry
+                    })
+                    .collect::<Vec<_>>();
+                if reverse {
+                    shared.reverse();
+                }
+                let mut options = build_test_rpc_options(&handle, temp.path().join("auth.json"));
+                let stale_shared = shared
+                    .iter()
+                    .map(|entry| {
+                        let mut stale = entry.clone();
+                        stale.model.base_url =
+                            format!("https://stale-{}.example.test/v1", entry.model.provider);
+                        stale.api_key = Some("stale-key".to_string());
+                        stale
+                            .headers
+                            .insert("x-route".to_string(), "stale".to_string());
+                        stale
+                    })
+                    .collect::<Vec<_>>();
+                options.available_models.clone_from(&stale_shared);
+                options.scoped_models = stale_shared
+                    .into_iter()
+                    .map(|entry| RpcScopedModel {
+                        model: entry,
+                        thinking_level: None,
+                    })
+                    .collect();
+                let mut native_only = shared
+                    .iter()
+                    .find(|entry| entry.model.provider == "openrouter")
+                    .expect("native provider")
+                    .clone();
+                native_only.model.id = "native-only".to_string();
+                native_only.model.base_url = "https://option-only.example.test/v1".to_string();
+                options.available_models.push(native_only.clone());
+                options.scoped_models.push(RpcScopedModel {
+                    model: native_only.clone(),
+                    thinking_level: None,
+                });
+                let mut agent_session = build_test_agent_session(Session::in_memory());
+                // Existing registry routes are authoritative; the native-only
+                // model is admitted solely through the RPC options merge.
+                agent_session.set_model_registry(
+                    crate::models::ModelRegistry::from_entries_for_tests(shared.clone()),
+                );
+                let session_handle = Arc::clone(&agent_session.session);
+                let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(8);
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+                let out_rx = Arc::new(Mutex::new(out_rx));
+                let server = handle.spawn(async move {
+                    Box::pin(run(agent_session, options, in_rx, out_tx)).await
+                });
+
+                let mut routes = shared;
+                routes.push(native_only);
+                for (index, requested) in routes.iter().enumerate() {
+                    let response = send_recv(
+                        &in_tx,
+                        &out_rx,
+                        &json!({
+                            "type": "set_model",
+                            "provider": requested.model.provider,
+                            "modelId": requested.model.id,
+                        })
+                        .to_string(),
+                        "set declared provider",
+                    )
+                    .await;
+                    assert_ok(&response, "set_model");
+                    assert_eq!(response["data"]["provider"], requested.model.provider);
+                    assert_eq!(response["data"]["id"], requested.model.id);
+                    assert_eq!(response["data"]["baseUrl"], requested.model.base_url);
+                    let state = send_recv(
+                        &in_tx,
+                        &out_rx,
+                        r#"{"type":"get_state"}"#,
+                        "read declared provider",
+                    )
+                    .await;
+                    assert_ok(&state, "get_state");
+                    assert_eq!(state["data"]["model"]["provider"], requested.model.provider);
+                    assert_eq!(state["data"]["model"]["id"], requested.model.id);
+                    assert_eq!(state["data"]["model"]["baseUrl"], requested.model.base_url);
+
+                    let expected = &routes[(index + 1) % routes.len()];
+                    let cycled = send_recv(
+                        &in_tx,
+                        &out_rx,
+                        r#"{"type":"cycle_model"}"#,
+                        "cycle declared providers",
+                    )
+                    .await;
+                    assert_ok(&cycled, "cycle_model");
+                    assert_eq!(cycled["data"]["model"]["provider"], expected.model.provider);
+                    assert_eq!(cycled["data"]["model"]["id"], expected.model.id);
+                    assert_eq!(cycled["data"]["model"]["baseUrl"], expected.model.base_url);
+                    let state = send_recv(
+                        &in_tx,
+                        &out_rx,
+                        r#"{"type":"get_state"}"#,
+                        "read cycled authoritative provider",
+                    )
+                    .await;
+                    assert_ok(&state, "get_state");
+                    assert_eq!(state["data"]["model"]["provider"], expected.model.provider);
+                    assert_eq!(state["data"]["model"]["id"], expected.model.id);
+                    assert_eq!(state["data"]["model"]["baseUrl"], expected.model.base_url);
+                }
+
+                let before = session_handle
+                    .lock(&AgentCx::for_request())
+                    .await
+                    .expect("session lock")
+                    .clone();
+                let missing = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"set_model","provider":"open-router","modelId":"native-only"}"#,
+                    "reject another provider's model",
+                )
+                .await;
+                assert_err(&missing, "set_model");
+                assert!(
+                    missing["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("get_available_models")
+                );
+                drop(in_tx);
+                let result = server.await;
+                assert!(result.is_ok(), "rpc server error: {result:?}");
+                let after = session_handle
+                    .lock(&AgentCx::for_request())
+                    .await
+                    .expect("session lock");
+                assert_eq!(
+                    after.effective_model_for_current_path(),
+                    before.effective_model_for_current_path()
+                );
+                assert_eq!(after.entries.len(), before.entries.len());
+            }
+        });
+    }
+
+    #[test]
+    fn rpc_set_model_checks_full_registry_before_credentials() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            for reverse in [false, true] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let mut current = dummy_entry("test-model", false);
+                current.model.provider = "test-provider".to_string();
+                current.model.api = "test-api".to_string();
+                let mut ready = dummy_entry("shared", false);
+                ready.model.provider = "openai-codex".to_string();
+                ready.model.api = "openai-codex-responses".to_string();
+                ready.model.base_url = "https://native.example.test/v1".to_string();
+                ready.api_key = Some("native-only-key".to_string());
+                ready.auth_header = true;
+                let mut requested = ready.clone();
+                requested.model.provider = "codex".to_string();
+                requested.model.base_url = "https://declared.example.test/v1".to_string();
+                requested.api_key = None;
+                let mut entries = vec![current.clone(), ready.clone(), requested];
+                if reverse {
+                    entries.reverse();
+                }
+                let mut stored = Session::in_memory();
+                stored.header.provider = Some(current.model.provider.clone());
+                stored.header.model_id = Some(current.model.id.clone());
+                let mut agent_session = build_test_agent_session(stored);
+                agent_session.set_model_registry(
+                    crate::models::ModelRegistry::from_entries_for_tests(entries),
+                );
+                let session_handle = Arc::clone(&agent_session.session);
+                let mut options = build_test_rpc_options(&handle, temp.path().join("auth.json"));
+                // Codex has no ambient API-key variables, and this private
+                // auth path disables external credential discovery.
+                assert!(options.auth.resolve_api_key("codex", None).is_none());
+                options.available_models = vec![ready];
+                let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(8);
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+                let out_rx = Arc::new(Mutex::new(out_rx));
+                let server = handle.spawn(async move {
+                    Box::pin(run(agent_session, options, in_rx, out_tx)).await
+                });
+
+                let response = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"set_model","provider":"codex","modelId":"shared"}"#,
+                    "reject missing credentials on declared provider",
+                )
+                .await;
+                assert_err(&response, "set_model");
+                assert!(
+                    response["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Missing credentials for codex/shared")
+                );
+                let state = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"get_state"}"#,
+                    "retain previous destination",
+                )
+                .await;
+                assert_ok(&state, "get_state");
+                assert_eq!(state["data"]["model"]["provider"], current.model.provider);
+                assert_eq!(state["data"]["model"]["id"], current.model.id);
+                let available = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"get_available_models"}"#,
+                    "retain admitted model listing",
+                )
+                .await;
+                assert_ok(&available, "get_available_models");
+                assert_eq!(available["data"]["models"].as_array().unwrap().len(), 1);
+                assert_eq!(available["data"]["models"][0]["provider"], "openai-codex");
+                drop(in_tx);
+                let result = server.await;
+                assert!(result.is_ok(), "rpc server error: {result:?}");
+                let stored = session_handle
+                    .lock(&AgentCx::for_request())
+                    .await
+                    .expect("session lock");
+                assert_eq!(stored.header.provider.as_deref(), Some("test-provider"));
+                assert_eq!(stored.header.model_id.as_deref(), Some("test-model"));
+                assert!(
+                    stored
+                        .entries
+                        .iter()
+                        .all(|entry| !matches!(entry, SessionEntry::ModelChange(_)))
+                );
+            }
+        });
+    }
+
+    #[test]
     fn rpc_set_model_persists_clamped_thinking_header_even_when_runtime_is_already_off() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -25189,9 +27940,80 @@ export default function init(pi) {
             auto_retry_enabled: false,
         };
 
-        let state = session_state(&session, &options, &snapshot, false, false);
+        let state = session_state(&session, &options.available_models, &snapshot, false, false);
         assert_eq!(state["model"]["provider"], "openrouter");
         assert_eq!(state["model"]["id"], "gpt-4o-mini");
+        assert_eq!(state["contextTokens"], 0);
+        assert_eq!(state["contextWindow"], 200_000);
+    }
+
+    #[test]
+    fn session_state_context_estimate_excludes_archived_and_sibling_history() {
+        let mut model = dummy_entry("test-model", false);
+        model.model.provider = "test-provider".to_string();
+        let mut session = Session::in_memory();
+        session.header.provider = Some("test-provider".to_string());
+        session.header.model_id = Some("test-model".to_string());
+        let root = session.append_message(SessionMessage::User {
+            content: UserContent::Text("archived history ".repeat(2000)),
+            timestamp: Some(1),
+        });
+        session.append_message(SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("old answer"))],
+                usage: Usage {
+                    total_tokens: 190_000,
+                    ..Usage::default()
+                },
+                stop_reason: StopReason::Stop,
+                ..AssistantMessage::default()
+            },
+        });
+        let kept = session.append_message(SessionMessage::User {
+            content: UserContent::Text("retained current request".to_string()),
+            timestamp: Some(2),
+        });
+        let before = crate::compaction::estimate_model_context_tokens(
+            &session.to_messages_for_current_path(),
+        );
+        let compacted = session.append_compaction(
+            "short continuation brief".to_string(),
+            kept,
+            before,
+            None,
+            None,
+        );
+        assert!(session.navigate_to(&root));
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("unselected sibling ".repeat(3000)),
+            timestamp: Some(3),
+        });
+        assert!(session.navigate_to(&compacted));
+        let snapshot = RpcStateSnapshot {
+            steering_count: 0,
+            follow_up_count: 0,
+            steering_mode: QueueMode::OneAtATime,
+            follow_up_mode: QueueMode::OneAtATime,
+            auto_compaction_enabled: false,
+            auto_retry_enabled: false,
+        };
+        let expected = crate::compaction::estimate_model_context_tokens(
+            &session.to_messages_for_current_path(),
+        );
+        assert!(expected < before);
+        let state = session_state(&session, &[model.clone()], &snapshot, false, false);
+        assert_eq!(state["contextTokens"], expected);
+        assert!(state["contextTokens"].as_u64().unwrap() < 1000);
+        assert_eq!(state["contextWindow"], 200_000);
+        assert_eq!(
+            session_state(&session, &[], &snapshot, false, false)["contextWindow"],
+            Value::Null,
+        );
+        model.model.context_window = 0;
+        assert_eq!(
+            session_state(&session, &[model], &snapshot, false, false)["contextWindow"],
+            Value::Null,
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -25320,6 +28142,43 @@ export default function init(pi) {
         let val_b = json!({"type": "extension_ui_response", "requestId": "req-1", "value": "Beta"});
         let resp = rpc_parse_extension_ui_response(&val_b, &active).unwrap();
         assert_eq!(resp.value, Some(json!("Beta")));
+    }
+
+    #[test]
+    fn ask_cancellation_tracking_preserves_other_cards_and_retries_backpressure() {
+        let ask = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
+        for id in ["cancelled", "answered", "live"] {
+            ask.register_channel_ui_request_for_tests(id);
+        }
+        let mut state = RpcAskBridgeState::default();
+        state
+            .forwarded
+            .extend(["cancelled", "answered", "live"].map(str::to_string));
+        for id in ["cancelled", "answered"] {
+            ask.respond_ui(
+                id,
+                crate::ask::AskResponse {
+                    answers: Vec::new(),
+                    dismissed: true,
+                },
+            );
+        }
+        // The normal ask_response path removes its ID while holding this
+        // same state lock; only an abandoned wait emits cancellation.
+        state.forwarded.remove("answered");
+        state.prune(&ask, |_| false);
+        assert!(state.forwarded.contains("cancelled"));
+        let mut cancelled = Vec::new();
+        state.prune(&ask, |id| {
+            cancelled.push(id.to_string());
+            true
+        });
+        assert_eq!(cancelled, vec!["cancelled"]);
+        assert_eq!(state.forwarded, HashSet::from(["live".to_string()]));
+        let shared = Arc::new(std::sync::Mutex::new(state));
+        drop(RpcAskBridgeCloseGuard(Arc::clone(&shared)));
+        assert!(shared.lock().unwrap().closed);
+        assert!(ask.channel_ui_request_is_pending("live"));
     }
 
     /// bd-cv653.3.8: the ask_request frame carries the request id, the

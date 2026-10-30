@@ -256,6 +256,7 @@ fn run_scripted(
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            cost_budget: None,
             turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
@@ -641,6 +642,101 @@ fn sdk_session_persistence() {
         });
 }
 
+#[test]
+fn sdk_resumed_session_persists_turn_through_canonical_path() {
+    let harness = TestHarness::new("sdk_resumed_session_persists_turn_through_canonical_path");
+    let session_dir = harness.temp_dir().join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("create session dir");
+    let path = session_dir.join("resumed.jsonl");
+    let options = SessionOptions {
+        no_session: false,
+        session_path: Some(path.clone()),
+        session_dir: Some(session_dir.clone()),
+        no_context_files: true,
+        enabled_tools: Some(Vec::new()),
+        compaction_settings: Some(ResolvedCompactionSettings {
+            enabled: false,
+            ..ResolvedCompactionSettings::default()
+        }),
+        ..default_session_options(&harness)
+    };
+    let cwd = harness.temp_dir().to_path_buf();
+
+    run_async(async move {
+        let mut source = Session::create_with_dir(Some(session_dir));
+        source.header.cwd = cwd.display().to_string();
+        source.path = Some(path.clone());
+        source.append_model_message(Message::User(UserMessage {
+            content: UserContent::Text("before resume".to_string()),
+            timestamp: 1,
+        }));
+        source.save().await.expect("seed session");
+        let session_id = source.header.id.clone();
+        drop(source);
+
+        let canonical = std::fs::canonicalize(&path).expect("canonical session path");
+        // Let the SDK discover and canonicalize the saved session itself. On
+        // Windows this is the verbatim path that previously broke lock checks.
+        let mut handle = create_agent_session(options).await.expect("resume session");
+        let (resumed_id, resumed_path) = handle
+            .with_session(|session| (session.header.id.clone(), session.path.clone()))
+            .await
+            .expect("resumed session identity");
+        assert_eq!(resumed_id, session_id);
+        assert_eq!(resumed_path.as_deref(), Some(canonical.as_path()));
+        #[cfg(windows)]
+        assert!(matches!(
+            canonical.components().next(),
+            Some(std::path::Component::Prefix(prefix)) if prefix.kind().is_verbatim()
+        ));
+
+        let provider = Arc::new(ScriptedProvider::new(Script::SingleText(
+            "saved after resume".to_string(),
+        )));
+        let scripted_transport = Arc::new(IdentityPreservingScriptedProvider {
+            identity: handle.session().agent.provider(),
+            scripted: Arc::clone(&provider),
+        });
+        handle.session_mut().agent.set_provider(scripted_transport);
+        handle
+            .prompt("after resume", |_| {})
+            .await
+            .expect("resumed SDK prompt must persist its turn");
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+        let saved_messages = handle.messages().await.expect("saved SDK messages");
+        drop(handle);
+
+        let reopened = Session::open(&canonical.to_string_lossy())
+            .await
+            .expect("reopen resumed SDK session");
+        assert_eq!(reopened.header.id, session_id);
+        assert_eq!(reopened.path.as_deref(), Some(canonical.as_path()));
+        let messages = reopened.to_messages_for_current_path();
+        assert_eq!(messages.len(), 3, "seed, resumed prompt, and reply survive");
+        assert_eq!(
+            serde_json::to_value(&messages).expect("serialize reopened messages"),
+            serde_json::to_value(&saved_messages).expect("serialize saved messages"),
+        );
+        let user_texts: Vec<_> = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(user_texts, ["before resume", "after resume"]);
+        assert!(matches!(
+            messages.last(),
+            Some(Message::Assistant(message))
+                if matches!(message.content.as_slice(), [ContentBlock::Text(text)]
+                    if text.text == "saved after resume")
+        ));
+    });
+}
+
 // ============================================================================
 // 6. Abort — verify prompt can be cancelled
 // ============================================================================
@@ -675,7 +771,7 @@ fn sdk_compact_empty_session() {
     let events_ref = Arc::clone(&events);
     run_async(async move {
         handle
-            .compact(move |event| {
+            .compact(None, move |event| {
                 events_ref.lock().expect("lock").push(event);
             })
             .await
@@ -1093,6 +1189,81 @@ fn sdk_mcp_discovery_honors_workspace_trust() {
     assert_eq!(trusted_names, vec!["global-server", "project-server"]);
 }
 
+#[test]
+fn sdk_mcp_project_opt_out_skips_malformed_sources_and_keeps_explicit_files() {
+    let harness = TestHarness::new("sdk_mcp_project_opt_out");
+    let global = harness.temp_path("mcp-global");
+    std::fs::create_dir_all(&global).expect("global MCP directory");
+    for relative in [".pi/mcp.json", ".agents/mcp.json", ".claude/mcp.json"] {
+        harness.create_file(relative, b"{ malformed project definition");
+    }
+    harness.create_file(
+        ".pi/settings.json",
+        br#"{"mcp":{"enableProjectConfig":false}}"#,
+    );
+    std::fs::write(
+        global.join("mcp.json"),
+        r#"{"mcpServers":{"global":{"url":"https://global.example.test/mcp"}}}"#,
+    )
+    .expect("global MCP definition");
+    let explicit = harness.create_file(
+        "explicit-mcp.json",
+        br#"{"mcpServers":{"explicit":{"url":"https://explicit.example.test/mcp"}}}"#,
+    );
+    let mut options = default_session_options(&harness);
+    options.workspace_trusted = true;
+    options.mcp = Some(McpSessionOptions {
+        config_paths: vec![explicit],
+        global_dir: Some(global),
+    });
+    let disabled =
+        run_async(create_agent_session(options.clone())).expect("disabled project session");
+    let manager = disabled.mcp_manager().expect("MCP manager");
+    let mut names = manager
+        .list()
+        .into_iter()
+        .map(|row| row.name)
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, vec!["explicit", "global"]);
+    assert!(
+        manager.warnings().is_empty(),
+        "disabled files must not be read"
+    );
+
+    harness.create_file(
+        ".pi/settings.json",
+        br#"{"mcp":{"enableProjectConfig":true}}"#,
+    );
+    let enabled =
+        run_async(create_agent_session(options.clone())).expect("enabled project session");
+    let manager = enabled.mcp_manager().expect("MCP manager");
+    assert_eq!(
+        manager
+            .list()
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["explicit"]
+    );
+    assert!(
+        !manager.warnings().is_empty(),
+        "malformed project source blocks lower layers"
+    );
+
+    options.workspace_trusted = false;
+    let untrusted = run_async(create_agent_session(options)).expect("untrusted session");
+    let manager = untrusted.mcp_manager().expect("MCP manager");
+    let mut names = manager
+        .list()
+        .into_iter()
+        .map(|row| row.name)
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, vec!["explicit", "global"]);
+    assert!(manager.warnings().is_empty());
+}
+
 // ============================================================================
 // 13. Conformance: Event ordering guarantees
 // ============================================================================
@@ -1131,8 +1302,10 @@ fn sdk_conformance_event_ordering() {
             AgentEvent::AutoRetryEnd { .. } => "AutoRetryEnd",
             AgentEvent::FailoverStart { .. } => "FailoverStart",
             AgentEvent::FailoverEnd { .. } => "FailoverEnd",
+            AgentEvent::PrewalkSwitched { .. } => "PrewalkSwitched",
             AgentEvent::ExtensionError { .. } => "ExtensionError",
             AgentEvent::AdvisorNote { .. } => "AdvisorNote",
+            AgentEvent::CostWarning { .. } => "CostWarning",
             AgentEvent::ProviderError { .. } => "ProviderError",
         })
         .collect();
@@ -1345,6 +1518,7 @@ fn sdk_conformance_session_tool_hooks() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            cost_budget: None,
             turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
@@ -1436,6 +1610,7 @@ fn sdk_conformance_combined_callback_ordering() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            cost_budget: None,
             turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
@@ -1554,6 +1729,7 @@ fn sdk_continue_turn_uses_combined_listener_path() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            cost_budget: None,
             turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
@@ -1649,6 +1825,7 @@ fn sdk_continue_turn_with_abort_refuses_a_pre_aborted_signal() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            cost_budget: None,
             turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,

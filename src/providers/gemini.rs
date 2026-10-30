@@ -6,7 +6,8 @@
 use crate::error::{Error, Result};
 use crate::http::client::{Client, RequestBuilder};
 use crate::model::{
-    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, ToolCall, Usage, UserContent,
+    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, ToolCall, ToolResultMessage,
+    Usage, UserContent,
 };
 use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
@@ -15,7 +16,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 
 mod files;
@@ -30,6 +31,7 @@ const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta"
 const GOOGLE_GEMINI_CLI_BASE: &str = "https://cloudcode-pa.googleapis.com";
 const GOOGLE_ANTIGRAVITY_BASE: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 const MAX_GENERATION_ERROR_BYTES: usize = 64 * 1024;
+const MAX_READY_EVENTS_PER_YIELD: usize = 64;
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 fn authorization_override(
@@ -427,8 +429,9 @@ impl Provider for GeminiProvider {
             let provider = self.name().to_string();
             let cloud_cli_mode = self.google_cli_mode;
 
-            let stream =
-                StreamState::new(event_source, model, api, provider).into_stream(cloud_cli_mode);
+            let stream = StreamState::new(event_source, model, api, provider)
+                .with_usage_observer(options.usage_observer.clone())
+                .into_stream(cloud_cli_mode);
 
             return Ok(Box::pin(stream));
         }
@@ -520,8 +523,9 @@ impl Provider for GeminiProvider {
         let provider = self.name().to_string();
         let cloud_cli_mode = self.google_cli_mode;
 
-        let stream =
-            StreamState::new(event_source, model, api, provider).into_stream(cloud_cli_mode);
+        let stream = StreamState::new(event_source, model, api, provider)
+            .with_usage_observer(options.usage_observer.clone())
+            .into_stream(cloud_cli_mode);
 
         Ok(Box::pin(stream))
     }
@@ -530,6 +534,23 @@ impl Provider for GeminiProvider {
 // ============================================================================
 // Stream State
 // ============================================================================
+
+/// Heartbeats and usage-only frames do not produce public events. A ready
+/// transport must still let the consumer's abort branch and sibling sessions
+/// run; this yield remains owned by the response rather than a detached task.
+async fn yield_stream_turn() {
+    let mut yielded = false;
+    std::future::poll_fn(|task| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            task.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+}
 
 /// Shared by Developer API, Cloud Code Assist and Google-native Vertex.
 /// Keeping one parser also keeps signature boundaries and usage accounting
@@ -550,6 +571,7 @@ where
     saw_terminal: bool,
     content_state: reasoning::ContentState,
     usage_state: reasoning::UsageState,
+    usage_observer: Option<crate::provider::UsageObserver>,
 }
 
 impl<S> StreamState<S>
@@ -581,7 +603,16 @@ where
             saw_terminal: false,
             content_state: reasoning::ContentState::default(),
             usage_state: reasoning::UsageState::default(),
+            usage_observer: None,
         }
+    }
+
+    pub(super) fn with_usage_observer(
+        mut self,
+        observer: Option<crate::provider::UsageObserver>,
+    ) -> Self {
+        self.usage_observer = observer;
+        self
     }
 
     /// The returned stream is fused: once it yields `None` every later poll
@@ -591,14 +622,24 @@ where
         self,
         cloud_cli_mode: bool,
     ) -> impl Stream<Item = Result<StreamEvent>> {
-        stream::unfold(self, move |mut state| async move {
+        stream::unfold(Some(self), move |active| async move {
+            let mut state = active?;
+            let mut ready_events = 0;
             loop {
                 if let Some(event) = state.pending_events.pop_front() {
-                    return Some((Ok(event), state));
+                    let active =
+                        (!matches!(&event, StreamEvent::Done { .. } | StreamEvent::Error { .. }))
+                            .then_some(state);
+                    return Some((Ok(event), active));
                 }
                 if state.finished {
                     return None;
                 }
+                if ready_events == MAX_READY_EVENTS_PER_YIELD {
+                    yield_stream_turn().await;
+                    ready_events = 0;
+                }
+                ready_events += 1;
                 match state.event_source.next().await {
                     Some(Ok(msg)) => {
                         if msg.event == "ping" {
@@ -610,20 +651,21 @@ where
                             state.process_event(&msg.data)
                         };
                         if let Err(error) = result {
-                            state.finished = true;
-                            return Some((Err(error), state));
+                            return Some((Err(error), None));
                         }
                     }
                     Some(Err(error)) => {
                         // SseStream errors are terminal. Swallowing a timeout
                         // here would turn its next EOF into a clean success
                         // when a finish marker had already been observed.
-                        state.finished = true;
-                        return Some((Err(Error::sse(&error)), state));
+                        return Some((Err(Error::sse(&error)), None));
                     }
                     None => {
                         let outcome = state.finish_at_eof();
-                        return Some((outcome, state));
+                        // Keep reading through EOF for trailing usage and late
+                        // signatures, then release the source and its owner
+                        // before the consumer can observe the terminal result.
+                        return Some((outcome, None));
                     }
                 }
             }
@@ -684,6 +726,9 @@ where
                 metadata.cached_content_token_count,
                 metadata.total_token_count,
             );
+            if let Some(observer) = &self.usage_observer {
+                observer.observe(&self.partial.usage)?;
+            }
         }
 
         // A blocked prompt arrives as `promptFeedback.blockReason` with no
@@ -1105,24 +1150,70 @@ pub(crate) struct GeminiUsageMetadata {
 /// Keep every parallel function response in the same user turn. Gemini
 /// validates that the response turn answers all calls in the preceding model
 /// turn; separate user turns fail that contract even for text-only results.
+/// Responses without wire IDs are matched by position, so restore call order
+/// when parallel tools completed or were persisted in a different order.
 /// Media follows the complete response turn, with its originating call named.
 ///
 /// Shared by the Developer API, Cloud Code Assist and Vertex adapters.
 /// https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures#parallel-function-calling-example
 pub(crate) fn convert_messages_to_gemini(messages: &[Message]) -> Vec<GeminiContent> {
     let mut contents = Vec::with_capacity(messages.len());
-    let mut responses = Vec::new();
-    let mut media = Vec::new();
+    let mut results = Vec::new();
+    let mut call_order = HashMap::new();
+    let mut next_call_ordinal = 0;
     for message in messages {
         if let Message::ToolResult(result) = message {
-            append_tool_result_parts(result, &mut responses, &mut media);
+            results.push(result.as_ref());
         } else {
-            append_tool_result_turns(&mut contents, &mut responses, &mut media);
+            append_ordered_tool_result_turns(&mut contents, &mut results, &call_order);
+            if let Message::Assistant(assistant) = message {
+                for block in &assistant.content {
+                    if let ContentBlock::ToolCall(call) = block {
+                        call_order.insert(call.id.as_str(), next_call_ordinal);
+                        next_call_ordinal += 1;
+                    }
+                }
+            }
             contents.extend(convert_message_to_gemini(message));
         }
     }
-    append_tool_result_turns(&mut contents, &mut responses, &mut media);
+    append_ordered_tool_result_turns(&mut contents, &mut results, &call_order);
     contents
+}
+
+fn append_ordered_tool_result_turns(
+    contents: &mut Vec<GeminiContent>,
+    results: &mut Vec<&ToolResultMessage>,
+    call_order: &HashMap<&str, usize>,
+) {
+    if results.is_empty() {
+        return;
+    }
+    let mut known_results: Vec<_> = results
+        .iter()
+        .filter_map(|result| {
+            call_order
+                .get(result.tool_call_id.as_str())
+                .map(|&ordinal| (ordinal, *result))
+        })
+        .collect();
+    known_results.sort_by_key(|(ordinal, _)| *ordinal);
+    // Only matched slots move. Imported or incomplete histories may contain
+    // results with no recorded call; preserve those results where they were.
+    for (slot, (_, result)) in results
+        .iter_mut()
+        .filter(|result| call_order.contains_key(result.tool_call_id.as_str()))
+        .zip(known_results)
+    {
+        *slot = result;
+    }
+
+    let mut responses = Vec::with_capacity(results.len());
+    let mut media = Vec::new();
+    for result in results.drain(..) {
+        append_tool_result_parts(result, &mut responses, &mut media);
+    }
+    append_tool_result_turns(contents, &mut responses, &mut media);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1344,6 +1435,516 @@ pub(crate) fn convert_tool_to_gemini(tool: &ToolDef) -> GeminiFunctionDeclaratio
 #[cfg(test)]
 mod tests {
     mod integration_reasoning;
+
+    mod stream_lifecycle {
+        use super::super::*;
+        use asupersync::runtime::RuntimeBuilder;
+        use futures::FutureExt as _;
+        use serde_json::{Value, json};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context as TaskContext, Poll, Wake, Waker};
+
+        type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
+
+        #[derive(Clone, Copy)]
+        struct Mode {
+            api: &'static str,
+            provider: &'static str,
+            cloud_cli: bool,
+        }
+
+        const MODES: [Mode; 3] = [
+            Mode {
+                api: "google-generative-ai",
+                provider: "google",
+                cloud_cli: false,
+            },
+            Mode {
+                api: "google-vertex",
+                provider: "google-vertex",
+                cloud_cli: false,
+            },
+            Mode {
+                api: "google-gemini-cli",
+                provider: "google-gemini-cli",
+                cloud_cli: true,
+            },
+        ];
+
+        enum Tail {
+            Eof,
+            Pending,
+            Repeat(Vec<u8>),
+        }
+
+        struct ObservedSource {
+            chunks: VecDeque<std::io::Result<Vec<u8>>>,
+            tail: Tail,
+            repeated_polls: usize,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl Stream for ObservedSource {
+            type Item = std::io::Result<Vec<u8>>;
+
+            fn poll_next(
+                self: Pin<&mut Self>,
+                _: &mut TaskContext<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                let this = self.get_mut();
+                if let Some(chunk) = this.chunks.pop_front() {
+                    return Poll::Ready(Some(chunk));
+                }
+                match &this.tail {
+                    Tail::Eof => Poll::Ready(None),
+                    Tail::Pending => Poll::Pending,
+                    Tail::Repeat(frame) => {
+                        this.repeated_polls += 1;
+                        // A regression must fail rather than hang this test on
+                        // an endlessly ready source that never yields a result.
+                        assert!(
+                            this.repeated_polls <= MAX_READY_EVENTS_PER_YIELD * 4,
+                            "silent frames monopolized the consumer's poll"
+                        );
+                        Poll::Ready(Some(Ok(frame.clone())))
+                    }
+                }
+            }
+        }
+
+        impl Drop for ObservedSource {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        fn observed(
+            mode: Mode,
+            chunks: impl IntoIterator<Item = std::io::Result<Vec<u8>>>,
+            tail: Tail,
+        ) -> (EventStream, Arc<AtomicBool>) {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let source = ObservedSource {
+                chunks: chunks.into_iter().collect(),
+                tail,
+                repeated_polls: 0,
+                dropped: Arc::clone(&dropped),
+            };
+            let state = StreamState::new(
+                SseStream::new(source),
+                "gemini-test".into(),
+                mode.api.into(),
+                mode.provider.into(),
+            );
+            (Box::pin(state.into_stream(mode.cloud_cli)), dropped)
+        }
+
+        fn wire(mode: Mode, value: Value) -> Vec<u8> {
+            let value = if mode.cloud_cli {
+                json!({"response": value})
+            } else {
+                value
+            };
+            format!("data: {value}\n\n").into_bytes()
+        }
+
+        fn usage() -> Value {
+            json!({"usageMetadata": {
+                "promptTokenCount": 11,
+                "candidatesTokenCount": 3,
+                "thoughtsTokenCount": 2,
+                "cachedContentTokenCount": 4,
+                "totalTokenCount": 16
+            }})
+        }
+
+        fn assert_usage(message: &AssistantMessage) {
+            assert_eq!(message.usage.input, 7);
+            assert_eq!(message.usage.cache_read, 4);
+            assert_eq!(message.usage.output, 5);
+            assert_eq!(message.usage.total_tokens, 16);
+        }
+
+        fn assert_retired(output: &mut EventStream, dropped: &AtomicBool) {
+            // Check before another poll: the consumer can retain a stream
+            // indefinitely after receiving its terminal outcome.
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "terminal delivery retained the response source"
+            );
+            for _ in 0..3 {
+                assert!(
+                    output
+                        .next()
+                        .now_or_never()
+                        .expect("terminal stream must stay ready")
+                        .is_none()
+                );
+            }
+        }
+
+        struct UsageWireProvider {
+            mode: Mode,
+            response: std::sync::Mutex<Option<(Vec<std::io::Result<Vec<u8>>>, Tail)>>,
+            dropped: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl Provider for UsageWireProvider {
+            fn name(&self) -> &str {
+                self.mode.provider
+            }
+            fn api(&self) -> &str {
+                self.mode.api
+            }
+            fn model_id(&self) -> &str {
+                "gemini-usage-fixture"
+            }
+
+            fn model_cost(&self) -> Option<crate::provider::ModelCost> {
+                Some(crate::provider::ModelCost {
+                    audio: None,
+                    input: 1_000_000.0,
+                    output: 1_000_000.0,
+                    cache_read: 1_000_000.0,
+                    cache_write: 0.0,
+                })
+            }
+
+            async fn stream(
+                &self,
+                _context: &Context<'_>,
+                options: &StreamOptions,
+            ) -> Result<EventStream> {
+                let (chunks, tail) = self
+                    .response
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("one wire request");
+                let source = ObservedSource {
+                    chunks: chunks.into(),
+                    tail,
+                    repeated_polls: 0,
+                    dropped: Arc::clone(&self.dropped),
+                };
+                let state = StreamState::new(
+                    SseStream::new(source),
+                    self.model_id().into(),
+                    self.api().into(),
+                    self.name().into(),
+                )
+                .with_usage_observer(options.usage_observer.clone());
+                Ok(Box::pin(state.into_stream(self.mode.cloud_cli)))
+            }
+        }
+
+        fn guarded_usage_wire(
+            mode: Mode,
+            chunks: Vec<std::io::Result<Vec<u8>>>,
+            tail: Tail,
+        ) -> (Arc<dyn Provider>, crate::cost::CostBudget, Arc<AtomicBool>) {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let provider = Arc::new(UsageWireProvider {
+                mode,
+                response: std::sync::Mutex::new(Some((chunks, tail))),
+                dropped: Arc::clone(&dropped),
+            });
+            let budget = crate::cost::CostBudget::new(None, Some(15.0), 0.0).unwrap();
+            (
+                crate::provider::guard_with_cost_budget(provider, budget.clone()),
+                budget,
+                dropped,
+            )
+        }
+
+        #[test]
+        fn usage_only_pending_wire_updates_budget_before_any_public_event_and_survives_drop() {
+            futures::executor::block_on(async {
+                for mode in MODES {
+                    let (provider, budget, dropped) =
+                        guarded_usage_wire(mode, vec![Ok(wire(mode, usage()))], Tail::Pending);
+                    let mut output = provider
+                        .stream(&Context::default(), &StreamOptions::default())
+                        .await
+                        .unwrap();
+                    assert!(output.next().now_or_never().is_none());
+                    assert_eq!(budget.snapshot().pending, 16.0);
+                    assert_eq!(budget.spent(), 0.0);
+                    assert!(!dropped.load(Ordering::SeqCst));
+                    assert!(matches!(
+                        provider
+                            .stream(&Context::default(), &StreamOptions::default())
+                            .await,
+                        Err(Error::CostCap { .. })
+                    ));
+                    drop(output);
+                    assert!(dropped.load(Ordering::SeqCst));
+                    assert_eq!(budget.spent(), 16.0);
+                    assert_eq!(budget.snapshot().pending, 0.0);
+                }
+            });
+        }
+
+        #[test]
+        fn later_wire_usage_survives_transport_parser_and_incomplete_failures_without_double_billing()
+         {
+            futures::executor::block_on(async {
+                for mode in MODES {
+                    for outcome in ["transport", "parser", "incomplete", "done"] {
+                        let mut chunks = vec![
+                            Ok(wire(
+                                mode,
+                                json!({"candidates": [{"content": {"parts": [{"text": "answer"}]}}]}),
+                            )),
+                            Ok(wire(mode, usage())),
+                            Ok(wire(mode, usage())),
+                        ];
+                        match outcome {
+                            "transport" => chunks.push(Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "fixture",
+                            ))),
+                            "parser" => chunks.push(Ok(b"data: {broken json}\n\n".to_vec())),
+                            "done" => chunks.push(Ok(wire(
+                                mode,
+                                json!({"candidates": [{"finishReason": "STOP"}]}),
+                            ))),
+                            _ => {}
+                        }
+                        let (provider, budget, dropped) =
+                            guarded_usage_wire(mode, chunks, Tail::Eof);
+                        let mut output = provider
+                            .stream(&Context::default(), &StreamOptions::default())
+                            .await
+                            .unwrap();
+                        let mut terminal = false;
+                        for _ in 0..12 {
+                            let Some(event) =
+                                output.next().now_or_never().expect("bounded ready wire")
+                            else {
+                                break;
+                            };
+                            match event {
+                                Ok(StreamEvent::Done { message, .. }) => {
+                                    assert_eq!(outcome, "done");
+                                    assert_usage(&message);
+                                    assert_eq!(message.usage.cost.total, 16.0);
+                                    terminal = true;
+                                }
+                                Err(_) => {
+                                    assert_ne!(outcome, "done");
+                                    terminal = true;
+                                }
+                                _ => continue,
+                            }
+                            assert!(dropped.load(Ordering::SeqCst));
+                            assert_eq!(budget.spent(), 16.0);
+                            break;
+                        }
+                        assert!(terminal);
+                        assert_retired(&mut output, &dropped);
+                        drop(output);
+                        assert_eq!(budget.spent(), 16.0);
+                        assert_eq!(budget.snapshot().pending, 0.0);
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn terminal_releases_source_after_collecting_late_usage_and_signatures() {
+            for mode in MODES {
+                let chunks = [
+                    json!({"candidates": [{"content": {"parts": [{"text": "answer"}]}}]}),
+                    json!({"candidates": [{"finishReason": "STOP"}]}),
+                    json!({"candidates": [{"content": {"parts": [{
+                        "text": "", "thoughtSignature": "bGF0ZQ=="
+                    }]}}]}),
+                    usage(),
+                ]
+                .map(|value| Ok(wire(mode, value)));
+                let (mut output, dropped) = observed(mode, chunks, Tail::Eof);
+                let mut terminal = None;
+                for _ in 0..12 {
+                    let event = output.next().now_or_never().unwrap().unwrap().unwrap();
+                    if let StreamEvent::Done { reason, message } = event {
+                        assert_eq!(reason, StopReason::Stop);
+                        terminal = Some(message);
+                        break;
+                    }
+                    assert!(!dropped.load(Ordering::SeqCst));
+                }
+                let message = terminal.expect("missing terminal outcome");
+                assert_eq!(message.api, mode.api);
+                assert_eq!(message.provider, mode.provider);
+                assert_usage(&message);
+                assert_eq!(message.content.len(), 2);
+                let ContentBlock::Text(text) = &message.content[1] else {
+                    panic!("missing late signed text");
+                };
+                // ubs:ignore[rust.security.constant-time-compare] Public fixture equality, not authentication.
+                assert_eq!(text.text_signature.as_deref(), Some("bGF0ZQ=="));
+                assert_retired(&mut output, &dropped);
+            }
+        }
+
+        #[test]
+        fn refused_prompt_retains_late_usage_and_retires_its_source() {
+            for mode in MODES {
+                let chunks = [
+                    json!({"promptFeedback": {"blockReason": "SAFETY"}}),
+                    usage(),
+                ]
+                .map(|value| Ok(wire(mode, value)));
+                let (mut output, dropped) = observed(mode, chunks, Tail::Eof);
+                let Some(Ok(StreamEvent::Done { reason, message })) =
+                    output.next().now_or_never().unwrap()
+                else {
+                    panic!("missing refused terminal outcome");
+                };
+                assert_eq!(reason, StopReason::Error);
+                assert!(message.error_message.as_deref().unwrap().contains("SAFETY"));
+                assert!(message.content.is_empty());
+                assert_usage(&message);
+                assert_retired(&mut output, &dropped);
+            }
+        }
+
+        #[test]
+        fn parser_transport_and_incomplete_errors_retire_before_delivery() {
+            for mode in MODES {
+                let cases = [
+                    (vec![Ok(b"data: {broken json}\n\n".to_vec())], Tail::Pending),
+                    (
+                        vec![Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "fixture",
+                        ))],
+                        Tail::Pending,
+                    ),
+                    (Vec::new(), Tail::Eof),
+                    (
+                        vec![
+                            Ok(wire(
+                                mode,
+                                json!({"candidates": [{"finishReason": "STOP"}]}),
+                            )),
+                            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "fixture")),
+                        ],
+                        Tail::Pending,
+                    ),
+                ];
+                for (chunks, tail) in cases {
+                    let (mut output, dropped) = observed(mode, chunks, tail);
+                    let event = output.next().now_or_never().unwrap().unwrap();
+                    assert!(event.is_err(), "failure became a success: {event:?}");
+                    assert_retired(&mut output, &dropped);
+                }
+            }
+        }
+
+        #[test]
+        fn dropping_a_pending_stream_releases_the_source() {
+            for mode in MODES {
+                let (mut output, dropped) = observed(mode, [], Tail::Pending);
+                assert!(output.next().now_or_never().is_none());
+                assert!(!dropped.load(Ordering::SeqCst));
+                drop(output);
+                assert!(dropped.load(Ordering::SeqCst));
+            }
+        }
+
+        struct WakeFlag(AtomicBool);
+
+        impl Wake for WakeFlag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        fn silent_frame(mode: Mode, metadata: bool) -> Vec<u8> {
+            if metadata {
+                wire(mode, usage())
+            } else {
+                b"event: ping\ndata: {}\n\n".to_vec()
+            }
+        }
+
+        #[test]
+        fn buffered_heartbeat_and_usage_bursts_yield_and_resume() {
+            for mode in MODES {
+                for metadata in [false, true] {
+                    let mut bytes =
+                        silent_frame(mode, metadata).repeat(MAX_READY_EVENTS_PER_YIELD * 2);
+                    bytes.extend(wire(mode, usage()));
+                    bytes.extend(wire(
+                        mode,
+                        json!({"candidates": [{"finishReason": "STOP"}]}),
+                    ));
+                    let (mut output, dropped) = observed(mode, [Ok(bytes)], Tail::Eof);
+                    let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+                    let waker = Waker::from(Arc::clone(&flag));
+                    let mut task = TaskContext::from_waker(&waker);
+                    assert!(
+                        output.as_mut().poll_next(&mut task).is_pending(),
+                        "ready silent frames must yield before completing the burst"
+                    );
+                    assert!(
+                        flag.0.load(Ordering::SeqCst),
+                        "yield did not arrange another poll"
+                    );
+                    assert!(!dropped.load(Ordering::SeqCst));
+                    let mut terminal = None;
+                    for _ in 0..4 {
+                        if let Poll::Ready(Some(Ok(StreamEvent::Done { message, .. }))) =
+                            output.as_mut().poll_next(&mut task)
+                        {
+                            terminal = Some(message);
+                            break;
+                        }
+                    }
+                    assert_usage(&terminal.expect("yielded stream did not finish"));
+                    assert_retired(&mut output, &dropped);
+                }
+            }
+        }
+
+        #[test]
+        fn continuously_ready_frames_allow_abort_and_release_on_drop() {
+            let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+            for mode in MODES {
+                for metadata in [false, true] {
+                    let (mut output, dropped) =
+                        observed(mode, [], Tail::Repeat(silent_frame(mode, metadata)));
+                    runtime.block_on(async {
+                        let (abort, signal) = crate::agent::AbortHandle::new();
+                        // Poll the response first. Its cooperative yield must
+                        // let the other branch run and deliver cancellation.
+                        let next = Box::pin(output.next());
+                        let cancel = Box::pin(async move {
+                            abort.abort();
+                            signal.wait().await;
+                        });
+                        match futures::future::select(next, cancel).await {
+                            futures::future::Either::Right(((), pending)) => drop(pending),
+                            futures::future::Either::Left(_) => {
+                                panic!("ready frame flood starved cancellation");
+                            }
+                        }
+                    });
+                    assert!(!dropped.load(Ordering::SeqCst));
+                    drop(output);
+                    assert!(dropped.load(Ordering::SeqCst));
+                }
+            }
+        }
+    }
 
     use super::*;
     use crate::model::TextContent;
@@ -2053,6 +2654,136 @@ mod tests {
         assert_eq!(json["toolConfig"]["functionCallingConfig"]["mode"], "AUTO");
     }
 
+    fn assert_legacy_gemini_schema_fields(schema: &Value) {
+        // Field vocabulary from https://ai.google.dev/api/generate-content#Schema.
+        // This checks the outgoing contract, without emulating a live provider.
+        let object = schema.as_object().expect("schema object");
+        for keyword in object.keys() {
+            assert!(
+                matches!(
+                    keyword.as_str(),
+                    "type"
+                        | "format"
+                        | "title"
+                        | "description"
+                        | "nullable"
+                        | "enum"
+                        | "maxItems"
+                        | "minItems"
+                        | "properties"
+                        | "required"
+                        | "minProperties"
+                        | "maxProperties"
+                        | "minLength"
+                        | "maxLength"
+                        | "pattern"
+                        | "example"
+                        | "anyOf"
+                        | "propertyOrdering"
+                        | "default"
+                        | "items"
+                        | "minimum"
+                        | "maximum"
+                ),
+                "unsupported Gemini Schema field {keyword}: {schema}"
+            );
+        }
+        assert!(
+            schema
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        "object" | "array" | "string" | "integer" | "number" | "boolean"
+                    )
+                })
+                || object.contains_key("anyOf"),
+            "schema needs a type or typed alternatives: {schema}"
+        );
+        if let Some(properties) = object.get("properties") {
+            for property in properties.as_object().expect("properties object").values() {
+                assert_legacy_gemini_schema_fields(property);
+            }
+        }
+        if let Some(items) = object.get("items") {
+            assert_legacy_gemini_schema_fields(items);
+        }
+        if let Some(alternatives) = object.get("anyOf") {
+            let alternatives = alternatives.as_array().expect("anyOf array");
+            assert!(!alternatives.is_empty(), "empty alternatives: {schema}");
+            for alternative in alternatives {
+                assert_legacy_gemini_schema_fields(alternative);
+            }
+        }
+        if let Some(required) = object.get("required") {
+            let properties = schema["properties"]
+                .as_object()
+                .expect("required properties");
+            for name in required.as_array().expect("required array") {
+                let name = name.as_str().expect("required property name");
+                assert!(
+                    properties.contains_key(name),
+                    "undefined required property {name}: {schema}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_write_tool_request_uses_legacy_gemini_schema_fields() {
+        use crate::tools::Tool as _;
+
+        let write = crate::tools::WriteTool::new(std::path::Path::new("."));
+        let provider = GeminiProvider::new("gemini-2.0-flash");
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Resolve the inspected conflict.".to_string()),
+                timestamp: 0,
+            })],
+            vec![ToolDef {
+                name: write.name().to_string(),
+                description: write.description().to_string(),
+                parameters: write.parameters(),
+            }],
+        );
+        let request =
+            serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                .expect("serialize real write tool request");
+        let declarations = request["tools"][0]["functionDeclarations"]
+            .as_array()
+            .expect("function declarations");
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0]["name"], "write");
+        let parameters = &declarations[0]["parameters"];
+        assert_legacy_gemini_schema_fields(parameters);
+        assert_eq!(parameters["required"], serde_json::json!(["path"]));
+        assert_eq!(parameters["properties"]["content"]["type"], "string");
+        let choices = &parameters["properties"]["conflicts"];
+        assert_eq!(choices["type"], "array");
+        assert_eq!(choices["minItems"], 1);
+        assert_eq!(choices["maxItems"], 64);
+        let resolution = &choices["items"]["properties"]["resolution"]["anyOf"];
+        assert_eq!(
+            resolution[0]["properties"]["kind"]["enum"],
+            serde_json::json!(["ours", "theirs", "base"])
+        );
+        assert_eq!(
+            resolution[1]["properties"]["kind"]["enum"],
+            serde_json::json!(["text"])
+        );
+        assert_eq!(
+            resolution[1]["required"],
+            serde_json::json!(["kind", "value"])
+        );
+        assert_eq!(
+            parameters["anyOf"][0]["properties"]["content"],
+            parameters["properties"]["content"]
+        );
+        assert_eq!(parameters["anyOf"][1]["properties"]["conflicts"], *choices);
+    }
+
     #[test]
     fn test_build_request_default_max_tokens() {
         let provider = GeminiProvider::new("gemini-2.0-flash");
@@ -2252,8 +2983,13 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn parallel_function_results_share_one_turn_before_their_media() {
-        for with_media in [false, true] {
+    fn parallel_function_results_follow_call_order_before_their_media() {
+        for (with_media, result_order) in [
+            (false, [0, 1, 2, 3, 4]),
+            (false, [2, 4, 3, 1, 0]),
+            (true, [0, 1, 2, 3, 4]),
+            (true, [2, 4, 3, 1, 0]),
+        ] {
             let image = ContentBlock::Image(crate::model::ImageContent {
                 data: "AQ==".to_string(),
                 mime_type: "image/png".to_string(),
@@ -2300,7 +3036,8 @@ mod tests {
                     ..AssistantMessage::default()
                 }),
             ];
-            for (index, (id, name)) in calls.iter().enumerate() {
+            for index in result_order {
+                let (id, name) = calls[index];
                 let mut content = match index {
                     0 => vec![ContentBlock::Text(TextContent::new("image result"))],
                     1 => vec![ContentBlock::Text(TextContent::new("text result"))],
@@ -2315,8 +3052,8 @@ mod tests {
                     }
                 }
                 messages.push(Message::tool_result(crate::model::ToolResultMessage {
-                    tool_call_id: (*id).to_string(),
-                    tool_name: (*name).to_string(),
+                    tool_call_id: id.to_string(),
+                    tool_name: name.to_string(),
                     content,
                     details: Some(serde_json::json!({"kept_in_history": true})),
                     is_error: index == 3,
@@ -2379,14 +3116,19 @@ mod tests {
 
     #[test]
     fn function_response_batches_preserve_turn_boundaries_and_user_images() {
-        let call = |id: &str| {
+        let call = |ids: &[&str]| {
             Message::assistant(AssistantMessage {
-                content: vec![ContentBlock::ToolCall(ToolCall {
-                    id: id.to_string(),
-                    name: "read".to_string(),
-                    arguments: serde_json::json!({"path": id}),
-                    thought_signature: None,
-                })],
+                content: ids
+                    .iter()
+                    .map(|id| {
+                        ContentBlock::ToolCall(ToolCall {
+                            id: (*id).to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": id}),
+                            thought_signature: None,
+                        })
+                    })
+                    .collect(),
                 stop_reason: StopReason::ToolUse,
                 ..AssistantMessage::default()
             })
@@ -2410,7 +3152,8 @@ mod tests {
         let context = Context::owned(
             None,
             vec![
-                call("call_a"),
+                call(&["call_a", "call_b"]),
+                result("call_b", "Ag=="),
                 result("call_a", "AQ=="),
                 Message::Custom(crate::model::CustomMessage {
                     custom_type: "context".to_string(),
@@ -2419,10 +3162,13 @@ mod tests {
                     details: None,
                     timestamp: 0,
                 }),
-                call("call_b"),
-                result("call_b", "Ag=="),
+                // Reused IDs follow this model turn's order, without changing
+                // the order of the already completed first turn.
+                call(&["call_b", "call_a"]),
+                result("call_a", "BA=="),
+                result("call_b", "Aw=="),
                 Message::User(crate::model::UserMessage {
-                    content: UserContent::Blocks(vec![image("Aw==")]),
+                    content: UserContent::Blocks(vec![image("BQ==")]),
                     timestamp: 0,
                 }),
             ],
@@ -2434,34 +3180,106 @@ mod tests {
                 .unwrap();
         let contents = wire["contents"].as_array().unwrap();
         assert_eq!(contents.len(), 8);
-        for (model_index, response_index, media_index, id, data) in
-            [(0, 1, 2, "call_a", "AQ=="), (4, 5, 6, "call_b", "Ag==")]
-        {
+        for (model_index, response_index, media_index, expected) in [
+            (0, 1, 2, [("call_a", "AQ=="), ("call_b", "Ag==")]),
+            (4, 5, 6, [("call_b", "Aw=="), ("call_a", "BA==")]),
+        ] {
             assert_eq!(contents[model_index]["role"], "model");
             assert_eq!(
                 contents[response_index]["parts"].as_array().unwrap().len(),
-                1
+                2
             );
-            assert_eq!(
-                contents[response_index]["parts"][0]["functionResponse"]["response"]["result"],
-                "(see attached media)",
-            );
-            assert_eq!(contents[media_index]["parts"].as_array().unwrap().len(), 3);
-            assert_eq!(
-                contents[media_index]["parts"][1]["text"],
-                format!("Media from read (tool call {id}):"),
-            );
-            assert_eq!(
-                contents[media_index]["parts"][2]["inline_data"]["data"],
-                data
-            );
+            assert_eq!(contents[media_index]["parts"].as_array().unwrap().len(), 5);
+            for (index, (id, data)) in expected.into_iter().enumerate() {
+                assert_eq!(
+                    contents[response_index]["parts"][index]["functionResponse"]["response"]["result"],
+                    "(see attached media)",
+                );
+                assert_eq!(
+                    contents[media_index]["parts"][1 + index * 2]["text"],
+                    format!("Media from read (tool call {id}):"),
+                );
+                assert_eq!(
+                    contents[media_index]["parts"][2 + index * 2]["inline_data"]["data"],
+                    data
+                );
+            }
         }
         assert_eq!(
             contents[3]["parts"][0]["text"],
             "Keep the second result separate"
         );
         assert_eq!(contents[7]["parts"].as_array().unwrap().len(), 1);
-        assert_eq!(contents[7]["parts"][0]["inline_data"]["data"], "Aw==");
+        assert_eq!(contents[7]["parts"][0]["inline_data"]["data"], "BQ==");
+    }
+
+    #[test]
+    fn function_response_order_preserves_unmatched_slots_and_duplicate_results() {
+        let mut messages = vec![Message::assistant(AssistantMessage {
+            content: ["call_a", "call_b"]
+                .into_iter()
+                .map(|id| {
+                    ContentBlock::ToolCall(ToolCall {
+                        id: id.to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": id}),
+                        thought_signature: None,
+                    })
+                })
+                .collect(),
+            stop_reason: StopReason::ToolUse,
+            ..AssistantMessage::default()
+        })];
+        for (id, text) in [
+            ("unknown_first", "first unmatched"),
+            ("call_b", "b"),
+            ("unknown_middle", "middle unmatched"),
+            ("call_a", "first a"),
+            ("call_a", "second a"),
+            ("unknown_last", "last unmatched"),
+        ] {
+            messages.push(Message::tool_result(ToolResultMessage {
+                tool_call_id: id.to_string(),
+                tool_name: "read".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new(text))],
+                details: None,
+                is_error: false,
+                timestamp: 0,
+            }));
+        }
+        let wire = serde_json::to_value(convert_messages_to_gemini(&messages)).unwrap();
+        let results: Vec<_> = wire[1]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| {
+                part["functionResponse"]["response"]["result"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            results,
+            [
+                "first unmatched",
+                "first a",
+                "middle unmatched",
+                "second a",
+                "b",
+                "last unmatched",
+            ]
+        );
+
+        // Without any matching assistant calls, preserve the entire batch.
+        let wire = serde_json::to_value(convert_messages_to_gemini(&messages[1..])).unwrap();
+        assert_eq!(
+            wire[0]["parts"][1]["functionResponse"]["response"]["result"],
+            "b"
+        );
+        assert_eq!(
+            wire[0]["parts"][3]["functionResponse"]["response"]["result"],
+            "first a"
+        );
     }
 
     #[test]
@@ -2765,12 +3583,15 @@ mod tests {
             }),
             replay,
         ];
-        for block in &message.content {
+        for block in message.content.iter().rev() {
             if let ContentBlock::ToolCall(call) = block {
                 messages.push(Message::tool_result(crate::model::ToolResultMessage {
                     tool_call_id: call.id.clone(),
                     tool_name: call.name.clone(),
-                    content: vec![ContentBlock::Text(TextContent::new("contents"))],
+                    content: vec![ContentBlock::Text(TextContent::new(format!(
+                        "contents of {}",
+                        call.arguments["path"].as_str().unwrap()
+                    )))],
                     details: None,
                     is_error: false,
                     timestamp: 1,
@@ -2803,6 +3624,14 @@ mod tests {
         assert_eq!(
             wire["contents"][2]["parts"][1]["functionResponse"]["name"],
             "read"
+        );
+        assert_eq!(
+            wire["contents"][2]["parts"][0]["functionResponse"]["response"]["result"],
+            "contents of a.txt"
+        );
+        assert_eq!(
+            wire["contents"][2]["parts"][1]["functionResponse"]["response"]["result"],
+            "contents of b.txt"
         );
     }
 

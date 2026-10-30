@@ -71,6 +71,7 @@ fn test_model(id: &str, reasoning: bool) -> Model {
         reasoning,
         input: vec![InputType::Text],
         cost: ModelCost {
+            audio: None,
             input: 3.0,
             output: 15.0,
             cache_read: 0.3,
@@ -468,6 +469,35 @@ async fn send_recv_after_abort(
     }
 }
 
+/// Wait until the provider stream of the current turn is open.
+///
+/// `isStreaming` turns true when a prompt is admitted, before its turn has
+/// reached the provider. An abort that lands in that window ends the turn with
+/// "Retry aborted" and no messages, which is the correct outcome there (pinned
+/// by `rpc_abort_before_first_turn_poll_never_enters_provider`) and is not the
+/// mid-stream abort a test means when it says the turn is streaming. Which
+/// side wins that window depends on the scheduler, so wait it out.
+async fn wait_for_assistant_stream_start(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) {
+    let start = Instant::now();
+    loop {
+        let line = require_line(recv_line(out_rx, label).await);
+        let value = parse_response(&line);
+        if value.get("type").and_then(Value::as_str) == Some("message_start")
+            && value.pointer("/message/role").and_then(Value::as_str) == Some("assistant")
+        {
+            return;
+        }
+        assert!(
+            !is_agent_end_type(&value),
+            "{label}: the turn ended before its provider stream opened: {value}"
+        );
+        assert!(
+            start.elapsed() <= RPC_E2E_WAIT_TIMEOUT,
+            "{label}: timed out waiting for the provider stream to open"
+        );
+    }
+}
+
 async fn wait_for_streaming_state(
     in_tx: &asupersync::channel::mpsc::Sender<String>,
     out_rx: &Arc<Mutex<Receiver<String>>>,
@@ -640,6 +670,7 @@ async fn run_rpc_swarm_session(
     .to_string();
     let prompt_resp = send_recv(&in_tx, &out_rx, &prompt, "prompt(start keyless replay)").await;
     assert_ok(&prompt_resp, "prompt");
+    wait_for_assistant_stream_start(&out_rx, "prompt(provider stream open)").await;
 
     let streaming_state = wait_for_streaming_state(&in_tx, &out_rx, session_idx).await;
     assert!(
@@ -3016,9 +3047,21 @@ fn rpc_bash_persistence_failure_reports_real_backlog_without_retryable_error() {
             "the failed flush must not claim durable success"
         );
 
+        // A returned save failure fences the session (555f79bb2), and the RPC
+        // loop then ends with that failure instead of a clean exit
+        // (2ed244381): the client was told the command ran and was not saved.
         drop(in_tx);
-        let result = server.await;
-        assert!(result.is_ok(), "rpc server error: {result:?}");
+        let error = server
+            .await
+            .expect_err("a server holding an unsaved backlog must not exit cleanly");
+        assert!(
+            error.is_session_persistence(),
+            "the exit error must keep its persistence classification: {error}"
+        );
+        assert!(
+            error.to_string().contains("quarantined"),
+            "the exit error must name the quarantine: {error}"
+        );
     });
 }
 
@@ -4075,6 +4118,60 @@ fn rpc_new_session_can_be_cancelled_by_extension() {
         drop(in_tx);
         let result = server.await;
         assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+const USER_BASH_RESULT_EXT: &str = r#"
+export default function init(pi) {
+    pi.on("user_bash", (event) => ({
+        result: { output: `hooked:${event.command}`, exitCode: 7 },
+    }));
+}
+"#;
+
+/// The RPC `bash` command consults `user_bash` as OMP's bash runner does; it
+/// used to run the shell directly, so a hook that runs commands elsewhere (a
+/// remote host, a sandbox) never saw them.
+#[test]
+fn rpc_bash_takes_a_user_bash_hook_result() {
+    let harness = TestHarness::new("rpc_bash_takes_a_user_bash_hook_result");
+    let cassette_dir = cassette_root();
+    let marker = harness.temp_path("shell-ran.txt");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let (agent_session, _manager) = build_agent_session_with_js_extension(
+            Session::in_memory(),
+            &cassette_dir,
+            &harness,
+            USER_BASH_RESULT_EXT,
+        )
+        .await;
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = rpc_output_channel();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server =
+            handle.spawn(async move { Box::pin(run(agent_session, options, in_rx, out_tx)).await });
+
+        let command = format!(
+            "touch {}",
+            shell_single_quote(&marker.display().to_string())
+        );
+        let bash = json!({ "id": "1", "type": "bash", "command": command }).to_string();
+        let resp = send_recv(&in_tx, &out_rx, &bash, "bash(hooked)").await;
+        assert_ok(&resp, "bash");
+        assert_eq!(resp["data"]["output"], format!("hooked:{command}"));
+        assert_eq!(resp["data"]["exitCode"], 7);
+        assert!(!marker.exists(), "the hook's result replaces the shell run"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
     });
 }
 

@@ -97,6 +97,7 @@ pub mod agent_hub;
 #[doc(hidden)]
 pub mod app;
 pub mod approval;
+pub(crate) mod archive_read;
 #[doc(hidden)]
 pub(crate) mod artifact_output;
 pub mod ask;
@@ -136,6 +137,7 @@ pub mod conformance_shapes;
 #[doc(hidden)]
 pub mod connectors;
 pub mod context_files;
+pub mod cost;
 pub mod crash;
 #[doc(hidden)]
 pub mod crypto_shim;
@@ -150,6 +152,7 @@ pub mod delight;
 pub mod dialects;
 #[doc(hidden)]
 pub mod doctor;
+pub(crate) mod document_read;
 #[doc(hidden)]
 pub(crate) mod embedded_assets;
 #[doc(hidden)]
@@ -198,6 +201,7 @@ pub mod gallery;
 pub mod gc;
 #[doc(hidden)]
 pub mod github;
+pub mod goal;
 pub mod handoff;
 #[doc(hidden)]
 pub mod hostcall_amac;
@@ -228,6 +232,7 @@ pub mod interactive;
 pub mod interactive_ftui;
 #[doc(hidden)]
 pub mod jobs;
+pub mod judgment;
 #[doc(hidden)]
 pub mod keybindings;
 #[doc(hidden)]
@@ -268,6 +273,7 @@ pub mod plan;
 pub mod platform;
 #[doc(hidden)]
 pub mod pmu_telemetry;
+pub mod prewalk;
 pub mod profiler;
 #[doc(hidden)]
 pub mod provider;
@@ -306,6 +312,7 @@ pub mod session_metrics;
 #[cfg(feature = "tui")]
 #[doc(hidden)]
 pub mod session_picker;
+pub mod session_recovery;
 #[cfg(feature = "sqlite-sessions")]
 #[doc(hidden)]
 pub mod session_sqlite;

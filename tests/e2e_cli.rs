@@ -8,7 +8,7 @@ mod common;
 
 #[cfg(unix)]
 use asupersync::runtime::RuntimeBuilder;
-use common::TestHarness;
+use common::{MockHttpResponse, MockHttpServer, TestHarness};
 use pi::config::Config;
 #[cfg(unix)]
 use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
@@ -23,7 +23,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::{BufRead as _, Read as _, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -279,8 +279,17 @@ impl CliTestHarness {
             )
     }
 
-    #[allow(clippy::too_many_lines)]
     fn run_with_stdin(&self, args: &[&str], stdin: Option<&[u8]>) -> CliResult {
+        self.run_with_stdout_observer(args, stdin, |_| {})
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn run_with_stdout_observer(
+        &self,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+        mut on_line: impl FnMut(&[u8]) + Send + 'static,
+    ) -> CliResult {
         self.harness
             .log()
             .info("action", format!("Running CLI: {}", args.join(" ")));
@@ -317,11 +326,23 @@ impl CliTestHarness {
         let mut child = command.spawn().expect("run pi");
         let child_pid = child.id();
 
-        let mut child_stdout = child.stdout.take().expect("child stdout piped");
+        let child_stdout = child.stdout.take().expect("child stdout piped");
         let mut child_stderr = child.stderr.take().expect("child stderr piped");
         let stdout_handle = std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = child_stdout.read_to_end(&mut buf);
+            let mut reader = std::io::BufReader::new(child_stdout);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                let result = reader.read_until(b'\n', &mut line);
+                buf.extend_from_slice(&line);
+                if !line.is_empty() {
+                    on_line(&line);
+                }
+                if !matches!(result, Ok(length) if length > 0) {
+                    break;
+                }
+            }
             buf
         });
         let stderr_handle = std::thread::spawn(move || {
@@ -1864,6 +1885,38 @@ fn e2e_cli_print_json_ends_quietly_when_its_reader_closes_the_pipe() {
         "a closed stdout pipe must not produce a crash bundle; found {bundles:?} in {}",
         crashes.display()
     );
+}
+
+/// GH #264: `pi --help | head -3` printed "Broken pipe (os error 32)" and
+/// exited 1, so `set -o pipefail` scripts that grep the help text failed.
+/// The read end is closed before pi starts, so every write is EPIPE; a reader
+/// that leaves mid-output would only race the pipe buffer.
+#[test]
+fn e2e_cli_help_and_version_end_quietly_when_the_reader_closed_the_pipe() {
+    let harness = CliTestHarness::new("e2e_cli_help_and_version_end_quietly_into_a_closed_pipe");
+    for flag in ["--help", "--version"] {
+        let (reader, writer) = std::io::pipe().expect("create stdout pipe");
+        drop(reader);
+        let output = Command::new(&harness.binary_path)
+            .arg(flag)
+            .envs(harness.env.clone())
+            .current_dir(harness.harness.temp_dir())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(writer))
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run pi into a closed pipe");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "pi {flag} into a closed pipe exited {:?}; stderr: {stderr}",
+            output.status
+        );
+        assert!(
+            !stderr.contains("Broken pipe"),
+            "pi {flag} reported the closed pipe as an error: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -3825,6 +3878,11 @@ fn setup_vcr_anthropic_response(
             }
         }]
     });
+    // Store the request as a recording would: redacted. Playback redacts the
+    // incoming body before matching, so an unredacted template never matches a
+    // tool schema with a sensitive-looking property such as edit's `token`.
+    let mut cassette: pi::vcr::Cassette = serde_json::from_value(cassette).expect("cassette shape");
+    pi::vcr::redact_cassette(&mut cassette);
 
     let cassette_path = cassette_dir.join(format!("{cassette_name}.json"));
     fs::write(
@@ -4103,6 +4161,283 @@ fn collect_json_mode_text_deltas(lines: &[serde_json::Value]) -> Vec<String> {
                 .map(ToOwned::to_owned)
         })
         .collect()
+}
+
+fn prewalk_stream_response(tool_path: Option<&str>) -> MockHttpResponse {
+    let delta = tool_path.map_or_else(
+        || json!({"role": "assistant", "content": "Prewalk destination finished."}),
+        |path| {
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "index": 0, "id": format!("write-{path}"), "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": json!({"path": path, "content": "one completed edit"}).to_string()
+                    }
+                }]
+            })
+        },
+    );
+    let start = json!({
+        "id": "prewalk-completion", "object": "chat.completion.chunk",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
+    });
+    let end = json!({
+        "id": "prewalk-completion",
+        "choices": [{"index": 0, "delta": {},
+            "finish_reason": if tool_path.is_some() { "tool_calls" } else { "stop" }}]
+    });
+    MockHttpResponse {
+        status: 200,
+        headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+        body: format!("data: {start}\n\ndata: {end}\n\ndata: [DONE]\n\n").into_bytes(),
+    }
+}
+
+fn configure_prewalk_cli(
+    harness: &CliTestHarness,
+    destination: Vec<MockHttpResponse>,
+    retries: u32,
+) -> MockHttpServer {
+    let server = harness.harness.start_mock_http_server();
+    server.add_route_queue(
+        "POST",
+        "/source/v1/chat/completions",
+        vec![prewalk_stream_response(Some("first-edit.txt"))],
+    );
+    server.add_route_queue("POST", "/target/v1/chat/completions", destination);
+    let agent_dir = PathBuf::from(&harness.env["PI_CODING_AGENT_DIR"]);
+    fs::create_dir_all(&agent_dir).expect("create isolated prewalk configuration");
+    fs::write(agent_dir.join("auth.json"), b"{}").expect("write isolated auth store");
+    fs::write(
+        agent_dir.join("models.json"),
+        serde_json::to_vec(&json!({"providers": {
+            "prewalk-source": {
+                "api": "openai-completions",
+                "baseUrl": format!("{}/source/v1", server.base_url()),
+                "apiKey": "source-fixture-key", "authHeader": true,
+                "models": [{"id": "source", "reasoning": false,
+                    "contextWindow": 32_000, "maxTokens": 512}]
+            },
+            "prewalk-target": {
+                "api": "openai-completions",
+                "baseUrl": format!("{}/target/v1", server.base_url()),
+                "apiKey": "target-fixture-key", "authHeader": true,
+                "models": [{"id": "target", "reasoning": false,
+                    "contextWindow": 64_000, "maxTokens": 256}]
+            }
+        }}))
+        .unwrap(),
+    )
+    .expect("write prewalk models");
+    fs::write(
+        &harness.env["PI_CONFIG_PATH"],
+        serde_json::to_vec(&json!({
+            "defaultProvider": "prewalk-source", "defaultModel": "source",
+            "compaction": {"enabled": false},
+            "retry": {"enabled": retries > 0, "maxRetries": retries,
+                "baseDelayMs": 0, "maxDelayMs": 0}
+        }))
+        .unwrap(),
+    )
+    .expect("write prewalk settings");
+    server
+}
+
+fn run_prewalk_cli(harness: &CliTestHarness, mode: &str, tool_limit: &str) -> CliResult {
+    let mut args = vec![
+        "--mode",
+        mode,
+        "--prewalk-into",
+        "prewalk-target/target:off",
+        // Print and RPC runs have no approval surface, so the default
+        // always-ask mode denies the edit and nothing arms the handoff.
+        "--approval-mode",
+        "write",
+        "--tools",
+        "read,write",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-context-files",
+        "--session",
+        "prewalk-session.jsonl",
+        "--max-tool-iterations",
+        tool_limit,
+    ];
+    if mode == "rpc" {
+        harness.run_with_stdin(
+            &args,
+            Some(b"{\"id\":\"prewalk\",\"type\":\"prompt\",\"message\":\"Complete this prewalk task.\"}\n"),
+        )
+    } else {
+        args.extend(["--print", "Complete this prewalk task."]);
+        harness.run(&args)
+    }
+}
+
+fn assert_prewalk_cli_transcript(
+    harness: &CliTestHarness,
+    server: &MockHttpServer,
+    requests: usize,
+) {
+    let captured = server.requests();
+    assert_eq!(
+        captured.len(),
+        requests,
+        "exact native provider admission count"
+    );
+    assert_eq!(captured[0].path, "/source/v1/chat/completions");
+    for request in &captured[1..] {
+        assert_eq!(request.path, "/target/v1/chat/completions");
+        assert!(request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && value == "Bearer target-fixture-key"
+        }));
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["model"], "target");
+        let messages = body["messages"].as_array().expect("destination transcript");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .count(),
+            1,
+            "completed source edit must appear once in every destination attempt"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message["role"] == "user"
+                        && message.to_string().contains("Complete this prewalk task.")
+                })
+                .count(),
+            1,
+            "continuation must not replay the authored prompt"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(harness.harness.temp_path("first-edit.txt")).unwrap(),
+        "one completed edit"
+    );
+    let saved = fs::read_to_string(harness.harness.temp_path("prewalk-session.jsonl")).unwrap();
+    let entries = parse_json_mode_stdout_lines(&saved);
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry["message"]["role"] == "toolResult")
+            .count(),
+        1,
+        "the native edit result must be durably recorded exactly once"
+    );
+    assert!(entries.iter().any(|entry| {
+        entry["type"] == "model_change"
+            && entry["provider"] == "prewalk-target"
+            && entry["modelId"] == "target"
+    }));
+}
+
+#[test]
+fn e2e_cli_print_prewalk_continues_even_with_retries_disabled() {
+    for mode in ["text", "json"] {
+        let harness = CliTestHarness::new(&format!("print_prewalk_{mode}"));
+        let server = configure_prewalk_cli(&harness, vec![prewalk_stream_response(None)], 0);
+        let result = run_prewalk_cli(&harness, mode, "8");
+        assert_exit_code(&harness.harness, &result, 0);
+        assert_contains(
+            &harness.harness,
+            &result.stdout,
+            "Prewalk destination finished.",
+        );
+        assert_prewalk_cli_transcript(&harness, &server, 2);
+        if mode == "json" {
+            let events = parse_json_mode_stdout_lines(&result.stdout);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "prewalk_switched")
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn e2e_cli_rpc_prewalk_retries_the_destination_without_replaying_tools() {
+    let harness = CliTestHarness::new("rpc_prewalk_retry");
+    let server = configure_prewalk_cli(
+        &harness,
+        vec![
+            MockHttpResponse::json(
+                503,
+                &json!({"error": {
+                    "message": "fixture unavailable", "type": "server_error"
+                }}),
+            ),
+            prewalk_stream_response(None),
+        ],
+        1,
+    );
+    let result = run_prewalk_cli(&harness, "rpc", "8");
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_prewalk_cli_transcript(&harness, &server, 3);
+    let events = parse_json_mode_stdout_lines(&result.stdout);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "prewalk_switched")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "agent_end")
+            .count(),
+        1
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "auto_retry_end" && event["success"] == true)
+    );
+    assert_eq!(events.last().unwrap()["type"], "agent_end");
+    // A successful RPC turn ends with `"error": null`, as in e2e_failover.
+    assert!(
+        events.last().unwrap()["error"].is_null(),
+        "{}",
+        events.last().unwrap()
+    );
+}
+
+#[test]
+fn e2e_cli_prewalk_preserves_the_original_tool_iteration_limit() {
+    for mode in ["json", "rpc"] {
+        let harness = CliTestHarness::new(&format!("prewalk_tool_budget_{mode}"));
+        let server = configure_prewalk_cli(
+            &harness,
+            vec![prewalk_stream_response(Some("must-not-execute.txt"))],
+            0,
+        );
+        let result = run_prewalk_cli(&harness, mode, "1");
+        assert_prewalk_cli_transcript(&harness, &server, 2);
+        assert!(!harness.harness.temp_path("must-not-execute.txt").exists());
+        let events = parse_json_mode_stdout_lines(&result.stdout);
+        assert!(events.iter().any(|event| {
+            event
+                .to_string()
+                .contains("Maximum tool iterations (1) exceeded")
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "tool_execution_end")
+                .count(),
+            1
+        );
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4849,6 +5184,149 @@ fn e2e_cli_no_tools_omits_tool_definitions() {
     assert_contains(&harness.harness, &result.stdout, "ok");
 }
 
+#[test]
+fn e2e_cli_print_mcp_honors_project_discovery_setting() {
+    let harness = CliTestHarness::new("e2e_cli_print_mcp_project_setting");
+    let global = PathBuf::from(&harness.env["PI_CODING_AGENT_DIR"]);
+    fs::create_dir_all(&global).expect("global MCP directory");
+    fs::write(
+        global.join("mcp.json"),
+        r#"{"mcpServers":{"shared":{"url":"https://global.example.test/mcp"}}}"#,
+    )
+    .expect("global MCP definition");
+    harness.harness.create_file(
+        ".pi/mcp.json",
+        br#"{"mcpServers":{"shared":{"url":"https://project.example.test/mcp"},"project-only":{"command":"project-bin"}}}"#,
+    );
+    let explicit = harness.harness.create_file(
+        "explicit-mcp.json",
+        br#"{"mcpServers":{"explicit":{"command":"explicit-bin"}}}"#,
+    );
+    let settings = PathBuf::from(&harness.env["PI_CONFIG_PATH"]);
+    for (enabled, expected_provenance, expected_names) in [
+        (false, "global", vec!["explicit", "shared"]),
+        (true, ".pi", vec!["explicit", "project-only", "shared"]),
+    ] {
+        fs::write(
+            &settings,
+            json!({"mcp":{"enableProjectConfig":enabled}}).to_string(),
+        )
+        .expect("MCP discovery setting");
+        let result = harness.run(&[
+            "--trust",
+            "-p",
+            "--mode",
+            "json",
+            "--mcp-config",
+            explicit.to_str().expect("explicit path"),
+            "/mcp list",
+        ]);
+        assert_eq!(result.exit_code, 0, "{}\n{}", result.stdout, result.stderr);
+        let record = result
+            .stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["type"] == "mcp_result")
+            .expect("MCP command result");
+        assert_eq!(record["success"], true);
+        let servers = record["data"]["servers"].as_array().expect("server list");
+        let mut names = servers
+            .iter()
+            .map(|server| server["name"].as_str().expect("name"))
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, expected_names);
+        let shared = servers
+            .iter()
+            .find(|server| server["name"] == "shared")
+            .expect("shared server");
+        assert_eq!(shared["provenance"], expected_provenance);
+    }
+}
+
+/// A process isolation flag must also skip already acknowledged MCP servers
+/// and command-based credential resolvers, not merely hide their tool names.
+#[cfg(unix)]
+#[test]
+fn e2e_cli_no_mcp_skips_acknowledged_servers_and_credentials() {
+    let mut harness =
+        CliTestHarness::new("e2e_cli_no_mcp_skips_acknowledged_servers_and_credentials");
+    let cwd = harness.harness.temp_dir().to_path_buf();
+    let global = PathBuf::from(&harness.env["PI_CODING_AGENT_DIR"]);
+    fs::create_dir_all(&global).expect("global MCP directory");
+    let server_marker = harness.harness.temp_path("mcp-server-started");
+    let credential_marker = harness.harness.temp_path("mcp-credential-resolved");
+    let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+    fs::write(
+        global.join("mcp.json"),
+        json!({
+            "mcpServers": {
+                "isolation-fixture": {
+                    "command": "/bin/sh",
+                    "args": ["-c", format!("printf started > {}; exit 1", quote(&server_marker))],
+                    "env": {
+                        "TOKEN": format!(
+                            "$CMD:printf resolved > {}; printf fixture-token",
+                            quote(&credential_marker)
+                        )
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write MCP fixture");
+    let discovery = pi::mcp::config::discover(&cwd, &global, &[], true);
+    assert!(discovery.warnings.is_empty(), "{:?}", discovery.warnings);
+    let server = discovery.servers.first().expect("discover fixture");
+    pi::mcp::TrustStore::load(&global.join("mcp-trust.json"))
+        .expect("load MCP trust")
+        .acknowledge(
+            &server.name,
+            &server.fingerprint(&cwd),
+            "CLI isolation test",
+        )
+        .expect("acknowledge fixture without executing it");
+
+    let system_prompt = "Test MCP isolation.";
+    let request_body = json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Say ok."}]}
+        ],
+        "system": expected_system_prompt(system_prompt),
+        "max_tokens": VCR_CLAUDE_SONNET_MAX_TOKENS,
+        "stream": true
+    });
+    setup_vcr_anthropic(&mut harness, "e2e_no_mcp", &request_body, "ok");
+    let result = harness.run(&[
+        "-p",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--no-tools",
+        "--no-mcp",
+        "--no-extensions",
+        "--no-skills",
+        "--no-context-files",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "--system-prompt",
+        system_prompt,
+        "Say ok.",
+    ]);
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_contains(&harness.harness, &result.stdout, "ok");
+    assert!(!server_marker.exists(), "disabled MCP server was started");
+    assert!(
+        !credential_marker.exists(),
+        "disabled MCP credential command was resolved"
+    );
+}
+
 /// `--tools read,grep` enables only read and grep tools.
 /// The VCR cassette expects a request with exactly those two tool definitions.
 #[test]
@@ -5312,6 +5790,14 @@ fn e2e_cli_no_tools_handles_tool_use_response_gracefully() {
 /// SSE frames for an Anthropic response that calls one tool and stops with
 /// `stop_reason: "tool_use"`.
 fn build_anthropic_tool_use_chunks(tool_name: &str, tool_input: &serde_json::Value) -> Vec<String> {
+    build_anthropic_tool_use_chunks_with_id("toolu_mock_approval_001", tool_name, tool_input)
+}
+
+fn build_anthropic_tool_use_chunks_with_id(
+    tool_id: &str,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> Vec<String> {
     let message_start = json!({
         "type": "message_start",
         "message": {
@@ -5336,7 +5822,7 @@ fn build_anthropic_tool_use_chunks(tool_name: &str, tool_input: &serde_json::Val
         "index": 0,
         "content_block": {
             "type": "tool_use",
-            "id": "toolu_mock_approval_001",
+            "id": tool_id,
             "name": tool_name,
             "input": {}
         }
@@ -5581,6 +6067,341 @@ fn e2e_print_mode_yolo_approves_tools_and_exits_zero() {
         "an auto-approved run must still exit 0.\nstderr:\n{}\nstdout:\n{}",
         result.stderr, result.stdout
     );
+}
+
+#[cfg(unix)]
+fn print_background_args() -> Vec<&'static str> {
+    vec![
+        "-p",
+        "--mode",
+        "json",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--yolo",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "--tools",
+        "bash,jobs",
+        "--system-prompt",
+        "You are a test harness model.",
+    ]
+}
+
+/// The real shell job cannot settle until the original AgentEnd has reached
+/// the caller. A successful third provider request therefore proves that
+/// print mode woke an idle session, not that its ordinary tool loop happened
+/// to notice a fast job before returning.
+#[test]
+#[cfg(unix)]
+fn e2e_cli_print_background_results_wake_only_when_enabled() {
+    for (name, flag, setting, wake_fails) in [
+        ("default", false, false, false),
+        ("flag", true, false, false),
+        ("setting", false, true, false),
+        ("failure", true, false, true),
+    ] {
+        let mut harness = CliTestHarness::new(&format!("print_background_{name}"));
+        fs::write(
+            harness.global_settings_path(),
+            serde_json::to_vec(&json!({
+                "retry": {"enabled": false},
+                "async": {"printWake": setting}
+            }))
+            .expect("settings"),
+        )
+        .expect("write settings");
+        setup_vcr_anthropic_sequence(
+            &mut harness,
+            &format!("print_background_{name}"),
+            &[
+                (
+                    json!({"model": "claude-sonnet-4-5", "stream": true}),
+                    build_anthropic_tool_use_chunks(
+                        "bash",
+                        &json!({
+                            "command": "while [ ! -e release-job ]; do sleep 0.02; done; printf 'JOB_DONE_42\\n'",
+                            "background": true
+                        }),
+                    ),
+                ),
+                (
+                    json!({"model": "claude-sonnet-4-5", "stream": true}),
+                    build_anthropic_response_chunks("JOB_STARTED"),
+                ),
+                (
+                    json!({"model": "claude-sonnet-4-5", "stream": true}),
+                    if wake_fails {
+                        vec![
+                            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"background wake rejected\"}}\n\n".to_string(),
+                        ]
+                    } else {
+                        build_anthropic_response_chunks("FINAL_BACKGROUND_RESULT")
+                    },
+                ),
+            ],
+        );
+        let mut args = print_background_args();
+        if flag {
+            args.push("--wait-async");
+        }
+        args.extend([
+            "--max-time",
+            "30",
+            "Start a background job and report its result.",
+        ]);
+        let gate = harness.harness.temp_path("release-job");
+        let enabled = flag || setting;
+        let result = harness.run_with_stdout_observer(&args, None, move |line| {
+            if enabled
+                && serde_json::from_slice::<serde_json::Value>(line)
+                    .is_ok_and(|event| event["type"] == "agent_end")
+            {
+                fs::write(&gate, "continue").expect("release job after agent idle");
+            }
+        });
+        assert_exit_code(&harness.harness, &result, i32::from(wake_fails));
+        if wake_fails {
+            assert_contains(&harness.harness, &result.stderr, "background wake rejected");
+        }
+        let events = parse_json_mode_stdout_lines(&result.stdout);
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|event| event["type"] == "agent_start")
+            .collect();
+        let ends = events
+            .iter()
+            .filter(|event| event["type"] == "agent_end")
+            .count();
+        assert_eq!(starts.len(), if enabled { 2 } else { 1 }, "{name}");
+        assert_eq!(ends, starts.len(), "balanced wake lifecycle: {name}");
+        assert!(
+            starts
+                .iter()
+                .all(|event| event["sessionId"] == events[0]["id"])
+        );
+        assert_eq!(
+            result.stdout.contains("FINAL_BACKGROUND_RESULT"),
+            enabled && !wake_fails
+        );
+        let notices = events
+            .iter()
+            .filter(|event| {
+                event["type"] == "message_end"
+                    && event["message"]["role"] == "user"
+                    && event["message"]["content"].as_str().is_some_and(|text| {
+                        text.starts_with("[background job ") && text.contains("JOB_DONE_42")
+                    })
+            })
+            .count();
+        assert_eq!(
+            notices,
+            usize::from(enabled),
+            "notice delivered once: {name}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn e2e_cli_wait_async_waits_for_jobs_started_by_a_wake_turn() {
+    let mut harness = CliTestHarness::new("print_background_nested_wake");
+    fs::write(
+        harness.global_settings_path(),
+        r#"{"retry":{"enabled":false}}"#,
+    )
+    .expect("disable retries");
+    setup_vcr_anthropic_sequence(
+        &mut harness,
+        "print_background_nested_wake",
+        &[
+            (
+                json!({"model": "claude-sonnet-4-5", "stream": true}),
+                build_anthropic_tool_use_chunks(
+                    "bash",
+                    &json!({
+                        "command": "while [ ! -e release-first ]; do sleep 0.02; done; printf 'FIRST_DONE\\n'",
+                        "background": true
+                    }),
+                ),
+            ),
+            (
+                json!({"model": "claude-sonnet-4-5", "stream": true}),
+                build_anthropic_response_chunks("FIRST_STARTED"),
+            ),
+            (
+                json!({"model": "claude-sonnet-4-5", "stream": true}),
+                build_anthropic_tool_use_chunks_with_id(
+                    "toolu_background_second",
+                    "bash",
+                    &json!({
+                        "command": "while [ ! -e release-second ]; do sleep 0.02; done; printf 'SECOND_DONE\\n'",
+                        "background": true
+                    }),
+                ),
+            ),
+            (
+                json!({"model": "claude-sonnet-4-5", "stream": true}),
+                build_anthropic_response_chunks("SECOND_STARTED"),
+            ),
+            (
+                json!({"model": "claude-sonnet-4-5", "stream": true}),
+                build_anthropic_response_chunks("BOTH_JOBS_FINISHED"),
+            ),
+        ],
+    );
+    let mut args = print_background_args();
+    args.extend([
+        "--wait-async",
+        "--max-time",
+        "30",
+        "Run two dependent background jobs.",
+    ]);
+    let root = harness.harness.temp_dir().to_path_buf();
+    let mut completed_turns = 0;
+    let result = harness.run_with_stdout_observer(&args, None, move |line| {
+        if serde_json::from_slice::<serde_json::Value>(line)
+            .is_ok_and(|event| event["type"] == "agent_end")
+        {
+            completed_turns += 1;
+            let gate = match completed_turns {
+                1 => Some("release-first"),
+                2 => Some("release-second"),
+                _ => None,
+            };
+            if let Some(gate) = gate {
+                fs::write(root.join(gate), "continue").expect("release owned job");
+            }
+        }
+    });
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_contains(&harness.harness, &result.stdout, "BOTH_JOBS_FINISHED");
+    let events = parse_json_mode_stdout_lines(&result.stdout);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "agent_start")
+            .count(),
+        3
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "agent_end")
+            .count(),
+        3
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn e2e_cli_wait_async_deadline_fails_and_reaps_the_owned_job() {
+    for retry_backoff in [false, true] {
+        let name = if retry_backoff {
+            "print_background_deadline_initial_retry"
+        } else {
+            "print_background_deadline_idle"
+        };
+        let mut harness = CliTestHarness::new(name);
+        fs::write(
+            harness.global_settings_path(),
+            r#"{"retry":{"enabled":true,"maxRetries":1,"baseDelayMs":60000,"maxDelayMs":60000,"modelFallback":false}}"#,
+        )
+        .expect("configure long retry backoff");
+        let original_reply = if retry_backoff {
+            vec![
+                "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"server error\"}}\n\n".to_string(),
+            ]
+        } else {
+            build_anthropic_response_chunks("JOB_STILL_RUNNING")
+        };
+        setup_vcr_anthropic_sequence(
+            &mut harness,
+            name,
+            &[
+                (
+                    json!({"model": "claude-sonnet-4-5", "stream": true}),
+                    build_anthropic_tool_use_chunks(
+                        "bash",
+                        &json!({
+                            "command": "printf '%s' $$ > job.pid; while :; do sleep 1; done",
+                            "background": true
+                        }),
+                    ),
+                ),
+                (
+                    json!({"model": "claude-sonnet-4-5", "stream": true}),
+                    original_reply,
+                ),
+                (
+                    json!({"model": "claude-sonnet-4-5", "stream": true}),
+                    build_anthropic_response_chunks("RETRY_MUST_NOT_START_AFTER_DEADLINE"),
+                ),
+            ],
+        );
+        let mut args = print_background_args();
+        args.extend(["--wait-async", "--max-time", "2", "Start a background job."]);
+        let result = harness.run(&args);
+        assert_exit_code(&harness.harness, &result, 1);
+        assert_contains(
+            &harness.harness,
+            &result.stderr,
+            "--max-time reached before background work settled",
+        );
+        assert!(
+            !result
+                .stdout
+                .contains("RETRY_MUST_NOT_START_AFTER_DEADLINE")
+        );
+        if retry_backoff {
+            let events = parse_json_mode_stdout_lines(&result.stdout);
+            let retry_start = events
+                .iter()
+                .find(|event| event["type"] == "auto_retry_start");
+            assert!(
+                retry_start.is_some(),
+                "original turn must reach retry backoff"
+            );
+            let retry_end = events
+                .iter()
+                .find(|event| event["type"] == "auto_retry_end");
+            assert!(retry_end.is_some_and(|event| event["success"] == false));
+        }
+        let pid = fs::read_to_string(harness.harness.temp_path("job.pid"))
+            .expect("background shell started")
+            .trim()
+            .parse::<u32>()
+            .expect("shell pid");
+        let alive = Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(!alive, "deadline left owned background shell {pid} running");
+    }
+}
+
+#[test]
+fn e2e_cli_wait_async_rejects_non_print_modes_before_provider_startup() {
+    for (mode, args) in [
+        ("rpc", vec!["--mode", "rpc", "--wait-async"]),
+        ("interactive", vec!["--wait-async"]),
+    ] {
+        let harness = CliTestHarness::new(&format!("wait_async_rejects_{mode}"));
+        let result = harness.run(&args);
+        assert_exit_code(&harness.harness, &result, 2);
+        assert_contains(
+            &harness.harness,
+            &result.stderr,
+            "--wait-async requires print mode",
+        );
+    }
 }
 
 // ============================================================================

@@ -117,31 +117,11 @@ struct LogicalTurn {
 struct LogicalTurnState {
     session_id: Option<Arc<str>>,
     messages: Vec<Message>,
-    retry: Option<u32>,
-    fallback: Option<(String, String)>,
+    recovery: crate::failover::RecoveryEventLifecycle,
     finished: bool,
 }
 
 impl LogicalTurnState {
-    fn end_retry(&mut self, success: bool, error: Option<String>) -> Option<AgentEvent> {
-        self.retry.take().map(|attempt| AgentEvent::AutoRetryEnd {
-            success,
-            attempt,
-            final_error: error,
-        })
-    }
-
-    fn end_fallback(&mut self, success: bool) -> Option<AgentEvent> {
-        self.fallback
-            .take()
-            .map(|(provider, model)| AgentEvent::FailoverEnd {
-                success,
-                provider,
-                model,
-                restored_primary: false,
-            })
-    }
-
     fn forget_incomplete_tail(&mut self) {
         while self.messages.last().is_some_and(|message| {
             matches!(
@@ -156,7 +136,7 @@ impl LogicalTurnState {
 
     /// At most two pending lifecycles close before an incoming event. A fixed
     /// array avoids allocating a Vec for every streamed text delta.
-    fn observe(&mut self, mut event: AgentEvent) -> [Option<AgentEvent>; 3] {
+    fn observe(&mut self, event: AgentEvent) -> [Option<AgentEvent>; 3] {
         if self.finished {
             return [None, None, None];
         }
@@ -164,9 +144,7 @@ impl LogicalTurnState {
             self.messages.extend(messages);
             return [None, None, None];
         }
-        let mut retry_end = None;
-        let mut fallback_end = None;
-        let forward = match &mut event {
+        let forward = match &event {
             AgentEvent::AgentStart { session_id } => {
                 if self.session_id.is_some() {
                     false
@@ -174,45 +152,6 @@ impl LogicalTurnState {
                     self.session_id = Some(Arc::clone(session_id));
                     true
                 }
-            }
-            AgentEvent::AutoRetryStart {
-                attempt,
-                error_message,
-                ..
-            } => {
-                retry_end = self.end_retry(false, Some(error_message.clone()));
-                self.retry = Some(*attempt);
-                true
-            }
-            AgentEvent::AutoRetryEnd { attempt, .. } => {
-                let matches = self.retry == Some(*attempt);
-                if matches {
-                    self.retry = None;
-                }
-                matches
-            }
-            AgentEvent::FailoverStart {
-                to_provider,
-                to_model,
-                ..
-            } => {
-                retry_end = self.end_retry(false, Some("Retry budget exhausted".to_string()));
-                fallback_end = self.end_fallback(false);
-                self.fallback = Some((to_provider.clone(), to_model.clone()));
-                true
-            }
-            AgentEvent::FailoverEnd {
-                provider,
-                model,
-                restored_primary: false,
-                ..
-            } => {
-                // Pair the end with the target that its Start announced,
-                // even if another runtime mutation changed the live model.
-                self.fallback.take().is_some_and(|target| {
-                    (*provider, *model) = target;
-                    true
-                })
             }
             AgentEvent::AutoCompactionEnd {
                 aborted: false,
@@ -225,7 +164,11 @@ impl LogicalTurnState {
             }
             _ => true,
         };
-        [retry_end, fallback_end, forward.then_some(event)]
+        if forward {
+            self.recovery.observe(event)
+        } else {
+            [None, None, None]
+        }
     }
 }
 
@@ -292,8 +235,7 @@ impl LogicalTurn {
             }
             state.finished = true;
             let success = error.is_none();
-            let retry_end = state.end_retry(success, error.clone());
-            let fallback_end = state.end_fallback(success);
+            let [retry_end, fallback_end] = state.recovery.finish(success, error.clone());
             let terminal = state
                 .session_id
                 .take()
@@ -465,6 +407,11 @@ impl AgentSessionHandle {
 
         // Construct this once for the entire call. Recovery events must reach
         // subscribers too, and a resumed attempt must not fan out a second time.
+        self.session.set_recovery_cli_api_key(
+            self.failover
+                .as_ref()
+                .and_then(|options| options.cli_api_key.clone()),
+        );
         let shared: EventCallback = Arc::new(self.make_combined_callback(on_event));
         let shared = complete_stream_callback(shared, self.listeners.on_stream_event.clone());
         self.maybe_restore_primary(&shared).await?;
@@ -477,6 +424,7 @@ impl AgentSessionHandle {
         // this logical turn so retries and provider swaps reuse it after the
         // individual attempt has restored the session's ordinary prompt.
         let mut turn_system_prompt = self.session.agent.system_prompt().map(str::to_string);
+        let prewalk_turn = self.session.begin_prewalk_turn();
         let first = match input {
             Some(UserContent::Text(input)) => {
                 self.session
@@ -517,11 +465,23 @@ impl AgentSessionHandle {
                 turn_system_prompt.as_deref(),
                 &shared,
                 &turn,
+                &prewalk_turn,
             )
             .await;
         // Also cover failures while preparing a retry/failover. Install the
         // fence before observers receive the logical turn's terminal event.
-        let result = fence_session_persistence(&admission, result);
+        let mut result = fence_session_persistence(&admission, result);
+        let outcome = match &result {
+            Ok(message) => TurnOutcome::Completed(message),
+            Err(error) => TurnOutcome::Failed(error),
+        };
+        if let Some(error) = self.session.record_terminal_credential_failure(outcome) {
+            result = Err(error);
+        }
+        let interrupted = result.as_ref().map_or(true, |message| {
+            matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+        });
+        self.session.finish_prewalk_turn(interrupted);
         turn.finish(&result);
         result
     }
@@ -529,6 +489,11 @@ impl AgentSessionHandle {
     /// Install (or clear) fallback-chain configuration on a pre-built handle.
     #[must_use]
     pub fn with_failover(mut self, options: Option<FailoverOptions>) -> Self {
+        self.session.set_recovery_cli_api_key(
+            options
+                .as_ref()
+                .and_then(|options| options.cli_api_key.clone()),
+        );
         self.failover_state = options
             .as_ref()
             .map_or_else(crate::failover::FailoverState::new_empty, |options| {
@@ -558,6 +523,7 @@ impl AgentSessionHandle {
     async fn reconcile_failover_state(
         &mut self,
         configured_cooldown_secs: u64,
+        available_models: &[crate::models::ModelEntry],
         cx: &crate::agent_cx::AgentCx,
     ) -> Result<bool> {
         let session = self
@@ -571,8 +537,15 @@ impl AgentSessionHandle {
             session
                 .effective_model_for_current_path()
                 .is_none_or(|(provider, model)| {
-                    crate::provider_metadata::provider_ids_match(runtime.name(), &provider)
-                        && runtime.model_id().eq_ignore_ascii_case(&model)
+                    crate::models::model_identities_match(
+                        self.session
+                            .model_registry()
+                            .map_or(available_models, crate::models::ModelRegistry::models),
+                        runtime.name(),
+                        runtime.model_id(),
+                        &provider,
+                        &model,
+                    )
                 });
         self.failover_state.reconcile_from_session(
             &session,
@@ -617,7 +590,7 @@ impl AgentSessionHandle {
         let session_actions = self.session.session_action_admission_gate();
         let session_action_permit = session_actions.acquire(cx.cx()).await?;
         if !self
-            .reconcile_failover_state(options.cooldown_secs, &cx)
+            .reconcile_failover_state(options.cooldown_secs, &options.available_models, &cx)
             .await?
         {
             return Ok(false);
@@ -636,11 +609,14 @@ impl AgentSessionHandle {
             }
         };
         let primary = self.failover_state.primary_for_swap(live);
-        let Some(chain) = crate::failover::chain_for(
+        let Some(chain) = self.session.resolve_fallback_chain(
             &options.chains,
-            "default",
             &primary.provider,
             &primary.model_id,
+            self.session.model_registry().map_or(
+                options.available_models.as_slice(),
+                crate::models::ModelRegistry::models,
+            ),
         ) else {
             return Ok(false);
         };
@@ -729,7 +705,7 @@ impl AgentSessionHandle {
         let session_actions = self.session.session_action_admission_gate();
         let session_action_permit = session_actions.acquire(cx.cx()).await?;
         if !self
-            .reconcile_failover_state(options.cooldown_secs, &cx)
+            .reconcile_failover_state(options.cooldown_secs, &options.available_models, &cx)
             .await?
         {
             return Ok(());
@@ -846,18 +822,55 @@ impl AgentSessionHandle {
         turn_system_prompt: Option<&str>,
         shared: &EventCallback,
         turn: &LogicalTurn,
+        prewalk_turn: &crate::prewalk::PrewalkTurn,
     ) -> Result<AssistantMessage> {
-        let Some(policy) = self.retry else {
-            return first;
-        };
         let mut progress = TurnProgress {
             retry_count: 0,
             failovers_this_turn: 0,
             stream_can_retry: true,
         };
+        // Compaction changes the request and has its own enablement. It must
+        // remain available even when transient retries are disabled, and may
+        // happen only once across all retries/fallbacks of this logical turn.
+        let mut overflow_compaction_attempted = false;
         let mut failed_over = false;
         let mut current = first;
         loop {
+            // The native turn has already saved every result in the triggering
+            // tool batch. Continue that transcript exactly once, without the
+            // retry rewind or a second user message.
+            if current.is_ok() && self.session.prewalk_handoff_pending() {
+                self.finish_recovery(&current, progress.retry_count, failed_over, shared);
+                progress.retry_count = 0;
+                failed_over = false;
+                ensure_not_aborted(abort_signal)?;
+                // An extension's explicit model selection outranks an armed
+                // automatic handoff. Check and commit under the same provider
+                // and session-action authority; native continuation installs
+                // a newer explicit choice without overwriting it.
+                if let Some(target) = self
+                    .session
+                    .complete_prewalk_handoff(prewalk_turn, Some(abort_signal))
+                    .await?
+                {
+                    self.failover_state.clear();
+                    shared(AgentEvent::PrewalkSwitched {
+                        provider: target.provider,
+                        model: target.model,
+                        thinking: self
+                            .session
+                            .agent
+                            .stream_options()
+                            .thinking_level
+                            .unwrap_or_default(),
+                    });
+                }
+                ensure_not_aborted(abort_signal)?;
+                current = self
+                    .resume_recovery_attempt(abort_signal, turn_system_prompt, shared)
+                    .await;
+                continue;
+            }
             // Re-resolve after every committed swap. Compaction settings may
             // be overridden by an embedder and are not model-capacity evidence.
             let window = self
@@ -868,6 +881,31 @@ impl AgentSessionHandle {
             let outcome = match &current {
                 Ok(message) => TurnOutcome::Completed(message),
                 Err(error) => TurnOutcome::Failed(error),
+            };
+            if !overflow_compaction_attempted
+                && self.session.compaction_settings().enabled
+                && crate::failover::needs_context_compaction(outcome, window)
+            {
+                overflow_compaction_attempted = true;
+                let recovered = self
+                    .prepare_context_overflow_recovery(&current, abort_signal, shared, turn)
+                    .await;
+                match recovered {
+                    Ok(true) => {
+                        current = self
+                            .resume_recovery_attempt(abort_signal, turn_system_prompt, shared)
+                            .await;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => current = Err(error),
+                }
+                self.finish_recovery(&current, progress.retry_count, failed_over, shared);
+                return current;
+            }
+            let Some(policy) = self.retry else {
+                self.finish_recovery(&current, progress.retry_count, failed_over, shared);
+                return current;
             };
             let decision = crate::failover::decide(outcome, &progress, &policy, window);
             if matches!(
@@ -926,6 +964,14 @@ impl AgentSessionHandle {
                 .await
             {
                 // Preparation has already closed the retry it announced.
+                if crate::failover::marks_credential_pool_exhausted(&error.to_string()) {
+                    // No provider call was made after the durable rewind. Feed
+                    // the temporary exhaustion through the normal bounded
+                    // fallback policy instead of retrying a cooled key.
+                    progress.retry_count = attempt;
+                    current = Err(error);
+                    continue;
+                }
                 self.close_failover_lifecycle(failed_over, false, shared);
                 return Err(error);
             }
@@ -934,6 +980,37 @@ impl AgentSessionHandle {
                 .resume_recovery_attempt(abort_signal, turn_system_prompt, shared)
                 .await;
         }
+    }
+
+    async fn prepare_context_overflow_recovery(
+        &mut self,
+        current: &Result<AssistantMessage>,
+        abort_signal: &AbortSignal,
+        shared: &EventCallback,
+        turn: &LogicalTurn,
+    ) -> Result<bool> {
+        ensure_not_aborted(abort_signal)?;
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.session.provider_admission_gate();
+        admission.ensure_allowed()?;
+        // Rewind only the incomplete assistant response. Accepted user/media
+        // input and every completed tool result stay in the durable transcript.
+        self.session
+            .restore_retry_tail_with_admission(&cx, current.is_ok(), Some(&admission))
+            .await?;
+        admission.ensure_allowed()?;
+        turn.restored_tail();
+        ensure_not_aborted(abort_signal)?;
+        let forwarded = Arc::clone(shared);
+        let compacted = self
+            .session
+            .compact_after_context_overflow(abort_signal, move |event| forwarded(event))
+            .await?;
+        // Never race cancellation against the compaction save. Its durable
+        // transaction settles first; cancellation then forbids continuation.
+        admission.ensure_allowed()?;
+        ensure_not_aborted(abort_signal)?;
+        Ok(compacted)
     }
 
     async fn prepare_same_provider_retry(
@@ -945,12 +1022,31 @@ impl AgentSessionHandle {
         abort_signal: &AbortSignal,
         turn: &LogicalTurn,
     ) -> Result<()> {
+        let error_message = Self::turn_error_text_for(current);
+        let quota_credential = error_message
+            .as_deref()
+            .filter(|error| {
+                crate::failover::classify_failover(error)
+                    == Some(crate::failover::FailoverClass::Quota)
+            })
+            .and_then(|_| {
+                self.session
+                    .agent
+                    .stream_options()
+                    .api_key
+                    .as_ref()
+                    .map(|key| {
+                        (
+                            self.session.agent.provider().name().to_string(),
+                            key.clone(),
+                        )
+                    })
+            });
         turn.emit(AgentEvent::AutoRetryStart {
             attempt,
             max_attempts: policy.max_retries,
             delay_ms: u64::from(delay_ms),
-            error_message: Self::turn_error_text_for(current)
-                .unwrap_or_else(|| "Request error".to_string()),
+            error_message: error_message.unwrap_or_else(|| "Request error".to_string()),
         });
         let result = async {
             if !Self::await_retry_backoff(delay_ms, abort_signal).await {
@@ -966,6 +1062,21 @@ impl AgentSessionHandle {
             turn.restored_tail();
             // Do not race cancellation against a durability operation: let it
             // settle, then refuse provider re-entry when the signal was raised.
+            ensure_not_aborted(abort_signal)?;
+            if let Some((provider, key)) = quota_credential.as_ref() {
+                // A successful rewind is the prerequisite for credential
+                // rotation, just as it is for another provider request. Keep
+                // a delayed retry from changing a newer provider selection.
+                let authority = admission.acquire_transition_authority(cx.cx()).await?;
+                ensure_not_aborted(abort_signal)?;
+                let legacy_pin = self
+                    .failover
+                    .as_ref()
+                    .and_then(|options| options.cli_api_key.as_deref());
+                self.session
+                    .rotate_rate_limited_credential(provider, key, legacy_pin)?;
+                drop(authority);
+            }
             ensure_not_aborted(abort_signal)
         }
         .await;

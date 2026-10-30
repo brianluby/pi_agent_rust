@@ -18,6 +18,7 @@ mod pull_diagnostics;
 mod request;
 #[cfg(test)]
 mod test_server;
+pub(in crate::lsp) mod workspace;
 pub use file_uri::{path_to_uri, try_path_to_uri, uri_to_path};
 
 const WAIT_TICK: Duration = Duration::from_millis(10);
@@ -131,6 +132,7 @@ pub struct ServerCapabilities {
 
 pub struct LspClient {
     rpc: JsonRpcClient,
+    workspace: std::sync::Arc<workspace::Workspace>,
     root: PathBuf,
     root_uri: String,
     open_docs: Mutex<HashMap<String, OpenDoc>>,
@@ -159,15 +161,28 @@ impl LspClient {
         env: &[(String, String)],
         root: &Path,
         initialization_options: Option<&Value>,
+        settings: Option<&Value>,
         timeout: Duration,
     ) -> Result<Self> {
+        // Reject invalid configured settings before a server can run. The
+        // same snapshot answers reverse requests during initialize, then is
+        // pushed only after initialized, as required by the protocol.
+        let budget = request::RequestBudget::new(timeout);
+        let settings = settings.map(workspace::Settings::parse).transpose()?;
+        if settings.is_some() {
+            crate::lsp::refactor_preview::check_owner(&AgentCx::for_current_or_request())?;
+        }
+        budget.remaining()?;
         // Resolve the workspace before spawning; never send an ambiguous or
         // relative native path as the server's document root.
         let root = root.canonicalize()?;
         let root_uri = try_path_to_uri(&root)?;
+        let workspace =
+            std::sync::Arc::new(workspace::Workspace::new(&root_uri, settings.as_ref())?);
         let rpc = JsonRpcClient::spawn(command, args, env, &root)?;
         let client = Self {
             rpc,
+            workspace,
             root,
             root_uri: root_uri.clone(),
             open_docs: Mutex::new(HashMap::new()),
@@ -181,6 +196,9 @@ impl LspClient {
             quiescent: std::sync::atomic::AtomicBool::new(false),
             next_document_version: AtomicU64::new(1),
         };
+        // A server may ask for workspace data while initialize is pending.
+        // Install the service before posting that request, not at first edit.
+        client.set_server_request_handler(std::sync::Arc::new(|_, _| None));
         let mut params = serde_json::json!({
             "processId":std::process::id(),"rootUri":root_uri,
             "workspaceFolders":[{"uri":root_uri,"name":"workspace"}],
@@ -209,7 +227,7 @@ impl LspClient {
                         "completionItem":{
                             "snippetSupport":true,"insertReplaceSupport":true,
                             "documentationFormat":["markdown","plaintext"],
-                            "insertTextModeSupport":{"valueSet":[1]},
+                            "insertTextModeSupport":{"valueSet":[1,2]},
                             "resolveSupport":{"properties":["detail","documentation","additionalTextEdits"]}
                         },
                         "completionList":{"itemDefaults":["editRange","insertTextFormat","insertTextMode","data"]}
@@ -219,10 +237,11 @@ impl LspClient {
                     "callHierarchy":{"dynamicRegistration":false},
                     "typeHierarchy":{"dynamicRegistration":false},
                     "documentSymbol":{"hierarchicalDocumentSymbolSupport":true},
-                    "rename":{"prepareSupport":true,"honorsChangeAnnotations":false},
+                    "rename":{"prepareSupport":true,"honorsChangeAnnotations":true},
                     "codeAction":{
                         "dynamicRegistration":false,"dataSupport":true,
                         "disabledSupport":true,"isPreferredSupport":true,
+                        "honorsChangeAnnotations":true,
                         "codeActionLiteralSupport":{"codeActionKind":{"valueSet":[
                             "quickfix","refactor","refactor.extract","refactor.inline","refactor.rewrite","source"
                         ]}},
@@ -230,9 +249,12 @@ impl LspClient {
                     }
                 },
                 "workspace":{
+                    "configuration":true,
+                    "didChangeConfiguration":{"dynamicRegistration":false},
                     "diagnostics":{"refreshSupport":false},
                     "applyEdit":true,"workspaceEdit":{
-                        "documentChanges":true,"resourceOperations":["create","rename","delete"]
+                        "documentChanges":true,"resourceOperations":["create","rename","delete"],
+                        "changeAnnotationSupport":{"groupsOnLabel":false}
                     },
                     "symbol":{
                         "dynamicRegistration":false,
@@ -250,7 +272,7 @@ impl LspClient {
             params["initializationOptions"] = options.clone();
         }
         let result = client
-            .call("initialize", params, timeout)
+            .call("initialize", params, budget.remaining()?)
             .await
             .map_err(|err| {
                 client.rpc.kill();
@@ -280,6 +302,11 @@ impl LspClient {
             .rpc
             .notify("initialized", serde_json::json!({}))
             .map_err(|err| Error::tool("lsp", format!("[LSP_TRANSPORT_IO] {}", err.message())))?;
+        if let Some(settings) = settings {
+            client
+                .set_workspace_settings_with_timeout(&settings, budget.remaining()?)
+                .await?;
+        }
         Ok(client)
     }
 
@@ -359,7 +386,7 @@ impl LspClient {
     #[allow(clippy::significant_drop_tightening)]
     pub fn poll_notifications(&self) {
         // Hold one owner across drain and apply: concurrent callers must not
-        // publish an earlier batch after a newer one has already been applied.
+        // publish an earlier batch after a newer one was already applied.
         let mut generation = Self::lock(&self.notification_generation);
         self.observe_notification_loss(&mut generation, self.rpc.dropped_notifications());
         for notification in self.rpc.drain_notifications() {
@@ -448,7 +475,15 @@ impl LspClient {
     }
 
     pub fn set_server_request_handler(&self, handler: super::jsonrpc::ServerRequestHandler) {
-        self.rpc.set_server_request_handler(handler);
+        // Reserved workspace services survive installation/replacement of an
+        // application's applyEdit handler and cannot be overridden by it.
+        let workspace = std::sync::Arc::clone(&self.workspace);
+        self.rpc
+            .set_server_request_responder(std::sync::Arc::new(move |method, params| {
+                workspace
+                    .respond(method, params)
+                    .or_else(|| handler(method, params).map(Ok))
+            }));
     }
 
     pub fn call_no_wait_notify(

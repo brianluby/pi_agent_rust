@@ -83,6 +83,326 @@ fn recorded_models(tool: &SubagentTool) -> Vec<String> {
         .collect()
 }
 
+fn explicit_model_catalog(tool: &SubagentTool) {
+    std::fs::write(tool.global_dir.join("models.json"), json!({"providers": {
+        "selection-local": {
+            "baseUrl":"http://127.0.0.1:1/v1", "api":"openai-completions", "authHeader":false,
+            "models":[{"id":"selection-fast", "reasoning":false}, {"id":"selection-careful", "reasoning":true}]
+        }
+    }}).to_string()).unwrap();
+}
+
+fn fallback_config() -> Config {
+    Config {
+        retry: Some(crate::config::RetrySettings {
+            fallback_chains: Some(std::collections::HashMap::from([
+                (
+                    "task".to_string(),
+                    vec!["selection-local/selection-careful:high".to_string()],
+                ),
+                ("default".to_string(), vec![]),
+            ])),
+            ..Default::default()
+        }),
+        disabled_providers: Some(vec!["excluded-provider".to_string()]),
+        ..Default::default()
+    }
+}
+
+fn record_fallback_script(body: &str) -> String {
+    format!(
+        "while [ \"$#\" -gt 0 ]; do\n\
+           case \"$1\" in\n\
+             --subagent-fallback-policy) shift; printf '%s\\n' \"$1\" >> \"$PI_CODING_AGENT_DIR/fallback-used\" ;;\n\
+           esac\n\
+           shift\n\
+         done\n{body}"
+    )
+}
+
+fn recorded_fallbacks(tool: &SubagentTool) -> Vec<Value> {
+    std::fs::read_to_string(tool.global_dir.join("fallback-used"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn task_role_provenance_is_carried_in_all_modes_without_model_id_inference() {
+    let role = json!({"agent":"worker", "task":"role-owned work"});
+    let explicit =
+        json!({"agent":"worker", "task":"explicit work", "model":"selection-local/selection-fast"});
+    for input in [
+        role.clone(),
+        json!({"tasks":[role.clone(), explicit.clone()], "concurrency":1}),
+        json!({"chain":[role.clone(), explicit.clone()]}),
+        json!({"workflow":[
+            {"id":"role", "call":role.clone()},
+            {"id":"explicit", "needs":["role"], "call":explicit.clone()}
+        ]}),
+    ] {
+        let (_dir, tool) = fixture(&record_fallback_script(&emit(&[ended("complete", "stop")])));
+        explicit_model_catalog(&tool);
+        let tool = tool
+            .with_model_config(Some(fallback_config()))
+            .with_role_model_selection(Some((
+                crate::models::ModelRole::Task,
+                "selection-local/selection-fast".to_string(),
+            )));
+        let output = run(&tool, input.clone());
+        assert!(!output.is_error, "{output:?}");
+        let policies = recorded_fallbacks(&tool);
+        assert_eq!(policies[0]["role"], "task");
+        assert_eq!(
+            policies[0]["disabled_providers"],
+            json!(["excluded-provider"])
+        );
+        if input.get("agent").is_none() {
+            assert_eq!(policies.len(), 2);
+            assert_eq!(
+                policies[1]["role"], "default",
+                "same model does not imply same role"
+            );
+        }
+        std::fs::write(tool.global_dir.join("agents/worker.md"),
+            "---\nname: worker\ndescription: pinned\nmodel: selection-local/selection-fast\n---\nComplete the task.").unwrap();
+        assert!(!run(&tool, request()).is_error);
+        assert_eq!(recorded_fallbacks(&tool).last().unwrap()["role"], "default");
+    }
+}
+
+#[test]
+fn admitted_fallback_snapshot_survives_configuration_changes_schema_retry_and_revival() {
+    let body = format!(
+        "if [ -f \"$PI_CODING_AGENT_DIR/retried\" ]; then\n{}\
+         else\n: > \"$PI_CODING_AGENT_DIR/retried\"\n{}\
+         fi\n",
+        emit(&[ended(r#"{"accepted":true}"#, "stop")]),
+        emit(&[ended("not JSON", "stop")]),
+    );
+    let (_dir, mut tool) = fixture(&record_fallback_script(&body));
+    tool = tool
+        .with_model_config(Some(fallback_config()))
+        .with_role_model_selection(Some((
+            crate::models::ModelRole::Task,
+            "selection-local/selection-fast".to_string(),
+        )));
+    let request: SubagentRequest = serde_json::from_value(json!({
+        "chain":[
+            {"agent":"worker", "task":format!("frozen-policy-{}", uuid::Uuid::new_v4()),
+             "outputSchema":{"type":"object", "required":["accepted"]}, "schemaMode":"strict"},
+            {"agent":"worker", "task":"follow-up"}
+        ]
+    }))
+    .unwrap();
+    let prepared = tool.prepare_request(&request).unwrap();
+    tool.model_config
+        .as_mut()
+        .unwrap()
+        .retry
+        .as_mut()
+        .unwrap()
+        .fallback_chains
+        .as_mut()
+        .unwrap()
+        .insert("task".to_string(), vec![]);
+    let results = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap()
+        .block_on(prepared.run(None));
+    assert!(results.iter().all(|result| !result.is_error));
+    assert_eq!(results[0].schema_retries, Some(1));
+    let policies = recorded_fallbacks(&tool);
+    assert_eq!(policies.len(), 3);
+    assert!(policies.iter().all(|policy| policy == &policies[0]));
+    assert_eq!(
+        policies[0]["retry"]["fallback_chains"]["task"],
+        json!(["selection-local/selection-careful:high"])
+    );
+    let revived = revive_through_hub(&tool.cwd, results[0].hub_id.as_deref().unwrap());
+    assert!(!revived.is_error, "{revived:?}");
+    assert_eq!(recorded_fallbacks(&tool)[3], policies[0]);
+    assert!(!run(&tool, json!({"agent":"worker", "task":"new policy"})).is_error);
+    assert_eq!(
+        recorded_fallbacks(&tool)[4]["retry"]["fallback_chains"]["task"],
+        json!([])
+    );
+}
+
+#[test]
+fn explicit_models_override_definition_role_and_parent_in_every_one_shot_mode() {
+    let first =
+        json!({"agent":"worker", "task":"inspect", "model":"selection-local/selection-fast"});
+    let second = json!({"agent":"worker", "task":"review {previous}", "model":"selection-local/selection-careful:high"});
+    for input in [
+        first.clone(),
+        json!({"tasks":[first.clone(), second.clone()], "concurrency":1}),
+        json!({"chain":[first.clone(), second.clone()]}),
+        json!({"workflow":[
+            {"id":"inspect", "call":first.clone()},
+            {"id":"review", "needs":["inspect"], "call":second.clone()}
+        ]}),
+    ] {
+        let (_dir, tool) = fixture(&record_model_script(&emit(&[ended("complete", "stop")])));
+        explicit_model_catalog(&tool);
+        std::fs::write(tool.global_dir.join("agents/worker.md"),
+            "---\nname: worker\ndescription: pinned fixture\nmodel: definition/model\n---\nComplete the task.").unwrap();
+        let tool = tool
+            .with_model_config(Some(Config::default()))
+            .with_role_model_spec(Some("role/model".to_string()))
+            .with_parent_model(Some(ToolModelSelection {
+                provider: "parent".to_string(),
+                model: "parent-model".to_string(),
+            }));
+        let expected = if input.get("agent").is_some() {
+            vec!["selection-local|selection-fast"]
+        } else {
+            vec![
+                "selection-local|selection-fast",
+                "selection-local|selection-careful",
+            ]
+        };
+        let output = run(&tool, input);
+        assert!(!output.is_error, "{output:?}");
+        assert_eq!(recorded_models(&tool), expected);
+    }
+}
+
+#[test]
+fn invalid_later_model_rejects_entire_request_before_process_or_isolation() {
+    for key in ["tasks", "chain", "workflow"] {
+        let (_dir, tool) = fixture(&record_model_script(&emit(&[ended("complete", "stop")])));
+        explicit_model_catalog(&tool);
+        let tool = tool.with_model_config(Some(Config::default()));
+        let first = json!({"agent":"worker", "task":"must not run", "model":"selection-fast", "isolation":"worktree"});
+        let second = json!({"agent":"worker", "task":"invalid destination", "model":"missing-provider/private-selector-sentinel"});
+        let input = if key == "workflow" {
+            json!({"workflow":[{"id":"first", "call":first}, {"id":"second", "needs":["first"], "call":second}]})
+        } else {
+            let mut input = json!({});
+            input[key] = json!([first, second]);
+            input
+        };
+        let error = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(tool.execute("invalid-model", input, None))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("PI_SUBAGENT_MODEL"), "{error}");
+        assert!(!error.contains("private-selector-sentinel"), "{error}");
+        assert!(!tool.global_dir.join("models-used").exists());
+    }
+}
+
+#[test]
+fn prepared_model_identity_survives_catalog_and_parent_changes() {
+    let (_dir, tool) = fixture(&record_model_script(&emit(&[ended("complete", "stop")])));
+    explicit_model_catalog(&tool);
+    let scope = ToolModelScope::default();
+    scope.set("first-parent", "first-model");
+    let tool = tool
+        .with_model_config(Some(Config::default()))
+        .with_model_scope(scope.clone());
+    let request: SubagentRequest = serde_json::from_value(json!({
+        "chain":[{"agent":"worker", "task":"inspect", "model":"selection-fast"},
+                 {"agent":"worker", "task":"review", "model":"selection-careful:high"}]
+    }))
+    .unwrap();
+    let prepared = tool.prepare_request(&request).unwrap();
+    scope.set("changed-parent", "changed-model");
+    std::fs::write(tool.global_dir.join("models.json"), "{\"providers\":{}}").unwrap();
+    let results = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap()
+        .block_on(prepared.run(None));
+    assert!(results.iter().all(|result| !result.is_error));
+    assert_eq!(
+        recorded_models(&tool),
+        vec![
+            "selection-local|selection-fast",
+            "selection-local|selection-careful"
+        ]
+    );
+}
+
+#[test]
+fn queued_children_schema_retries_and_revival_keep_their_original_cost_account() {
+    for mode in ["tasks", "chain"] {
+        let body = format!(
+            "test -n \"$PI_SUBAGENT_COST_ADDRESS\" || exit 70\n\
+             test -n \"$PI_SUBAGENT_COST_TOKEN\" || exit 71\n\
+             test -z \"$PI_SUBAGENT_HUB_ADDRESS\" || exit 72\n\
+             if [ -f \"$PI_CODING_AGENT_DIR/retried\" ]; then\n{}\
+             else\n: > \"$PI_CODING_AGENT_DIR/retried\"\n{}\
+             fi\n",
+            emit(&[ended(r#"{"accepted":true}"#, "stop")]),
+            emit(&[ended("not JSON", "stop")]),
+        );
+        let (_dir, tool) = fixture(&record_model_script(&body));
+        std::fs::write(
+            tool.global_dir.join("agents/worker.md"),
+            "---\nname: worker\ndescription: cost-only fixture\ntools: read\n---\nFinish.",
+        )
+        .unwrap();
+        let original = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+        let replacement = crate::cost::CostBudget::new(None, Some(1.0), 1.0).unwrap();
+        let scope = crate::cost::CostScope::default();
+        scope.set(Some(original.clone()));
+        let tool = tool.with_cost_scope(scope.clone());
+        let mut input = json!({"concurrency":1});
+        input[mode] = json!([
+            {"agent":"worker", "task":"cost captured before queue",
+             "outputSchema":{"type":"object","required":["accepted"]}, "schemaMode":"strict"},
+            {"agent":"worker", "task":"follow up on {previous}"}
+        ]);
+        let parsed: SubagentRequest = serde_json::from_value(input).unwrap();
+        let prepared = tool.prepare_request(&parsed).unwrap();
+        scope.set(Some(replacement));
+        let results = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(prepared.run(None));
+        assert!(
+            results.iter().all(|result| !result.is_error),
+            "{mode}: {results:?}"
+        );
+        assert_eq!(results[0].schema_retries, Some(1));
+        assert_eq!(recorded_models(&tool).len(), 3);
+        let source_id = results[0].hub_id.as_deref().unwrap();
+        let source = crate::agent_hub::registry()
+            .lock()
+            .unwrap()
+            .native_revival_source(source_id)
+            .unwrap();
+        assert!(
+            source
+                .launch
+                .cost_budget
+                .as_ref()
+                .unwrap()
+                .same_tree(&original)
+        );
+
+        // New work uses the current session, while revival keeps its source.
+        let refused = run(&tool, request());
+        assert!(refused.is_error);
+        assert!(result(&refused)["pid"].is_null());
+        assert_eq!(recorded_models(&tool).len(), 3);
+        let revived = revive_through_hub(&tool.cwd, source_id);
+        assert!(!revived.is_error, "{revived:?}");
+        assert_eq!(recorded_models(&tool).len(), 4);
+
+        // Spending the original allowance prevents another revival before
+        // registration or spawn, even though the live scope was replaced.
+        original.record(1.0).unwrap();
+        let refused = revive_through_hub(&tool.cwd, source_id);
+        assert!(refused.is_error);
+        assert_eq!(recorded_models(&tool).len(), 4);
+    }
+}
+
 #[test]
 fn subagent_launch_model_precedence_keeps_resolved_parent_ids_exact() {
     let (_dir, tool) = fixture(&record_model_script(&emit(&[ended("complete", "stop")])));
@@ -1167,15 +1487,23 @@ fn invalid_isolation_settings_do_not_launch() {
         emit(&[ended("answer", "stop")]),
     ));
     for (isolation, apply) in [("worktre", "apply"), ("worktree", "aply")] {
-        let output = run(
-            &tool,
-            json!({"tasks":[{
-                "agent":"worker","task":"must not launch","isolation":isolation,"isoApply":apply
-            }]}),
+        // `workspace::validate_request` admits workspace controls before
+        // discovery or launch, so a typo is a tool error, not a failed task.
+        let error = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(tool.execute(
+                "protocol-test",
+                json!({"tasks":[{
+                    "agent":"worker","task":"must not launch","isolation":isolation,"isoApply":apply
+                }]}),
+                None,
+            ))
+            .expect_err("invalid workspace controls must be refused");
+        assert!(
+            error.to_string().contains("PI_SUBAGENT_INVALID_WORKSPACE"),
+            "{error}"
         );
-        assert!(output.is_error, "{output:?}");
-        assert_eq!(result(&output)["status"], "failed");
-        assert!(result(&output)["pid"].is_null());
         assert!(!tool.cwd.join("launched").exists());
     }
 }

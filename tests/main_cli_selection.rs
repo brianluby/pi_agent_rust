@@ -58,6 +58,7 @@ fn custom_model_entry(provider: &str, api_key: Option<&str>) -> ModelEntry {
             reasoning: true,
             input: vec![InputType::Text],
             cost: ModelCost {
+                audio: None,
                 input: 0.0,
                 output: 0.0,
                 cache_read: 0.0,
@@ -766,19 +767,19 @@ fn process_file_arguments_small_image_respects_auto_resize_flag() {
 }
 
 #[test]
-fn apply_piped_stdin_inserts_message_and_sets_print() {
+fn apply_piped_stdin_returns_input_and_sets_print() {
     let mut cli = cli::Cli::parse_from(["pi", "hello", "world"]);
-    apply_piped_stdin(&mut cli, Some("stdin".to_string()));
+    let input = apply_piped_stdin(&mut cli, Some("stdin".to_string()));
 
     assert!(cli.print);
-    let messages = cli.message_args();
-    assert_eq!(messages, vec!["stdin", "hello", "world"]);
+    assert_eq!(input.as_deref(), Some("stdin"));
+    assert_eq!(cli.message_args(), vec!["hello", "world"]);
 }
 
 #[test]
 fn apply_piped_stdin_none_keeps_args() {
     let mut cli = cli::Cli::parse_from(["pi", "hello"]);
-    apply_piped_stdin(&mut cli, None);
+    assert!(apply_piped_stdin(&mut cli, None).is_none());
     assert!(!cli.print);
     assert_eq!(cli.message_args(), vec!["hello"]);
 }
@@ -962,6 +963,43 @@ fn process_file_arguments_empty_file_skipped() {
     // Only non-empty file gets a <file> tag
     let file_tag_count = processed.text.matches("<file name=\"").count();
     assert_eq!(file_tag_count, 1);
+}
+
+/// Binary files used to be decoded lossily and inlined: up to a megabyte of
+/// replacement characters in the prompt.
+#[test]
+fn process_file_arguments_binary_file_gets_a_notice() {
+    let harness = TestHarness::new("process_file_arguments_binary_file_gets_a_notice");
+    let mut bytes = b"\x7fELF\x02\x01\x01\x00".to_vec();
+    bytes.extend(std::iter::repeat_n(0xff_u8, 4096));
+    let binary = harness.create_file("tool.bin", &bytes);
+    // A multibyte character cut off by the 8 KiB sniff window is still text.
+    let mut text = "a".repeat(8191);
+    text.push_str("é and more\n");
+    let utf8 = harness.create_file("wide.txt", &text);
+    let args = [&binary, &utf8]
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+
+    let processed = process_file_arguments(
+        &args,
+        harness.temp_dir(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("ok");
+
+    assert!(
+        processed.text.contains(&format!(
+            "[Binary file ({} bytes), not included.]",
+            bytes.len()
+        )),
+        "{}",
+        processed.text
+    ); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+    assert!(!processed.text.contains('\u{FFFD}')); // ubs:ignore[rust.panic.assert-macros] -- test assertion
+    assert!(processed.text.contains("é and more")); // ubs:ignore[rust.panic.assert-macros] -- test assertion
 }
 
 #[test]
@@ -1325,7 +1363,7 @@ fn cli_message_args_empty_when_only_files() {
 #[test]
 fn apply_piped_stdin_empty_content_no_op() {
     let mut cli = cli::Cli::parse_from(["pi", "hello"]);
-    apply_piped_stdin(&mut cli, Some(String::new()));
+    assert!(apply_piped_stdin(&mut cli, Some(String::new())).is_none());
     assert!(!cli.print);
     assert_eq!(cli.message_args(), vec!["hello"]);
 }
@@ -1333,7 +1371,7 @@ fn apply_piped_stdin_empty_content_no_op() {
 #[test]
 fn apply_piped_stdin_whitespace_only_no_op() {
     let mut cli = cli::Cli::parse_from(["pi", "hello"]);
-    apply_piped_stdin(&mut cli, Some("\n\n\r\n".to_string()));
+    assert!(apply_piped_stdin(&mut cli, Some("\n\n\r\n".to_string())).is_none());
     assert!(!cli.print);
     assert_eq!(cli.message_args(), vec!["hello"]);
 }
@@ -1341,9 +1379,10 @@ fn apply_piped_stdin_whitespace_only_no_op() {
 #[test]
 fn apply_piped_stdin_trims_trailing_newlines() {
     let mut cli = cli::Cli::parse_from(["pi"]);
-    apply_piped_stdin(&mut cli, Some("some input\n\n".to_string()));
+    let input = apply_piped_stdin(&mut cli, Some("some input\n\n".to_string()));
     assert!(cli.print);
-    assert_eq!(cli.message_args(), vec!["some input"]);
+    assert_eq!(input.as_deref(), Some("some input"));
+    assert!(cli.message_args().is_empty());
 }
 
 #[test]

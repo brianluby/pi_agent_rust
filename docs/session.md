@@ -20,6 +20,16 @@ Filename format: `YYYY-MM-DDTHH-MM-SS.sssZ_id.jsonl`
 1. Header: the first line is always a `SessionHeader` object containing metadata (ID, timestamp, CWD, initial settings).
 2. Entries: subsequent lines are `SessionEntry` objects representing events in the conversation.
 
+### When a session is saved
+
+A prompt is saved before the provider sees it. Each completed turn (the
+assistant message and its tool results) is saved before the next provider
+request, so a crash mid-run loses at most the turn in flight.
+`--session-durability throughput` skips those mid-run saves and saves when the
+run returns. An append that fails partway, on a full disk for example, is cut
+back to the last complete line, so the session takes the next save once there
+is room.
+
 ### Entry types
 
 - `message`: User or Assistant message.
@@ -153,13 +163,111 @@ Visualizes the branching structure of the current session.
 - Navigate: Up/Down
 - Switch: Enter (switches active context to the selected node)
 
+That selector is in `pi --classic`. In the default stack, `/tree` lists each
+branch's tip with its latest user message, and `/tree <index|id>` switches the
+conversation to that tip. This is how you return to a path you left with
+`/rewind`, `/branch` or double-Esc.
+
 #### Forking (`/fork`)
 
 Creates a new session file starting from the current point (or a selected point). This is useful when you want to explore a significantly different direction without cluttering the current session file.
 
 #### Compaction (`/compact`)
 
-Manually triggers context compaction. Pi also compacts automatically based on the `compaction` settings in `settings.json`.
+Manually triggers context compaction, without waiting for the automatic threshold. Pi also compacts automatically based on the `compaction` settings in `settings.json`.
+
+### Session commands in print mode
+
+Explicit command-line arguments can perform session maintenance without opening
+the terminal UI:
+
+```sh
+pi --continue -p '/compact'
+pi --session ./run.jsonl -p '/compact shake'
+pi --session ./run.jsonl -p '/handoff preserve migration decisions and next steps'
+pi --session ./run.jsonl -p '/retry'
+```
+
+`/compact` uses the selected session's native summarizer, privacy policy,
+extension hooks and durable compaction transaction. `/compact shake` uses the
+same transaction with local removal of bulky older tool output and no summary
+model request. Neither waits for the automatic threshold. Disabled compaction is
+an error; a session whose history all fits in `keepRecentTokens`, or that has
+nothing new since its last compaction, reports that no change was made. Custom
+compaction instructions are not accepted on this surface.
+
+`/handoff [focus]` asks the selected model for a continuation brief and compacts
+the selected session in place. It preserves the session ID, path, name, branch
+history and recent native messages. The brief records goals, decisions,
+constraints, completed work, failed approaches, open questions and next steps;
+the optional focus tells the model what to emphasize. The command appends a
+normal compaction entry with `details.mode: "handoff"`. Original history remains
+in the session tree, and the next prompt uses the brief and retained tail.
+
+Manual handoff runs even when automatic compaction is disabled or below its
+threshold. It uses the configured `keepRecentTokens` budget, rounds retention
+back to complete turns, and always keeps the latest authored user turn with its
+ordered images, audio, video and completed tool work. A single authored turn,
+an already compacted leaf, or a budget retaining all history has no safe older
+prefix: the command returns an error without calling the model. It does not
+split the last turn to force a checkpoint. Automatic aggressive, shake and
+snapcompact policies do not change this manual operation.
+
+Handoff uses the existing compaction privacy policy for history, focus and the
+stored summary. The model request has no tools, uses isolated transport/cache
+identity, and has a 60-second generation deadline and a 64-KiB text limit. Empty,
+truncated, tool-requesting or otherwise incomplete responses fail without a
+local fallback or a new compaction entry. A changed source session also refuses
+installation. Before-compaction hooks can cancel; replacement summaries from
+those hooks are explicitly refused for handoff. The ordinary post-compaction
+hook runs after durable installation. Optional focus is limited to 4096 UTF-8
+bytes and cannot contain NUL. The terminal's `--report`, `--model` and
+`--import` modes are refused here; write `/handoff -- <focus>` for a focus that
+starts with `-`.
+
+`/retry` immediately repeats the latest retryable user turn from the selected
+branch. It preserves ordered text and image/audio/video content, saves the
+rewound parent before invoking the provider, and retains the abandoned attempt
+as a sibling in the session tree. Missing retryable input or failed persistence
+stops the command. The repeated turn uses the ordinary print-mode provider
+retry, failover and tool-approval behavior. Stored input is not rescanned for
+magic keywords because its original authored/template provenance is unavailable.
+
+Use `--continue`, `--resume`, `--session` or `--session-dir` when the result should
+persist. Print mode without a requested session remains ephemeral. Commands and
+ordinary message arguments can be mixed; they run in argument order.
+
+Only original command-line message arguments have command authority. Piped
+stdin and file bytes remain input, including text beginning with `/retry`,
+`/compact`, `/handoff` or `@`. A command produced by prompt-template expansion also remains
+input. A command explicitly paired with `@file` attachments is refused rather
+than dropping the attachments; submit it separately. If stdin and files are
+both supplied, files retain their normal pairing with the first input message,
+and later explicit CLI commands still execute.
+
+Command failures return a nonzero exit status, including an error-valued
+provider response during `/retry` in JSON mode. `--mode json` retains the session
+header and native events, adds `command_start` when a retry begins, and emits a
+successful `command_result` only after the operation finishes. Compaction results
+include `data.changed` and the native compaction result when one was produced.
+Ctrl+C and extension cancellation fail the command without acknowledging success;
+interrupted persistence retains the native session admission fence.
+
+Both terminal frontends also run this native transaction with `/handoff [focus]`.
+Escape requests cancellation, and the UI waits for the transaction to finish
+before accepting another foreground request. A queued handoff stays bound to its
+original session and cancellation handle. Unknown leading options are errors;
+use `/handoff -- <focus>` for focus text beginning with a dash.
+
+The `pi handoff` subcommand remains the local structured report. In either
+terminal, `/handoff --report [human|agent|target] [path]` selects that report
+explicitly. The default terminal also retains `/handoff --model` and its
+`--export` options for a separate preview or evidence bundle; those modes do not
+compact the conversation. Its `/handoff --import <absolute-bundle.json>` mode
+inspects an exported bundle and can create a separate native continuation
+session with explicit output and workspace paths. Import leaves the active
+session unchanged and does not start a model turn. See
+[Model-assisted handoff](model-handoff.md) and [Handoff import](handoff-import.md).
 
 ## ADR: Session Store V2 + Wire-Format Contract
 

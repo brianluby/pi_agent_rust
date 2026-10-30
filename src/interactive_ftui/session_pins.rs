@@ -68,14 +68,18 @@ pub fn sort_pinned_first<T, S: std::hash::BuildHasher>(
 /// The `/resume` picker rows for `cwd`, newest first with pinned sessions
 /// on top and marked, as `(label, session path)`.
 ///
-/// Read from the session index each time, so sessions saved and pins set
-/// during this run show up. Index failures degrade to an empty list.
-pub fn resume_entries(cwd: &str, pins_dir: &Path) -> Vec<(String, String)> {
+/// Listed as the classic picker lists them: under `session_dir`
+/// (`--session-dir`) when set, without files deleted since they were
+/// indexed, one row per session. Read each time, so sessions saved and pins
+/// set during this run show up.
+pub fn resume_entries(
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    pins_dir: &Path,
+) -> Vec<(String, String)> {
     let pinned = load_pinned(pins_dir);
     sort_pinned_first(
-        crate::session_index::SessionIndex::new()
-            .list_sessions(Some(cwd))
-            .unwrap_or_default(),
+        crate::session_picker::list_sessions_for_project(cwd, session_dir),
         &pinned,
         |meta| meta.id.as_str(),
     )
@@ -86,10 +90,22 @@ pub fn resume_entries(cwd: &str, pins_dir: &Path) -> Vec<(String, String)> {
         } else {
             ""
         };
-        let label = match &meta.name {
-            Some(name) => format!("{pin}{name} · {} msgs", meta.message_count),
-            None => format!("{pin}{} · {} msgs", meta.id, meta.message_count),
-        };
+        // As the classic picker shows them: the name, or the first eight
+        // characters of the id, then when the session was last saved. Rows
+        // of full ids and message counts gave nothing to tell sessions apart.
+        let title = meta
+            .name
+            .as_deref()
+            .unwrap_or_else(|| crate::session_picker::truncate_session_id(&meta.id, 8));
+        let saved = chrono::DateTime::from_timestamp_millis(meta.last_modified_ms)
+            .filter(|_| meta.last_modified_ms > 0)
+            .map(|time| {
+                time.with_timezone(&chrono::Local)
+                    .format(" · %Y-%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let label = format!("{pin}{title}{saved} · {} msgs", meta.message_count);
         (label, meta.path)
     })
     .collect()
@@ -131,5 +147,47 @@ mod tests {
         // A corrupt file reads as nothing pinned rather than failing.
         std::fs::write(pins_path(dir.path()), "not json").expect("write");
         assert!(load_pinned(dir.path()).is_empty());
+    }
+
+    /// The FTUI list read the default sessions directory, so sessions saved
+    /// under `--session-dir` never showed up, and it kept deleted files.
+    #[test]
+    fn resume_entries_read_the_session_dir_and_drop_deleted_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base_dir = tmp.path().join("sessions");
+        let cwd = tmp.path().join("repo");
+        let project_dir = base_dir.join(crate::session::encode_cwd(&cwd));
+        std::fs::create_dir_all(&project_dir).expect("project sessions");
+        let mut header = crate::session::SessionHeader::new();
+        header.id = "kept-session-id".to_string();
+        header.cwd = cwd.display().to_string();
+        let path = project_dir.join("kept.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{{\"type\":\"message\"}}\n",
+                serde_json::to_string(&header).expect("header")
+            ),
+        )
+        .expect("write session");
+
+        let rows = resume_entries(&cwd, Some(&base_dir), tmp.path());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].1, path.display().to_string());
+        // An unnamed session shows a short id and when it was last saved.
+        let saved: chrono::DateTime<chrono::Local> = std::fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .expect("mtime")
+            .into();
+        let label = rows.first().map_or("", |(label, _)| label.as_str());
+        assert!(
+            label.starts_with(&format!("kept-ses · {} · ", saved.format("%Y-%m-%d %H:%M")))
+                && label.ends_with(" msgs"),
+            "{label}"
+        );
+
+        std::fs::remove_file(&path).expect("delete session");
+        let rows = resume_entries(&cwd, Some(&base_dir), tmp.path());
+        assert!(rows.is_empty(), "{rows:?}"); // ubs:ignore[rust.panic.assert-macros] -- test assertion
     }
 }

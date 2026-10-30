@@ -54,6 +54,10 @@ pub(crate) fn run_on_sqlite_thread<T: Send>(f: impl FnOnce() -> Result<T> + Send
 /// local block-on executor (cheap re-entry, no reactor required).
 pub(crate) struct SqliteConnection {
     conn: fsqlite::Connection,
+    /// The private copy a read-only open is served from, when there is one
+    /// (see `open_read_only_snapshot`). Declared after `conn` so the
+    /// connection closes before the directory is removed.
+    _snapshot: Option<tempfile::TempDir>,
 }
 
 impl SqliteConnection {
@@ -62,7 +66,10 @@ impl SqliteConnection {
             path.to_string_lossy().into_owned(),
         ))?;
         futures::executor::block_on(conn.execute("PRAGMA busy_timeout = 5000"))?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            _snapshot: None,
+        })
     }
 
     pub(crate) fn open_read_only(path: &Path) -> std::result::Result<Self, SqliteError> {
@@ -72,7 +79,10 @@ impl SqliteConnection {
         let conn = futures::executor::block_on(fsqlite::Connection::open_schema_only(
             path.to_string_lossy().into_owned(),
         ))?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            _snapshot: None,
+        })
     }
 
     /// Execute one or more statements without parameters.
@@ -161,6 +171,10 @@ fn ensure_regular_sqlite_artifact_if_present(path: &Path) -> Result<bool> {
 fn open_sqlite_connection_read_only(path: &Path) -> Result<SqliteConnection> {
     ensure_regular_sqlite_artifact_if_present(path)?;
     crate::session::ensure_session_file_readable(path).map_err(|err| Error::Io(Box::new(err)))?;
+    if opened_sidecar_is_read_only(path)? {
+        let _uses_wal = sqlite_database_uses_wal(path)?;
+        return open_read_only_snapshot(path);
+    }
     let all_sidecars_exist = ensure_preexisting_sqlite_sidecar_access(path, false)?;
     // Validates the database header bytes even though fsqlite reads through
     // both WAL and rollback-journal databases.
@@ -173,6 +187,63 @@ fn open_sqlite_connection_read_only(path: &Path) -> Result<SqliteConnection> {
             .map_err(|err| Error::Io(Box::new(err)))?;
     }
     map_sqlite_result(SqliteConnection::open_read_only(path))
+}
+
+/// fsqlite opens these existing sidecars read-write even for a read-only
+/// connection (and maps `-shm`), so one this process may only read makes the
+/// open fail in place.
+const READ_WRITE_OPENED_SIDECARS: [&str; 4] =
+    ["-wal", "-shm", "-fsqlite-ns-gate", "-fsqlite-ns-use"];
+
+fn opened_sidecar_is_read_only(path: &Path) -> Result<bool> {
+    for suffix in READ_WRITE_OPENED_SIDECARS {
+        let sidecar = append_sidecar_suffix(path, suffix);
+        if ensure_regular_sqlite_artifact_if_present(&sidecar)?
+            && crate::session::ensure_session_file_read_write(&sidecar).is_err()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Serve a read-only open from a private copy of the database and the WAL
+/// family it reads, for a session whose sidecars fsqlite cannot open in place
+/// (`opened_sidecar_is_read_only`). fsqlite rebuilds the WAL index and its
+/// namespace sidecars beside the copy, which a read-only connection cannot do
+/// ("recovery in progress"), so the copy is opened read-write; callers only
+/// read through it and it is discarded with the connection. The WAL family is
+/// copied first, so a checkpoint between the copies only moves committed pages
+/// into the database copy and never drops them.
+fn open_read_only_snapshot(path: &Path) -> Result<SqliteConnection> {
+    let snapshot = tempfile::Builder::new()
+        .prefix("pi-session-snapshot-")
+        .tempdir()
+        .map_err(|err| Error::session(format!("Failed to create a SQLite snapshot: {err}")))?;
+    let name = path.file_name().ok_or_else(|| {
+        Error::session(format!(
+            "SQLite session path has no file name: {}",
+            path.display()
+        ))
+    })?;
+    let copy = snapshot.path().join(name);
+    for suffix in ["-wal-cert-head", "-wal-cert", "-wal", ""] {
+        let source = append_sidecar_suffix(path, suffix);
+        if !suffix.is_empty() && !ensure_regular_sqlite_artifact_if_present(&source)? {
+            continue;
+        }
+        let mut reader = crate::session::open_existing_session_file_for_read(&source)?;
+        let mut writer = std::fs::File::create_new(append_sidecar_suffix(&copy, suffix))
+            .map_err(|err| Error::Io(Box::new(err)))?;
+        std::io::copy(&mut reader, &mut writer).map_err(|err| {
+            Error::session(format!("Failed to snapshot {}: {err}", source.display()))
+        })?;
+    }
+    let conn = map_sqlite_result(SqliteConnection::open_read_write(&copy))?;
+    Ok(SqliteConnection {
+        _snapshot: Some(snapshot),
+        ..conn
+    })
 }
 
 fn sqlite_database_uses_wal(path: &Path) -> Result<bool> {
@@ -588,6 +659,25 @@ fn write_session_meta(conn: &SqliteConnection, entries: &[SessionEntry]) -> Resu
         ],
     ))?;
     Ok(())
+}
+
+/// Inspect the authoritative header in one read snapshot without materializing
+/// entries or attachments. The existing read-only open preserves backend
+/// integrity checks and its handling of the SQLite sidecar family.
+pub(crate) fn load_session_header(path: &Path) -> Result<SessionHeader> {
+    if !crate::session::session_path_try_exists(path).map_err(|err| Error::Io(Box::new(err)))? {
+        return Err(Error::SessionNotFound {
+            path: path.display().to_string(),
+        });
+    }
+    run_on_sqlite_thread(|| {
+        let conn = open_sqlite_connection_read_only(path)?;
+        let snapshot = entry_io::ReadSnapshot::begin(&conn)?;
+        let header = read_stored_header(&conn)?
+            .ok_or_else(|| Error::session("SQLite session missing header row"))?;
+        snapshot.finish()?;
+        Ok(header)
+    })
 }
 
 #[allow(
@@ -1276,6 +1366,10 @@ mod tests {
                 futures::executor::block_on(load_session_meta(&path)).expect("metadata-only read");
             assert_eq!(meta.name, name);
             assert_eq!(meta.message_count, 1);
+            assert_eq!(
+                load_session_header(&path).expect("header-only read").id,
+                header.id
+            );
             futures::executor::block_on(load_session(&path))
                 .expect_err("full load must still detect corrupt history");
         }

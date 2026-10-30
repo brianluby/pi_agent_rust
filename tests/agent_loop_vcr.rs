@@ -147,6 +147,16 @@ fn format_event(event: &AgentEvent) -> serde_json::Value {
             "model": model,
             "restoredPrimary": restored_primary,
         }),
+        AgentEvent::PrewalkSwitched {
+            provider,
+            model,
+            thinking,
+        } => json!({
+            "event": "prewalk_switched",
+            "provider": provider,
+            "model": model,
+            "thinking": thinking,
+        }),
         AgentEvent::ExtensionError {
             extension_id,
             event,
@@ -158,6 +168,7 @@ fn format_event(event: &AgentEvent) -> serde_json::Value {
             "error": error,
         }),
         AgentEvent::AdvisorNote { .. } => json!({ "event": "advisor_note" }),
+        AgentEvent::CostWarning { .. } => json!({ "event": "cost_warning" }),
         AgentEvent::ProviderError { .. } => json!({ "event": "provider_error" }),
     }
 }
@@ -204,6 +215,7 @@ fn agent_loop_openai_vcr_basic() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            cost_budget: None,
             turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
@@ -394,6 +406,7 @@ fn agent_loop_anthropic_simple_text() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            cost_budget: None,
             turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
@@ -501,6 +514,7 @@ fn agent_loop_anthropic_error_stream() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            cost_budget: None,
             turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
@@ -591,6 +605,7 @@ fn agent_loop_anthropic_tool_call_stop() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            cost_budget: None,
             turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
