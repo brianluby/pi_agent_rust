@@ -37,10 +37,13 @@ use uuid::Uuid;
 pub(crate) mod bash_session;
 mod client_files;
 mod client_terminals;
+mod interim_response;
 mod structured_json;
 mod structured_sqlite;
 pub use client_files::{TextFileClient, TextFileClientScope};
 pub use client_terminals::{TerminalClient, TerminalClientScope, TerminalCommand};
+pub use interim_response::interim_response_text;
+pub(crate) use interim_response::{interim_response_text_from_details, is_interim_response_path};
 
 /// Run an internal, resource-bounded data query before normal Pi startup.
 /// The worker receives admitted bytes and never loads project configuration,
@@ -337,6 +340,18 @@ pub trait Tool: Send + Sync {
 
     /// Get the tool parameters as JSON Schema.
     fn parameters(&self) -> serde_json::Value;
+
+    /// Host-only planning/mutation evidence from this tool's raw successful
+    /// execution. Ordinary, extension and MCP tools cannot opt in by naming
+    /// themselves after a native tool or returning similar-looking details.
+    #[doc(hidden)]
+    fn prewalk_evidence(
+        &self,
+        _input: &serde_json::Value,
+        _output: &ToolOutput,
+    ) -> crate::prewalk::ToolEvidence {
+        crate::prewalk::ToolEvidence::default()
+    }
 
     /// Execute the tool.
     ///
@@ -5948,6 +5963,12 @@ impl ToolRegistry {
                 )),
                 "write" => tools.push(Box::new(
                     WriteTool::new(cwd)
+                        .with_output_enabled(
+                            config
+                                .and_then(|config| config.out.as_ref())
+                                .and_then(|settings| settings.enabled)
+                                .unwrap_or(false),
+                        )
                         .with_mutation_recorder(mutation_recorder.clone())
                         .with_workspace(workspace.clone()),
                 )),
@@ -6671,7 +6692,7 @@ impl std::fmt::Debug for SharedToolRegistry {
 // ============================================================================
 
 /// Input parameters for the read tool.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReadInput {
     path: String,
@@ -6681,6 +6702,8 @@ struct ReadInput {
     hashline: bool,
     #[serde(default)]
     raw: bool,
+    #[serde(default)]
+    rendered: bool,
 }
 
 pub struct ReadTool {
@@ -6871,6 +6894,24 @@ impl ReadTool {
     async fn execute_scheme_read(&self, input: &ReadInput) -> Result<ToolOutput> {
         use std::fmt::Write as _;
 
+        if !input.raw
+            && input.path.starts_with("ssh://")
+            && crate::notebook::is_notebook_path(Path::new(&input.path))
+        {
+            let input = input.clone();
+            return asupersync::runtime::spawn_blocking(move || {
+                let source = crate::url_router::ssh_fetch_document(
+                    &input.path,
+                    crate::notebook::MAX_NOTEBOOK_BYTES as u64,
+                )?;
+                notebook_source_read_output(
+                    &input,
+                    &source,
+                    serde_json::json!({"path": input.path, "scheme": "ssh"}),
+                )
+            })
+            .await;
+        }
         let resolved = crate::url_router::resolve(&input.path, &self.cwd)?;
         let total_lines = resolved.content.lines().count();
         let start_line = input
@@ -6999,13 +7040,68 @@ impl ReadTool {
     }
 }
 
+/// One notebook view contract for admitted disk files, SSH snapshots and
+/// editor-owned buffers. Output windows never duplicate full text in details.
+fn notebook_source_read_output(
+    input: &ReadInput,
+    source: &[u8],
+    mut details: serde_json::Value,
+) -> Result<ToolOutput> {
+    if source.len() > crate::notebook::MAX_NOTEBOOK_BYTES {
+        return Err(Error::tool(
+            "read",
+            "[NOTEBOOK_EDIT] Notebook exceeds the 10 MiB limit",
+        ));
+    }
+    details["contentType"] = serde_json::json!("notebook");
+    details["sourceBytes"] = serde_json::json!(source.len());
+    details["rendered"] = serde_json::json!(input.rendered);
+    details["editable"] = serde_json::json!(!input.rendered);
+    if input.rendered {
+        if input.hashline {
+            return Err(Error::tool(
+                "read",
+                "[DOCUMENT_HASHLINE] Saved notebook output is not an edit location; omit rendered for cell-source anchors or use raw=true for JSON anchors",
+            ));
+        }
+        let rendered =
+            crate::url_read::convert_bytes(&input.path, "application/x-ipynb+json", source, false)?;
+        details["extractor"] = serde_json::json!(rendered.extractor);
+        return document_read_output(input, &rendered.content, details, true);
+    }
+    let source = std::str::from_utf8(source)
+        .map_err(|_| Error::tool("read", "[NOTEBOOK_EDIT] Notebook JSON must be valid UTF-8"))?;
+    let notebook = crate::notebook::Notebook::parse(source, &input.path)?;
+    let editable = notebook.editable_text()?;
+    details["extractor"] = serde_json::json!("notebook-cells");
+    notebook_read_output(input, &editable, details)
+}
+
 /// Window rendered documents without returning their full text a second time
 /// in `details`. Offsets address the projection, never the source's edit lines.
 fn document_read_output(
     input: &ReadInput,
     content: &str,
+    details: serde_json::Value,
+    numbered: bool,
+) -> Result<ToolOutput> {
+    window_read_output(input, content, details, numbered, false)
+}
+
+fn notebook_read_output(
+    input: &ReadInput,
+    content: &str,
+    details: serde_json::Value,
+) -> Result<ToolOutput> {
+    window_read_output(input, content, details, true, input.hashline)
+}
+
+fn window_read_output(
+    input: &ReadInput,
+    content: &str,
     mut details: serde_json::Value,
     numbered: bool,
+    hashline: bool,
 ) -> Result<ToolOutput> {
     let total_lines = content.lines().count();
     let start = usize::try_from(input.offset.unwrap_or(1))
@@ -7033,7 +7129,9 @@ fn document_read_output(
     let mut shown = 0usize;
     let mut byte_limited = false;
     for (index, line) in content.lines().skip(start - 1).take(limit).enumerate() {
-        let prefix = if numbered {
+        let prefix = if hashline {
+            format!("{}:", format_hashline_tag(start + index - 1, line))
+        } else if numbered {
             format!("{:>width$}→", start + index)
         } else {
             String::new()
@@ -7101,7 +7199,7 @@ impl Tool for ReadTool {
         "read"
     }
     fn description(&self) -> &str {
-        "Read local files, document URLs, ZIP archive members, images (jpg, png, gif, webp), and video frames. Local videos return metadata and a contact sheet; clip.mp4:42 selects a zero-based frame, and clip.mp4:1m2s or :00:01:02 selects a timestamp. Video decoding requires ffmpeg/ffprobe with the fd protocol and does not support hashline or line windows. Query JSON/JSONL with data.json?q=<jq filter> and optional &raw=true, &compact=true, &limit=N, &offset=N (zero-based result paging). Browse local SQLite with data.sqlite, data.sqlite:table, :table:key, :table?where=...&order=column:desc&limit=N&offset=N, or data.sqlite?q=SELECT...; queries are read-only and include committed WAL data. Structured queries need supported process memory limits (Linux or macOS 13+). DOCX/PPTX render text, XLSX renders saved cells and formula results, EPUB renders chapters, and notebooks render saved cells and outputs. PDF extraction requires url-pdf. Read archive.zip to list children or archive.zip:path/to/file for a UTF-8 member. Use raw=true on the source path for original text. Query results, rendered documents, and archive members have no hashline edit anchors. Images are attachments. Output is limited to 2000 lines or 1MB; tool offset/limit address rendered lines (one-based), separately from query result paging."
+        "Read local files, document URLs, ZIP archive members, images (jpg, png, gif, webp), and video frames. Local videos return metadata and a contact sheet; clip.mp4:42 selects a zero-based frame, and clip.mp4:1m2s or :00:01:02 selects a timestamp. Video decoding requires ffmpeg/ffprobe with the fd protocol and does not support hashline or line windows. Query JSON/JSONL with data.json?q=<jq filter> and optional &raw=true, &compact=true, &limit=N, &offset=N (zero-based result paging). Browse local SQLite with data.sqlite, data.sqlite:table, :table:key, :table?where=...&order=column:desc&limit=N&offset=N, or data.sqlite?q=SELECT...; queries are read-only and include committed WAL data. Structured queries need supported process memory limits (Linux or macOS 13+). DOCX/PPTX render text, XLSX renders saved cells and formula results, and EPUB renders chapters. Local/SSH notebooks expose editable # %% cell markers and support hashline; rendered=true shows their saved cells and outputs instead. Notebook reads never execute code. PDF extraction requires url-pdf. Read archive.zip to list children or archive.zip:path/to/file for a UTF-8 member. Use raw=true on the source path for original text, and raw=true on edit/hashline_edit when editing notebook JSON. Query results, rendered documents, and archive members have no hashline edit anchors. Images are attachments. Output is limited to 2000 lines or 1MB; tool offset/limit address rendered lines (one-based), separately from query result paging."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -7127,6 +7225,10 @@ impl Tool for ReadTool {
                 "raw": {
                     "type": "boolean",
                     "description": "Read original source text instead of converting a document or querying data. Use the source path without query selectors, with hashline=true for editing JSON. This differs from &raw=true in a JSON query, which prints returned strings without quotes."
+                },
+                "rendered": {
+                    "type": "boolean",
+                    "description": "For a notebook, show saved cells and outputs instead of editable cell markers. Does not execute code; incompatible with hashline. raw=true takes precedence."
                 }
             },
             "required": ["path"]
@@ -7157,6 +7259,12 @@ impl Tool for ReadTool {
             return Err(Error::validation(
                 "`offset` must be non-negative".to_string(),
             ));
+        }
+
+        // A reply's ignored suffix must not turn it into a structured-file
+        // query before the URL router can explain that it is write-only.
+        if is_interim_response_path(&input.path) {
+            return self.execute_scheme_read(&input).await;
         }
 
         if !input.raw
@@ -7375,6 +7483,42 @@ impl Tool for ReadTool {
         }
         let initial_bytes = &buffer[..initial_read];
 
+        if !input.raw && crate::notebook::is_notebook_path(&path) {
+            let bound = crate::notebook::MAX_NOTEBOOK_BYTES;
+            if meta.len() > bound as u64 {
+                return Err(Error::tool(
+                    "read",
+                    "[NOTEBOOK_EDIT] Notebook exceeds the 10 MiB limit; use raw=true to inspect the JSON source",
+                ));
+            }
+            // Continue through the already-admitted descriptor. Conversion
+            // must see the whole notebook, even for a one-line source window.
+            let mut bytes = initial_bytes.to_vec();
+            let remaining = bound.saturating_sub(bytes.len());
+            file.take(remaining as u64 + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| {
+                    Error::tool("read", format!("Failed to read notebook: {error}"))
+                })?;
+            let request = input.clone();
+            let display = path.to_string_lossy().into_owned();
+            let output = asupersync::runtime::spawn_blocking(move || {
+                notebook_source_read_output(&request, &bytes, serde_json::json!({"path": display}))
+            })
+            .await?;
+            cache_tool_output(
+                cache_key,
+                stable_cache_dependency_for_open_file(
+                    &path,
+                    cache_file.as_ref(),
+                    cache_deps.as_deref(),
+                ),
+                &output,
+            );
+            return Ok(output);
+        }
+
         if let Some(mime_type) = detect_supported_image_mime_type_from_bytes(initial_bytes) {
             if self.block_images {
                 return Err(Error::tool(
@@ -7482,11 +7626,6 @@ impl Tool for ReadTool {
         // for coding workflows; document reads expose useful saved content.
         let document_mime = if input.raw {
             None
-        } else if path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("ipynb"))
-        {
-            Some("application/x-ipynb+json")
         } else if initial_bytes.starts_with(b"%PDF")
             || path
                 .extension()
@@ -10933,6 +11072,8 @@ struct EditInput {
     path: String,
     old_text: String,
     new_text: String,
+    #[serde(default)]
+    raw: bool,
 }
 
 pub struct EditTool {
@@ -11550,6 +11691,73 @@ struct TextReplacementOutcome {
     after_normalized: String,
 }
 
+/// Apply native edits to a notebook's source view, then return JSON for the
+/// existing raw-byte CAS/undo path. Non-notebooks and raw=true retain the
+/// ordinary byte-preserving edit behavior.
+fn apply_file_text_replacement(
+    raw: &[u8],
+    input: &EditInput,
+    file_path: &Path,
+) -> Result<TextReplacementOutcome> {
+    if input.raw || !crate::notebook::is_notebook_path(file_path) {
+        return apply_unique_text_replacement(
+            raw,
+            &input.old_text,
+            &input.new_text,
+            &input.path,
+            "edit",
+        );
+    }
+    let source = std::str::from_utf8(raw)
+        .map_err(|_| Error::tool("edit", "Notebook JSON must be valid UTF-8"))?;
+    let notebook = crate::notebook::Notebook::parse(source, &input.path)?;
+    let editable = notebook.editable_text()?;
+    let mut outcome = apply_unique_text_replacement(
+        editable.as_bytes(),
+        &input.old_text,
+        &input.new_text,
+        &input.path,
+        "edit",
+    )?;
+    outcome.final_content = notebook.serialize_edited(&outcome.final_content)?;
+    // Different marker spellings can refer to the same original cell. The
+    // serialized notebook, rather than its editable projection, owns mutation.
+    if outcome.final_content == source {
+        return Err(Error::tool(
+            "edit",
+            format!(
+                "No changes made to {}. The edit produced identical notebook JSON.",
+                input.path
+            ),
+        ));
+    }
+    Ok(outcome)
+}
+
+fn apply_file_hashline_edits(
+    source: &str,
+    input: &HashlineEditInput,
+    file_path: &Path,
+) -> Result<HashlineApplyOutcome> {
+    if input.raw || !crate::notebook::is_notebook_path(file_path) {
+        return apply_hashline_edits_to_content(source, &input.edits, &input.path);
+    }
+    let notebook = crate::notebook::Notebook::parse(source, &input.path)?;
+    let editable = notebook.editable_text()?;
+    let mut outcome = apply_hashline_edits_to_content(&editable, &input.edits, &input.path)?;
+    outcome.final_content = notebook.serialize_edited(&outcome.final_content)?;
+    if outcome.final_content == source {
+        return Err(Error::tool(
+            "hashline_edit",
+            format!(
+                "No changes made to {}. The edits produced identical notebook JSON.",
+                input.path
+            ),
+        ));
+    }
+    Ok(outcome)
+}
+
 /// Shared text-replacement core for local and `ssh://` edits
 /// (bd-cv653.6.5): exactly one fuzzy-unique match of `old_text` replaced
 /// with `new_text`, preserving BOM, line endings, and unmatched bytes
@@ -11946,21 +12154,23 @@ fn apply_hashline_edits_to_content(
         }
     }
 
-    if !any_change {
-        return Err(Error::tool(
-            "hashline_edit",
-            format!(
-                "No changes made to {display_path}. All edits were no-ops (replacement identical to existing content)."
-            ),
-        ));
-    }
-
     // Reconstruct content
     let after_normalized = lines.join("\n");
     let new_content = restore_line_endings(&after_normalized, original_ending);
     let mut final_content = new_content;
     if had_bom {
         final_content = format!("\u{FEFF}{final_content}");
+    }
+
+    // Individually effective, nonoverlapping operations can cancel each other
+    // out. A successful edit must change the final image, not just a splice.
+    if !any_change || final_content == raw_content {
+        return Err(Error::tool(
+            "hashline_edit",
+            format!(
+                "No changes made to {display_path}. The edits were no-ops or cancelled each other out, leaving identical content."
+            ),
+        ));
     }
 
     Ok(HashlineApplyOutcome {
@@ -11983,13 +12193,7 @@ impl EditTool {
         })
         .await
         .map_err(|e| Error::tool("edit", format!("ssh read failed: {e}")))?;
-        let outcome = apply_unique_text_replacement(
-            &raw,
-            &input.old_text,
-            &input.new_text,
-            &input.path,
-            "edit",
-        )?;
+        let outcome = apply_file_text_replacement(&raw, input, Path::new(&input.path))?;
         let write_url = input.path.clone();
         let payload = outcome.final_content.clone();
         let write_details = asupersync::runtime::spawn_blocking_io(move || {
@@ -12051,7 +12255,7 @@ impl HashlineEditTool {
                     .to_string(),
             )
         })?;
-        let outcome = apply_hashline_edits_to_content(&raw_content, &input.edits, &input.path)?;
+        let outcome = apply_file_hashline_edits(&raw_content, input, Path::new(&input.path))?;
 
         let write_url = input.path.clone();
         let payload = outcome.final_content.clone();
@@ -12090,6 +12294,14 @@ impl HashlineEditTool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for EditTool {
+    fn prewalk_evidence(
+        &self,
+        input: &serde_json::Value,
+        output: &ToolOutput,
+    ) -> crate::prewalk::ToolEvidence {
+        crate::prewalk::ToolEvidence::text_edit(input, output)
+    }
+
     fn bind_text_file_client_scope(&mut self, scope: TextFileClientScope) {
         self.text_file_client = scope;
     }
@@ -12101,7 +12313,7 @@ impl Tool for EditTool {
         "edit"
     }
     fn description(&self) -> &str {
-        "Edit a file by replacing text. The oldText must match a unique region; matching is exact but normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace."
+        "Edit a file by replacing text. The oldText must match a unique region; matching is exact but normalizes line endings, Unicode spaces/quotes/dashes, and ignores trailing whitespace. For .ipynb, edit the cell-marked view returned by read; cell:N preserves that cell's identity, metadata and saved outputs. Use raw=true to edit notebook JSON instead."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -12120,6 +12332,10 @@ impl Tool for EditTool {
                 "newText": {
                     "type": "string",
                     "description": "New text to replace the old text with"
+                },
+                "raw": {
+                    "type": "boolean",
+                    "description": "Edit original notebook JSON instead of its editable cell-marked view. Use with a prior read(raw=true)."
                 }
             },
             "required": ["path", "oldText", "newText"]
@@ -12248,13 +12464,7 @@ impl Tool for EditTool {
         }
 
         let source_expectation = AtomicContentExpectation::from_bytes(&raw);
-        let outcome = apply_unique_text_replacement(
-            &raw,
-            &input.old_text,
-            &input.new_text,
-            &input.path,
-            "edit",
-        )?;
+        let outcome = apply_file_text_replacement(&raw, &input, &path)?;
         let final_content = outcome.final_content;
         let normalized_content = outcome.before_normalized;
         let new_content_for_diff = outcome.after_normalized;
@@ -12336,8 +12546,38 @@ struct WriteInput {
     content: String,
 }
 
+/// Compare the admitted preimage without allocating another file-sized buffer.
+/// An unreadable preimage is unknown, not evidence that a write changed bytes;
+/// write-only access must retain its existing successful execution behavior.
+fn write_content_changed(path: &Path, roots: &[PathBuf], content: &[u8]) -> Option<bool> {
+    let mut file = match open_regular_file_within_roots_with(path, roots, || {}) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(true),
+        Err(_) => return None,
+    };
+    if file.metadata().ok()?.len() != u64::try_from(content.len()).ok()? {
+        return Some(true);
+    }
+    let mut buffer = [0_u8; 8192];
+    let mut offset = 0;
+    while offset < content.len() {
+        let length = buffer.len().min(content.len() - offset);
+        match file.read_exact(&mut buffer[..length]) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Some(true),
+            Err(_) => return None,
+        }
+        if buffer[..length] != content[offset..offset + length] {
+            return Some(true);
+        }
+        offset += length;
+    }
+    Some(file.read(&mut buffer[..1]).ok()? != 0)
+}
+
 pub struct WriteTool {
     cwd: PathBuf,
+    output_enabled: bool,
     text_file_client: TextFileClientScope,
     before_persist_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
@@ -12348,11 +12588,20 @@ impl WriteTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            output_enabled: false,
             text_file_client: TextFileClientScope::default(),
             workspace: WorkspaceHandle::default(),
             before_persist_hook: None,
             mutation_recorder: None,
         }
+    }
+
+    /// Enable the host's interim reply surface. Native child agents remain
+    /// unable to address the user even when their inherited settings opt in.
+    #[must_use]
+    pub const fn with_output_enabled(mut self, enabled: bool) -> Self {
+        self.output_enabled = enabled;
+        self
     }
 
     /// Attach the session workspace root handle (bd-cv653.3.12).
@@ -12418,6 +12667,7 @@ impl WriteTool {
         }
         let resolved = resolved?;
         let regions: Vec<_> = resolved
+            .regions
             .iter()
             .map(|region| serde_json::json!({"index": region.index, "file": region.file}))
             .collect();
@@ -12431,6 +12681,7 @@ impl WriteTool {
                 "schema": "pi.conflict.write.v1",
                 "regions": regions,
                 "paths": paths,
+                "changedPaths": resolved.changed_paths,
                 "gitIndexUpdated": false
             })),
             is_error: false,
@@ -12441,6 +12692,7 @@ impl WriteTool {
     fn with_before_persist_hook(cwd: &Path, hook: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            output_enabled: false,
             text_file_client: TextFileClientScope::default(),
             workspace: WorkspaceHandle::default(),
             before_persist_hook: Some(Arc::new(hook)),
@@ -12468,6 +12720,32 @@ fn ends_with_read_truncation_notice(content: &str) -> bool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for WriteTool {
+    fn prewalk_evidence(
+        &self,
+        input: &serde_json::Value,
+        output: &ToolOutput,
+    ) -> crate::prewalk::ToolEvidence {
+        let Some(details) = &output.details else {
+            return crate::prewalk::ToolEvidence::default();
+        };
+        if details["schema"] == "pi.conflict.write.v1" {
+            return crate::prewalk::ToolEvidence::paths(
+                details["changedPaths"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str),
+            );
+        }
+        if details["changed"] == true {
+            crate::prewalk::ToolEvidence::paths(
+                input.get("path").and_then(serde_json::Value::as_str),
+            )
+        } else {
+            crate::prewalk::ToolEvidence::default()
+        }
+    }
+
     fn bind_text_file_client_scope(&mut self, scope: TextFileClientScope) {
         self.text_file_client = scope;
     }
@@ -12479,7 +12757,11 @@ impl Tool for WriteTool {
         "write"
     }
     fn description(&self) -> &str {
-        "Write content to a file, creating parent directories as needed. Resolve merge conflicts using literal content at conflict://N/token or typed conflicts at conflict://*. Read conflict://* first for current indices and tokens; side views are read-only."
+        if self.output_enabled && !interim_response::caller_is_child() {
+            "Write content to a file, creating parent directories as needed. For .ipynb, provide complete notebook JSON; use edit or hashline_edit to modify the cell-marked view from read. Write nonempty Markdown to out:// (up to 64 KiB UTF-8) to answer the user or report progress without ending the task, then keep working; out:// never writes a file. Resolve merge conflicts using literal content at conflict://N/token or typed conflicts at conflict://*. Read conflict://* first for current indices and tokens; side views are read-only."
+        } else {
+            "Write content to a file, creating parent directories as needed. For .ipynb, provide complete notebook JSON; use edit or hashline_edit to modify the cell-marked view from read. Resolve merge conflicts using literal content at conflict://N/token or typed conflicts at conflict://*. Read conflict://* first for current indices and tokens; side views are read-only."
+        }
     }
 
     fn effects(&self) -> ToolEffects {
@@ -12492,6 +12774,9 @@ impl Tool for WriteTool {
         let Some(path) = input.get("path").and_then(serde_json::Value::as_str) else {
             return self.effects();
         };
+        if is_interim_response_path(path) && interim_response::validated_input(input).is_ok() {
+            return ToolEffects::read();
+        }
         if path.starts_with("conflict://") {
             // Git inventory uses a process even though publication is local.
             ToolEffects::write().union(ToolEffects::process())
@@ -12548,12 +12833,17 @@ impl Tool for WriteTool {
                 }
             }
         });
+        let path_description = if self.output_enabled && !interim_response::caller_is_child() {
+            "File path; out:// for a mid-task Markdown reply (no file write, maximum 64 KiB UTF-8); conflict://N/token for literal replacement, or conflict://* for typed choices"
+        } else {
+            "File path, conflict://N/token for literal replacement, or conflict://* for typed choices"
+        };
         serde_json::json!({
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File path, conflict://N/token for literal replacement, or conflict://* for typed choices"
+                    "description": path_description
                 },
                 "content": content,
                 "conflicts": conflicts
@@ -12579,8 +12869,15 @@ impl Tool for WriteTool {
         &self,
         tool_call_id: &str,
         input: serde_json::Value,
-        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        if input
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_interim_response_path)
+        {
+            return self.execute_interim_response(&input, on_update.as_deref());
+        }
         if input
             .get("path")
             .and_then(serde_json::Value::as_str)
@@ -12710,18 +13007,21 @@ impl Tool for WriteTool {
             recorder.begin_file(tool_call_id, "write", &path);
         }
         let persisted = asupersync::runtime::spawn_blocking_io(move || {
-            before_persist_hook.map_or_else(
-                || atomic_replace_file(&path_clone, &cwd_clone, &content_bytes),
-                |hook| {
-                    atomic_replace_file_with(
-                        &path_clone,
-                        &cwd_clone,
-                        &content_bytes,
-                        None,
-                        move || hook(),
-                    )
-                },
-            )
+            let changed = write_content_changed(&path_clone, &cwd_clone, &content_bytes);
+            before_persist_hook
+                .map_or_else(
+                    || atomic_replace_file(&path_clone, &cwd_clone, &content_bytes),
+                    |hook| {
+                        atomic_replace_file_with(
+                            &path_clone,
+                            &cwd_clone,
+                            &content_bytes,
+                            None,
+                            move || hook(),
+                        )
+                    },
+                )
+                .map(|()| changed)
         })
         .await
         .map_err(|e| Error::tool("write", format!("Failed to write file: {e}")));
@@ -12732,14 +13032,14 @@ impl Tool for WriteTool {
                 recorder.abort(tool_call_id);
             }
         }
-        persisted?;
+        let changed = persisted?;
 
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(format!(
                 "Successfully wrote {} bytes to {}",
                 bytes_written, input.path
             )))],
-            details: None,
+            details: Some(serde_json::json!({"changed":changed})),
             is_error: false,
         })
     }
@@ -17712,6 +18012,8 @@ fn strip_hashline_prefix(line: &str) -> &str {
 struct HashlineEditInput {
     path: String,
     edits: Vec<HashlineOp>,
+    #[serde(default)]
+    raw: bool,
 }
 
 /// A single hashline edit operation.
@@ -17913,6 +18215,14 @@ fn op_precedence(op: &str) -> u8 {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for HashlineEditTool {
+    fn prewalk_evidence(
+        &self,
+        input: &serde_json::Value,
+        output: &ToolOutput,
+    ) -> crate::prewalk::ToolEvidence {
+        crate::prewalk::ToolEvidence::text_edit(input, output)
+    }
+
     fn bind_text_file_client_scope(&mut self, scope: TextFileClientScope) {
         self.text_file_client = scope;
     }
@@ -17927,7 +18237,8 @@ impl Tool for HashlineEditTool {
         "Apply precise file edits using LINE#HASH tags from a prior read with hashline=true. \
          Each edit specifies an op (replace/prepend/append), a pos anchor (\"N#AB\"), an optional \
          end anchor for range replace, and replacement lines. Edits are validated against current \
-         file hashes and applied bottom-up to avoid index invalidation."
+         file hashes and applied bottom-up to avoid index invalidation. For .ipynb, anchors \
+         address the editable cell view; set raw=true when the preceding read used raw=true."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -17937,6 +18248,10 @@ impl Tool for HashlineEditTool {
                 "path": {
                     "type": "string",
                     "description": "Path to the file to edit (relative or absolute)"
+                },
+                "raw": {
+                    "type": "boolean",
+                    "description": "Apply anchors to original notebook JSON instead of the editable cell view; match read(raw=true)."
                 },
                 "edits": {
                     "type": "array",
@@ -18076,7 +18391,7 @@ impl Tool for HashlineEditTool {
             )
         })?;
 
-        let outcome = apply_hashline_edits_to_content(&raw_content, &input.edits, &input.path)?;
+        let outcome = apply_file_hashline_edits(&raw_content, &input, &path)?;
         let final_content = outcome.final_content;
         let normalized = outcome.before_normalized;
         let new_normalized = outcome.after_normalized;
@@ -18149,6 +18464,10 @@ impl Tool for HashlineEditTool {
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+#[path = "tools/notebook_tests.rs"]
+mod notebook_tool_tests;
 
 #[cfg(test)]
 mod tests {
@@ -26063,6 +26382,83 @@ mod tests {
                 err_msg.contains("no-ops"),
                 "error should mention no-ops: {err_msg}"
             );
+        });
+    }
+
+    #[test]
+    fn test_hashline_edit_rejects_operations_that_cancel_each_other_out() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("test.txt");
+            let original = "a\na\n";
+            std::fs::write(&file, original).unwrap();
+            let tool = HashlineEditTool::new(dir.path());
+            let input = serde_json::json!({
+                "path": file,
+                "edits": [
+                    {"op":"replace", "pos":format_hashline_tag(0, "a"), "lines":[]},
+                    {"op":"append", "pos":format_hashline_tag(1, "a"), "lines":["a"]}
+                ]
+            });
+            let error = tool
+                .execute("net-zero-edit", input, None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("leaving identical content"));
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        });
+    }
+
+    #[test]
+    fn test_notebook_marker_aliases_do_not_report_successful_native_edits() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("analysis.ipynb");
+            let source = serde_json::json!({
+                "nbformat":4, "nbformat_minor":5, "metadata":{},
+                "cells":[{
+                    "id":"code", "cell_type":"code", "metadata":{},
+                    "source":["value = 1\n"], "execution_count":null, "outputs":[]
+                }]
+            })
+            .to_string();
+            let notebook = crate::notebook::Notebook::parse(&source, "analysis.ipynb").unwrap();
+            // Start with canonical JSON so a formatting-only rewrite cannot
+            // hide that both marker spellings denote exactly the same cell.
+            let original = notebook
+                .serialize_edited(&notebook.editable_text().unwrap())
+                .unwrap();
+            std::fs::write(&file, &original).unwrap();
+            let tools = ToolRegistry::new(&["edit", "hashline_edit"], dir.path(), None);
+            for (name, input) in [
+                (
+                    "edit",
+                    serde_json::json!({
+                        "path":file, "oldText":"# %% [code] cell:0", "newText":"# %% [code] cell:00"
+                    }),
+                ),
+                (
+                    "hashline_edit",
+                    serde_json::json!({
+                        "path":file, "edits":[{
+                            "op":"replace", "pos":format_hashline_tag(0, "# %% [code] cell:0"),
+                            "lines":["# %% [code] cell:00"]
+                        }]
+                    }),
+                ),
+            ] {
+                let error = tools
+                    .get(name)
+                    .unwrap()
+                    .execute("marker-alias", input, None)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("identical notebook JSON"),
+                    "{name}: {error}"
+                );
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+            }
         });
     }
 

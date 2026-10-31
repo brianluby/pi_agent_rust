@@ -602,11 +602,24 @@ This applies to JSONL and SQLite sessions, including the first charge arriving
 after a zero-spend checkpoint. Failed replacements and same-file reloads keep
 the foreground account live. Cost journals are not created for `--no-session`.
 
+Saved forks retain references to observed unfinished billing writers. A fork
+can recover their final charges even after every foreground handle has closed, without
+opening an ancestor's transcript or SQLite database. Repeated forks of one live
+account use the same journal. Once a writer's final closure is observed, later
+checkpoints retain its final total and remove the completed reference. Missing
+required journals or writers block further requests instead of resetting spend.
+
 Keep the adjacent `.pi-cost-*.json` files with their session files when backing
-up or moving a session directory. Failure to acknowledge a journal write blocks
-further requests on the affected account. A crash before a normal checkpoint or
-before a final charge receives its durable acknowledgement can still lose
-uncheckpointed spend; these limits do not replace the provider's billing records.
+up a session directory. Unfinished references use the original absolute journal
+location: moving or copying the directory does not redirect outstanding billing
+to the copy. Observe final closure and save a new checkpoint before expecting a
+snapshot to be independent of its original journals. Failure to acknowledge a
+journal write blocks further requests on the affected account. If an incomplete
+save leaves primary usage and journal charges with an uncertain overlap, the
+known lower bound is retained and further requests are blocked. A crash before
+a normal checkpoint or before a final charge receives its durable acknowledgement
+can still lose uncheckpointed spend; these limits do not replace the provider's
+billing records.
 
 ### Native Subagents and Orchestration
 
@@ -725,7 +738,7 @@ Thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`
 
 ### Customization (Skills & Prompt Templates)
 
-- **Skills**: Drop `SKILL.md` under `~/.pi/agent/skills/` or `.pi/skills/` and invoke with `/skill:name`.
+- **Skills**: Place a skill directory containing `SKILL.md` under `.pi/skills/`, `.agents/skills/`, `~/.pi/agent/skills/`, or `~/.agents/skills/` and invoke it with `/skill:name`. See [skill discovery and precedence](docs/skills.md#locations).
 - **Prompt templates**: Markdown files under `~/.pi/agent/prompts/` or `.pi/prompts/`; invoke via `/<template> [args]`.
 - **Packages**: Share bundles with `pi install npm:@org/pi-packages` (skills, prompts, themes, extensions).
 
@@ -748,6 +761,50 @@ Pi runs in four modes, each suited to different workflows:
 | **Print** | `pi -p "..."` | Single response to stdout, no TUI, scriptable |
 | **RPC** | `pi --mode rpc` | Headless JSON protocol over stdin/stdout for IDE integrations |
 | **ACP** | `pi --acp` | JSON-RPC 2.0 Agent Client Protocol over stdin/stdout (e.g. the Zed editor) |
+
+**ACP model selection.** After `initialize`, `session/new`, `session/load`, and
+`session/resume` return model choices and the active selection. Modern clients
+use the `model` selector in `configOptions` and send
+`session/set_config_option` with `configId: "model"`. Older clients can use
+`models.currentModelId`, `models.availableModels`, and `session/set_model` with
+`modelId`. Both surfaces use the same opaque `provider/model` values, including
+custom BYO IDs containing slashes or query strings. Successful selections
+publish a complete `config_option_update` before the response, including any
+change to the model's supported thinking level.
+
+Choices come from Pi's existing model registry and credential availability,
+with the requested workspace's disabled-provider policy applied. `--models`
+and `enabled_models` guide startup and cycling; explicit editor selections can
+choose other registered models. The current model stays visible when restoring
+a saved session or making an explicit selection outside those preferences.
+An explicit `--api-key` admits additional models only for its bound provider;
+other providers still need their own credentials unless they require no key.
+If an editor shows an empty picker, compare its `session/new` response with
+`pi --list-models` using the same configuration and launch environment.
+
+**ACP session forks.** Pi advertises the optional ACP v1 draft
+`sessionCapabilities.fork` capability. A client can create an active branch
+from the source's complete selected conversation:
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"session/fork","params":{"sessionId":"SOURCE_ID","cwd":"/absolute/workspace","mcpServers":[]}}
+```
+
+The response contains a new `sessionId`, model choices, and `configOptions`.
+The last user message and assistant reply are included in the fork; the source
+keeps its conversation and remains usable. Forking does not run the model or
+replay the transcript. Use `session/load` on the returned ID when an editor
+needs the inherited history. A live source or an exact saved ID in the configured
+session directory can be forked. With `--session-dir`, the fork is saved before
+success is acknowledged, including retained model spend and pending billing
+ancestry. Live source and fork share the configured session-tree cost budget.
+
+Forks stay in the source's canonical workspace; nonempty
+`additionalDirectories` are rejected. The request supplies a fresh MCP server
+list (omission means none), and editor file requests, terminal requests, and
+permissions use the new session identity. An active source prompt, unresolved
+editor write, unsettled terminal cleanup, or failed-persistence admission fence
+blocks the fork until the source is ready.
 
 **ACP attachments.** `session/prompt` accepts ordered text, images, native
 `audio` blocks, and embedded audio/video resource blobs. Audio-only prompts
@@ -1325,16 +1382,31 @@ This means a CLI flag always overrides a `settings.json` value, and a project-le
 
 ### Resource Resolution
 
-Skills, prompt templates, themes, and extensions follow the same resolution order:
+Resource resolution gives explicit CLI paths priority, followed by CLI `-e`
+sources, configured project resources, configured user resources, and installed
+packages. Project packages take priority over user packages.
 
-1. CLI-specified paths (`--skill`, `--prompt-template`, `--theme`, `-e`)
-2. Project directory (`.pi/skills/`, `.pi/prompts/`, `.pi/themes/`, `.pi/extensions/`)
-3. Global directory (`~/.pi/agent/skills/`, `~/.pi/agent/prompts/`, etc.)
-4. Installed packages (`~/.pi/agent/packages/`)
+Skills additionally discover universal `.agents/skills/` directories from the
+working directory through its ancestors up to the Git root (or filesystem root
+when no Git root exists), plus `~/.agents/skills/` in the user's home directory.
+Ancestor probing is capped at 64 locations and each selected skill root has a
+16,384-entry discovery budget; an over-budget root is rejected rather than
+partially loaded. Within each scope, Pi-specific skills and settings entries take
+priority over universal skills; nearer project universal roots take priority over
+farther ancestors, and project universal skills still take priority over user
+skills. Managed
+skills from `<agent_dir>/skills.managed/` load last. See the complete
+[skill precedence table](docs/skills.md#precedence).
 
 When multiple resources share the same name, the first occurrence wins. Collisions are logged as diagnostics.
 
-`--no-skills` (and its siblings `--no-prompt-templates`, `--no-themes`, `--no-extensions`) disables tiers 2–4 **including** `skills` entries listed in `settings.json` — upstream-pi parity. Explicit CLI paths (tier 1) still load, so `pi --no-skills --skill /path/to/skill-a --skill /path/to/skill-b` is the way to run with an exact, isolated skill set (e.g. per-profile setups via shell aliases or wrapper scripts).
+`--no-skills` disables automatic discovery (including universal and managed
+skills), installed package skills, and `skills` entries in `settings.json`.
+Explicit CLI `--skill` paths and skills supplied by CLI `-e` sources still load,
+so `pi --no-skills --skill /path/to/skill-a --skill /path/to/skill-b` selects an
+isolated skill set. The sibling `--no-prompt-templates`, `--no-themes`, and
+`--no-extensions` flags likewise preserve explicit CLI resources while disabling
+configured discovery for their categories.
 
 Project context files are a separate switch. By default pi appends `AGENTS.md` / `CLAUDE.md` from `~/.pi/agent/`, the working directory, and every ancestor directory to the system prompt (plus imported foreign-format workspace rules). `--no-context-files` (or `PI_NO_CONTEXT_FILES=1`) disables that discovery entirely; `--no-skills` does not cover it. Hosts that compose the whole prompt with `--system-prompt` typically pass `--no-context-files --no-skills` together.
 

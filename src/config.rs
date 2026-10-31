@@ -75,6 +75,7 @@ pub struct Config {
     #[serde(alias = "modelRoles")]
     pub model_roles: Option<ModelRoleSettings>,
     /// Automatic session titling (see [`TitlingSettings`], bd-cv653.3.1).
+    #[serde(alias = "title")]
     pub titling: Option<TitlingSettings>,
     /// Opt in to a one-shot strong-to-small model handoff on fresh sessions.
     pub prewalk: Option<PrewalkSettings>,
@@ -93,6 +94,8 @@ pub struct Config {
     pub plan: Option<PlanSettings>,
     /// Read-tool settings (bd-cv653.2.2 URL reads).
     pub read: Option<ReadSettings>,
+    /// Mid-turn Markdown replies through `write out://`.
+    pub out: Option<OutSettings>,
     /// Bash-tool mediation settings (bd-cv653.1.7).
     pub bash: Option<BashSettings>,
     /// Memory-bank settings (bd-cv653.4.1).
@@ -507,14 +510,22 @@ pub struct TitlingSettings {
     /// Master switch for automatic session titling (default: true).
     #[serde(alias = "autoTitle", alias = "auto")]
     pub auto_title: Option<bool>,
+    /// Recheck generated titles after this many substantive user prompts.
+    /// Zero (the default) disables refresh; explicit user names are preserved.
+    #[serde(alias = "refreshAfterPrompts")]
+    pub refresh_after_prompts: Option<u32>,
 }
 
-/// Prewalk is off unless explicitly enabled. The destination is the `smol`
-/// model role; CLI `--prewalk-into` can choose a destination for one launch.
+/// Prewalk is off unless explicitly enabled. Selectors are resolved when a
+/// cycle is armed; command overrides never change these saved defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrewalkSettings {
     pub enabled: Option<bool>,
+    /// Planning model selected by `/prewalk restart` (default: `@default`).
+    pub from: Option<String>,
+    /// Handoff destination (default: `@smol`).
+    pub into: Option<String>,
 }
 
 /// A path-scoped model-set override (bd-cv653.3.2).
@@ -543,6 +554,15 @@ pub struct ModelScopeOverride {
 pub struct ToolSettings {
     #[serde(alias = "loadMode")]
     pub load_mode: Option<std::collections::HashMap<String, String>>,
+}
+
+/// Interim responses shown without ending the agent's current task.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutSettings {
+    /// Unset follows the host surface: on in the top-level interactive TUI,
+    /// off in unattended sessions. Native child agents never emit replies.
+    pub enabled: Option<bool>,
 }
 
 /// Plan-mode configuration (bd-cv653.3.5).
@@ -1014,6 +1034,8 @@ impl Config {
             prewalk: match (base.prewalk, other.prewalk) {
                 (Some(base), Some(other)) => Some(PrewalkSettings {
                     enabled: other.enabled.or(base.enabled),
+                    from: other.from.or(base.from),
+                    into: other.into.or(base.into),
                 }),
                 (base, other) => other.or(base),
             },
@@ -1022,6 +1044,12 @@ impl Config {
             tools: merge_tools(base.tools, other.tools),
             plan: merge_plan(base.plan, other.plan),
             read: merge_read(base.read, other.read),
+            out: match (base.out, other.out) {
+                (Some(base), Some(other)) => Some(OutSettings {
+                    enabled: other.enabled.or(base.enabled),
+                }),
+                (base, other) => other.or(base),
+            },
             bash: merge_bash(base.bash, other.bash),
             memory: merge_memory(base.memory, other.memory),
             mcp: match (base.mcp, other.mcp) {
@@ -1179,6 +1207,36 @@ impl Config {
             .as_ref()
             .and_then(|t| t.auto_title)
             .unwrap_or(true)
+    }
+
+    /// Optional prompt interval for checking whether a generated title drifted.
+    #[must_use]
+    pub fn title_refresh_after_prompts(&self) -> u32 {
+        if !self.auto_title_enabled() {
+            return 0;
+        }
+        self.titling
+            .as_ref()
+            .and_then(|settings| settings.refresh_after_prompts)
+            .unwrap_or(0)
+    }
+
+    /// Planning selector for an explicit prewalk restart.
+    #[must_use]
+    pub fn prewalk_from(&self) -> &str {
+        self.prewalk
+            .as_ref()
+            .and_then(|settings| settings.from.as_deref())
+            .unwrap_or("@default")
+    }
+
+    /// Destination for startup arming and commands without an override.
+    #[must_use]
+    pub fn prewalk_into(&self) -> &str {
+        self.prewalk
+            .as_ref()
+            .and_then(|settings| settings.into.as_deref())
+            .unwrap_or("@smol")
     }
 
     /// Seconds before the primary model is retried after a failover
@@ -2118,6 +2176,7 @@ fn merge_titling(
     match (base, other) {
         (Some(base), Some(other)) => Some(TitlingSettings {
             auto_title: other.auto_title.or(base.auto_title),
+            refresh_after_prompts: other.refresh_after_prompts.or(base.refresh_after_prompts),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -2658,6 +2717,66 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
+
+    #[test]
+    fn prewalk_selectors_merge_independently_without_enabling_the_workflow()
+    -> serde_json::Result<()> {
+        let base: Config = serde_json::from_value(json!({
+            "prewalk": {"enabled": true, "from": "@slow", "into": "@smol"}
+        }))?;
+        let project: Config = serde_json::from_value(json!({
+            "prewalk": {"enabled": false, "into": "openai/gpt-5-mini:low"}
+        }))?;
+        let merged = Config::merge(base, project);
+        assert_eq!(
+            merged
+                .prewalk
+                .as_ref()
+                .and_then(|settings| settings.enabled),
+            Some(false)
+        );
+        assert_eq!(merged.prewalk_from(), "@slow");
+        assert_eq!(merged.prewalk_into(), "openai/gpt-5-mini:low");
+
+        let selectors_only: Config = serde_json::from_value(json!({
+            "prewalk": {"from": "@plan", "into": "@default"}
+        }))?;
+        assert_eq!(
+            selectors_only
+                .prewalk
+                .as_ref()
+                .and_then(|settings| settings.enabled),
+            None
+        );
+        assert_eq!(Config::default().prewalk_from(), "@default");
+        assert_eq!(Config::default().prewalk_into(), "@smol");
+        Ok(())
+    }
+
+    #[test]
+    fn title_refresh_is_opt_in_and_merges_without_losing_auto_title() {
+        assert_eq!(Config::default().title_refresh_after_prompts(), 0);
+        for source in [
+            r#"{"title":{"refreshAfterPrompts":3}}"#,
+            r#"{"titling":{"refresh_after_prompts":3}}"#,
+        ] {
+            let config: Config = serde_json::from_str(source).expect("title refresh settings");
+            assert!(unrecognised_setting_keys(source).is_empty());
+            assert_eq!(config.title_refresh_after_prompts(), 3);
+            let empty = serde_json::from_str(r#"{"titling":{}}"#).expect("empty title override");
+            let merged = Config::merge(config, empty);
+            assert_eq!(merged.title_refresh_after_prompts(), 3);
+            let disabled = serde_json::from_str(r#"{"titling":{"autoTitle":false}}"#)
+                .expect("disable auto titles");
+            let disabled = Config::merge(merged, disabled);
+            assert_eq!(disabled.title_refresh_after_prompts(), 0);
+            assert_eq!(disabled.titling.unwrap().refresh_after_prompts, Some(3));
+        }
+        for invalid in ["-1", "1.5", "true", "4294967296"] {
+            let source = format!(r#"{{"title":{{"refreshAfterPrompts":{invalid}}}}}"#);
+            assert!(serde_json::from_str::<Config>(&source).is_err());
+        }
+    }
 
     #[test]
     fn session_cost_thresholds_validate_and_merge_individually() {
@@ -3837,6 +3956,27 @@ mod tests {
     fn a_nested_struct_key_is_recognised_by_its_own_name() {
         let keys = unrecognised_setting_keys(r#"{ "retry": { "maxRetries": 9 } }"#);
         assert!(keys.is_empty(), "reported: {keys:?}");
+    }
+
+    #[test]
+    fn interim_response_settings_preserve_unset_and_explicit_overrides() {
+        let base: Config = serde_json::from_str(r#"{"out":{"enabled":true}}"#).unwrap();
+        for overlay in [r#"{}"#, r#"{"out":{}}"#, r#"{"out":{"enabled":null}}"#] {
+            let merged = Config::merge(base.clone(), serde_json::from_str(overlay).unwrap());
+            assert_eq!(merged.out.unwrap().enabled, Some(true), "{overlay}");
+        }
+        let off: Config = serde_json::from_str(r#"{"out":{"enabled":false}}"#).unwrap();
+        let merged = Config::merge(base, off);
+        assert_eq!(merged.out.as_ref().unwrap().enabled, Some(false));
+        let roundtrip: Config =
+            serde_json::from_str(&serde_json::to_string(&merged).unwrap()).unwrap();
+        assert_eq!(roundtrip.out.unwrap().enabled, Some(false));
+        assert!(Config::default().out.is_none());
+        assert!(unrecognised_setting_keys(r#"{"out":{"enabled":true}}"#).is_empty());
+        assert_eq!(
+            unrecognised_setting_keys(r#"{"out":{"enabledd":true}}"#),
+            vec!["out.enabledd".to_string()]
+        );
     }
 
     #[test]

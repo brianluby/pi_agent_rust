@@ -157,6 +157,264 @@ fn e2e_ftui_launch_help_bash_quit() {
     session.write_artifacts();
 }
 
+/// Deliver the actual terminal bytes, without tmux choosing an encoding for
+/// a named modified key. This exercises Crossterm's decoder as well as FTUI.
+fn send_ftui_terminal_bytes(session: &TuiSession, bytes: &[u8]) {
+    let status = std::process::Command::new("tmux")
+        .args([
+            "-L",
+            &session.tmux.socket_name,
+            "send-keys",
+            "-t",
+            &session.tmux.session_name,
+            "-H",
+        ])
+        .args(bytes.iter().map(|byte| format!("{byte:02x}")))
+        .status()
+        .expect("inject terminal bytes");
+    assert!(status.success(), "terminal byte injection failed");
+}
+
+/// Match the editor immediately above the footer, including empty rows.
+/// Waiting merely for "Hello world" can accept the frame from BEFORE a
+/// newline, and checking only submitted text misses issue #276 entirely.
+fn wait_for_ftui_editor_rows(session: &TuiSession, expected: &[&str]) -> String {
+    let start = std::time::Instant::now();
+    loop {
+        let pane = session.tmux.capture_pane();
+        if pane
+            .lines()
+            .rev()
+            .skip(1)
+            .take(expected.len())
+            .map(str::trim_end)
+            .eq(expected.iter().rev().copied())
+        {
+            return pane;
+        }
+        assert!(
+            start.elapsed() < COMMAND_TIMEOUT,
+            "editor rows {expected:?} never became visible above the footer; pane:\n{pane}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Reproduce the recording through a real PTY: the draft's earlier lines
+/// must remain visible after each newline, BEFORE another character arrives.
+/// A loopback provider also proves exactly one intact multiline submission.
+#[allow(clippy::too_many_lines)]
+fn run_ftui_multiline_terminal_scenario(
+    name: &str,
+    keybindings: Option<&str>,
+    newline_sequences: [&[u8]; 3],
+    release_sequence: &[u8],
+    submit_sequence: &[u8],
+) {
+    let [first_newline, second_newline, third_newline] = newline_sequences;
+    let Some((_lock, mut session)) = new_locked_session(name) else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+    let server = session.harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/v1/chat/completions",
+        openai_sse("multiline terminal regression received"),
+    );
+    let models = serde_json::json!({
+        "providers": {
+            "newline-test": {
+                "api": "openai-completions",
+                "baseUrl": format!("{}/v1", server.base_url()),
+                "apiKey": "test-key",
+                "models": [{"id": "newline-model", "contextWindow": 128_000}]
+            }
+        }
+    });
+    session.harness.create_file(
+        "env/agent/models.json",
+        &serde_json::to_vec(&models).expect("serialize loopback model"),
+    );
+    if let Some(config) = keybindings {
+        session
+            .harness
+            .create_file("env/agent/keybindings.json", config.as_bytes());
+    }
+    session.set_env("PI_NO_AUTO_UPDATE_CHECK", "1");
+    session.launch(&[
+        "--ftui",
+        "--no-session",
+        "--provider",
+        "newline-test",
+        "--model",
+        "newline-model",
+        "--tools",
+        "read",
+        "--no-mcp",
+        "--no-context-files",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-extensions",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "--system-prompt",
+        "Multiline terminal regression",
+    ]);
+    let startup = session.wait_and_capture("startup", "pi interactive stack", STARTUP_TIMEOUT);
+    assert!(startup.contains("pi interactive stack"), "{startup}");
+
+    session.tmux.send_literal("Hello world");
+    wait_for_ftui_editor_rows(&session, &["Hello world"]);
+    send_ftui_terminal_bytes(&session, first_newline);
+    wait_for_ftui_editor_rows(&session, &["Hello world", ""]);
+    if !release_sequence.is_empty() {
+        send_ftui_terminal_bytes(&session, release_sequence);
+    }
+    session.tmux.send_literal("asds");
+    wait_for_ftui_editor_rows(&session, &["Hello world", "asds"]);
+    send_ftui_terminal_bytes(&session, second_newline);
+    wait_for_ftui_editor_rows(&session, &["Hello world", "asds", ""]);
+    send_ftui_terminal_bytes(&session, third_newline);
+    wait_for_ftui_editor_rows(&session, &["Hello world", "asds", "", ""]);
+    session.tmux.send_literal("asd");
+    wait_for_ftui_editor_rows(&session, &["Hello world", "asds", "", "asd"]);
+    assert!(
+        server.requests().is_empty(),
+        "newline chords must not submit a partial draft"
+    );
+
+    send_ftui_terminal_bytes(&session, submit_sequence);
+    let pane = session.wait_and_capture(
+        "submitted",
+        "multiline terminal regression received",
+        COMMAND_TIMEOUT,
+    );
+    assert!(
+        pane.contains("multiline terminal regression received"),
+        "multiline turn did not finish; pane:\n{pane}"
+    );
+    let requests = server.requests();
+    let prompts: Vec<_> = requests
+        .iter()
+        .filter(|request| request.path == "/v1/chat/completions")
+        .collect();
+    assert_eq!(prompts.len(), 1, "submit must produce exactly one turn");
+    let prompt = prompts.first().expect("single submitted prompt");
+    let body: serde_json::Value =
+        serde_json::from_slice(&prompt.body).expect("parse submitted request");
+    let message = body
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .expect("request messages")
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        .expect("submitted user message");
+    let content = message.get("content").expect("submitted content");
+    let text = content
+        .as_str()
+        .or_else(|| content.as_array()?.first()?.get("text")?.as_str())
+        .expect("submitted text content part");
+    assert_eq!(text, "Hello world\nasds\n\nasd");
+    let transcript_rows: Vec<_> = pane.lines().map(str::trim_end).collect();
+    assert!(
+        transcript_rows
+            .windows(4)
+            .any(|rows| rows == ["› Hello world", "  asds", "", "  asd"]),
+        "submitted transcript lost multiline order or blank rows; pane:\n{pane}"
+    );
+
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
+#[test]
+fn e2e_ftui_terminal_newlines_remain_visible_and_submit_once() {
+    run_ftui_multiline_terminal_scenario(
+        "e2e_ftui_terminal_newlines",
+        None,
+        [b"\x1b[13;2u", b"\x1b[13;5u", b"\x1b\r"],
+        b"\x1b[13;2:3u",
+        b"\r",
+    );
+}
+
+#[test]
+fn e2e_ftui_terminal_newlines_honor_remapped_bindings() {
+    run_ftui_multiline_terminal_scenario(
+        "e2e_ftui_remapped_newlines",
+        Some(r#"{"newLine":"ctrl+j","submit":"ctrl+enter"}"#),
+        [b"\n", b"\n", b"\n"],
+        b"",
+        b"\x1b[13;5u",
+    );
+}
+
+/// Universal defaults must reach both the interactive command catalogue and
+/// the actual SDK session prompt. Neither assertion uses the low-level loader.
+#[test]
+fn e2e_ftui_universal_skills_reach_catalogue_and_session_prompt() {
+    let Some((_lock, mut session)) =
+        new_locked_session("e2e_ftui_universal_skills_reach_catalogue_and_session_prompt")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+    let home = session.harness.create_dir("env/home");
+    session.remove_env("PI_CONFIG_PATH");
+    session.set_env("HOME", home.to_str().expect("isolated home"));
+    session.set_env("USERPROFILE", home.to_str().expect("isolated home"));
+    session.harness.create_file(
+        ".agents/skills/project-check/SKILL.md",
+        b"---\nname: project-check\ndescription: Project universal check\n---\nProject instructions.\n",
+    );
+    session.harness.create_file(
+        "env/home/.agents/skills/user-check/SKILL.md",
+        b"---\nname: user-check\ndescription: User universal check\n---\nUser instructions.\n",
+    );
+    let mut args = ftui_args();
+    args.retain(|flag| *flag != "--no-skills");
+    args.extend([
+        "--trust",
+        "--no-mcp",
+        "--no-context-files",
+        "--tools",
+        "read",
+    ]);
+    session.launch(&args);
+    session.wait_and_capture("startup", "pi interactive stack", STARTUP_TIMEOUT);
+
+    let pane =
+        session.send_text_and_wait("skills", "/skills", "User universal check", COMMAND_TIMEOUT);
+    assert!(pane.contains("Project universal check"), "{pane}");
+    assert!(pane.contains("User universal check"), "{pane}");
+
+    // `/skillful status` reads the live SDK agent's prompt, so this catches
+    // discovery that populated only the UI while omitting model visibility.
+    let pane = session.send_text_and_wait(
+        "skill_prompt_status",
+        "/skillful status",
+        "Skill listing: on for this session.",
+        COMMAND_TIMEOUT,
+    );
+    assert!(
+        pane.contains("Skill listing: on for this session."),
+        "{pane}"
+    );
+
+    session.tmux.send_literal("/skill:proj");
+    let pane = session.wait_and_capture(
+        "skill_autocomplete",
+        "/skill:project-check",
+        COMMAND_TIMEOUT,
+    );
+    assert!(pane.contains("/skill:project-check"), "{pane}");
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
 /// bd-2crrf: a default (FTUI) launch initializes ONE extension runtime and
 /// one agent session. main used to build a classic `AgentSession`, boot the
 /// extension runtime on it and drop it, before the FTUI driver built its own

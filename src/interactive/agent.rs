@@ -329,6 +329,27 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
         AgentEvent::AutoCompactionStart { reason } => {
             batcher.send_immediate(PiMsg::SystemNote(format!("Compacting context: {reason}")));
         }
+        AgentEvent::ManualCompactionStart { mode } => {
+            let mode = mode.as_deref().unwrap_or("summary");
+            batcher.send_immediate(PiMsg::SystemNote(format!("Compacting context: {mode}")));
+        }
+        AgentEvent::ManualCompactionEnd {
+            aborted,
+            skipped,
+            error_message,
+            ..
+        } => {
+            let message = if *aborted {
+                "Compaction aborted".to_string()
+            } else if skipped.unwrap_or(false) {
+                "Compaction skipped: context is already small enough".to_string()
+            } else if let Some(error) = error_message {
+                format!("Compaction failed: {error}")
+            } else {
+                "Compaction complete".to_string()
+            };
+            batcher.send_immediate(PiMsg::SystemNote(message));
+        }
         AgentEvent::PrewalkSwitched {
             provider,
             model,
@@ -386,6 +407,13 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
             partial_result,
             ..
         } => {
+            // out:// is promoted to assistant prose only by its successful
+            // terminal result; updates may be coalesced or followed by an
+            // execution failure and must not create duplicate replies.
+            if tool_name == "write" && crate::tools::interim_response_text(partial_result).is_some()
+            {
+                return;
+            }
             batcher.send_immediate(PiMsg::ToolUpdate {
                 name: tool_name.clone(),
                 tool_id: tool_call_id.clone(),
@@ -399,6 +427,16 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
             is_error,
             result,
         } => {
+            if tool_name == "write"
+                && !is_error
+                && let Some(text) = crate::tools::interim_response_text(result)
+            {
+                batcher.send_immediate(PiMsg::InterimResponse {
+                    tool_id: tool_call_id.clone(),
+                    text: text.to_string(),
+                });
+                return;
+            }
             // Todo footer (bd-cv653.3.9): state-driven off the tool result's
             // todo_list.v1 details, never a side channel.
             if tool_name == "todo"
@@ -835,6 +873,43 @@ impl PiApp {
         msg: PiMsg,
         attempts_remaining: u8,
     ) -> Option<Cmd> {
+        let login_event_id = match &msg {
+            PiMsg::OAuthDeviceFlowStarted { attempt_id, .. }
+            | PiMsg::OAuthCallbackPoll { attempt_id }
+            | PiMsg::OAuthCallbackReceived { attempt_id, .. }
+            | PiMsg::LoginFinished { attempt_id, .. } => Some(attempt_id),
+            _ => None,
+        };
+        if let Some(attempt_id) = login_event_id {
+            let Some(attempt) = self
+                .login_attempt
+                .as_ref()
+                .filter(|attempt| &attempt.id == attempt_id)
+            else {
+                return None;
+            };
+            match self.session_event_ownership(&attempt.session_id) {
+                SessionEventOwnership::Current => {}
+                SessionEventOwnership::Stale => {
+                    self.retire_login();
+                    return None;
+                }
+                SessionEventOwnership::Busy => {
+                    if attempts_remaining == 0 {
+                        // The attempt id still owns this login even though the
+                        // source session cannot be inspected. Release that
+                        // owner instead of stranding its listener or spinner.
+                        self.retire_login();
+                        self.status_message = Some(
+                            "Login cancelled because the session remained busy; run /login again"
+                                .to_string(),
+                        );
+                        return None;
+                    }
+                    return self.retry_busy_session_event(msg, attempts_remaining);
+                }
+            }
+        }
         if let PiMsg::McpAuthFinished {
             request_id,
             message,
@@ -862,7 +937,9 @@ impl PiApp {
         match msg {
             PiMsg::HandoffFinished { .. } | PiMsg::McpAuthFinished { .. } => return None,
             PiMsg::System(message) | PiMsg::AgentError(message)
-                if self.handoff_request_id.is_some() || self.mcp_auth_request_id.is_some() =>
+                if self.handoff_request_id.is_some()
+                    || self.mcp_auth_request_id.is_some()
+                    || self.login_attempt.is_some() =>
             {
                 // Background notices cannot release an operator request's
                 // abort handle or admit another foreground operation.
@@ -871,6 +948,7 @@ impl PiApp {
                 self.scroll_to_bottom();
             }
             PiMsg::AgentStart => {
+                self.retire_login();
                 self.agent_state = AgentState::Processing;
                 self.current_response.clear();
                 self.current_thinking.clear();
@@ -1045,6 +1123,34 @@ impl PiApp {
                     let follow_tail = self.follow_stream_tail;
                     self.refresh_conversation_viewport(follow_tail);
                 }
+            }
+            PiMsg::InterimResponse { tool_id, text } => {
+                // Commit preceding narration before the interim reply, so a
+                // later model response or retry cannot move it out of order.
+                if !self.current_response.is_empty() || !self.current_thinking.is_empty() {
+                    self.messages.push(ConversationMessage::new(
+                        MessageRole::Assistant,
+                        std::mem::take(&mut self.current_response),
+                        (!self.current_thinking.is_empty())
+                            .then(|| std::mem::take(&mut self.current_thinking)),
+                    ));
+                    self.current_assistant_start = (0, 0);
+                    self.discard_incomplete_on_next_assistant = false;
+                }
+                self.current_tool_summary.remove(&tool_id);
+                if self.current_tool_id.as_deref() == Some(tool_id.as_str()) {
+                    self.current_tool = None;
+                    self.current_tool_id = None;
+                    self.tool_progress = None;
+                    self.pending_tool_output = None;
+                    self.agent_state = AgentState::Processing;
+                }
+                self.messages.push(ConversationMessage::new(
+                    MessageRole::Assistant,
+                    super::tool_render::sanitize_terminal_text(&text).into_owned(),
+                    None,
+                ));
+                self.refresh_conversation_viewport(self.follow_stream_tail);
             }
             PiMsg::TodoSummary { summary } => {
                 self.todo_summary = summary;
@@ -1335,6 +1441,46 @@ impl PiApp {
                     attempts_remaining,
                 );
             }
+            PiMsg::SessionModelChanged {
+                owner_session_id,
+                message,
+            } => {
+                let selection: std::result::Result<_, ()> = (|| {
+                    let agent = self.agent.try_lock().map_err(|_| ())?;
+                    let session = self.session.try_lock().map_err(|_| ())?;
+                    if session.header.id != owner_session_id {
+                        return Ok(None);
+                    }
+                    Ok(Some((
+                        agent.handle.model(),
+                        agent.handle.session().current_model_entry(),
+                    )))
+                })();
+                let ((provider, model), entry) = match selection {
+                    Ok(Some(selection)) => selection,
+                    Ok(None) => return None,
+                    Err(()) => {
+                        return self.retry_busy_session_event(
+                            PiMsg::SessionModelChanged {
+                                owner_session_id,
+                                message,
+                            },
+                            attempts_remaining,
+                        );
+                    }
+                };
+                self.model = format!("{provider}/{model}");
+                if let Some(entry) = entry {
+                    self.model_entry = entry.clone();
+                    if let Ok(mut shared) = self.model_entry_shared.lock() {
+                        *shared = entry;
+                    }
+                }
+                self.status_message = Some(message.clone());
+                self.messages
+                    .push(ConversationMessage::new(MessageRole::System, message, None));
+                self.scroll_to_bottom();
+            }
             PiMsg::SessionSystemNote {
                 owner_session_id,
                 message,
@@ -1385,12 +1531,16 @@ impl PiApp {
                 }
             }
             PiMsg::OAuthDeviceFlowStarted {
+                attempt_id: _,
                 provider,
                 device_code,
                 user_code,
                 verification_uri,
                 expires_in,
             } => {
+                if self.pending_oauth.is_some() {
+                    return None;
+                }
                 let message = format!(
                     "OAuth login: {provider}\n\n\
 Open this URL:\n{verification_uri}\n\n\
@@ -1417,6 +1567,45 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.set_input_height(3);
                 self.input.focus();
                 self.status_message = None;
+                self.agent_state = AgentState::Idle;
+            }
+            PiMsg::LoginFinished {
+                attempt_id: _,
+                error,
+                retry,
+            } => {
+                if retry
+                    && error.is_some()
+                    && self
+                        .pending_oauth
+                        .as_ref()
+                        .is_some_and(|pending| pending.kind == PendingLoginKind::DeviceFlow)
+                {
+                    if let Some(attempt) = self.login_attempt.as_mut() {
+                        attempt.submitting = false;
+                    }
+                    self.agent_state = AgentState::Idle;
+                    self.status_message = error;
+                    self.input.focus();
+                    return None;
+                }
+                let completed = self.pending_oauth.clone();
+                self.retire_login();
+                let status = match (error, completed) {
+                    (Some(error), _) => format!("Login failed: {error}"),
+                    (None, Some(pending)) => {
+                        self.sync_active_provider_credentials(&pending.provider);
+                        super::login_flow::success_status(&pending.provider, pending.kind)
+                    }
+                    (None, None) => return None,
+                };
+                self.status_message = Some(status.clone());
+                self.messages
+                    .push(ConversationMessage::new(MessageRole::System, status, None));
+                self.scroll_to_bottom();
+                if !self.pending_inputs.is_empty() {
+                    return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
+                }
             }
             PiMsg::RetryCommitted {
                 session_id,
@@ -1537,7 +1726,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                     self.pending_inputs_paused_by_time_cap = false;
                     self.title_requested = !self.messages.is_empty();
                     self.todo_summary = None;
-                    self.pending_oauth = None;
+                    self.retire_login();
                     self.role_model_overrides.clear();
                     self.tree_ui = None;
                     self.extension_custom_active = false;
@@ -1705,9 +1894,45 @@ After approving access in the browser, press Enter in Pi to complete login."
                     return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
                 }
             }
-            PiMsg::OAuthCallbackReceived(callback_url) => {
-                // Auto-submit the OAuth code received from the local callback server.
-                if let Some(pending) = self.pending_oauth.take() {
+            PiMsg::OAuthCallbackPoll { attempt_id } => {
+                let Some(attempt) = self.login_attempt.as_mut() else {
+                    return None;
+                };
+                let Some(server) = attempt.callback.as_ref() else {
+                    return None;
+                };
+                match server.rx.try_recv() {
+                    Ok(path) => {
+                        let callback_url = format!("http://localhost:{}{path}", server.port);
+                        return self.handle_pi_message(PiMsg::OAuthCallbackReceived {
+                            attempt_id,
+                            callback_url,
+                        });
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return Some(Self::login_callback_poll_cmd(attempt_id));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        attempt.callback = None;
+                        self.status_message = Some(
+                            "Callback listener stopped; paste the authorization code to continue"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            PiMsg::OAuthCallbackReceived {
+                attempt_id: _,
+                callback_url,
+            } => {
+                // Browser input is never valid for an API-key or device prompt.
+                if let Some(pending) = self.pending_oauth.clone().filter(|pending| {
+                    pending.kind == PendingLoginKind::OAuth
+                        && self
+                            .login_attempt
+                            .as_ref()
+                            .is_some_and(|attempt| !attempt.submitting)
+                }) {
                     self.messages.push(ConversationMessage {
                         role: MessageRole::System,
                         content: "Authorization callback received from browser.".to_string(),
@@ -2937,6 +3162,7 @@ After approving access in the browser, press Enter in Pi to complete login."
     /// persisted session, still unnamed, exactly one user message so far, a
     /// tiny/smol-role model resolved, and titling not yet requested.
     fn maybe_request_session_title(&mut self) {
+        self.maybe_refresh_session_title();
         if self.title_requested || !self.save_enabled {
             return;
         }
@@ -3003,6 +3229,83 @@ After approving access in the browser, press Enter in Pi to complete login."
             .unwrap_or(false)
             {
                 drop(agent);
+                crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::SessionTitleSuggestion {
+                        owner_session_id,
+                        title,
+                    },
+                )
+                .await;
+            }
+        });
+    }
+
+    /// Reassess generated names after the configured number of substantive
+    /// prompts. Preparation uses the settled native session; asynchronous
+    /// results must still match its exact branch and name before saving.
+    fn maybe_refresh_session_title(&mut self) {
+        let interval = self.config.title_refresh_after_prompts();
+        if !self.save_enabled || interval == 0 {
+            return;
+        }
+        let Some(client) = self.title_client.clone() else {
+            return;
+        };
+        let prepared = {
+            let Ok(agent) = self.agent.try_lock() else {
+                return;
+            };
+            let session = agent.handle.session();
+            if session.ensure_provider_reentry_allowed().is_err() {
+                return;
+            }
+            let Ok(saved) = session.session.try_lock() else {
+                return;
+            };
+            let Ok(Some(prepared)) =
+                client.prepare_refresh_with_agent(&session.agent, &saved, interval)
+            else {
+                return;
+            };
+            let key = (saved.header.id.clone(), prepared.prompt_id().to_string());
+            if self.title_refresh_attempted.as_ref() == Some(&key) {
+                return;
+            }
+            (key, prepared)
+        };
+        let ((owner_session_id, prompt_id), prepared) = prepared;
+        self.title_refresh_attempted = Some((owner_session_id.clone(), prompt_id));
+        let (cancellation, registration) = crate::session_title::TitleCancellation::new();
+        let cancellation_check = cancellation.handle();
+        self.title_cancellation = Some(cancellation);
+        let owner = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            let assess = async {
+                let outcome = client.refresh(prepared).await?;
+                let agent = OwnedMutexGuard::lock(owner, &cx).await.ok()?;
+                Some((agent, outcome))
+            };
+            let Ok(Some((agent, outcome))) =
+                futures::future::Abortable::new(assess, registration).await
+            else {
+                return;
+            };
+            if cancellation_check.is_aborted() {
+                return;
+            }
+            let saved = crate::session_title::save_refresh_if_current(
+                agent.handle.session(),
+                &outcome,
+                Some(&cancellation_check),
+            )
+            .await
+            .unwrap_or(false);
+            drop(agent);
+            if saved && let Some(title) = outcome.title {
                 crate::interactive::enqueue_pi_event(
                     &event_tx,
                     &cx,
@@ -3396,6 +3699,21 @@ After approving access in the browser, press Enter in Pi to complete login."
     #[allow(clippy::too_many_lines)]
     pub(super) fn submit_message(&mut self, message: &str) -> Option<Cmd> {
         let message = message.trim();
+        if self.login_attempt.is_some() {
+            // Commands leave the sensitive prompt; they are never credentials.
+            if let Some((cmd, args)) = SlashCommand::parse(message) {
+                return self.handle_slash_command(cmd, args);
+            }
+            if let Some(pending) = self.pending_oauth.clone() {
+                if !message.is_empty() || pending.kind == PendingLoginKind::DeviceFlow {
+                    return self.submit_oauth_code(message, pending);
+                }
+            } else {
+                self.status_message =
+                    Some("Login is still starting; Escape cancels it".to_string());
+            }
+            return None;
+        }
         if message.is_empty() {
             return None;
         }
@@ -3420,10 +3738,6 @@ After approving access in the browser, press Enter in Pi to complete login."
         if self.handoff_request_id.is_some() {
             self.status_message = Some("Handoff is still running; Escape cancels it".to_string());
             return None;
-        }
-
-        if let Some(pending) = self.pending_oauth.take() {
-            return self.submit_oauth_code(message, pending);
         }
 
         if let Some((command, exclude_from_context)) = parse_bash_command(message) {
@@ -3992,6 +4306,70 @@ mod stream_delta_batcher_tests {
     fn build_test_app() -> PiApp {
         let (app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
         app
+    }
+
+    #[test]
+    fn interim_reply_dispatch_is_once_and_preserves_the_running_turn() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut batcher = UiStreamDeltaBatcher::new(tx);
+        let result = crate::tools::ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new("Shown to the user."))],
+            details: Some(serde_json::json!({
+                "schema": "pi.interim_response.v1",
+                "text": "## Progress\n\nStill checking."
+            })),
+            is_error: false,
+        };
+        dispatch_agent_event_to_ui(
+            &AgentEvent::ToolExecutionUpdate {
+                tool_call_id: "reply".to_string(),
+                tool_name: "write".to_string(),
+                args: serde_json::json!({"path": "out://"}),
+                partial_result: result.clone(),
+            },
+            &mut batcher,
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "provisional updates must not be promoted"
+        );
+        dispatch_agent_event_to_ui(
+            &AgentEvent::ToolExecutionEnd {
+                tool_call_id: "reply".to_string(),
+                tool_name: "write".to_string(),
+                result,
+                is_error: false,
+            },
+            &mut batcher,
+        );
+        let mut app = build_test_app();
+        let _ = app.handle_pi_message(PiMsg::AgentStart);
+        let _ = app.handle_pi_message(PiMsg::TextDelta("Earlier narration.".to_string()));
+        let _ = app.handle_pi_message(PiMsg::ToolStart {
+            name: "write".to_string(),
+            tool_id: "reply".to_string(),
+        });
+        let _ = app.handle_pi_message(rx.try_recv().expect("accepted reply"));
+        assert!(
+            rx.try_recv().is_err(),
+            "reply has one authoritative delivery"
+        );
+        assert_eq!(app.agent_state, AgentState::Processing);
+        assert!(app.current_tool.is_none());
+        assert!(app.current_response.is_empty());
+        let replies: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(
+            replies,
+            ["Earlier narration.", "## Progress\n\nStill checking."]
+        );
+        let _ = app.handle_pi_message(PiMsg::TextDelta("The later answer.".to_string()));
+        assert_eq!(app.current_response, "The later answer.");
+        assert_eq!(app.agent_state, AgentState::Processing);
     }
 
     #[test]
@@ -6200,6 +6578,41 @@ mod stream_delta_batcher_tests {
     }
 
     #[test]
+    fn async_model_completion_refreshes_current_selection_and_rejects_replaced_owner() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        let session_id = app.session.try_lock().unwrap().header.id.clone();
+        let (provider, model) = app.agent.try_lock().unwrap().handle.model();
+        app.model = "stale/display".to_string();
+        let agent = Arc::clone(&app.agent);
+        let held = agent.try_lock().unwrap();
+        assert!(
+            app.handle_pi_message(PiMsg::SessionModelChanged {
+                owner_session_id: session_id.clone(),
+                message: "pending restart".to_string(),
+            })
+            .is_some(),
+            "a contended model refresh must be retried"
+        );
+        drop(held);
+        let _ = app.handle_pi_message(PiMsg::SessionModelChanged {
+            owner_session_id: session_id.clone(),
+            message: "restart completed".to_string(),
+        });
+        assert_eq!(app.model, format!("{provider}/{model}"));
+        assert_eq!(app.status_message.as_deref(), Some("restart completed"));
+
+        app.session.try_lock().unwrap().header.id = "replacement-session".to_string();
+        app.model = "replacement/display".to_string();
+        let count = app.messages.len();
+        let _ = app.handle_pi_message(PiMsg::SessionModelChanged {
+            owner_session_id: session_id,
+            message: "obsolete restart".to_string(),
+        });
+        assert_eq!(app.model, "replacement/display");
+        assert_eq!(app.messages.len(), count);
+    }
+
+    #[test]
     fn open_tree_event_is_bound_to_its_originating_session() {
         let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
         let current_session_id = app
@@ -6668,7 +7081,17 @@ mod stream_delta_batcher_tests {
             crate::models::ModelRole::Smol,
             ("fixture-provider".to_string(), "fixture-model".to_string()),
         );
+        let attempt_id = app
+            .begin_login_attempt(&app.cwd.join("unused-auth.json"))
+            .expect("login attempt");
+        let login_signal = app
+            .login_attempt
+            .as_ref()
+            .expect("login owner")
+            .control
+            .signal();
         let _ = app.handle_pi_message(PiMsg::OAuthDeviceFlowStarted {
+            attempt_id,
             provider: "fixture-provider".to_string(),
             device_code: "device-code".to_string(),
             user_code: "user-code".to_string(),
@@ -6747,6 +7170,8 @@ mod stream_delta_batcher_tests {
             app.pending_oauth.is_none(),
             "the previous session's OAuth continuation must not leak"
         );
+        assert!(app.login_attempt.is_none());
+        assert!(login_signal.is_aborted());
         assert!(
             app.role_model_overrides.is_empty(),
             "the previous session's role model overrides must not leak"
@@ -6963,7 +7388,11 @@ mod stream_delta_batcher_tests {
             crate::models::ModelRole::Smol,
             ("fixture-provider".to_string(), "fixture-model".to_string()),
         );
+        let attempt_id = app
+            .begin_login_attempt(&app.cwd.join("unused-auth.json"))
+            .expect("login attempt");
         let _ = app.handle_pi_message(PiMsg::OAuthDeviceFlowStarted {
+            attempt_id,
             provider: "fixture-provider".to_string(),
             device_code: "device-code".to_string(),
             user_code: "user-code".to_string(),

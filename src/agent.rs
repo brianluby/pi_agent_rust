@@ -1094,6 +1094,20 @@ impl RegisteredMessageFetcher {
     }
 }
 
+/// A turn-owned host operation can request a normal yield after its earlier
+/// queued input has run. This is checked only at existing idle boundaries;
+/// it never interrupts provider streaming or a tool batch.
+struct RegisteredYieldCheck {
+    ready: Arc<dyn Fn() -> bool + Send + Sync>,
+    lifetime: Weak<()>,
+}
+
+impl RegisteredYieldCheck {
+    fn is_live(&self) -> bool {
+        self.lifetime.strong_count() > 0
+    }
+}
+
 type AgentEventHandler = Arc<dyn Fn(AgentEvent) + Send + Sync + 'static>;
 
 /// Persists completed messages mid-run, resolving to whether they reached the
@@ -1494,6 +1508,21 @@ pub enum AgentEvent {
         #[serde(rename = "errorMessage", skip_serializing_if = "Option::is_none")]
         error_message: Option<String>,
     },
+    /// A user-requested compaction began, independently of automatic thresholds.
+    ManualCompactionStart {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+    },
+    /// A manual compaction finished, was skipped, failed, or was cancelled.
+    ManualCompactionEnd {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<serde_json::Value>,
+        aborted: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        skipped: Option<bool>,
+        #[serde(rename = "errorMessage", skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
+    },
     /// Auto-retry lifecycle start.
     AutoRetryStart {
         attempt: u32,
@@ -1588,6 +1617,139 @@ pub enum AgentEvent {
         event: String,
         error: String,
     },
+}
+
+/// Own the progress pair for an admitted manual compaction. The native
+/// compaction engine is shared with automatic recovery; its callback is adapted
+/// at the manual boundary so those internals never publish automatic progress
+/// for a user's request. Dropping an in-flight operation still ends its pair.
+pub(crate) struct ManualCompactionProgress {
+    state: Arc<ManualCompactionProgressState>,
+}
+
+struct ManualCompactionProgressState {
+    on_event: AgentEventHandler,
+    ended: AtomicBool,
+}
+
+impl ManualCompactionProgressState {
+    fn finish(
+        &self,
+        result: Option<Value>,
+        aborted: bool,
+        skipped: bool,
+        error_message: Option<String>,
+    ) {
+        if !self.ended.swap(true, Ordering::SeqCst) {
+            (self.on_event)(AgentEvent::ManualCompactionEnd {
+                result,
+                aborted,
+                skipped: skipped.then_some(true),
+                error_message,
+            });
+        }
+    }
+}
+
+impl ManualCompactionProgress {
+    pub(crate) fn start(
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+        mode: Option<String>,
+    ) -> Self {
+        let state = Arc::new(ManualCompactionProgressState {
+            on_event: Arc::new(on_event),
+            ended: AtomicBool::new(false),
+        });
+        (state.on_event)(AgentEvent::ManualCompactionStart { mode });
+        Self { state }
+    }
+
+    pub(crate) fn callback(&self) -> impl Fn(AgentEvent) + Send + Sync + 'static + use<> {
+        let state = Arc::clone(&self.state);
+        move |event| match event {
+            AgentEvent::AutoCompactionStart { .. } => {}
+            AgentEvent::AutoCompactionEnd {
+                result,
+                aborted,
+                error_message,
+                ..
+            } => state.finish(
+                result,
+                aborted,
+                false,
+                error_message.or_else(|| aborted.then(|| "Compaction cancelled".to_string())),
+            ),
+            other => (state.on_event)(other),
+        }
+    }
+
+    pub(crate) fn finish(
+        &self,
+        result: Option<Value>,
+        aborted: bool,
+        skipped: bool,
+        error_message: Option<String>,
+    ) {
+        self.state.finish(result, aborted, skipped, error_message);
+    }
+
+    fn finish_outcome(&self, outcome: &Result<bool>) {
+        match outcome {
+            Ok(false) => self.finish(
+                None,
+                false,
+                true,
+                Some("Nothing to compact: already compacted or too little history".to_string()),
+            ),
+            Err(error) => self.finish(
+                None,
+                matches!(error, Error::Aborted),
+                false,
+                Some(error.to_string()),
+            ),
+            // Successful installation already published its result through
+            // the callback. Do not report success before that transaction.
+            Ok(true) => {}
+        }
+    }
+}
+
+impl Drop for ManualCompactionProgress {
+    fn drop(&mut self) {
+        self.finish(
+            None,
+            true,
+            false,
+            Some("Manual compaction interrupted before completion".to_string()),
+        );
+    }
+}
+
+/// Cancel only admission/read waits, never an admitted persistence transaction.
+/// If completion and cancellation race, refuse the newly acquired resource
+/// before publishing it to the caller.
+async fn await_compaction_admission<T>(
+    abort: Option<&AbortSignal>,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let Some(abort) = abort else {
+        return operation.await;
+    };
+    if abort.is_aborted() {
+        return Err(Error::Aborted);
+    }
+    let cancelled = abort.wait();
+    futures::pin_mut!(operation, cancelled);
+    match futures::future::select(cancelled, operation).await {
+        futures::future::Either::Left(_) => Err(Error::Aborted),
+        futures::future::Either::Right((result, _)) => {
+            if abort.is_aborted() {
+                Err(Error::Aborted)
+            } else {
+                result
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1879,6 +2041,9 @@ pub struct Agent {
     /// Fetchers for queued follow-up messages (idle).
     follow_up_fetchers: Vec<RegisteredMessageFetcher>,
 
+    /// Ordered maintenance barriers installed by live SDK control lanes.
+    yield_checks: Vec<RegisteredYieldCheck>,
+
     /// Whether queue sources may be polled and dispatched automatically.
     /// Hosts can pause either lane and explicitly take already staged batches.
     automatic_steering_dispatch: bool,
@@ -1913,6 +2078,7 @@ pub struct Agent {
     /// a provider inside the tool loop or lets a tool choose the destination.
     prewalk: Option<crate::prewalk::PrewalkState>,
     prewalk_budget: Option<PrewalkRunBudget>,
+    prewalk_evidence: StdMutex<crate::prewalk::ToolEvidence>,
 
     /// Discoverable tools promoted into the live schema mid-session via
     /// `xdev promote` (bd-cv653.1.6). Interior-mutable because tool
@@ -2104,6 +2270,7 @@ impl Agent {
             steering_fetchers: Vec::new(),
             initial_follow_up_fetcher: None,
             follow_up_fetchers: Vec::new(),
+            yield_checks: Vec::new(),
             automatic_steering_dispatch: true,
             automatic_follow_up_dispatch: true,
             job_session_scope,
@@ -2120,6 +2287,7 @@ impl Agent {
             stream_rule_turn: 0,
             prewalk: None,
             prewalk_budget: None,
+            prewalk_evidence: StdMutex::new(crate::prewalk::ToolEvidence::default()),
             promoted_tools: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             tool_defs_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             plan_state: crate::plan::PlanState::new(),
@@ -2237,6 +2405,7 @@ impl Agent {
         self.stream_rule_turn = 0;
         self.prewalk = None;
         self.prewalk_budget = None;
+        self.take_prewalk_evidence();
     }
 
     /// The destination armed for this live session, never restored from disk.
@@ -2246,6 +2415,7 @@ impl Agent {
     }
 
     pub(crate) fn begin_prewalk_run(&mut self) {
+        self.take_prewalk_evidence();
         // An abandoned SDK future may have yielded before it installed the
         // target. A later public prompt must not silently resume that decision.
         if self
@@ -2266,6 +2436,7 @@ impl Agent {
     }
 
     pub(crate) fn finish_prewalk_run(&mut self, interrupted: bool) {
+        self.take_prewalk_evidence();
         self.prewalk_budget = None;
         if interrupted {
             self.prewalk = None;
@@ -2287,6 +2458,37 @@ impl Agent {
     /// Explicitly cancel a pending one-shot model handoff.
     pub fn disarm_prewalk(&mut self) {
         self.prewalk = None;
+        self.take_prewalk_evidence();
+    }
+
+    fn take_prewalk_evidence(&self) -> crate::prewalk::ToolEvidence {
+        std::mem::take(
+            &mut *self
+                .prewalk_evidence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    fn record_prewalk_evidence(
+        &self,
+        tool: &dyn crate::tools::Tool,
+        input: &Value,
+        output: &ToolOutput,
+    ) {
+        if self.prewalk_budget.is_none()
+            || self.prewalk.is_none()
+            || output.is_error
+            || crate::agent_cx::AgentCx::for_current_or_request()
+                .checkpoint()
+                .is_err()
+        {
+            return;
+        }
+        self.prewalk_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .merge(tool.prewalk_evidence(input, output));
     }
 
     /// The shared tool approval state (bd-cv653.3.19).
@@ -2632,7 +2834,8 @@ impl Agent {
     /// Register async fetchers for queued steering/follow-up messages.
     ///
     /// This is additive: multiple sources (e.g. RPC, extensions) can register
-    /// fetchers, and the agent will poll all of them.
+    /// fetchers, and the agent will poll all of them. Sources own admission and
+    /// queue bounds; accepted batches are preserved in registration order.
     pub fn register_message_fetchers(
         &mut self,
         steering: Option<MessageFetcher>,
@@ -2667,6 +2870,24 @@ impl Agent {
             self.follow_up_fetchers
                 .push(RegisteredMessageFetcher::scoped(fetcher, lifetime));
         }
+    }
+
+    pub(crate) fn register_scoped_yield_check(
+        &mut self,
+        lifetime: &Arc<()>,
+        ready: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) {
+        self.yield_checks.retain(RegisteredYieldCheck::is_live);
+        self.yield_checks.push(RegisteredYieldCheck {
+            ready,
+            lifetime: Arc::downgrade(lifetime),
+        });
+    }
+
+    fn ordered_yield_requested(&self) -> bool {
+        self.yield_checks
+            .iter()
+            .any(|check| check.is_live() && (check.ready)())
     }
 
     /// Register the owning surface's bounded follow-up source for a resumed
@@ -4306,10 +4527,11 @@ impl Agent {
                     budget.turn_index = turn_index;
                     budget.warned = warned_at_handoff_threshold;
                 }
+                let prewalk_evidence = self.take_prewalk_evidence();
                 let handoff = if self.prewalk_budget.is_some()
                     && let Some(prewalk) = &mut self.prewalk
                 {
-                    prewalk.observe(&tool_calls, &tool_results);
+                    prewalk.observe(prewalk_evidence);
                     !tool_results.is_empty()
                         && !abort.as_ref().is_some_and(AbortSignal::is_aborted)
                         && prewalk.yield_at_boundary()
@@ -4349,6 +4571,7 @@ impl Agent {
                 // end. The nudge flows through pending_messages so it is
                 // evented and persisted like any user message.
                 if self.automatic_follow_up_dispatch
+                    && !self.ordered_yield_requested()
                     && pending_messages.is_empty()
                     && !has_more_tool_calls
                     && !abort.as_ref().is_some_and(AbortSignal::is_aborted)
@@ -4562,6 +4785,13 @@ impl Agent {
             return false;
         }
         let mut owning_surface_ready = self.message_queue.follow_up_batch_len() > 0;
+        if self.ordered_yield_requested() {
+            // A source may reach its barrier while handing over the last
+            // pre-barrier input. Drain everything already accepted before
+            // yielding, including batches dispatched one message at a time.
+            // The ready barrier prevents any further source or job polling.
+            return owning_surface_ready;
+        }
         if !owning_surface_ready {
             let owning_surface = self
                 .fetch_messages(self.initial_follow_up_fetcher.as_ref())
@@ -4581,7 +4811,9 @@ impl Agent {
             // registry. Poll them even while the owning source stays busy so a
             // continuously replenished RPC queue cannot starve the notice
             // registry until its oldest completions are evicted.
-            self.fetch_job_follow_up_messages().await;
+            if !self.ordered_yield_requested() {
+                self.fetch_job_follow_up_messages().await;
+            }
             return self.message_queue.follow_up_batch_len() > 0;
         }
 
@@ -4593,12 +4825,20 @@ impl Agent {
         self.follow_up_fetchers
             .retain(RegisteredMessageFetcher::is_live);
         for registered in &self.follow_up_fetchers {
+            if self.ordered_yield_requested() {
+                break;
+            }
             let fetched = self.fetch_messages(Some(&registered.fetcher)).await;
             for message in fetched {
-                self.message_queue.push_follow_up(message);
+                // Each source already owns admission and bounds. As with
+                // steering, this handoff must not evict accepted input that
+                // has already been removed from another source's queue.
+                self.message_queue.push_follow_up_lossless(message);
             }
         }
-        self.fetch_job_follow_up_messages().await;
+        if !self.ordered_yield_requested() {
+            self.fetch_job_follow_up_messages().await;
+        }
     }
 
     async fn fetch_job_follow_up_messages(&mut self) {
@@ -5854,6 +6094,9 @@ impl Agent {
         abort: Option<AbortSignal>,
         latency: SharedTurnLatencyAccumulator,
     ) -> Result<ToolExecutionOutcome> {
+        // A cancelled/abandoned batch must never donate evidence to a later
+        // request. Nested host calls contribute only while this batch runs.
+        self.take_prewalk_evidence();
         let mut results = Vec::new();
         let mut steering_messages: Option<Vec<QueuedAgentMessage>> = None;
 
@@ -6515,7 +6758,7 @@ impl Agent {
                 let mut output = inner
                     .execute_with_invocation(
                         &tool_call.id,
-                        inner_args,
+                        inner_args.clone(),
                         None,
                         crate::tools::ToolInvocationContext {
                             protect: &protect,
@@ -6525,6 +6768,7 @@ impl Agent {
                     )
                     .await
                     .unwrap_or_else(|err| Self::xdev_text_output(&err.to_string(), true));
+                self.record_prewalk_evidence(inner, &inner_args, &output);
                 output.details = Some(Self::xdev_dispatch_details(name, output.details.take()));
                 Some(output)
             }
@@ -6735,6 +6979,13 @@ impl Agent {
             .await;
         match outcome {
             Ok(output) => {
+                if self
+                    .check_invocation_session(expected_session)
+                    .await
+                    .is_ok()
+                {
+                    self.record_prewalk_evidence(tool, &tool_call.arguments, &output);
+                }
                 let is_error = output.is_error;
                 (output, is_error)
             }
@@ -7110,7 +7361,7 @@ impl Default for ExtensionHostConfiguration {
 
 /// RAII guard that resets an `AtomicBool` to `false` on drop, ensuring the
 /// flag is cleared even if the enclosing async task is cancelled.
-struct AtomicBoolGuard(Option<Arc<AtomicBool>>);
+pub(crate) struct AtomicBoolGuard(Option<Arc<AtomicBool>>);
 
 impl AtomicBoolGuard {
     fn activate(flag: &Arc<AtomicBool>) -> Self {
@@ -12689,6 +12940,89 @@ mod extensions_integration_tests {
     }
 
     #[test]
+    fn admitted_follow_up_batches_preserve_both_source_orders_and_authorship() {
+        fn source(messages: Vec<QueuedAgentMessage>) -> MessageFetcher {
+            let pending = Arc::new(StdMutex::new(messages));
+            Arc::new(move || {
+                let pending = Arc::clone(&pending);
+                Box::pin(async move { std::mem::take(&mut *pending.lock().expect("source queue")) })
+            })
+        }
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            for scoped_first in [false, true] {
+                for mode in [QueueMode::All, QueueMode::OneAtATime] {
+                    let mut agent = Agent::new(
+                        Arc::new(NoopProvider),
+                        ToolRegistry::from_tools(vec![]),
+                        AgentConfig::default(),
+                    );
+                    agent.set_queue_modes(QueueMode::OneAtATime, mode);
+                    let mut expected: Vec<_> = (0..MAX_FOLLOW_UP_QUEUE_SIZE)
+                        .map(|index| (format!("extension-{index:03}"), None))
+                        .collect();
+                    let permanent = source(
+                        expected
+                            .iter()
+                            .map(|(text, _)| {
+                                QueuedAgentMessage::generated(Message::User(UserMessage {
+                                    content: UserContent::Text(text.clone()),
+                                    timestamp: 0,
+                                }))
+                            })
+                            .collect(),
+                    );
+                    let authored = (
+                        "expanded SDK follow-up".to_string(),
+                        Some("original SDK follow-up".to_string()),
+                    );
+                    let scoped = source(vec![QueuedAgentMessage::authored(
+                        Message::User(UserMessage {
+                            content: UserContent::Text(authored.0.clone()),
+                            timestamp: 0,
+                        }),
+                        authored.1.clone().unwrap(),
+                    )]);
+                    let lifetime = Arc::new(());
+                    if scoped_first {
+                        agent.register_scoped_message_fetchers(&lifetime, None, Some(scoped));
+                        agent.register_message_fetchers(None, Some(permanent));
+                        expected.insert(0, authored);
+                    } else {
+                        agent.register_message_fetchers(None, Some(permanent));
+                        agent.register_scoped_message_fetchers(&lifetime, None, Some(scoped));
+                        expected.push(authored);
+                    }
+
+                    let mut delivered = Vec::new();
+                    while agent.stage_follow_up_messages().await {
+                        let batch = agent.pop_follow_up_for_current_session().await;
+                        if mode == QueueMode::OneAtATime {
+                            assert_eq!(batch.len(), 1);
+                        }
+                        delivered.extend(batch.into_iter().map(|message| {
+                            let authored = message.keyword_scan_source().map(str::to_string);
+                            let Message::User(UserMessage {
+                                content: UserContent::Text(text),
+                                ..
+                            }) = message.into_message()
+                            else {
+                                panic!("follow-up payload changed");
+                            };
+                            (text, authored)
+                        }));
+                        assert!(delivered.len() <= expected.len(), "input was replayed");
+                    }
+                    assert_eq!(delivered, expected, "scoped_first={scoped_first}, {mode:?}");
+                }
+            }
+        });
+    }
+
+    #[test]
     fn manual_follow_up_dispatch_keeps_staged_work_without_an_extra_provider_call() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -14337,6 +14671,8 @@ mod abort_tests {
             AgentEvent::ToolExecutionEnd { .. } => "tool_end",
             AgentEvent::AutoCompactionStart { .. } => "auto_compaction_start",
             AgentEvent::AutoCompactionEnd { .. } => "auto_compaction_end",
+            AgentEvent::ManualCompactionStart { .. } => "manual_compaction_start",
+            AgentEvent::ManualCompactionEnd { .. } => "manual_compaction_end",
             AgentEvent::AutoRetryStart { .. } => "auto_retry_start",
             AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
             AgentEvent::FailoverStart { .. } => "failover_start",
@@ -16301,10 +16637,6 @@ impl AgentSession {
         self
     }
 
-    pub(crate) const fn memory_enabled(&self) -> bool {
-        self.memory_settings.is_some()
-    }
-
     /// Extract and incrementally consolidate facts from the current saved branch.
     /// This uses the active provider and resolves the current session workdir.
     pub async fn sync_memory(&self) -> Result<crate::memory::MemorySyncReport> {
@@ -17176,6 +17508,94 @@ impl AgentSession {
         Ok(Some(target))
     }
 
+    /// Return to a planning model and arm a new one-shot handoff. Both
+    /// registered models and their credentials are admitted before changing
+    /// the active model or its persisted history. An existing arm must name
+    /// the same normalized destination; callers must disarm it explicitly to
+    /// replace it. A fresh cycle requires a new todo when that tool is enabled.
+    #[allow(clippy::too_many_lines)]
+    pub async fn restart_prewalk(
+        &mut self,
+        source: crate::prewalk::PrewalkTarget,
+        target: crate::prewalk::PrewalkTarget,
+    ) -> Result<Option<crate::prewalk::PrewalkTarget>> {
+        self.ensure_provider_reentry_allowed()?;
+        let session_actions = self.session_action_admission.clone();
+        let origin = session_actions.capture_origin();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.provider_admission.clone();
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let _session_action = session_actions.acquire_origin(&origin).await?;
+
+        let registry = self
+            .model_registry
+            .as_ref()
+            .ok_or_else(|| Error::validation("PREWALK_SOURCE: select a registered model"))?;
+        let source_entry = registry
+            .find(&source.provider, &source.model)
+            .ok_or_else(|| Error::validation("PREWALK_SOURCE: select a registered model"))?;
+        let target_entry = registry
+            .find(&target.provider, &target.model)
+            .ok_or_else(|| Error::validation("PREWALK_TARGET: select a registered model"))?;
+        let source = self.prepare_model_selection(
+            &source_entry.model.provider,
+            &source_entry.model.id,
+            source.thinking.unwrap_or_else(|| {
+                self.agent
+                    .stream_options()
+                    .thinking_level
+                    .unwrap_or_default()
+            }),
+        )?;
+        let prepared_target = self.prepare_model_selection(
+            &target_entry.model.provider,
+            &target_entry.model.id,
+            target.thinking.unwrap_or(source.thinking_level),
+        )?;
+        let target = crate::prewalk::PrewalkTarget {
+            provider: prepared_target.provider_id,
+            model: prepared_target.model_id,
+            thinking: Some(prepared_target.thinking_level),
+        };
+        if self
+            .agent
+            .prewalk_target()
+            .is_some_and(|current| current != &target)
+        {
+            return Err(Error::validation(
+                "PREWALK_ARMED: the requested destination differs from the armed handoff; disarm prewalk before changing its destination",
+            ));
+        }
+        let next = if source.provider_id == target.provider
+            && source.model_id == target.model
+            && Some(source.thinking_level) == target.thinking
+        {
+            None
+        } else {
+            Some(self.agent.prewalk.clone().unwrap_or_else(|| {
+                let todo_ready = self.agent.shared_tools().snapshot().get("todo").is_none();
+                crate::prewalk::PrewalkState::new(target.clone(), todo_ready)
+            }))
+        };
+
+        self.set_provider_model_selection(
+            &source.provider_id,
+            &source.model_id,
+            source.thinking_level,
+            ProviderSwapAdmission::Held(&authority),
+            false,
+        )
+        .await?;
+        // No await may separate durable source installation from the arm.
+        // On a failed save, the previous arm and live model remain untouched.
+        self.agent.prewalk = next;
+        self.agent.prewalk_budget = None;
+        if let Some(policy) = &mut self.child_fallback_policy {
+            policy.use_default_role();
+        }
+        Ok(self.agent.prewalk_target().cloned())
+    }
+
     /// Update the thinking/reasoning level for this session at runtime.
     ///
     /// Clamps the requested level to what the active model supports (e.g. a
@@ -17281,7 +17701,7 @@ impl AgentSession {
             .or_else(|| normalize_api_key_opt(entry.api_key.clone())))
     }
 
-    fn refresh_compaction_credential(&self, options: &mut StreamOptions) -> Result<()> {
+    pub(crate) fn refresh_compaction_credential(&self, options: &mut StreamOptions) -> Result<()> {
         let provider = self.agent.provider();
         let entry = self.current_model_entry();
         ExtensionCompactionModelState::refresh_key_from_sources(
@@ -17416,6 +17836,10 @@ impl AgentSession {
         self.compaction_worker.invalidate_for_context_switch();
         self.extensions_is_compacting
             .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn start_compaction_activity(&self) -> AtomicBoolGuard {
+        AtomicBoolGuard::activate(&self.extensions_is_compacting)
     }
 
     /// Whether a background compaction task is currently pending.
@@ -18441,8 +18865,20 @@ impl AgentSession {
         instructions: Option<&str>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
-        self.ensure_provider_reentry_allowed()?;
-        self.compact_synchronous(Arc::new(on_event), false, instructions, None, None)
+        self.compact_manual(false, instructions, None, on_event)
+            .await
+    }
+
+    /// Manual compaction with explicit cancellation. Cancellation can retire
+    /// generation or refuse installation, but never drops an admitted durable
+    /// save: keep polling until its reconciliation and progress pair finish.
+    pub async fn compact_now_with_abort(
+        &mut self,
+        instructions: Option<&str>,
+        abort: &AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<bool> {
+        self.compact_manual(false, instructions, Some(abort), on_event)
             .await
     }
 
@@ -18454,8 +18890,41 @@ impl AgentSession {
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
-        self.compact_synchronous(Arc::new(on_event), true, None, None, None)
-            .await
+        self.compact_manual(true, None, None, on_event).await
+    }
+
+    /// Provider-free manual compaction with the same cancellation and durable
+    /// installation boundary as [`Self::compact_now_with_abort`].
+    pub async fn shake_now_with_abort(
+        &mut self,
+        abort: &AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<bool> {
+        self.compact_manual(true, None, Some(abort), on_event).await
+    }
+
+    async fn compact_manual(
+        &mut self,
+        shake: bool,
+        instructions: Option<&str>,
+        abort: Option<&AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<bool> {
+        self.ensure_provider_reentry_allowed()?;
+        let progress =
+            ManualCompactionProgress::start(on_event, shake.then(|| "shake".to_string()));
+        let outcome = self
+            .compact_synchronous(
+                Arc::new(progress.callback()),
+                shake,
+                instructions,
+                None,
+                None,
+                abort,
+            )
+            .await;
+        progress.finish_outcome(&outcome);
+        outcome
     }
 
     /// Recover an overflowing request using the same durable compaction
@@ -18469,7 +18938,7 @@ impl AgentSession {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
         self.ensure_provider_reentry_allowed()?;
-        self.compact_synchronous(Arc::new(on_event), false, None, Some(abort), None)
+        self.compact_synchronous(Arc::new(on_event), false, None, Some(abort), None, None)
             .await
     }
 
@@ -18497,7 +18966,14 @@ impl AgentSession {
             ));
         }
         let changed = self
-            .compact_synchronous(Arc::new(on_event), false, None, None, Some((focus, abort)))
+            .compact_synchronous(
+                Arc::new(on_event),
+                false,
+                None,
+                None,
+                Some((focus, abort)),
+                None,
+            )
             .await?;
         if !changed {
             return Err(Error::session(
@@ -18665,6 +19141,7 @@ impl AgentSession {
                         provider_admission,
                         None,
                         None,
+                        None,
                     )
                     .await?;
                     self.compaction_worker.mark_applied_success();
@@ -18790,6 +19267,7 @@ impl AgentSession {
                         true,
                         provider_admission,
                         false,
+                        None,
                         None,
                     )
                     .await;
@@ -18967,6 +19445,7 @@ impl AgentSession {
             provider_admission,
             None,
             None,
+            None,
         )
         .await
     }
@@ -19022,26 +19501,39 @@ impl AgentSession {
         provider_admission: OwnedMutexGuard<()>,
         require_reduction: bool,
         handoff_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
+        manual_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
     ) -> Result<u64> {
         let cx = crate::agent_cx::AgentCx::for_request();
-        let session_action_permit = if handoff_source.is_some() {
-            Some(self.session_action_admission.acquire(cx.cx()).await?)
+        let source = handoff_source.or(manual_source);
+        let abort = source.map(|(_, abort)| abort);
+        let session_action_permit = if source.is_some() {
+            Some(
+                await_compaction_admission(abort, self.session_action_admission.acquire(cx.cx()))
+                    .await?,
+            )
         } else {
             None
         };
-        let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
-            .await
-            .map_err(|e| Error::session(e.to_string()))?;
+        let mut session = await_compaction_admission(abort, async {
+            OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))
+        })
+        .await?;
         self.provider_admission.ensure_allowed()?;
-        if let Some((source, abort)) = handoff_source {
+        if let Some((source, abort)) = source {
             if abort.is_aborted() {
                 return Err(Error::Aborted);
             }
             if SessionEditSnapshot::capture(&session)? != *source {
-                return Err(Error::session(
-                    "Handoff source changed during generation; the summary was not applied",
-                ));
+                return Err(Error::session(if handoff_source.is_some() {
+                    "Handoff source changed during generation; the summary was not applied"
+                } else {
+                    "Compaction source changed during generation; the result was not applied"
+                }));
             }
+        }
+        if handoff_source.is_some() {
             if summary.trim().is_empty()
                 || !compaction::overflow_compaction_preserves_current_turn(
                     &session.entries_for_current_path(),
@@ -19126,21 +19618,41 @@ impl AgentSession {
         // before dispatching the re-entrant post-install extension hook.
         drop(provider_admission);
 
-        if let (Some(region), Some(compaction_entry)) = (&self.extensions, compaction_entry) {
-            let payload = json!({
-                "compactionEntry": compaction_entry,
-                "fromExtension": from_extension,
-            });
-            if let Err(err) = region
-                .manager()
+        if let Some(compaction_entry) = compaction_entry {
+            self.dispatch_compaction_installed(&compaction_entry, from_extension)
+                .await;
+        }
+
+        Ok(tokens_after)
+    }
+
+    /// Notify extensions only after durable installation. The owned future
+    /// lets drivers release their outer AgentSession guard before callbacks.
+    pub(crate) fn dispatch_compaction_installed(
+        &self,
+        compaction_entry: &crate::session::CompactionEntry,
+        from_extension: bool,
+    ) -> BoxFuture<'static, ()> {
+        let Some(manager) = self
+            .extensions
+            .as_ref()
+            .map(|region| region.manager().clone())
+        else {
+            return futures::future::ready(()).boxed();
+        };
+        let payload = json!({
+            "compactionEntry": compaction_entry,
+            "fromExtension": from_extension,
+        });
+        async move {
+            if let Err(err) = manager
                 .dispatch_event(ExtensionEventName::SessionCompact, Some(payload))
                 .await
             {
                 tracing::warn!("session_compact extension hook failed (fail-open): {err}");
             }
         }
-
-        Ok(tokens_after)
+        .boxed()
     }
 
     /// Apply a completed compaction result to the session.
@@ -19151,6 +19663,7 @@ impl AgentSession {
         provider_admission: OwnedMutexGuard<()>,
         overflow_abort: Option<&AbortSignal>,
         handoff_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
+        manual_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
     ) -> Result<()> {
         let overflow = overflow_abort.is_some();
         let details = match compaction::compaction_details_to_value(&result.details) {
@@ -19175,6 +19688,7 @@ impl AgentSession {
                 provider_admission,
                 overflow,
                 handoff_source,
+                manual_source,
             )
             .await
         {
@@ -19182,7 +19696,7 @@ impl AgentSession {
             Err(err) => {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
-                    aborted: false,
+                    aborted: matches!(err, Error::Aborted),
                     will_retry: false,
                     error_message: Some(err.to_string()),
                 });
@@ -19218,31 +19732,37 @@ impl AgentSession {
         instructions: Option<&str>,
         overflow_abort: Option<&AbortSignal>,
         handoff: Option<(&str, &AbortSignal)>,
+        manual_abort: Option<&AbortSignal>,
     ) -> Result<bool> {
         // `compaction.enabled` is the automatic switch, as in OMP: it stops
         // overflow recovery, not a user's `/compact`, `/shake` or handoff.
         if !self.compaction_settings.enabled && overflow_abort.is_some() {
             return Ok(false);
         }
-        let abort = handoff.map(|(_, abort)| abort).or(overflow_abort);
+        let abort = handoff
+            .map(|(_, abort)| abort)
+            .or(overflow_abort)
+            .or(manual_abort);
         if abort.is_some_and(AbortSignal::is_aborted) {
             return Err(Error::Aborted);
         }
         let overflow = overflow_abort.is_some();
 
-        let (entries, preparation, handoff_snapshot) = {
+        let (entries, preparation, source_snapshot) = {
             let cx = crate::agent_cx::AgentCx::for_request();
-            let mut session = self
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::session(e.to_string()))?;
-            if handoff.is_some() {
+            let mut session = await_compaction_admission(abort, async {
+                self.session
+                    .lock(cx.cx())
+                    .await
+                    .map_err(|e| Error::session(e.to_string()))
+            })
+            .await?;
+            if handoff.is_some() || manual_abort.is_some() {
                 session.ensure_full_v2_hydration_before_save()?;
             }
             session.ensure_entry_ids();
-            let handoff_snapshot = handoff
-                .map(|_| SessionEditSnapshot::capture(&session))
+            let source_snapshot = (handoff.is_some() || manual_abort.is_some())
+                .then(|| SessionEditSnapshot::capture(&session))
                 .transpose()?;
             let entries = session
                 .entries_for_current_path()
@@ -19268,8 +19788,12 @@ impl AgentSession {
                 // `/compact` and `/shake`; automatic compaction does not run here.
                 compaction::prepare_manual_compaction(&entries, settings)
             };
-            (entries, prep, handoff_snapshot)
+            (entries, prep, source_snapshot)
         };
+
+        if abort.is_some_and(AbortSignal::is_aborted) {
+            return Err(Error::Aborted);
+        }
 
         if let Some(prep) = preparation {
             on_event(AgentEvent::AutoCompactionStart {
@@ -19319,12 +19843,17 @@ impl AgentSession {
                     return Err(error);
                 }
                 let cx = crate::agent_cx::AgentCx::for_current_or_request();
-                let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
+                let provider_admission = match await_compaction_admission(
+                    abort,
+                    self.provider_admission.acquire(cx.cx()),
+                )
+                .await
+                {
                     Ok(provider_admission) => provider_admission,
                     Err(err) => {
                         on_event(AgentEvent::AutoCompactionEnd {
                             result: None,
-                            aborted: false,
+                            aborted: matches!(err, Error::Aborted),
                             will_retry: false,
                             error_message: Some(err.to_string()),
                         });
@@ -19341,6 +19870,7 @@ impl AgentSession {
                         provider_admission,
                         overflow,
                         None,
+                        source_snapshot.as_ref().zip(manual_abort),
                     )
                     .await;
                 let tokens_after = match apply_result {
@@ -19348,7 +19878,7 @@ impl AgentSession {
                     Err(err) => {
                         on_event(AgentEvent::AutoCompactionEnd {
                             result: None,
-                            aborted: false,
+                            aborted: matches!(err, Error::Aborted),
                             will_retry: false,
                             error_message: Some(err.to_string()),
                         });
@@ -19376,18 +19906,21 @@ impl AgentSession {
 
             self.invalidate_background_compaction();
             let cx = crate::agent_cx::AgentCx::for_current_or_request();
-            let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
-                Ok(provider_admission) => provider_admission,
-                Err(err) => {
-                    on_event(AgentEvent::AutoCompactionEnd {
-                        result: None,
-                        aborted: false,
-                        will_retry: false,
-                        error_message: Some(err.to_string()),
-                    });
-                    return Err(err);
-                }
-            };
+            let provider_admission =
+                match await_compaction_admission(abort, self.provider_admission.acquire(cx.cx()))
+                    .await
+                {
+                    Ok(provider_admission) => provider_admission,
+                    Err(err) => {
+                        on_event(AgentEvent::AutoCompactionEnd {
+                            result: None,
+                            aborted: matches!(err, Error::Aborted),
+                            will_retry: false,
+                            error_message: Some(err.to_string()),
+                        });
+                        return Err(err);
+                    }
+                };
             if let Err(err) = self.provider_admission.ensure_allowed() {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
@@ -19412,7 +19945,7 @@ impl AgentSession {
             } else {
                 let compact =
                     compaction::compact(prep, provider, &stream_options, instructions, &privacy);
-                if let Some(abort) = overflow_abort {
+                if let Some(abort) = abort {
                     let cancelled = abort.wait();
                     futures::pin_mut!(compact, cancelled);
                     match futures::future::select(cancelled, compact).await {
@@ -19431,7 +19964,10 @@ impl AgentSession {
                         Arc::clone(&on_event),
                         provider_admission,
                         overflow_abort,
-                        handoff_snapshot.as_ref().zip(abort),
+                        source_snapshot
+                            .as_ref()
+                            .zip(handoff.map(|(_, abort)| abort)),
+                        source_snapshot.as_ref().zip(manual_abort),
                     )
                     .await?;
                 }
@@ -20388,16 +20924,20 @@ impl AgentSession {
         }
     }
 
-    async fn dispatch_before_compact(
+    pub(crate) fn dispatch_before_compact(
         &self,
         preparation: &compaction::CompactionPreparation,
         branch_entries: &[crate::session::SessionEntry],
         custom_instructions: Option<&str>,
-    ) -> SessionBeforeCompactOutcome {
-        let Some(region) = &self.extensions else {
-            return SessionBeforeCompactOutcome::default();
+    ) -> BoxFuture<'static, SessionBeforeCompactOutcome> {
+        let Some(manager) = self
+            .extensions
+            .as_ref()
+            .map(|region| region.manager().clone())
+        else {
+            return futures::future::ready(SessionBeforeCompactOutcome::default()).boxed();
         };
-
+        let tokens_before = preparation.tokens_before;
         let prep_value = compaction::compaction_preparation_to_value(preparation);
         let branch_entries_value =
             serde_json::to_value(branch_entries).unwrap_or(Value::Array(Vec::new()));
@@ -20411,24 +20951,28 @@ impl AgentSession {
             );
         }
 
-        let response = region
-            .manager()
-            .dispatch_event_with_response(
-                ExtensionEventName::SessionBeforeCompact,
-                Some(Value::Object(payload)),
-                // gh #178: a dedicated long-running budget — this hook may
-                // legitimately await the host compaction bridge.
-                ExtensionEventName::SessionBeforeCompact.default_timeout_ms(),
-            )
-            .await;
+        async move {
+            let response = manager
+                .dispatch_event_with_response(
+                    ExtensionEventName::SessionBeforeCompact,
+                    Some(Value::Object(payload)),
+                    // gh #178: a dedicated long-running budget — this hook may
+                    // legitimately await the host compaction bridge.
+                    ExtensionEventName::SessionBeforeCompact.default_timeout_ms(),
+                )
+                .await;
 
-        match response {
-            Ok(value) => apply_session_before_compact_response(value, preparation.tokens_before),
-            Err(err) => {
-                tracing::warn!("session_before_compact extension hook failed (fail-open): {err}");
-                SessionBeforeCompactOutcome::default()
+            match response {
+                Ok(value) => apply_session_before_compact_response(value, tokens_before),
+                Err(err) => {
+                    tracing::warn!(
+                        "session_before_compact extension hook failed (fail-open): {err}"
+                    );
+                    SessionBeforeCompactOutcome::default()
+                }
             }
         }
+        .boxed()
     }
 
     fn prepare_semantic_context_prompt(&self) -> Option<PreparedSemanticContextPrompt> {
@@ -20919,7 +21463,9 @@ impl AgentSession {
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             let input_id = session.append_model_message(user_message.clone());
-            if self.memory_settings.is_some() && self.input_source != InputSource::Extension {
+            if self.input_source != InputSource::Extension
+                && self.agent.magic_keyword_scan_override.as_deref() != Some("")
+            {
                 crate::memory::extraction::record_authored_input(&mut session, &input_id)?;
             }
             if self.advisor.is_some() && self.input_source != InputSource::Extension {
@@ -21022,7 +21568,9 @@ impl AgentSession {
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             let input_id = session.append_model_message(user_message.clone());
-            if self.memory_settings.is_some() && self.input_source != InputSource::Extension {
+            if self.input_source != InputSource::Extension
+                && self.agent.magic_keyword_scan_override.as_deref() != Some("")
+            {
                 crate::memory::extraction::record_authored_input(&mut session, &input_id)?;
             }
             if self.advisor.is_some() && self.input_source != InputSource::Extension {
@@ -21319,7 +21867,6 @@ impl AgentSession {
         let admission = self.provider_admission.clone();
         let cost_budget = self.agent.cost_budget().cloned();
         let reset_advisor = self.advisor.is_some();
-        let track_memory_inputs = self.memory_settings.is_some();
         let checkpoint: TurnCheckpoint = Arc::new(
             move |messages: Vec<(Message, bool)>| -> BoxFuture<'static, bool> {
                 let session = Arc::clone(&session);
@@ -21331,8 +21878,7 @@ impl AgentSession {
                         return false;
                     };
                     for (message, authored) in messages {
-                        let memory_input =
-                            track_memory_inputs && authored && matches!(&message, Message::User(_));
+                        let authored_input = authored && matches!(&message, Message::User(_));
                         let reset =
                             reset_advisor && authored && matches!(&message, Message::User(_));
                         let entry_id = session.append_model_message(message);
@@ -21341,14 +21887,16 @@ impl AgentSession {
                         {
                             tracing::warn!(error = %err, "mid-run advisor input reset failed");
                         }
-                        if memory_input
+                        if authored_input
                             && crate::memory::extraction::record_authored_input(
                                 &mut session,
                                 &entry_id,
                             )
                             .is_err()
                         {
-                            tracing::warn!("mid-run memory input provenance could not be recorded");
+                            tracing::warn!(
+                                "mid-run authored input provenance could not be recorded"
+                            );
                         }
                     }
                     if let Some(budget) = &cost_budget
@@ -21420,14 +21968,13 @@ impl AgentSession {
                 let reset_advisor = self.advisor.is_some()
                     && self.agent.is_authored_queue_delivery(message_index)
                     && matches!(&message, Message::User(_));
-                let memory_input = self.memory_settings.is_some()
-                    && self.agent.is_authored_queue_delivery(message_index)
+                let authored_input = self.agent.is_authored_queue_delivery(message_index)
                     && matches!(&message, Message::User(_));
                 let entry_id = session.append_model_message(message);
                 if reset_advisor {
                     append_advisor_input_reset(&mut session, &entry_id)?;
                 }
-                if memory_input {
+                if authored_input {
                     crate::memory::extraction::record_authored_input(&mut session, &entry_id)?;
                 }
             }

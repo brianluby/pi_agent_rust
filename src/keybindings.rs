@@ -1483,6 +1483,28 @@ impl KeyBindings {
             .collect()
     }
 
+    /// Whether configuration removed this chord from any of its default actions.
+    ///
+    /// Hosts should dispatch configured actions first, then use this to prevent
+    /// a widget's native keymap from reviving a removed default. The chord can
+    /// still belong to another action, such as `up` remaining a picker binding
+    /// after cursor movement is disabled, or `ctrl+enter` being reassigned to submit.
+    /// Native shortcuts absent from the default catalog are unaffected.
+    #[must_use]
+    pub fn is_removed_default_binding(&self, binding: &KeyBinding) -> bool {
+        static DEFAULTS: std::sync::LazyLock<KeyBindings> =
+            std::sync::LazyLock::new(KeyBindings::new);
+
+        // Ordinary typing and native-only shortcuts need no per-action scan.
+        if DEFAULTS.lookup(binding).is_none() {
+            return false;
+        }
+        AppAction::all().iter().copied().any(|action| {
+            DEFAULTS.get_bindings(action).contains(binding)
+                && !self.get_bindings(action).contains(binding)
+        })
+    }
+
     /// Get all key bindings for an action.
     #[must_use]
     pub fn get_bindings(&self, action: AppAction) -> &[KeyBinding] {
@@ -2378,6 +2400,118 @@ mod tests {
     }
 
     #[test]
+    fn removed_defaults_are_detected_after_either_config_loader() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("keybindings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "newLine": ["ctrl+j"],
+                "submit": ["ctrl+enter"],
+                "cursorUp": [],
+                "cursorLineStart": [],
+                "cursorWordLeft": [],
+                "deleteToLineEnd": [],
+                "followUp": []
+            }"#,
+        )
+        .expect("write bindings");
+        let strict = KeyBindings::load(&path).expect("strict bindings");
+        let diagnostic = KeyBindings::load_from_path_with_diagnostics(&path);
+        assert!(!diagnostic.has_warnings());
+
+        for bindings in [strict, diagnostic.bindings] {
+            for binding in [
+                KeyBinding::plain("enter"),
+                KeyBinding::shift("enter"),
+                KeyBinding::ctrl("enter"),
+                KeyBinding::plain("up"),
+                KeyBinding::plain("home"),
+                KeyBinding::ctrl("a"),
+                KeyBinding::alt("b"),
+                KeyBinding::ctrl("k"),
+                KeyBinding::alt("enter"),
+            ] {
+                assert!(bindings.is_removed_default_binding(&binding), "{binding}");
+            }
+            // Sharing a chord does not hide removal from another context.
+            assert_eq!(
+                bindings.lookup(&KeyBinding::plain("up")),
+                Some(AppAction::SelectUp)
+            );
+            // The host must still execute this reassignment before its guard.
+            assert_eq!(
+                bindings.lookup(&KeyBinding::ctrl("enter")),
+                Some(AppAction::Submit)
+            );
+            assert_eq!(
+                bindings.lookup(&KeyBinding::ctrl("j")),
+                Some(AppAction::NewLine)
+            );
+            for binding in [
+                KeyBinding::ctrl("j"),
+                KeyBinding::plain("right"),
+                KeyBinding::ctrl("y"),
+                KeyBinding::shift("left"),
+                KeyBinding::ctrl_shift("left"),
+                KeyBinding::plain("x"),
+            ] {
+                assert!(!bindings.is_removed_default_binding(&binding), "{binding}");
+            }
+        }
+    }
+
+    #[test]
+    fn default_and_retained_aliases_are_not_removed() {
+        let defaults = KeyBindings::new();
+        for binding in [
+            KeyBinding::plain("enter"),
+            KeyBinding::shift("enter"),
+            KeyBinding::ctrl("enter"),
+            KeyBinding::alt("enter"),
+            KeyBinding::plain("up"),
+            KeyBinding::ctrl("a"),
+        ] {
+            assert!(!defaults.is_removed_default_binding(&binding), "{binding}");
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("keybindings.json");
+        std::fs::write(&path, r#"{"newLine": ["shift+enter", "ctrl+j"]}"#).expect("write bindings");
+        let bindings = KeyBindings::load(&path).expect("bindings");
+        assert!(!bindings.is_removed_default_binding(&KeyBinding::shift("enter")));
+        assert!(bindings.is_removed_default_binding(&KeyBinding::ctrl("enter")));
+        assert!(!bindings.is_removed_default_binding(&KeyBinding::ctrl("j")));
+    }
+
+    #[test]
+    fn invalid_overrides_do_not_mark_retained_defaults_as_removed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("keybindings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "newLine": ["invalidkey123"],
+                "submit": 42,
+                "cursorUp": [false]
+            }"#,
+        )
+        .expect("write bindings");
+        assert!(KeyBindings::load(&path).is_err());
+        let diagnostic = KeyBindings::load_from_path_with_diagnostics(&path);
+        assert!(diagnostic.has_warnings());
+        for (binding, action) in [
+            (KeyBinding::shift("enter"), AppAction::NewLine),
+            (KeyBinding::ctrl("enter"), AppAction::NewLine),
+            (KeyBinding::plain("enter"), AppAction::Submit),
+            (KeyBinding::plain("up"), AppAction::CursorUp),
+        ] {
+            assert_eq!(diagnostic.bindings.lookup(&binding), Some(action));
+            assert!(!diagnostic.bindings.is_removed_default_binding(&binding));
+        }
+    }
+
+    #[test]
     fn test_load_warns_on_invalid_json() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("keybindings.json");
@@ -2963,6 +3097,111 @@ mod tests {
                 KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Up, ftui::Modifiers::SHIFT))
                     .unwrap();
             assert_eq!(bindings.lookup(&page_up), Some(AppAction::PageUp));
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        #[test]
+        fn terminal_enter_normalization_preserves_newline_chords_and_event_kinds() {
+            use crossterm::event as ct;
+
+            let bindings = KeyBindings::default();
+            let chords = [
+                (ct::KeyModifiers::NONE, "enter", Some(AppAction::Submit)),
+                (
+                    ct::KeyModifiers::SHIFT,
+                    "shift+enter",
+                    Some(AppAction::NewLine),
+                ),
+                (
+                    ct::KeyModifiers::CONTROL,
+                    "ctrl+enter",
+                    Some(AppAction::NewLine),
+                ),
+                (
+                    ct::KeyModifiers::ALT,
+                    "alt+enter",
+                    Some(AppAction::FollowUp),
+                ),
+                (
+                    ct::KeyModifiers::CONTROL | ct::KeyModifiers::SHIFT,
+                    "ctrl+shift+enter",
+                    None,
+                ),
+                (
+                    ct::KeyModifiers::ALT | ct::KeyModifiers::SHIFT,
+                    "alt+shift+enter",
+                    None,
+                ),
+                (
+                    ct::KeyModifiers::CONTROL | ct::KeyModifiers::ALT,
+                    "ctrl+alt+enter",
+                    None,
+                ),
+            ];
+            for (kind, expected_kind) in [
+                (ct::KeyEventKind::Press, ftui::KeyEventKind::Press),
+                (ct::KeyEventKind::Repeat, ftui::KeyEventKind::Repeat),
+                (ct::KeyEventKind::Release, ftui::KeyEventKind::Release),
+            ] {
+                for (modifiers, chord, expected_action) in chords {
+                    // Exercise the same backend boundary as TerminalSession,
+                    // rather than synthesizing an already-normalized FTUI key.
+                    let terminal = ct::Event::Key(ct::KeyEvent::new_with_kind(
+                        ct::KeyCode::Enter,
+                        modifiers,
+                        kind,
+                    ));
+                    let Some(ftui::Event::Key(key)) = ftui::Event::from_crossterm(terminal) else {
+                        panic!("terminal Enter event was dropped: {chord} {kind:?}"); // ubs:ignore test assertion: normalization must preserve this known key event.
+                    };
+                    assert_eq!(key.code, ftui::KeyCode::Enter);
+                    // The model must still be able to discard releases without
+                    // suppressing auto-repeat on multiline input.
+                    assert_eq!(key.kind, expected_kind);
+                    let binding = KeyBinding::from_ftui_key(&key).expect("Enter binding");
+                    assert_eq!(binding, chord.parse::<KeyBinding>().unwrap());
+                    assert_eq!(bindings.lookup(&binding), expected_action, "{chord}");
+                }
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        #[test]
+        fn terminal_newline_actions_respect_user_config() {
+            use crossterm::event as ct;
+
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("keybindings.json");
+            std::fs::write(
+                &path,
+                r#"{"newLine": ["ctrl+j"], "submit": ["ctrl+enter"]}"#,
+            )
+            .unwrap();
+            let loaded = KeyBindings::load_from_path_with_diagnostics(&path);
+            assert!(!loaded.has_warnings());
+
+            for (code, modifiers, newline, submit) in [
+                // Raw-mode LF is a Ctrl+J event, distinct from Enter. Users
+                // can bind it without an unconditional newline alias.
+                (
+                    ct::KeyCode::Char('j'),
+                    ct::KeyModifiers::CONTROL,
+                    true,
+                    false,
+                ),
+                (ct::KeyCode::Enter, ct::KeyModifiers::CONTROL, false, true),
+                (ct::KeyCode::Enter, ct::KeyModifiers::SHIFT, false, false),
+                (ct::KeyCode::Enter, ct::KeyModifiers::NONE, false, false),
+            ] {
+                let terminal = ct::Event::Key(ct::KeyEvent::new(code, modifiers));
+                let Some(ftui::Event::Key(key)) = ftui::Event::from_crossterm(terminal) else {
+                    panic!("configured terminal chord was dropped: {code:?} {modifiers:?}"); // ubs:ignore test assertion: normalization must preserve this known key event.
+                };
+                let binding = KeyBinding::from_ftui_key(&key).expect("configured binding");
+                let actions = loaded.bindings.matching_actions(&binding);
+                assert_eq!(actions.contains(&AppAction::NewLine), newline, "{binding}");
+                assert_eq!(actions.contains(&AppAction::Submit), submit, "{binding}");
+            }
         }
 
         #[test]

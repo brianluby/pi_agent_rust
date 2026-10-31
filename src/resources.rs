@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::package_manager::{
     PackageManager, PackageScope, ResolveExtensionSourcesOptions, ResolvedResource, ResourceOrigin,
+    project_universal_skill_dirs,
 };
 use crate::theme::{MAX_RESOURCE_FILE_BYTES, Theme};
 use serde_json::{Value, json};
@@ -61,14 +62,23 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send + 'static>) -> St
     )
 }
 
-fn read_dir_sorted_paths(dir: &Path) -> Vec<PathBuf> {
+fn read_dir_sorted_paths_bounded(dir: &Path, remaining: usize) -> Option<Vec<PathBuf>> {
     let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
+        return Some(Vec::new());
     };
 
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    let mut paths = Vec::new();
+    for entry in entries.flatten() {
+        if paths.len() >= remaining {
+            // Read one entry beyond the budget only to prove that this root
+            // exceeds its cap. Fail the whole root closed instead of returning
+            // an OS-order-dependent partial catalogue.
+            return None;
+        }
+        paths.push(entry.path());
+    }
     paths.sort();
-    paths
+    Some(paths)
 }
 
 fn canonical_identity_path(path: &Path) -> PathBuf {
@@ -117,6 +127,7 @@ pub struct ResourceDiagnostic {
 
 const MAX_SKILL_NAME_LEN: usize = 64;
 const MAX_SKILL_DESC_LEN: usize = 1024;
+const MAX_SKILL_DISCOVERY_ENTRIES: usize = 16_384;
 
 const ALLOWED_SKILL_FRONTMATTER: [&str; 8] = [
     "name",
@@ -151,6 +162,9 @@ pub struct LoadSkillsResult {
 pub struct LoadSkillsOptions {
     pub cwd: PathBuf,
     pub agent_dir: PathBuf,
+    /// Home for universal user skills, independent of `agent_dir`.
+    /// `None` disables that root for hermetic callers.
+    pub home_dir: Option<PathBuf>,
     pub skill_paths: Vec<PathBuf>,
     pub include_defaults: bool,
 }
@@ -407,6 +421,7 @@ impl ResourceLoader {
                 load_skills(LoadSkillsOptions {
                     cwd: cwd_s.clone(),
                     agent_dir: agent_s.clone(),
+                    home_dir: dirs::home_dir(),
                     skill_paths,
                     include_defaults: false,
                 })
@@ -509,6 +524,7 @@ impl ResourceLoader {
                 let result = load_skills(LoadSkillsOptions {
                     cwd: cwd_buf.clone(),
                     agent_dir: agent_dir.clone(),
+                    home_dir: dirs::home_dir(),
                     skill_paths,
                     include_defaults: false,
                 });
@@ -964,11 +980,31 @@ fn resolve_manifest_resource_path(
 // Skills loader
 // ============================================================================
 
+/// Default roots in collision precedence order. Only these exact directories
+/// are searched: never parent projects, sibling workspaces, or the whole home.
+pub(crate) fn default_skill_dirs(
+    cwd: &Path,
+    agent_dir: &Path,
+    home_dir: Option<&Path>,
+) -> Vec<(PathBuf, &'static str)> {
+    let mut roots = vec![(cwd.join(Config::project_dir()).join("skills"), "project")];
+    roots.extend(
+        project_universal_skill_dirs(cwd, home_dir)
+            .into_iter()
+            .map(|path| (path, "project")),
+    );
+    roots.push((agent_dir.join("skills"), "user"));
+    if let Some(home) = home_dir {
+        roots.push((home.join(".agents").join("skills"), "user"));
+    }
+    roots
+}
+
 #[allow(clippy::too_many_lines, clippy::items_after_statements)]
 pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
     let mut skill_map: HashMap<String, Skill> = HashMap::new();
     let mut real_paths: HashSet<PathBuf> = HashSet::new();
-    let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut visited_dirs: HashMap<PathBuf, bool> = HashMap::new();
     let mut diagnostics = Vec::new();
     let mut collisions = Vec::new();
 
@@ -983,7 +1019,7 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
         diagnostics.extend(result.diagnostics);
         for skill in result.skills {
             let real_path = canonical_identity_path(&skill.file_path);
-            if real_paths.contains(&real_path) {
+            if !real_paths.insert(real_path) {
                 continue;
             }
 
@@ -1000,37 +1036,42 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
                     }),
                 });
             } else {
-                real_paths.insert(real_path);
                 skill_map.insert(skill.name.clone(), skill);
             }
         }
     }
 
+    let default_dirs = default_skill_dirs(
+        &options.cwd,
+        &options.agent_dir,
+        options.home_dir.as_deref(),
+    );
+    let project_universal_dirs =
+        project_universal_skill_dirs(&options.cwd, options.home_dir.as_deref());
+    let user_universal_dir = options
+        .home_dir
+        .as_ref()
+        .map(|home| home.join(".agents").join("skills"));
+    let managed_dir = options.agent_dir.join("skills.managed");
+    let mut source_dirs = default_dirs.clone();
+    source_dirs.push((managed_dir.clone(), "managed"));
     if options.include_defaults {
-        merge_skills(
-            load_skills_from_dir_with_visited(
-                options.cwd.join(Config::project_dir()).join("skills"),
-                "project".to_string(),
-                true,
-                &mut visited_dirs,
-            ),
-            &mut skill_map,
-            &mut real_paths,
-            &mut diagnostics,
-            &mut collisions,
-        );
-        merge_skills(
-            load_skills_from_dir_with_visited(
-                options.agent_dir.join("skills"),
-                "user".to_string(),
-                true,
-                &mut visited_dirs,
-            ),
-            &mut skill_map,
-            &mut real_paths,
-            &mut diagnostics,
-            &mut collisions,
-        );
+        for (dir, source) in &default_dirs {
+            let universal_root = project_universal_dirs.iter().any(|root| root == dir)
+                || user_universal_dir.as_ref() == Some(dir);
+            merge_skills(
+                load_skills_from_dir_with_visited(
+                    dir.clone(),
+                    (*source).to_string(),
+                    !universal_root,
+                    &mut visited_dirs,
+                ),
+                &mut skill_map,
+                &mut real_paths,
+                &mut diagnostics,
+                &mut collisions,
+            );
+        }
 
         // Legacy footgun (bd-3znxm): users coming from upstream pi docs put
         // skills in `~/.pi/skills`, which Pi never loads — previously a
@@ -1039,7 +1080,7 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
         // agent_dir at temp roots and must not see host-dependent warnings.
         if options.agent_dir == Config::global_dir()
             && let Some(diagnostic) =
-                legacy_skills_dir_diagnostic(dirs::home_dir().as_deref(), &options.agent_dir)
+                legacy_skills_dir_diagnostic(options.home_dir.as_deref(), &options.agent_dir)
         {
             diagnostics.push(diagnostic);
         }
@@ -1058,13 +1099,16 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
 
         let source = if options.include_defaults {
             "path".to_string()
-        } else if is_under_path(&resolved, &options.agent_dir.join("skills")) {
-            "user".to_string()
-        } else if is_under_path(
-            &resolved,
-            &options.cwd.join(Config::project_dir()).join("skills"),
-        ) {
-            "project".to_string()
+        } else if let Some((_, source)) = source_dirs
+            .iter()
+            .find(|(dir, _)| resolved.starts_with(dir))
+            .or_else(|| {
+                source_dirs
+                    .iter()
+                    .find(|(dir, _)| is_under_path(&resolved, dir))
+            })
+        {
+            (*source).to_string()
         } else {
             "path".to_string()
         };
@@ -1116,22 +1160,19 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
     // Managed skills tier (bd-cv653.4.2): agent-authored skills load dead
     // last — user/project skills always win collisions, and the collision
     // diagnostic names the shadowed managed skill.
-    if options.include_defaults {
-        let managed_dir = options.agent_dir.join("skills.managed");
-        if managed_dir.is_dir() {
-            merge_skills(
-                load_skills_from_dir_with_visited(
-                    managed_dir,
-                    "managed".to_string(),
-                    true,
-                    &mut visited_dirs,
-                ),
-                &mut skill_map,
-                &mut real_paths,
-                &mut diagnostics,
-                &mut collisions,
-            );
-        }
+    if options.include_defaults && managed_dir.is_dir() {
+        merge_skills(
+            load_skills_from_dir_with_visited(
+                managed_dir,
+                "managed".to_string(),
+                true,
+                &mut visited_dirs,
+            ),
+            &mut skill_map,
+            &mut real_paths,
+            &mut diagnostics,
+            &mut collisions,
+        );
     }
 
     diagnostics.extend(collisions);
@@ -1151,7 +1192,7 @@ fn load_skills_from_dir(
     source: String,
     include_root_files: bool,
 ) -> LoadSkillsResult {
-    let mut visited_dirs = HashSet::new();
+    let mut visited_dirs = HashMap::new();
     load_skills_from_dir_with_visited(dir, source, include_root_files, &mut visited_dirs)
 }
 
@@ -1159,10 +1200,12 @@ fn load_skills_from_dir_with_visited(
     dir: PathBuf,
     source: String,
     include_root_files: bool,
-    visited_dirs: &mut HashSet<PathBuf>,
+    visited_dirs: &mut HashMap<PathBuf, bool>,
 ) -> LoadSkillsResult {
     let mut skills = Vec::new();
     let mut diagnostics = Vec::new();
+    let root_dir = dir.clone();
+    let mut scanned_entries = 0usize;
     let mut stack = vec![(dir, source, include_root_files)];
 
     while let Some((current_dir, current_source, current_include_root)) = stack.pop() {
@@ -1170,15 +1213,43 @@ fn load_skills_from_dir_with_visited(
             continue;
         }
 
-        // Prevent unbounded recursion for symlink cycles.
+        // Prevent cycles and repeated subtree walks. A directory encountered
+        // earlier as a child may later be a discovery root, where all *.md
+        // files (not just SKILL.md) are eligible. In that case inspect only
+        // the additional root files; its descendants were already visited.
         let canonical_dir = fs::canonicalize(&current_dir).unwrap_or_else(|_| current_dir.clone());
-        if !visited_dirs.insert(canonical_dir) {
-            continue;
-        }
+        let root_files_only = match visited_dirs.entry(canonical_dir) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(current_include_root);
+                false
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if !current_include_root || *entry.get() {
+                    continue;
+                }
+                entry.insert(true);
+                true
+            }
+        };
 
         let mut child_dirs = Vec::new();
+        let remaining = MAX_SKILL_DISCOVERY_ENTRIES.saturating_sub(scanned_entries);
+        let Some(paths) = read_dir_sorted_paths_bounded(&current_dir, remaining) else {
+            return LoadSkillsResult {
+                skills: Vec::new(),
+                diagnostics: vec![ResourceDiagnostic {
+                    kind: DiagnosticKind::Warning,
+                    message: format!(
+                        "skill discovery root exceeds the {MAX_SKILL_DISCOVERY_ENTRIES}-entry limit"
+                    ),
+                    path: root_dir,
+                    collision: None,
+                }],
+            };
+        };
+        scanned_entries = scanned_entries.saturating_add(paths.len());
 
-        for full_path in read_dir_sorted_paths(&current_dir) {
+        for full_path in paths {
             let file_name = full_path.file_name().unwrap_or_default().to_string_lossy();
 
             if file_name.starts_with('.') || file_name == "node_modules" {
@@ -1188,7 +1259,9 @@ fn load_skills_from_dir_with_visited(
             let (is_dir, is_file) = resolved_path_kind(&full_path);
 
             if is_dir {
-                child_dirs.push(full_path);
+                if !root_files_only {
+                    child_dirs.push(full_path);
+                }
                 continue;
             }
 
@@ -1199,6 +1272,9 @@ fn load_skills_from_dir_with_visited(
             let is_root_md = current_include_root && file_name.ends_with(".md");
             let is_skill_md = !current_include_root && file_name == "SKILL.md";
             if !is_root_md && !is_skill_md {
+                continue;
+            }
+            if root_files_only && file_name == "SKILL.md" {
                 continue;
             }
 
@@ -2304,8 +2380,8 @@ fn module_cache_dir() -> Option<PathBuf> {
 }
 
 /// Warn when a non-empty legacy `~/.pi/skills` directory exists (bd-3znxm):
-/// Pi only loads `<agent_dir>/skills` and project `.pi/skills`, so skills
-/// placed there following upstream pi docs silently never load.
+/// This is distinct from both the Pi-specific and universal skill roots, so
+/// skills placed there following upstream pi docs silently never load.
 fn legacy_skills_dir_diagnostic(
     home_dir: Option<&Path>,
     agent_dir: &Path,
@@ -2423,9 +2499,12 @@ fn dedupe_extension_entries_by_id_with_cache_dir(
 enum ResourcePathPrecedence {
     CliExtension,
     ProjectDirectory,
+    ProjectUniversal,
     GlobalDirectory,
+    GlobalUniversal,
     ProjectPackage,
     GlobalPackage,
+    Managed,
 }
 
 fn precedence_sorted_enabled_paths(resources: Vec<ResolvedResource>) -> Vec<PathBuf> {
@@ -2459,9 +2538,14 @@ const fn resource_path_precedence(resource: &ResolvedResource) -> ResourcePathPr
         (PackageScope::Project, ResourceOrigin::TopLevel) => {
             ResourcePathPrecedence::ProjectDirectory
         }
+        (PackageScope::Project, ResourceOrigin::Universal) => {
+            ResourcePathPrecedence::ProjectUniversal
+        }
         (PackageScope::User, ResourceOrigin::TopLevel) => ResourcePathPrecedence::GlobalDirectory,
+        (PackageScope::User, ResourceOrigin::Universal) => ResourcePathPrecedence::GlobalUniversal,
         (PackageScope::Project, ResourceOrigin::Package) => ResourcePathPrecedence::ProjectPackage,
         (PackageScope::User, ResourceOrigin::Package) => ResourcePathPrecedence::GlobalPackage,
+        (_, ResourceOrigin::Managed) => ResourcePathPrecedence::Managed,
     }
 }
 
@@ -2661,6 +2745,27 @@ mod tests {
     use std::future::Future;
     use std::io::Write;
 
+    #[test]
+    fn bounded_skill_directory_read_fails_closed_instead_of_returning_a_partial_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["c.md", "a.md", "b.md"] {
+            fs::write(dir.path().join(name), name).expect("write fixture");
+        }
+
+        assert!(
+            read_dir_sorted_paths_bounded(dir.path(), 2).is_none(),
+            "an over-budget directory must fail closed"
+        );
+        let paths = read_dir_sorted_paths_bounded(dir.path(), 3).expect("within budget");
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["a.md", "b.md", "c.md"]
+        );
+    }
+
     fn write_resource_at_limit(path: &Path, prefix: &[u8]) {
         assert!(prefix.len() <= MAX_RESOURCE_FILE_BYTES);
         let mut file = fs::File::create(path).expect("create exact-limit resource");
@@ -2731,6 +2836,7 @@ mod tests {
         let result = load_skills(LoadSkillsOptions {
             cwd: temp_dir.path().to_path_buf(),
             agent_dir: temp_dir.path().join("agent"),
+            home_dir: None,
             skill_paths: vec![exact.clone(), oversized.clone()],
             include_defaults: false,
         });
@@ -4035,6 +4141,119 @@ still frontmatter",
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_skill_precedence_across_cli_universal_packages_and_managed() {
+        run_async(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let cwd = temp.path().join("project");
+            let agent_dir = temp.path().join("custom-agent");
+            let home = temp.path().join("home");
+            let cli_package = temp.path().join("cli-package");
+            let project_package = temp.path().join("project-package");
+            let user_package = temp.path().join("user-package");
+            let tiers = [
+                temp.path().join("explicit"),
+                cli_package.join("skills"),
+                cwd.join(".pi/skills"),
+                cwd.join(".agents/skills"),
+                agent_dir.join("skills"),
+                home.join(".agents/skills"),
+                project_package.join("skills"),
+                user_package.join("skills"),
+                agent_dir.join("skills.managed"),
+            ];
+            // Each winner competes with every lower tier. This exercises real
+            // package resolution, including its path sorting, before the same
+            // merge/load pipeline used by ResourceLoader::load.
+            for winner in 0..tiers.len() {
+                let name = format!("tier-{winner}");
+                for dir in &tiers[winner..] {
+                    let skill_dir = dir.join(&name);
+                    fs::create_dir_all(&skill_dir).expect("create skill dir");
+                    fs::write(
+                        skill_dir.join("SKILL.md"),
+                        format!("---\nname: {name}\ndescription: A precedence fixture\n---\nBody"),
+                    )
+                    .expect("write skill");
+                }
+            }
+            for package in [&cli_package, &project_package, &user_package] {
+                fs::write(
+                    package.join("package.json"),
+                    r#"{"pi":{"skills":["skills"]}}"#,
+                )
+                .expect("write package manifest");
+            }
+            let roots = crate::package_manager::ResolveRoots {
+                global_settings_path: agent_dir.join("settings.json"),
+                project_settings_path: cwd.join(".pi/settings.json"),
+                global_base_dir: agent_dir.clone(),
+                project_base_dir: cwd.join(".pi"),
+                project_settings_enabled: true,
+                home_dir: Some(home.clone()),
+            };
+            for (settings, package) in [
+                (&roots.global_settings_path, &user_package),
+                (&roots.project_settings_path, &project_package),
+            ] {
+                fs::write(
+                    settings,
+                    serde_json::to_vec(&json!({"packages": [package]})).expect("encode settings"),
+                )
+                .expect("write settings");
+            }
+            let manager = PackageManager::new(cwd.clone());
+            let resolved = manager
+                .resolve_with_roots(&roots)
+                .await
+                .expect("resolve defaults");
+            let cli = manager
+                .resolve_extension_sources(
+                    &[cli_package.to_string_lossy().into_owned()],
+                    ResolveExtensionSourcesOptions {
+                        local: false,
+                        temporary: true,
+                    },
+                )
+                .await
+                .expect("resolve CLI package");
+
+            for include_configured in [true, false] {
+                let paths = merge_resource_paths(
+                    &tiers[..1],
+                    cli.skills.clone(),
+                    resolved.skills.clone(),
+                    include_configured,
+                );
+                let result = load_skills(LoadSkillsOptions {
+                    cwd: cwd.clone(),
+                    agent_dir: agent_dir.clone(),
+                    home_dir: Some(home.clone()),
+                    skill_paths: paths,
+                    include_defaults: false,
+                });
+                let expected_count = if include_configured { 9 } else { 2 };
+                assert_eq!(result.skills.len(), expected_count);
+                for (index, skill) in result.skills.iter().enumerate() {
+                    let name = format!("tier-{index}");
+                    assert_eq!(skill.name, name);
+                    assert_eq!(skill.file_path, tiers[index].join(name).join("SKILL.md"));
+                }
+                assert_eq!(
+                    result.diagnostics.len(),
+                    if include_configured { 36 } else { 1 }
+                );
+                assert!(
+                    result
+                        .diagnostics
+                        .iter()
+                        .all(|d| d.kind == DiagnosticKind::Collision)
+                );
+            }
+        });
+    }
+
+    #[test]
     fn test_precedence_sorted_enabled_paths_preserves_source_order_within_same_precedence() {
         let resources = vec![
             ResolvedResource {
@@ -4662,6 +4881,37 @@ still frontmatter",
 
     #[cfg(unix)]
     #[test]
+    fn test_universal_root_nested_in_native_tree_loads_root_markdown() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("project");
+        let nested_root = cwd.join(".pi/skills/shared");
+        fs::create_dir_all(&nested_root).expect("create nested root");
+        fs::create_dir_all(cwd.join(".agents")).expect("create universal base");
+        fs::write(
+            nested_root.join("instructions.md"),
+            "---\nname: skills\ndescription: Root Markdown skill\n---\nBody",
+        )
+        .expect("write root markdown");
+        std::os::unix::fs::symlink(&nested_root, cwd.join(".agents/skills"))
+            .expect("alias nested root");
+        let result = load_skills(LoadSkillsOptions {
+            cwd: cwd.clone(),
+            agent_dir: temp.path().join("agent"),
+            home_dir: None,
+            skill_paths: Vec::new(),
+            include_defaults: true,
+        });
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(
+            result.skills[0].file_path,
+            cwd.join(".agents/skills/instructions.md")
+        );
+        assert_eq!(result.skills[0].name, "skills");
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_load_skills_ignores_alias_symlink_to_same_skill_tree() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let skills_root = tmp.path().join("skills");
@@ -4680,6 +4930,7 @@ still frontmatter",
         let result = load_skills(LoadSkillsOptions {
             cwd: tmp.path().to_path_buf(),
             agent_dir: tmp.path().join("agent"),
+            home_dir: None,
             skill_paths: vec![skills_root],
             include_defaults: false,
         });
@@ -4708,6 +4959,7 @@ still frontmatter",
         let result = load_skills(LoadSkillsOptions {
             cwd: tmp.path().to_path_buf(),
             agent_dir: tmp.path().join("agent"),
+            home_dir: None,
             skill_paths: vec![real_root, alias_root],
             include_defaults: false,
         });
@@ -4745,6 +4997,7 @@ still frontmatter",
         let result = load_skills(LoadSkillsOptions {
             cwd: temp.path().to_path_buf(),
             agent_dir: temp.path().join("agent"),
+            home_dir: None,
             skill_paths: vec![root],
             include_defaults: false,
         });

@@ -20,21 +20,21 @@ use crate::worktree_iso::{IsoApplyMode, IsoBaseline, IsoHandle, IsoOutcome};
 use futures::stream::{self, StreamExt};
 use serde_json::Value;
 use std::collections::BTreeMap;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-#[cfg(any(not(unix), test))]
+#[cfg(any(not(any(unix, windows)), test))]
 use std::sync::mpsc::{self, Receiver};
-#[cfg(any(not(unix), test))]
+#[cfg(any(not(any(unix, windows)), test))]
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-#[cfg(any(not(unix), test))]
+#[cfg(any(not(any(unix, windows)), test))]
 use std::time::Instant;
 
 mod ownership;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod pipes;
 pub(super) mod worker;
 use ownership::{HubLease, ProcessLease};
@@ -463,23 +463,37 @@ impl ChildRunner {
         baseline: Option<&BaselineCapture>,
     ) -> Attempt {
         let cwd = self.task_cwd(&task);
-        let args = super::with_fallback_policy_args(
-            child_args(
-                agent,
-                &task.task,
-                self.role_model_spec.as_deref(),
-                launch.parent_model.as_ref(),
-                task.model_selection.as_ref(),
-                schema,
-            ),
-            task.fallback_policy.as_deref(),
+        let mut args = child_args(
+            agent,
+            &task.task,
+            self.role_model_spec.as_deref(),
+            launch.parent_model.as_ref(),
+            task.model_selection.as_ref(),
+            schema,
         );
+        let stdin = if task.task_file.is_some() {
+            // child_args always appends the instruction as its final argv.
+            // A captured file travels through private regular-file stdin so
+            // multi-megabyte instructions cannot exceed the OS argv limit.
+            args.pop();
+            super::task_file::stdin(&task.task, owner, self.deadline)
+        } else {
+            Ok(Stdio::null())
+        };
+        let args = super::with_fallback_policy_args(args, task.fallback_policy.as_deref());
         let policy = isolation_policy(&task);
         let mut attempt = Attempt::new(
             SubagentResult::starting(agent, task, step, &self.child_binary, &cwd, &args),
             self.deadline,
         );
         attempt.result.task = launch.display_task().to_string();
+        let stdin = match stdin {
+            Ok(stdin) => stdin,
+            Err(error) => {
+                attempt.result.fail(error.to_string());
+                return attempt;
+            }
+        };
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
@@ -614,7 +628,7 @@ impl ChildRunner {
         command
             .args(&args)
             .current_dir(&attempt.result.cwd)
-            .stdin(Stdio::null())
+            .stdin(stdin)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("PI_CODING_AGENT_DIR", &self.global_dir)
@@ -630,6 +644,16 @@ impl ChildRunner {
             use std::os::unix::process::CommandExt as _;
             command.process_group(0);
         }
+        #[cfg(windows)]
+        let mut pipes = match pipes::ChildPipes::configure(&mut command) {
+            Ok(pipes) => pipes,
+            Err(error) => {
+                attempt
+                    .result
+                    .fail(format!("PI_SUBAGENT_PIPE_SETUP: {error}"));
+                return attempt;
+            }
+        };
         // Check after callbacks and setup, immediately before dispatch.
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
@@ -659,6 +683,9 @@ impl ChildRunner {
                 return attempt;
             }
         };
+        // Configured Windows Stdio retains parent writer copies in Command.
+        // Close them now so only the child tree can keep output alive.
+        drop(command);
         attempt.result.pid = Some(child.id());
         // Close the registration-to-spawn race. A kill observed after OS spawn
         // still owns a reaper and must not be announced as a new running task.
@@ -669,20 +696,23 @@ impl ChildRunner {
             return attempt;
         }
         emit_progress(update, &attempt.result);
+        #[cfg(not(windows))]
         let Some(stdout) = child.child.as_mut().and_then(|child| child.stdout.take()) else {
             attempt
                 .result
                 .fail("Child stdout was not piped.".to_string());
             return attempt;
         };
+        #[cfg(not(windows))]
         let Some(stderr) = child.child.as_mut().and_then(|child| child.stderr.take()) else {
             attempt
                 .result
                 .fail("Child stderr was not piped.".to_string());
             return attempt;
         };
-        // Unix pipes are owned directly by this future. No blocking reader
-        // can survive a dropped turn or an escaped descendant retaining EOF.
+        // Unix descriptors and Windows overlapped readers belong to this
+        // future. No per-child reader thread survives a dropped turn or a
+        // writer retained outside the owned child tree.
         #[cfg(unix)]
         let mut pipes = match pipes::ChildPipes::new(stdout, stderr) {
             Ok(pipes) => pipes,
@@ -693,9 +723,7 @@ impl ChildRunner {
                 return attempt;
             }
         };
-        // Preserve the existing non-Unix transport until an equivalent owned
-        // overlapped-I/O implementation is available there.
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let (rx, stdout, stderr) = {
             let (tx, rx) = mpsc::sync_channel(protocol::PIPE_QUEUE_CAPACITY);
             let stdout = spawn_pipe_reader(stdout, PipeKind::Stdout, tx.clone());
@@ -711,9 +739,9 @@ impl ChildRunner {
             // Bounded nonblocking work keeps messaging inside the process
             // lifetime and leaves every tick a cancellation checkpoint.
             child.poll_hub();
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             pipes.drain(&mut protocol, &mut attempt.result, update);
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, windows)))]
             drain_child_frames(&rx, &mut protocol, &mut attempt.result, update);
             if !check_budget(owner, self.deadline, &mut attempt.result) {
                 // Invalid frames and expired budgets must stop the producer,
@@ -740,7 +768,7 @@ impl ChildRunner {
         // No descendant should keep writing or hold the pipes open after its
         // root exits. Cleanup gets a separate bounded drain, not a new work budget.
         child.stop_descendants();
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         pipes
             .finish(
                 &mut protocol,
@@ -750,7 +778,7 @@ impl ChildRunner {
                 self.deadline,
             )
             .await;
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         drain_until_reader_exit(
             rx,
             &mut protocol,
@@ -1073,7 +1101,7 @@ enum PipeFrame {
     Error(&'static str),
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn spawn_pipe_reader<R: Read + Send + 'static>(
     pipe: R,
     kind: PipeKind,
@@ -1109,7 +1137,7 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
     })
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(not(any(unix, windows)), test))]
 fn drain_child_frames(
     receiver: &Receiver<PipeFrame>,
     protocol: &mut protocol::ChildProtocol,
@@ -1163,7 +1191,7 @@ async fn poll_pause(owner: &AgentCx) {
     owner.time().sleep(Duration::from_millis(10)).await;
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(not(any(unix, windows)), test))]
 #[allow(clippy::too_many_arguments)]
 async fn drain_until_reader_exit(
     receiver: Receiver<PipeFrame>,

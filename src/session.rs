@@ -3097,20 +3097,18 @@ impl Clone for Session {
     }
 }
 
-/// Result of planning a `/fork` operation from a specific user message.
+/// Selected conversation and workspace provenance for a new session.
 ///
-/// Mirrors legacy semantics:
-/// - The new session's leaf is the *parent* of the selected user message (or `None` if root),
-///   so the selected message can be re-submitted as a new branch without creating consecutive
-///   user messages.
-/// - The selected user message text is returned for editor pre-fill.
+/// An interactive edit-and-fork selects the parent of a user message and
+/// returns that message for editor pre-fill. A current-context fork includes
+/// the active leaf and leaves the editor text empty.
 #[derive(Debug, Clone)]
 pub struct ForkPlan {
     /// Entries to copy into the new session file (path to the fork leaf, inclusive).
     pub entries: Vec<SessionEntry>,
-    /// Leaf ID to set in the new session (parent of selected user entry).
+    /// Leaf ID to set in the new session.
     pub leaf_id: Option<String>,
-    /// Text of the selected user message (for editor pre-fill).
+    /// Text for editor pre-fill; empty for a current-context fork.
     pub selected_text: String,
     // Session-wide metadata must come from the source, independently of the
     // selected conversation ancestry or the caller's process directory.
@@ -5681,12 +5679,21 @@ impl Session {
     }
 
     pub fn append_session_info(&mut self, name: Option<String>) -> String {
+        let source = name.as_ref().map(|_| SessionTitleSource::User);
+        self.append_session_info_with_source(name, source)
+    }
+
+    fn append_session_info_with_source(
+        &mut self,
+        name: Option<String>,
+        source: Option<SessionTitleSource>,
+    ) -> String {
         let id = self.next_entry_id();
         let base = EntryBase::new(self.leaf_id.clone(), id.clone());
         if name.is_some() {
             self.cached_name.clone_from(&name);
         }
-        let entry = SessionEntry::SessionInfo(SessionInfoEntry { base, name });
+        let entry = SessionEntry::SessionInfo(SessionInfoEntry { base, name, source });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
         self.entry_index.insert(id.clone(), self.entries.len() - 1);
@@ -5824,6 +5831,27 @@ impl Session {
     /// Set the session name by appending a `SessionInfo` entry.
     pub fn set_name(&mut self, name: &str) -> String {
         self.append_session_info(Some(name.to_string()))
+    }
+
+    /// Record the provenance needed to refresh an automatically generated name.
+    /// Ordinary name setters always record a user name, even if its text matches.
+    pub(crate) fn set_generated_name(&mut self, name: &str) -> String {
+        self.append_session_info_with_source(Some(name.to_string()), Some(SessionTitleSource::Auto))
+    }
+
+    /// The latest naming entry owns the session name across branches. Legacy
+    /// entries without provenance are treated as user names, never guessed auto.
+    pub(crate) fn name_entry(&self) -> Option<&SessionInfoEntry> {
+        self.entries.iter().rev().find_map(|entry| match entry {
+            SessionEntry::SessionInfo(info) if info.name.is_some() => Some(info),
+            _ => None,
+        })
+    }
+
+    #[must_use]
+    pub fn name_source(&self) -> Option<SessionTitleSource> {
+        self.name_entry()
+            .map(|info| info.source.unwrap_or(SessionTitleSource::User))
     }
 
     pub fn append_compaction(
@@ -6094,6 +6122,25 @@ impl Session {
         let selected_text = user_content_to_text(content);
         let leaf_id = message_entry.base.parent_id.clone();
 
+        self.plan_fork_at(leaf_id, selected_text)
+    }
+
+    /// Fork the complete selected conversation, including its current leaf.
+    ///
+    /// Unlike an interactive edit-and-fork, this retains the last user message
+    /// and its answer. Preparing the snapshot never navigates or rewrites the
+    /// source, and includes its latest session-wide workspace attachment even
+    /// when that metadata lives outside the selected conversation path.
+    pub fn plan_fork_current_context(&self) -> Result<ForkPlan> {
+        if self.v2_partial_hydration {
+            let mut complete = self.clone();
+            complete.ensure_full_v2_hydration_before_save()?;
+            return complete.plan_fork_current_context();
+        }
+        self.plan_fork_at(self.leaf_id.clone(), String::new())
+    }
+
+    fn plan_fork_at(&self, leaf_id: Option<String>, selected_text: String) -> Result<ForkPlan> {
         let entries = if let Some(ref leaf_id) = leaf_id {
             if self.is_linear {
                 let idx = self.entry_index.get(leaf_id).copied().ok_or_else(|| {
@@ -7480,7 +7527,15 @@ pub struct LabelEntry {
     pub label: Option<String>,
 }
 
-/// Session info entry.
+/// Provenance of a persisted session name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionTitleSource {
+    Auto,
+    User,
+}
+
+/// A name and its author. Missing source in older records means user-authored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfoEntry {
@@ -7488,6 +7543,8 @@ pub struct SessionInfoEntry {
     pub base: EntryBase,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SessionTitleSource>,
 }
 
 /// Custom entry.
@@ -13158,6 +13215,25 @@ mod tests {
 
         session.set_name("second");
         assert_eq!(session.get_name().as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn generated_name_provenance_is_explicit_and_manual_same_text_wins() {
+        let mut session = Session::in_memory();
+        session.set_generated_name("Fix parser recovery");
+        assert_eq!(session.name_source(), Some(SessionTitleSource::Auto));
+        let recorded = serde_json::to_value(session.name_entry().unwrap()).unwrap();
+        assert_eq!(recorded["source"], "auto");
+        session.set_name("Fix parser recovery");
+        assert_eq!(session.name_source(), Some(SessionTitleSource::User));
+        let legacy: SessionInfoEntry = serde_json::from_value(serde_json::json!({
+            "id": "legacy-name", "parentId": null,
+            "timestamp": "2026-10-30T00:00:00Z", "name": "Earlier name"
+        }))
+        .expect("older name record without provenance");
+        assert_eq!(legacy.source, None);
+        session.entries.push(SessionEntry::SessionInfo(legacy));
+        assert_eq!(session.name_source(), Some(SessionTitleSource::User));
     }
 
     #[test]

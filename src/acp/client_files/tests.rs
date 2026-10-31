@@ -199,6 +199,230 @@ fn native_read_uses_unsaved_buffers_normalized_lines_and_current_hashes() {
     });
 }
 
+fn editor_notebook() -> Value {
+    json!({
+        "nbformat": 4,
+        "nbformat_minor": 5,
+        "metadata": {"custom": "keep notebook metadata"},
+        "cells": [{
+            "id": "editor-code",
+            "cell_type": "code",
+            "metadata": {"tags": ["keep cell metadata"]},
+            "source": ["old = 1\n"],
+            "execution_count": 8,
+            "outputs": [{"output_type": "stream", "name": "stdout", "text": "saved editor result\n"}]
+        }]
+    })
+}
+
+#[test]
+fn notebook_source_rendered_and_raw_reads_all_use_the_unsaved_editor_buffer() {
+    asupersync::test_utils::run_test(|| async {
+        let fixture = Fixture::new(true, true);
+        let path = fixture.root.path().join("analysis.ipynb");
+        std::fs::write(&path, "stale disk bytes must never supply this view").unwrap();
+        let source = editor_notebook().to_string();
+        let source_view = fixture
+            .tool(
+                "read",
+                json!({"path":"analysis.ipynb", "hashline":true}),
+                vec![("fs/read_text_file", json!({"content":source}))],
+            )
+            .await
+            .unwrap();
+        assert!(text(&source_view).contains(":# %% [code] cell:0"));
+        assert!(text(&source_view).contains(":old = 1"));
+        assert!(!text(&source_view).contains("saved editor result"));
+        let details = source_view.details.as_ref().unwrap();
+        assert_eq!(details["source"], "editor");
+        assert_eq!(details["contentType"], "notebook");
+        assert_eq!(details["editable"], true);
+
+        let rendered = fixture
+            .tool(
+                "read",
+                json!({"path":"analysis.ipynb", "rendered":true}),
+                vec![("fs/read_text_file", json!({"content":source}))],
+            )
+            .await
+            .unwrap();
+        assert!(text(&rendered).contains("saved editor result"));
+        assert!(text(&rendered).contains("code was not executed"));
+        assert_eq!(rendered.details.as_ref().unwrap()["source"], "editor");
+        assert_eq!(rendered.details.as_ref().unwrap()["rendered"], true);
+        assert!(
+            fixture
+                .tool(
+                    "read",
+                    json!({"path":"analysis.ipynb", "rendered":true, "hashline":true}),
+                    vec![("fs/read_text_file", json!({"content":source}))],
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("DOCUMENT_HASHLINE")
+        );
+
+        let raw = fixture
+            .tool(
+                "read",
+                json!({"path":"analysis.ipynb", "raw":true, "rendered":true, "hashline":true}),
+                vec![("fs/read_text_file", json!({"content":source}))],
+            )
+            .await
+            .unwrap();
+        assert!(text(&raw).starts_with("1#"));
+        assert!(text(&raw).ends_with(&source));
+        assert!(!text(&raw).contains("# %% [code]"));
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "stale disk bytes must never supply this view"
+        );
+    });
+}
+
+#[test]
+fn notebook_editor_edits_round_trip_json_and_report_source_view_diffs() {
+    asupersync::test_utils::run_test(|| async {
+        for tool in ["edit", "hashline_edit"] {
+            let fixture = Fixture::new(true, true);
+            let original = editor_notebook();
+            let source = original.to_string();
+            let read = fixture
+                .tool(
+                    "read",
+                    json!({"path":"analysis.ipynb", "hashline":true}),
+                    vec![("fs/read_text_file", json!({"content":source}))],
+                )
+                .await
+                .unwrap();
+            let anchor = text(&read)
+                .lines()
+                .find(|line| line.ends_with(":old = 1"))
+                .unwrap()
+                .split_once(':')
+                .unwrap()
+                .0;
+            let arguments = if tool == "edit" {
+                json!({"path":"analysis.ipynb", "oldText":"old = 1", "newText":"new = 2"})
+            } else {
+                json!({"path":"analysis.ipynb", "edits":[{
+                    "op":"replace", "pos":anchor, "lines":["new = 2"]
+                }]})
+            };
+            let mut changed = original.clone();
+            changed["cells"][0]["source"] = json!(["new = 2\n"]);
+            let output = fixture
+                .tool(
+                    tool,
+                    arguments,
+                    vec![
+                        ("fs/read_text_file", json!({"content":source})),
+                        ("fs/read_text_file", json!({"content":source})),
+                        ("fs/write_text_file", json!({})),
+                        ("fs/read_text_file", json!({"content":changed.to_string()})),
+                    ],
+                )
+                .await
+                .unwrap();
+            let frames = fixture.frames.borrow();
+            let written = frames
+                .iter()
+                .find(|frame| frame["method"] == "fs/write_text_file")
+                .unwrap()["params"]["content"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(written).unwrap(),
+                changed,
+                "{tool}"
+            );
+            let details = output.details.as_ref().unwrap();
+            assert_eq!(details["destination"], "editor");
+            assert_eq!(details["verified"], true);
+            assert_eq!(details["firstChangedLine"], 2);
+            let diff = details["diff"].as_str().unwrap();
+            assert!(diff.contains("old = 1") && diff.contains("new = 2"));
+            assert!(!diff.contains("execution_count"));
+            assert!(!fixture.root.path().join("analysis.ipynb").exists());
+        }
+    });
+}
+
+#[test]
+fn notebook_editor_raw_edits_and_hidden_metadata_races_keep_json_authoritative() {
+    asupersync::test_utils::run_test(|| async {
+        let fixture = Fixture::new(true, true);
+        let original = editor_notebook();
+        let source = original.to_string();
+        let mut changed = original.clone();
+        changed["metadata"]["custom"] = json!("updated notebook metadata");
+        let output = fixture
+            .tool(
+                "edit",
+                json!({"path":"analysis.ipynb", "raw":true,
+                    "oldText":"keep notebook metadata", "newText":"updated notebook metadata"}),
+                vec![
+                    ("fs/read_text_file", json!({"content":source})),
+                    ("fs/read_text_file", json!({"content":source})),
+                    ("fs/write_text_file", json!({})),
+                    ("fs/read_text_file", json!({"content":changed.to_string()})),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(
+            output.details.as_ref().unwrap()["diff"]
+                .as_str()
+                .unwrap()
+                .contains("metadata")
+        );
+        let writes_before = fixture
+            .frames
+            .borrow()
+            .iter()
+            .filter(|frame| frame["method"] == "fs/write_text_file")
+            .count();
+        let error = fixture
+            .tool(
+                "edit",
+                json!({"path":"analysis.ipynb", "oldText":"old = 1", "newText":"new = 2"}),
+                vec![
+                    ("fs/read_text_file", json!({"content":source})),
+                    ("fs/read_text_file", json!({"content":changed.to_string()})),
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("changed while preparing"));
+        let writes_after = fixture
+            .frames
+            .borrow()
+            .iter()
+            .filter(|frame| frame["method"] == "fs/write_text_file")
+            .count();
+        assert_eq!(writes_before, writes_after);
+        std::fs::write(fixture.root.path().join("analysis.ipynb"), &source).unwrap();
+        assert!(
+            fixture
+                .tool(
+                    "read",
+                    json!({"path":"analysis.ipynb"}),
+                    vec![(
+                        "fs/read_text_file",
+                        json!({"content":"invalid editor notebook"})
+                    )],
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.path().join("analysis.ipynb")).unwrap(),
+            source
+        );
+    });
+}
+
 #[test]
 fn editor_read_windows_honor_explicit_limits_and_empty_offsets() {
     asupersync::test_utils::run_test(|| async {
@@ -280,6 +504,7 @@ fn native_edit_and_write_target_editor_and_report_formatter_readback() {
                 "write",
                 json!({"path":"new.txt", "content":"requested"}),
                 vec![
+                    ("fs/read_text_file", json!({"content":"before"})),
                     ("fs/write_text_file", json!({})),
                     ("fs/read_text_file", json!({"content":"formatted"})),
                 ],
@@ -405,10 +630,76 @@ fn write_only_acknowledgment_does_not_claim_verified_bytes() {
         let details = output.details.as_ref().unwrap();
         assert_eq!(details["destination"], "editor");
         assert_eq!(details["verified"], false);
+        assert!(details["changed"].is_null());
+        let mut prewalk = crate::prewalk::PrewalkState::new(
+            crate::prewalk::PrewalkTarget {
+                provider: "test".into(),
+                model: "implementation".into(),
+                thinking: None,
+            },
+            true,
+        );
+        prewalk.observe(
+            fixture
+                .tools
+                .get("write")
+                .unwrap()
+                .prewalk_evidence(&json!({"path":"file.txt", "content":"requested"}), &output),
+        );
+        assert!(!prewalk.ready());
         assert!(details.get("diff").is_none());
         assert!(text(&output).contains("not rolled back"));
         assert!(!fixture.abort.is_aborted());
         assert!(!fixture.root.path().join("file.txt").exists());
+    });
+}
+
+#[test]
+fn editor_write_prewalk_requires_a_verified_change_from_the_observed_preimage() {
+    asupersync::test_utils::run_test(|| async {
+        for (before, after, expected) in [
+            (json!({"content":"before"}), "changed", json!(true)),
+            // The editor may transform the requested bytes back to the original.
+            (json!({"content":"before"}), "before", json!(false)),
+            // A malformed or inaccessible preimage cannot prove a change, but
+            // it must not prevent an otherwise valid editor write.
+            (json!({"content":7}), "changed", Value::Null),
+        ] {
+            let fixture = Fixture::new(true, true);
+            let arguments = json!({"path":"file.txt", "content":"changed"});
+            let output = fixture
+                .tool(
+                    "write",
+                    arguments.clone(),
+                    vec![
+                        ("fs/read_text_file", before),
+                        ("fs/write_text_file", json!({})),
+                        ("fs/read_text_file", json!({"content":after})),
+                    ],
+                )
+                .await
+                .unwrap();
+            assert!(!output.is_error);
+            assert_eq!(output.details.as_ref().unwrap()["changed"], expected);
+            let mut prewalk = crate::prewalk::PrewalkState::new(
+                crate::prewalk::PrewalkTarget {
+                    provider: "test".into(),
+                    model: "implementation".into(),
+                    thinking: None,
+                },
+                true,
+            );
+            prewalk.observe(
+                fixture
+                    .tools
+                    .get("write")
+                    .unwrap()
+                    .prewalk_evidence(&arguments, &output),
+            );
+            assert_eq!(prewalk.ready(), expected == true);
+            assert!(!fixture.root.path().join("file.txt").exists());
+            assert!(!fixture.abort.is_aborted());
+        }
     });
 }
 
@@ -486,6 +777,10 @@ fn cancelled_unpublished_writes_are_safe_and_published_writes_fence_the_owning_s
             json!({"path":"file.txt", "content":"new"}),
             None,
         ));
+        let preimage = fixture
+            .await_frame(pending.as_mut(), "fs/read_text_file")
+            .await;
+        fixture.reply(&preimage, json!({"content":"before"}));
         assert!(futures::poll!(pending.as_mut()).is_pending());
         let request = fixture.frame("fs/write_text_file");
         drop(pending);

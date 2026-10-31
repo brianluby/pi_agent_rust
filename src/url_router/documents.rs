@@ -189,14 +189,17 @@ fn resource_diagnostic_error(
 
 fn resolve_skill(name: &str, cwd: &Path) -> Result<ResolvedDoc> {
     let agent_dir = crate::config::Config::global_dir();
-    let roots = [
-        cwd.join(crate::config::Config::project_dir())
-            .join("skills"),
-        agent_dir.join("skills"),
-    ];
+    let home_dir = dirs::home_dir();
+    let mut roots: Vec<PathBuf> =
+        crate::resources::default_skill_dirs(cwd, &agent_dir, home_dir.as_deref())
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+    roots.push(agent_dir.join("skills.managed"));
     let skills = crate::resources::load_skills(crate::resources::LoadSkillsOptions {
         cwd: cwd.to_path_buf(),
         agent_dir,
+        home_dir,
         skill_paths: Vec::new(),
         include_defaults: true,
     });
@@ -314,6 +317,27 @@ fn scratch_store() -> &'static std::sync::Mutex<std::collections::HashMap<String
     static STORE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     &STORE
+}
+
+/// Capture a scratch document without cloning an oversized instruction body.
+/// This is the same store as ordinary local:// reads, not a filesystem URL.
+pub(crate) fn read_local_bounded(name: &str, limit: usize) -> Result<String> {
+    let store = scratch_store()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let content = store.get(name).ok_or_else(|| {
+        Error::tool(
+            "read",
+            "PI_URL_UNRESOLVABLE: local scratch document does not exist",
+        )
+    })?;
+    if content.len() > limit {
+        return Err(Error::tool(
+            "read",
+            "PI_URL_LOCAL_LIMIT: scratch document exceeds the requested byte budget",
+        ));
+    }
+    Ok(content.clone())
 }
 
 #[allow(clippy::significant_drop_tightening)]

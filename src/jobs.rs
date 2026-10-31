@@ -39,8 +39,8 @@ use crate::model::{Message, UserContent, UserMessage};
 
 mod host_task;
 pub(crate) use host_task::{
-    admit_owned_task, clear_owned_task_progress, publish_owned_task_progress, spawn_owned_task,
-    with_owned_task_progress,
+    NativeTaskOwner, admit_owned_task, clear_owned_task_progress, current_native_task,
+    publish_owned_task_progress, spawn_owned_task, with_owned_task_progress,
 };
 
 /// Future returned by the live session-identity resolver shared by the jobs
@@ -1167,6 +1167,49 @@ fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Re
     Ok(Some(removed_bytes))
 }
 
+/// Managed writers hold their artifact lock until all output has been written.
+/// A directory scan can observe an earlier length just before that lock is
+/// released, so settled logs must be measured again under the acquired lock.
+fn artifact_file_reserved_bytes(
+    path: &Path,
+    scanned_metadata: &std::fs::Metadata,
+) -> std::io::Result<u64> {
+    if path.extension().is_none_or(|extension| extension != "log") {
+        return Ok(scanned_metadata.len());
+    }
+    let scanned_identity = FileIdentity::of_path_nofollow(path)?;
+    let artifact = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let opened_identity = FileIdentity::of_open_file(&artifact)?;
+    let current = std::fs::symlink_metadata(path)?;
+    let current_identity = FileIdentity::of_path_nofollow(path)?;
+    if !current.file_type().is_file()
+        || scanned_identity != current_identity
+        || opened_identity != current_identity
+    {
+        return Err(std::io::Error::other(format!(
+            "artifact identity changed while inspecting {}",
+            path.display()
+        )));
+    }
+    match fs4::FileExt::try_lock(&artifact) {
+        Ok(()) => {
+            let bytes = artifact.metadata().map(|metadata| metadata.len());
+            // Release the acquired lock even when querying the final size
+            // failed; propagate either error without admitting a new job.
+            fs4::FileExt::unlock(&artifact)?;
+            bytes
+        }
+        Err(fs4::TryLockError::WouldBlock) => Ok(artifact
+            .metadata()?
+            .len()
+            .max(u64::try_from(MAX_ARTIFACT_BYTES).unwrap_or(u64::MAX))),
+        Err(fs4::TryLockError::Error(err)) => Err(err),
+    }
+}
+
 fn artifact_directory_usage(jobs_dir: &Path) -> std::io::Result<(u64, usize)> {
     let mut bytes = 0u64;
     let mut entries = 0usize;
@@ -1179,37 +1222,7 @@ fn artifact_directory_usage(jobs_dir: &Path) -> std::io::Result<(u64, usize)> {
         let path = entry.path();
         let metadata = std::fs::symlink_metadata(&path)?;
         if metadata.file_type().is_file() {
-            bytes = bytes.saturating_add(metadata.len());
-            if path.extension().is_some_and(|extension| extension == "log") {
-                let scanned_identity = FileIdentity::of_path_nofollow(&path)?;
-                let artifact = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&path)?;
-                let opened_identity = FileIdentity::of_open_file(&artifact)?;
-                let current = std::fs::symlink_metadata(&path)?;
-                let current_identity = FileIdentity::of_path_nofollow(&path)?;
-                if !current.file_type().is_file()
-                    || scanned_identity != current_identity
-                    || opened_identity != current_identity
-                {
-                    return Err(std::io::Error::other(format!(
-                        "artifact identity changed while inspecting {}",
-                        path.display()
-                    )));
-                }
-                match fs4::FileExt::try_lock(&artifact) {
-                    Ok(()) => fs4::FileExt::unlock(&artifact)?,
-                    Err(fs4::TryLockError::WouldBlock) => {
-                        bytes = bytes.saturating_add(
-                            u64::try_from(MAX_ARTIFACT_BYTES)
-                                .unwrap_or(u64::MAX)
-                                .saturating_sub(metadata.len()),
-                        );
-                    }
-                    Err(fs4::TryLockError::Error(err)) => return Err(err),
-                }
-            }
+            bytes = bytes.saturating_add(artifact_file_reserved_bytes(&path, &metadata)?);
         }
     }
     Ok((bytes, entries))
@@ -2073,7 +2086,7 @@ pub(crate) mod windows_job_pipe {
     use mio::windows::NamedPipe;
     use mio::{Events, Interest, Poll, Registry, Token};
     use std::fs::{File, OpenOptions};
-    use std::io::{self, Read};
+    use std::io::{self, Read, Write};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -2081,8 +2094,9 @@ pub(crate) mod windows_job_pipe {
 
     const REACTOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
     const REACTOR_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+    const STDIN_WRITE_BYTES: usize = 8192;
 
-    /// Mio retains an Arc for every submitted read until Poll consumes its
+    /// Mio retains an Arc for every submitted operation until Poll consumes its
     /// completion, including cancellation. A per-job Poll cannot safely retire
     /// on a deadline: its last callback may arrive afterward. This one reactor
     /// lives until process exit and never owns job writers, pumps, or artifacts.
@@ -2246,6 +2260,61 @@ pub(crate) mod windows_job_pipe {
         }
     }
 
+    pub(crate) struct Writer {
+        pipe: NamedPipe,
+        reactor: &'static Reactor,
+    }
+
+    impl Writer {
+        /// Queue at most one bounded input chunk without waiting for the child.
+        /// Mio owns the submitted bytes until their completion; acceptance here
+        /// is not an RPC acknowledgment or proof that the child consumed them.
+        ///
+        /// # Errors
+        ///
+        /// Returns WouldBlock while a previous chunk remains pending, or an
+        /// I/O error when the shared reactor or pipe fails.
+        pub(crate) fn try_write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.reactor.check()?;
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            self.pipe
+                .write(&buffer[..buffer.len().min(STDIN_WRITE_BYTES)])
+        }
+    }
+
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            let _ = self.reactor.registry.deregister(&mut self.pipe);
+            // Mio's Drop cancels reads and connects, but preserves writes so
+            // they can flush. Disconnect instead: a cancelled RPC must discard
+            // pending input even when duplicated clients remain open and never
+            // read. Never flush here. The shared Poll reaps the outstanding
+            // completions after this endpoint has been retired.
+            let _ = self.pipe.disconnect();
+        }
+    }
+
+    pub(crate) fn stdin_pair() -> io::Result<(Writer, File)> {
+        let reactor = reactor()?;
+        let name = format!(
+            r"\\.\pipe\pi-worker-stdin-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let mut pipe = NamedPipe::new(&name)?;
+        // The child receives an ordinary synchronous stdin handle. As with
+        // output pipes, connect the client first so there is no pending connect
+        // completion that could submit fresh I/O after this owner is dropped.
+        let reader = OpenOptions::new().read(true).open(&name)?;
+        reactor
+            .registry
+            .register(&mut pipe, Token(0), Interest::WRITABLE)?;
+        pipe.connect()?;
+        reactor.check()?;
+        Ok((Writer { pipe, reactor }, reader))
+    }
+
     pub(crate) fn pair() -> io::Result<(Reader, File)> {
         let reactor = reactor()?;
         let name = format!(r"\\.\pipe\pi-job-{}", uuid::Uuid::new_v4().simple());
@@ -2276,6 +2345,49 @@ pub(crate) mod windows_job_pipe {
     mod tests {
         use super::*;
 
+        fn stdin_bytes() -> Vec<u8> {
+            (0_u8..=250).cycle().take(256 * 1024).collect()
+        }
+
+        fn backpressure_stdin(writer: &mut Writer, bytes: &[u8]) -> usize {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut accepted = 0;
+            loop {
+                assert!(accepted < bytes.len(), "fixture never filled the pipe");
+                match writer.try_write(&bytes[accepted..]) {
+                    Ok(count) => {
+                        assert!(count > 0 && count <= STDIN_WRITE_BYTES);
+                        accepted += count;
+                    }
+                    // Mio 1.2.4 creates a 64 KiB pipe buffer. Queue beyond
+                    // that capacity without any client reading, so this is
+                    // actual stdin backpressure, not only a delayed callback.
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock && accepted > 64 * 1024 =>
+                    {
+                        return accepted;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => panic!("queue worker stdin: {error}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "stdin did not reach backpressure"
+                );
+            }
+        }
+
+        fn assert_disconnected(reader: &mut File) {
+            let read = reader.read(&mut [0]);
+            assert!(
+                matches!(read, Ok(0) | Err(_)),
+                "cancelled stdin delivered buffered command bytes: {read:?}"
+            );
+        }
+
         #[test]
         fn try_read_does_not_wait_for_the_readiness_notification_lock() {
             let _guard = super::super::process_test_guard();
@@ -2300,6 +2412,174 @@ pub(crate) mod windows_job_pipe {
             assert_eq!(result, Ok(Err(io::ErrorKind::WouldBlock)));
             drop(reader);
             drop(writer);
+        }
+
+        #[test]
+        fn try_write_does_not_wait_for_the_readiness_notification_lock() {
+            let _guard = super::super::process_test_guard();
+            let (mut writer, reader) = stdin_pair().expect("Windows worker stdin");
+            let state = Arc::clone(&writer.reactor.state);
+            let progress = state
+                .progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (sent, received) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let result = writer.try_write(b"x").map_err(|error| error.kind());
+                let _ = sent.send(result);
+                writer
+            });
+            let result = received.recv_timeout(Duration::from_secs(2));
+            drop(progress);
+            let writer = worker.join().expect("worker stdin poll thread");
+            drop(writer);
+            drop(reader);
+            assert_eq!(result, Ok(Ok(1)));
+        }
+
+        #[test]
+        fn dropping_backpressured_stdin_disconnects_duplicated_readers() {
+            let _guard = super::super::process_test_guard();
+            let (mut writer, mut reader) = stdin_pair().expect("Windows worker stdin");
+            let mut retained_reader = reader.try_clone().expect("retained stdin client");
+            backpressure_stdin(&mut writer, &stdin_bytes());
+            let (sent, received) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                drop(writer);
+                let _ = sent.send(());
+            });
+            let retired = received.recv_timeout(Duration::from_secs(2));
+            // Both clients remain open while Drop runs. A mistaken flush is
+            // detected without stranding this test's cleanup: release clients
+            // before joining even when the bounded retirement check fails.
+            let reads = retired
+                .is_ok()
+                .then(|| (reader.read(&mut [0]), retained_reader.read(&mut [0])));
+            drop(reader);
+            drop(retained_reader);
+            worker.join().expect("stdin retirement thread");
+            assert!(retired.is_ok(), "stdin Drop waited for a client to read");
+            let (first, retained) = reads.expect("retired stdin observations");
+            for read in [first, retained] {
+                assert!(
+                    matches!(read, Ok(0) | Err(_)),
+                    "cancelled stdin retained command bytes: {read:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn stdin_bytes_remain_exact_across_backpressure() {
+            let _guard = super::super::process_test_guard();
+            let (mut writer, mut reader) = stdin_pair().expect("Windows worker stdin");
+            let bytes = stdin_bytes();
+            let mut accepted = backpressure_stdin(&mut writer, &bytes);
+            let expected = bytes.len();
+            let (sent, received) = std::sync::mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let mut actual = vec![0; expected];
+                let read = reader.read_exact(&mut actual).map(|()| actual);
+                let _ = sent.send(());
+                read
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut failure = None;
+            while accepted < bytes.len() && Instant::now() < deadline {
+                match writer.try_write(&bytes[accepted..]) {
+                    Ok(0) => {
+                        failure = Some(io::Error::new(io::ErrorKind::WriteZero, "worker stdin"));
+                        break;
+                    }
+                    Ok(count) => accepted += count,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            // Acceptance into Mio is not delivery. Keep the writer alive until
+            // the client confirms every byte, or disconnect it to release the
+            // blocked reader before reporting any failed assertion.
+            let wait = if accepted == bytes.len() {
+                Duration::from_secs(10)
+            } else {
+                Duration::ZERO
+            };
+            let delivered = received.recv_timeout(wait);
+            drop(writer);
+            let actual = worker.join().expect("stdin consumer thread");
+            assert!(failure.is_none(), "stdin write failed: {failure:?}");
+            assert_eq!(accepted, bytes.len(), "stdin writes stopped progressing");
+            assert!(delivered.is_ok(), "accepted stdin never reached the client");
+            assert_eq!(actual.expect("complete stdin command"), bytes);
+        }
+
+        #[test]
+        fn repeated_stdin_cancellation_reclaims_completion_handles() {
+            const CHILD: &str = "PI_TEST_WINDOWS_STDIN_HANDLE_RECLAIM";
+            if std::env::var_os(CHILD).is_some() {
+                reactor().expect("warm shared reactor");
+                let pid = sysinfo::get_current_pid().expect("current process");
+                let mut system = sysinfo::System::new();
+                system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+                let process = system.process(pid).expect("current process handle");
+                let baseline = process.open_files().expect("Windows handle count");
+                let bytes = stdin_bytes();
+                let mut clients = Vec::new();
+                for _ in 0..16 {
+                    let (mut writer, mut reader) = stdin_pair().expect("Windows worker stdin");
+                    let mut retained = reader.try_clone().expect("retained stdin client");
+                    backpressure_stdin(&mut writer, &bytes);
+                    drop(writer);
+                    assert_disconnected(&mut reader);
+                    assert_disconnected(&mut retained);
+                    clients.extend([reader, retained]);
+                }
+                // Retained client handles are intentional. Server handles
+                // held by cancelled read/write completions must still retire.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let handles = process.open_files().expect("Windows handle count");
+                    if handles <= baseline + clients.len() {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "cancelled stdin completions retained server handles: {handles} vs {}",
+                        baseline + clients.len()
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                return;
+            }
+            // Run handle accounting in its own process: parallel unit tests
+            // legitimately open unrelated handles and cannot share a baseline.
+            let _guard = super::super::process_test_guard();
+            let mut command = Command::new(std::env::current_exe().expect("test binary"));
+            command
+                .args([
+                    "--exact",
+                    "jobs::windows_job_pipe::tests::repeated_stdin_cancellation_reclaims_completion_handles",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdin(Stdio::null());
+            let child = crate::tools::spawn_command_with_job_discipline(&mut command)
+                .expect("isolated stdin handle regression");
+            let mut child = super::super::BackgroundChild::new(child);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if let Some(status) = child.try_wait().expect("observe handle regression") {
+                    assert!(status.success(), "stdin handle regression failed: {status}");
+                    break;
+                }
+                assert!(Instant::now() < deadline, "stdin handle regression stalled");
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 }
@@ -2338,6 +2618,37 @@ impl Drop for JobPumpThreadTestGuard {
     }
 }
 
+/// Output-state contention must not turn a nonblocking pipe reader into an
+/// uncancellable worker. The monitor can seal output without acquiring these
+/// mutexes, so observe that fence while waiting and again after acquisition.
+fn lock_job_output_state<'a, T>(
+    state: &'a Mutex<T>,
+    output_sealed: &AtomicBool,
+    state_name: &str,
+) -> std::io::Result<Option<std::sync::MutexGuard<'a, T>>> {
+    loop {
+        if output_sealed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        match state.try_lock() {
+            Ok(guard) => {
+                if output_sealed.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                return Ok(Some(guard));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(OUTPUT_PUMP_POLL_INTERVAL);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(std::io::Error::other(format!(
+                    "job {state_name} state poisoned"
+                )));
+            }
+        }
+    }
+}
+
 fn pump_job_stream<R: Read>(
     mut reader: R,
     artifact: &Mutex<ArtifactSink>,
@@ -2372,12 +2683,20 @@ fn pump_job_stream<R: Read>(
                     return Ok(());
                 }
                 let data = &chunk[..n];
-                artifact
-                    .lock()
-                    .map_err(|_| std::io::Error::other("job artifact state poisoned"))?
-                    .write(data);
-                if let Ok(mut tail) = tail.lock() {
-                    tail.push(data);
+                {
+                    let Some(mut artifact) =
+                        lock_job_output_state(artifact, output_sealed, "artifact")?
+                    else {
+                        return Ok(());
+                    };
+                    artifact.write(data);
+                }
+                match lock_job_output_state(tail, output_sealed, "tail") {
+                    Ok(Some(mut tail)) => tail.push(data),
+                    Ok(None) => return Ok(()),
+                    // A poisoned tail remains best-effort; artifact failures
+                    // retain their existing error path above.
+                    Err(_) => {}
                 }
             }
         }
@@ -2954,6 +3273,7 @@ fn snapshot_now_best_effort(handle: &JobWaitHandle) -> Result<JobSnapshot> {
 }
 
 fn wait_with_handle(handle: &JobWaitHandle, timeout: Duration) -> Result<JobSnapshot> {
+    let _dependency = hold_native_job_wait(handle, timeout)?;
     let started = Instant::now();
     loop {
         if let Some(snapshot) = settled_snapshot(handle) {
@@ -2964,6 +3284,39 @@ fn wait_with_handle(handle: &JobWaitHandle, timeout: Duration) -> Result<JobSnap
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn hold_native_job_wait(
+    handle: &JobWaitHandle,
+    timeout: Duration,
+) -> Result<Option<Arc<crate::agent_hub::DependencyHold>>> {
+    if timeout.is_zero() || settled_snapshot(handle).is_some() || current_native_task().is_some() {
+        // Background work can wait internally while the parent remains free
+        // to answer. Only the foreground observer owns a parent dependency.
+        return Ok(None);
+    }
+    let native = {
+        let reg = registry()
+            .lock()
+            .map_err(|_| Error::tool("jobs", "jobs registry poisoned"))?;
+        reg.jobs.get(&handle.id).is_some_and(|job| {
+            job.owner_session_id == handle.owner_session_id && job.schema == host_task::TASK_SCHEMA
+        })
+    };
+    if !native {
+        return Ok(None);
+    }
+    crate::agent_hub::registry()
+        .lock()
+        .map_err(|_| Error::tool("hub", "PI_HUB_WAIT_REGISTRY: registry is poisoned"))?
+        .hold_job_results(
+            NativeTaskOwner {
+                session: handle.owner_session_id.clone(),
+                job: handle.id.clone(),
+            },
+            timeout,
+        )
+        .map(Some)
 }
 
 fn remaining_wait_slice(now: Instant, deadline: Option<Instant>) -> Option<Duration> {
@@ -3032,6 +3385,14 @@ async fn wait_async_with_handle(
     }
 
     let cx = crate::agent_cx::AgentCx::for_current_or_request();
+    let dependency = hold_native_job_wait(handle, timeout)?;
+    let max_wait_slice = if dependency.is_some() {
+        // Completion notifications remain the primary wakeup. This bound
+        // also observes cancellation when the child needs the waiting parent.
+        max_wait_slice.min(Duration::from_millis(100))
+    } else {
+        max_wait_slice
+    };
     let now = cx
         .cx()
         .timer_driver()
@@ -3041,6 +3402,12 @@ async fn wait_async_with_handle(
         if let Some(snapshot) = settled_snapshot(handle) {
             return Ok(snapshot);
         }
+        cx.checkpoint().map_err(|_| {
+            Error::tool(
+                "jobs",
+                "PI_JOBS_WAIT_CANCELLED: job wait owner is cancelled",
+            )
+        })?;
         let now = cx
             .cx()
             .timer_driver()
@@ -3923,6 +4290,70 @@ mod tests {
         assert!(sink.file.is_none(), "settlement must close the artifact fd");
     }
 
+    #[test]
+    #[allow(clippy::significant_drop_tightening)] // Keep contention through cancellation.
+    fn sealed_pump_joins_while_output_tail_remains_locked() {
+        const OUTPUT: &[u8] = b"buffered output before cancellation";
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("contended-pump.log");
+        let file = std::fs::File::create(&path).expect("pump artifact");
+        let artifact = Arc::new(Mutex::new(ArtifactSink::new(file, 64)));
+        let tail = Arc::new(Mutex::new(TailBuffer::new(64)));
+        let sealed = Arc::new(AtomicBool::new(false));
+        let tail_guard = tail.lock().expect("hold output tail");
+        let pump_artifact = Arc::clone(&artifact);
+        let pump_tail = Arc::clone(&tail);
+        let pump_sealed = Arc::clone(&sealed);
+        let mut pump = Some(std::thread::spawn(move || {
+            pump_job_stream(
+                std::io::Cursor::new(OUTPUT),
+                &pump_artifact,
+                &pump_tail,
+                &pump_sealed,
+            )
+        }));
+
+        // Artifact publication proves the real pump passed its post-read seal
+        // check. It must now acquire the tail mutex before it can observe EOF;
+        // sealing before the read would not exercise the original deadlock.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let artifact_written = loop {
+            if artifact
+                .try_lock()
+                .is_ok_and(|sink| sink.bytes_written == OUTPUT.len())
+            {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        sealed.store(true, Ordering::Release);
+        let joined_while_locked = finish_pump(&mut pump, Instant::now() + Duration::from_secs(2));
+
+        // Always release contention and reap the worker before assertions, so
+        // the old blocking implementation fails without leaking a test thread.
+        drop(tail_guard);
+        let cleaned_up = finish_pump(&mut pump, Instant::now() + Duration::from_secs(2));
+        assert!(
+            artifact_written,
+            "the pump must consume and persist its input"
+        );
+        assert!(cleaned_up, "the pump must stop after test cleanup");
+        assert!(
+            joined_while_locked,
+            "sealing must join the pump without waiting for the output-state mutex"
+        );
+        assert!(pump.is_none());
+        assert!(
+            tail.lock().expect("output tail").text().is_empty(),
+            "a sealed pump must not publish its buffered chunk after contention clears"
+        );
+        assert_eq!(std::fs::read(&path).expect("artifact output"), OUTPUT);
+    }
+
     #[cfg(unix)]
     #[test]
     fn sealed_nonblocking_pipe_pump_joins_while_writer_remains_open() {
@@ -4270,21 +4701,64 @@ mod tests {
     }
 
     #[test]
+    fn artifact_budget_counts_growth_before_the_writer_seals() {
+        let _guard = process_test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (path, file) =
+            create_job_artifact(temp.path(), "job-growing").expect("create and reserve artifact");
+        let scanned_metadata = std::fs::symlink_metadata(&path).expect("initial metadata");
+        assert_eq!(scanned_metadata.len(), 0);
+
+        // Reproduce the scan/write/seal interleaving without scheduler timing:
+        // the scanner retains its old metadata while the real sink grows and
+        // releases the lock before per-file accounting resumes.
+        let mut sink = ArtifactSink::new(file, MAX_ARTIFACT_BYTES);
+        sink.write(b"final output");
+        assert!(sink.write_error.is_none());
+        sink.seal();
+        let final_bytes = std::fs::metadata(&path).expect("final metadata").len();
+        assert!(final_bytes > scanned_metadata.len());
+
+        let reserved = artifact_file_reserved_bytes(&path, &scanned_metadata)
+            .expect("measure artifact after sealing");
+        assert_eq!(reserved, final_bytes);
+        let next_job_reservation = u64::try_from(MAX_ARTIFACT_BYTES).expect("artifact cap fits");
+        assert!(
+            !artifact_capacity_available(reserved, 1, next_job_reservation, 10),
+            "growth after the directory snapshot must count against the next job's budget"
+        );
+        assert!(artifact_capacity_available(
+            reserved,
+            1,
+            next_job_reservation + final_bytes,
+            10,
+        ));
+    }
+
+    #[test]
     fn aggregate_artifact_budget_reserves_locked_live_files_at_full_cap() {
         let _guard = process_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
         let live_path = temp.path().join("job-live.log");
-        let live = std::fs::OpenOptions::new()
+        let mut live = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(&live_path)
             .expect("live artifact");
         fs4::FileExt::lock(&live).expect("reserve live artifact");
+        live.write_all(b"partial output")
+            .expect("write live artifact");
 
-        let two_job_budget = u64::try_from(MAX_ARTIFACT_BYTES)
-            .expect("artifact cap fits")
-            .saturating_mul(2);
+        let live_reservation = u64::try_from(MAX_ARTIFACT_BYTES).expect("artifact cap fits");
+        assert_eq!(
+            artifact_directory_usage(temp.path()).expect("account for live artifact"),
+            (live_reservation, 1),
+            "stored bytes are part of the live reservation, not an additional charge"
+        );
+        let two_job_budget = live_reservation.saturating_mul(2);
+        ensure_artifact_budget(temp.path(), two_job_budget, 10)
+            .expect("one live artifact and one prospective job fit exactly two caps");
         let error = ensure_artifact_budget(temp.path(), two_job_budget - 1, 10)
             .expect_err("live artifact plus prospective job must reserve two full caps");
         assert!(error.to_string().contains("PI_JOBS_ARTIFACT_CAPACITY"));

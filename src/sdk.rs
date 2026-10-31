@@ -381,6 +381,14 @@ pub struct SessionOptions {
     /// Plan entry and checkpoint restoration report `PLAN_TOOLS_DISABLED`
     /// under that policy; opening a saved conversation remains available.
     pub enabled_tools: Option<Vec<String>>,
+    /// Per-session override for `out://` interim replies. `None` uses loaded
+    /// configuration; SDK/noninteractive sessions default to disabled.
+    /// Child agents always reject these replies, even when explicitly enabled.
+    pub out_enabled: Option<bool>,
+    /// Host surface default for `out://` replies, used only when both
+    /// `out_enabled` and loaded configuration leave the setting unset.
+    /// Interactive hosts enable this; SDK/noninteractive hosts default to false.
+    pub out_default_enabled: bool,
     /// Primary workspace for a new session. When resuming, an explicit value
     /// must identify the saved workspace; omitting it selects the session's
     /// latest workdir attachment rather than the caller's process cwd.
@@ -600,6 +608,8 @@ impl Default for SessionOptions {
             system_prompt: None,
             append_system_prompt: None,
             enabled_tools: None,
+            out_enabled: None,
+            out_default_enabled: false,
             working_directory: None,
             workspace_trusted: false,
             package_dir: None,
@@ -1475,8 +1485,8 @@ impl RpcTransportClient {
         })
     }
 
-    /// Clone a write-only lane that remains usable while `prompt*` or
-    /// `handoff*` borrows this client for its single response consumer.
+    /// Clone a write-only lane that remains usable while `prompt*`, `compact*`,
+    /// or `handoff*` borrows this client for its single response consumer.
     #[must_use]
     pub fn control_handle(&self) -> RpcControlHandle {
         RpcControlHandle {
@@ -1736,6 +1746,8 @@ impl RpcTransportClient {
         self.request_no_data("abort_bash", Map::new()).await
     }
 
+    /// Compact this session, including when automatic compaction is disabled.
+    /// Use [`Self::compact_with_events`] to display progress while waiting.
     pub async fn compact(&mut self) -> Result<RpcCompactionResult> {
         self.compact_with_instructions(None).await
     }
@@ -1744,6 +1756,19 @@ impl RpcTransportClient {
         &mut self,
         custom_instructions: Option<&str>,
     ) -> Result<RpcCompactionResult> {
+        self.compact_with_events(custom_instructions, |_| {}).await
+    }
+
+    /// Compact with live `manual_compaction_start` / `manual_compaction_end`
+    /// frames, followed by the terminal response after durable installation.
+    /// A skipped pass still emits both events and returns the server's error.
+    /// Use [`Self::control_handle`] to abort while this request is pending, and
+    /// continue polling until the terminal response arrives.
+    pub async fn compact_with_events(
+        &mut self,
+        custom_instructions: Option<&str>,
+        on_event: impl FnMut(Value),
+    ) -> Result<RpcCompactionResult> {
         let mut payload = Map::new();
         if let Some(custom_instructions) = custom_instructions {
             payload.insert(
@@ -1751,7 +1776,10 @@ impl RpcTransportClient {
                 Value::String(custom_instructions.to_string()),
             );
         }
-        self.request_typed("compact", payload).await
+        let data = self
+            .request_with_events("compact", payload, on_event)
+            .await?;
+        Self::parse_response_data(data, "compact")
     }
 
     /// Durably replace an older safe prefix with a continuation brief in the
@@ -2245,27 +2273,59 @@ pub(crate) struct PreparedSessionShutdown {
 }
 
 impl PreparedSessionShutdown {
-    /// Arm late billing only once the candidate is complete. The caller must
-    /// install it synchronously after this succeeds; dropping a preparation
-    /// before this point leaves the source account live and unretired.
-    pub(crate) fn retire_cost_for(&self, replacement: &AgentSessionHandle) -> Result<()> {
+    /// A prospective source reference that can be written into a fork before
+    /// its first save. Cloning it does not activate a journal or retire work.
+    pub(crate) fn prepared_cost_budget(&self) -> Option<&crate::cost::CostBudget> {
+        self.cost_budget.as_ref()
+    }
+
+    /// Persist a shared candidate's ancestry, then arm late billing as the
+    /// final action. The caller must install it synchronously after this
+    /// succeeds; dropping a preparation leaves the source live and unretired.
+    pub(crate) async fn retire_cost_for(&self, replacement: &mut AgentSessionHandle) -> Result<()> {
         let Some(budget) = &self.cost_budget else {
             return Ok(());
         };
-        let candidate = replacement.session.session.try_lock().map_err(|_| {
-            Error::session("replacement session is busy; cost handoff was not applied")
-        })?;
-        // Reloading the same session keeps its account live. Treating its
-        // ongoing foreground usage as late billing would count it twice.
-        if crate::cost::same_session_target(&self.session, &candidate)
-            && replacement
-                .session
-                .agent
-                .cost_budget()
-                .is_some_and(|active| active.same_tree(budget))
+        if replacement
+            .session
+            .agent
+            .cost_budget()
+            .is_some_and(|active| active.same_tree(budget))
         {
-            return Ok(());
+            let mut candidate = asupersync::sync::OwnedMutexGuard::lock(
+                Arc::clone(&replacement.session.session),
+                &self.owner,
+            )
+            .await
+            .map_err(|error| Error::session(format!("replacement session lock failed: {error}")))?;
+            let same_target = crate::cost::same_session_target(&self.session, &candidate);
+            let retained = budget.for_replacement(&candidate, true)?;
+            retained.checkpoint(&mut candidate)?;
+            if replacement.session.save_enabled() {
+                candidate.save().await?;
+            }
+            // A newly saved candidate only now has a native journal identity.
+            // Watch independent writers that later resume this active fork.
+            let retained = budget.for_replacement(&candidate, true)?;
+            // Demoting the previous native source can discover a writer's
+            // final bill. Save that reconciled amount before its closed
+            // reference is pruned or the replacement becomes current.
+            retained.checkpoint(&mut candidate)?;
+            if replacement.session.save_enabled() {
+                candidate.save().await?;
+            }
+            drop(candidate);
+            replacement.session.agent.set_cost_budget(Some(retained));
+            replacement
+                .session
+                .refresh_extension_completion_host_state();
+            // Same-file reload carries the prospective reference forward but
+            // keeps foreground billing live until a later real retirement.
+            if same_target {
+                return Ok(());
+            }
         }
+        // No await or fallible candidate preparation may follow activation.
         budget.retire_session(&self.session, &self.owner)
     }
 }
@@ -2443,15 +2503,45 @@ impl AgentSessionHandle {
             report.fail(warning);
             return Err(report);
         }
-        Ok(PreparedSessionShutdown {
-            owner_session_id,
-            owner: cx.cx().clone(),
-            cost_budget: self
+        let cost_budget = if self.session.save_enabled() {
+            match self
                 .session
                 .agent
                 .cost_budget()
-                .filter(|_| self.session.save_enabled())
-                .cloned(),
+                .map(|budget| budget.prepare_handoff(&session))
+                .transpose()
+            {
+                Ok(budget) => budget,
+                Err(error) => {
+                    let mut report = SessionResourceShutdown::default();
+                    report.fail(format!("failed to prepare model cost ancestry: {error}"));
+                    return Err(report);
+                }
+            }
+        } else {
+            None
+        };
+        // Fresh sessions acquire their source path at the first save. Record
+        // that acknowledged source before any descendant can be published.
+        if let Some(budget) = &cost_budget {
+            if let Err(error) = budget.checkpoint(&mut session) {
+                let mut report = SessionResourceShutdown::default();
+                report.fail(format!("failed to checkpoint model cost ancestry: {error}"));
+                return Err(report);
+            }
+            if let Err(error) = session
+                .flush_autosave(crate::session::AutosaveFlushTrigger::Shutdown)
+                .await
+            {
+                let mut report = SessionResourceShutdown::default();
+                report.fail(format!("failed to save model cost ancestry: {error}"));
+                return Err(report);
+            }
+        }
+        Ok(PreparedSessionShutdown {
+            owner_session_id,
+            owner: cx.cx().clone(),
+            cost_budget,
             session,
             session_actions,
             session_action_permit,
@@ -2595,13 +2685,23 @@ impl AgentSessionHandle {
                     };
                     match persisted {
                         Ok(()) => {
-                            if checkpointed
-                                && let Some(budget) = budget
-                                && let Err(error) = budget.retire_session(&session, cx.cx())
-                            {
-                                report.fail(format!(
-                                    "failed to preserve late model spend: {error}"
-                                ));
+                            if checkpointed && let Some(budget) = budget {
+                                let preserved: Result<()> = async {
+                                    let prepared = budget.prepare_handoff(&session)?;
+                                    prepared.checkpoint(&mut session)?;
+                                    session
+                                        .flush_autosave(
+                                            crate::session::AutosaveFlushTrigger::Shutdown,
+                                        )
+                                        .await?;
+                                    prepared.retire_session(&session, cx.cx())
+                                }
+                                .await;
+                                if let Err(error) = preserved {
+                                    report.fail(format!(
+                                        "failed to preserve late model spend: {error}"
+                                    ));
+                                }
                             }
                         }
                         Err(err) => {
@@ -2829,6 +2929,19 @@ impl AgentSessionHandle {
         target: crate::prewalk::PrewalkTarget,
     ) -> Result<Option<crate::prewalk::PrewalkTarget>> {
         self.session.arm_prewalk(target).await
+    }
+
+    /// Durably return to a planning model and arm its implementation model.
+    /// Both destinations are validated before changing the session. A
+    /// successful restart retires the previous automatic fallback cycle.
+    pub async fn restart_prewalk(
+        &mut self,
+        source: crate::prewalk::PrewalkTarget,
+        target: crate::prewalk::PrewalkTarget,
+    ) -> Result<Option<crate::prewalk::PrewalkTarget>> {
+        let armed = self.session.restart_prewalk(source, target).await?;
+        self.failover_state.clear();
+        Ok(armed)
     }
 
     #[must_use]
@@ -3384,22 +3497,55 @@ impl AgentSessionHandle {
     /// threshold and with auto-compaction off too. `instructions`
     /// (`/compact <focus>`) steer the summary. Returns whether it changed
     /// the session; `false` means there was too little history to compact.
+    /// The callback and session subscribers receive exactly one
+    /// `ManualCompactionStart` / `ManualCompactionEnd` pair for an admitted
+    /// request, including a skipped pass, failure, or dropped operation.
     pub async fn compact(
         &mut self,
         instructions: Option<&str>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
+        let on_event = self.make_combined_callback(on_event);
         self.session.compact_now(instructions, on_event).await
+    }
+
+    /// Explicitly cancellable manual compaction. The abort signal can stop
+    /// summary generation and prevents installing a cancelled or stale result.
+    /// Await completion so provider cleanup and any admitted durable save can
+    /// finish; subscribers receive the same paired manual lifecycle events.
+    pub async fn compact_with_abort(
+        &mut self,
+        instructions: Option<&str>,
+        abort: AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<bool> {
+        let on_event = self.make_combined_callback(on_event);
+        self.session
+            .compact_now_with_abort(instructions, &abort, on_event)
+            .await
     }
 
     /// OMP `/shake`: compaction that drops bulky tool output from the older
     /// span instead of summarizing it with the model (no provider request).
-    /// Returns whether it changed the session.
+    /// Returns whether it changed the session. Subscribers and the callback
+    /// receive manual compaction progress with start mode `"shake"`.
     pub async fn shake(
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<bool> {
+        let on_event = self.make_combined_callback(on_event);
         self.session.shake_now(on_event).await
+    }
+
+    /// Cancellable provider-free manual compaction. Once durable installation
+    /// begins, cancellation does not drop its reconciliation transaction.
+    pub async fn shake_with_abort(
+        &mut self,
+        abort: AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<bool> {
+        let on_event = self.make_combined_callback(on_event);
+        self.session.shake_now_with_abort(&abort, on_event).await
     }
 
     /// Generate and durably install a continuation brief in this session.
@@ -3481,10 +3627,13 @@ impl AgentSessionHandle {
 
     /// Build a combined callback that fans out to the per-prompt callback,
     /// session-level subscribers, and typed hooks.
-    fn make_combined_callback(
+    fn make_combined_callback<F>(
         &self,
-        per_prompt: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> impl Fn(AgentEvent) + Send + Sync + 'static {
+        per_prompt: F,
+    ) -> impl Fn(AgentEvent) + Send + Sync + 'static + use<F>
+    where
+        F: Fn(AgentEvent) + Send + Sync + 'static,
+    {
         let listeners = self.listeners.clone();
         // Extension observation events (bd-82331). Lifecycle events reach
         // extensions from inside the agent loop, but message_* and
@@ -3682,6 +3831,14 @@ fn load_session_config(
     Config::load_with_roots_and_project_trust(config_override, global_dir, cwd, workspace_trusted)
 }
 
+fn apply_session_out_config(config: &mut Config, options: &SessionOptions) {
+    let enabled = options
+        .out_enabled
+        .or_else(|| config.out.as_ref().and_then(|out| out.enabled))
+        .unwrap_or(options.out_default_enabled);
+    config.out.get_or_insert_with(Default::default).enabled = Some(enabled);
+}
+
 fn build_stream_options_with_optional_key(
     config: &Config,
     api_key: Option<String>,
@@ -3822,12 +3979,13 @@ pub(crate) async fn create_agent_session_deferred_mcp(
 
     let global_dir = Config::global_dir();
     let config_override = Config::config_path_override_from_env(&cwd);
-    let config = load_session_config(
+    let mut config = load_session_config(
         &cwd,
         &global_dir,
         config_override.as_deref(),
         options.workspace_trusted,
     )?;
+    apply_session_out_config(&mut config, &options);
     let mut session = Session::new(&cli, &config).await?;
     if let Some(saved) = &saved_workdir {
         // Recheck the observation after native transcript validation and
@@ -6910,6 +7068,53 @@ mod tests {
         assert_eq!(trusted.default_thinking_level.as_deref(), Some("high"));
     }
 
+    #[test]
+    fn out_surface_default_respects_reloaded_workspace_settings_and_sdk_overrides() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let global_dir = tmp.path().join("global");
+        std::fs::create_dir_all(cwd.join(".pi")).unwrap();
+        std::fs::create_dir_all(&global_dir).unwrap();
+        let options = SessionOptions {
+            out_default_enabled: true,
+            ..SessionOptions::default()
+        };
+
+        let mut initial = load_session_config(&cwd, &global_dir, None, true).unwrap();
+        apply_session_out_config(&mut initial, &options);
+        assert_eq!(initial.out.as_ref().unwrap().enabled, Some(true));
+        assert!(options.out_enabled.is_none());
+
+        std::fs::write(cwd.join(".pi/settings.json"), r#"{"out":{"enabled":false}}"#).unwrap();
+        let rebuilt_options = options.clone();
+        assert!(options.out_enabled.is_none());
+        let mut rebuilt = load_session_config(&cwd, &global_dir, None, true).unwrap();
+        apply_session_out_config(&mut rebuilt, &rebuilt_options);
+        assert_eq!(rebuilt.out.as_ref().unwrap().enabled, Some(false));
+
+        let override_options = SessionOptions {
+            out_enabled: Some(true),
+            ..SessionOptions::default()
+        };
+        let mut overridden = load_session_config(&cwd, &global_dir, None, true).unwrap();
+        apply_session_out_config(&mut overridden, &override_options);
+        assert_eq!(overridden.out.as_ref().unwrap().enabled, Some(true));
+
+        let mut sdk_default = Config::default();
+        apply_session_out_config(&mut sdk_default, &SessionOptions::default());
+        assert_eq!(sdk_default.out.as_ref().unwrap().enabled, Some(false));
+        let mut explicit_disabled = initial;
+        apply_session_out_config(
+            &mut explicit_disabled,
+            &SessionOptions {
+                out_enabled: Some(false),
+                out_default_enabled: true,
+                ..SessionOptions::default()
+            },
+        );
+        assert_eq!(explicit_disabled.out.as_ref().unwrap().enabled, Some(false));
+    }
+
     /// Configured secrets settings govern an SDK-built session (the default
     /// FTUI stack): user patterns are obfuscated and block mode refuses,
     /// where the session used to run the built-in default regardless.
@@ -7713,13 +7918,23 @@ mod tests {
         .expect("compact");
         assert!(!changed, "an empty session reports no change"); // ubs:ignore[rust.panic.assert-macros] -- boolean result; assert_eq! on a bool fails clippy
 
-        assert!(
-            events
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty(),
-            "expected no compaction lifecycle events for empty session"
-        );
+        let events = events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            AgentEvent::ManualCompactionStart { mode: None }
+        ));
+        assert!(matches!(
+            events[1],
+            AgentEvent::ManualCompactionEnd {
+                result: None,
+                aborted: false,
+                skipped: Some(true),
+                ..
+            }
+        ));
     }
 
     /// `/compact <focus>`: the focus text reaches the summary request.
@@ -7763,11 +7978,36 @@ mod tests {
                 EventListeners::new(),
             );
 
+            let subscribed = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = Arc::clone(&subscribed);
+            handle.subscribe(move |event| {
+                subscriber
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(event).unwrap());
+            });
+            let callbacks = Arc::new(Mutex::new(Vec::new()));
+            let callback = Arc::clone(&callbacks);
             let changed = handle
-                .compact(Some("keep the retry-count decision"), |_| {})
+                .compact(Some("keep the retry-count decision"), move |event| {
+                    callback
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::to_value(event).unwrap());
+                })
                 .await
                 .expect("compact");
             assert!(changed, "the history compacts"); // ubs:ignore[rust.panic.assert-macros] -- boolean result
+            let events = callbacks.lock().unwrap();
+            assert_eq!(*events, *subscribed.lock().unwrap());
+            assert_eq!(events.len(), 2, "one pair reaches both SDK consumers");
+            assert_eq!(events[0]["type"], "manual_compaction_start");
+            assert_eq!(events[1]["type"], "manual_compaction_end");
+            assert_eq!(events[1]["aborted"], false);
+            assert!(events[1]["result"]["summary"].is_string());
+            assert!(events[1].get("skipped").is_none());
+            assert!(events[1].get("errorMessage").is_none());
+            drop(events);
             let sent = requests.lock().expect("requests").clone();
             assert!(
                 sent.iter()
@@ -7775,6 +8015,187 @@ mod tests {
                         .contains("Additional focus: keep the retry-count decision")),
                 "{sent:?}"
             );
+        });
+    }
+
+    fn cancellable_compaction_handle() -> AgentSessionHandle {
+        let mut stored = Session::in_memory();
+        for i in 0..3 {
+            stored.append_message(crate::session::SessionMessage::User {
+                content: UserContent::Text(format!("question {i} ").repeat(100)),
+                timestamp: Some(i),
+            });
+            stored.append_message(crate::session::SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new(format!("answer {i}")))],
+                    stop_reason: StopReason::Stop,
+                    ..AssistantMessage::default()
+                },
+            });
+        }
+        let mut agent = Agent::new(
+            Arc::new(RewindPrivacyProvider {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        agent.replace_messages(stored.to_messages_for_current_path());
+        AgentSessionHandle::from_session_with_listeners(
+            AgentSession::new(
+                agent,
+                Arc::new(AsyncMutex::new(stored)),
+                false,
+                ResolvedCompactionSettings {
+                    enabled: false,
+                    keep_recent_tokens: 1,
+                    ..ResolvedCompactionSettings::default()
+                },
+            ),
+            EventListeners::new(),
+        )
+    }
+
+    #[test]
+    fn manual_compaction_abort_cancels_admission_and_summary_without_changing_history() {
+        for phase in ["before", "session_lock", "summary"] {
+            run_async(async {
+                let mut handle = cancellable_compaction_handle();
+                let store = handle.session_store();
+                let before = SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+                let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let actions = handle.session.session_action_admission_gate();
+                handle
+                    .session
+                    .agent
+                    .set_provider(Arc::new(RewindCallbackProvider {
+                        delegate: RewindPrivacyProvider {
+                            requests: Arc::new(Mutex::new(Vec::new())),
+                        },
+                        store: Arc::clone(&store),
+                        actions,
+                        action: RewindCallbackAction::Pending,
+                        after_callback: Arc::new(Mutex::new(None)),
+                        calls: Arc::clone(&calls),
+                    }));
+                let (abort, signal) = AbortHandle::new();
+                if phase == "before" {
+                    abort.abort();
+                }
+                let held = (phase == "session_lock").then(|| store.try_lock().unwrap());
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let output = Arc::clone(&events);
+                let mut compact = Box::pin(handle.compact_with_abort(None, signal, move |event| {
+                    output
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::to_value(event).unwrap());
+                }));
+                if phase != "before" {
+                    assert!(futures::poll!(compact.as_mut()).is_pending(), "{phase}");
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        usize::from(phase == "summary")
+                    );
+                    abort.abort();
+                }
+                assert!(matches!(compact.await, Err(Error::Aborted)), "{phase}");
+                drop(held);
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    usize::from(phase == "summary")
+                );
+                assert!(
+                    SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap() == before
+                );
+                assert_eq!(
+                    serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                    before_agent
+                );
+                assert!(handle.session.ensure_provider_reentry_allowed().is_ok());
+                let events = events.lock().unwrap();
+                assert_eq!(
+                    events.len(),
+                    2,
+                    "one completed manual progress pair: {phase}"
+                );
+                assert_eq!(events[0]["type"], "manual_compaction_start");
+                assert_eq!(events[1]["type"], "manual_compaction_end");
+                assert_eq!(events[1]["aborted"], true);
+                assert!(events[1]["result"].is_null());
+            });
+        }
+    }
+
+    #[test]
+    fn manual_compaction_refuses_source_changed_during_generation() {
+        for action in [RewindCallbackAction::Append, RewindCallbackAction::Header] {
+            run_async(async {
+                let mut handle = cancellable_compaction_handle();
+                let store = handle.session_store();
+                let before_agent = serde_json::to_value(handle.session.agent.messages()).unwrap();
+                let after_callback = Arc::new(Mutex::new(None));
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let actions = handle.session.session_action_admission_gate();
+                handle
+                    .session
+                    .agent
+                    .set_provider(Arc::new(RewindCallbackProvider {
+                        delegate: RewindPrivacyProvider {
+                            requests: Arc::new(Mutex::new(Vec::new())),
+                        },
+                        store: Arc::clone(&store),
+                        actions,
+                        action,
+                        after_callback: Arc::clone(&after_callback),
+                        calls: Arc::clone(&calls),
+                    }));
+                let (_, signal) = AbortHandle::new();
+                let error = handle
+                    .compact_with_abort(None, signal, |_| {})
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("Compaction source changed"),
+                    "{error}"
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                let live = SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+                assert!(after_callback.lock().unwrap().as_ref() == Some(&live));
+                assert_eq!(
+                    serde_json::to_value(handle.session.agent.messages()).unwrap(),
+                    before_agent
+                );
+                assert!(handle.session.ensure_provider_reentry_allowed().is_ok());
+            });
+        }
+    }
+
+    #[test]
+    fn cancellable_shake_honors_abort_and_ignores_disabled_automatic_compaction() {
+        run_async(async {
+            let mut handle = cancellable_compaction_handle();
+            let store = handle.session_store();
+            let before = SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap();
+            let (abort, signal) = AbortHandle::new();
+            abort.abort();
+            assert!(matches!(
+                handle.shake_with_abort(signal, |_| {}).await,
+                Err(Error::Aborted)
+            ));
+            assert!(SessionEditSnapshot::capture(&store.try_lock().unwrap()).unwrap() == before);
+            let (_, signal) = AbortHandle::new();
+            assert!(
+                handle
+                    .shake_with_abort(signal, |_| {})
+                    .await
+                    .expect("shake")
+            );
+            assert!(store.try_lock().unwrap().entries.iter().any(|entry| {
+                matches!(entry, crate::session::SessionEntry::Compaction(compaction)
+                    if compaction.details.as_ref().is_some_and(|details| details["mode"] == "shake"))
+            }));
         });
     }
 
@@ -8437,10 +8858,14 @@ mod tests {
                 // This charge races with candidate construction, after the
                 // exact source checkpoint has already reached storage.
                 budget.record(0.5).unwrap();
-                let next = saving_handle_with_store(tmp.path(), store_kind);
-                prepared.retire_cost_for(&next).unwrap();
+                let mut next = saving_handle_with_store(tmp.path(), store_kind);
+                prepared.retire_cost_for(&mut next).await.unwrap();
                 let old = std::mem::replace(&mut handle, next);
-                assert!(old.commit_resource_shutdown(prepared).await.completed_cleanly());
+                assert!(
+                    old.commit_resource_shutdown(prepared)
+                        .await
+                        .completed_cleanly()
+                );
 
                 // A captured request keeps its original account after the
                 // foreground has installed a different session.
@@ -8457,6 +8882,173 @@ mod tests {
                 assert!(handle.shutdown_owned_resources().await.completed_cleanly());
             });
         }
+    }
+
+    #[test]
+    fn shared_replacement_recovers_late_bills_after_both_handles_are_closed() {
+        for store_kind in [
+            crate::session::SessionStoreKind::Jsonl,
+            #[cfg(feature = "sqlite-sessions")]
+            crate::session::SessionStoreKind::Sqlite,
+        ] {
+            let tmp = tempdir().unwrap();
+            let mut handle = saving_handle_with_store(tmp.path(), store_kind);
+            let budget = crate::cost::CostBudget::new(None, Some(2.0), 0.0).unwrap();
+            budget.record(0.25).unwrap();
+            let mut outstanding = budget.start_attempt().unwrap();
+            outstanding.observe(0.5).unwrap();
+            handle.session.agent.set_cost_budget(Some(budget.clone()));
+            run_async(async {
+                let prepared = handle.preflight_replacement().await.unwrap();
+                assert!(prepared.prepared_cost_budget().unwrap().same_tree(&budget));
+                let source_path = prepared.session.path.clone().unwrap();
+                let source_bytes = std::fs::read(&source_path).unwrap();
+                let mut next = saving_handle_with_store(tmp.path(), store_kind);
+                // Use the original live account, as a candidate constructed
+                // before preflight would. The commit seam must add ancestry.
+                next.session.agent.set_cost_budget(Some(budget.clone()));
+                prepared.retire_cost_for(&mut next).await.unwrap();
+                let fork_path = next
+                    .session_store()
+                    .try_lock()
+                    .unwrap()
+                    .path
+                    .clone()
+                    .unwrap();
+                let old = std::mem::replace(&mut handle, next);
+                assert!(
+                    old.commit_resource_shutdown(prepared)
+                        .await
+                        .completed_cleanly()
+                );
+                assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+                let fork_bytes = std::fs::read(&fork_path).unwrap();
+
+                // All foreground handles are gone. Only the original request
+                // remains, so no descendant can relay its eventual final bill.
+                outstanding.finish(1.75).unwrap();
+                drop(outstanding);
+                drop(budget);
+                assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+                assert_eq!(std::fs::read(&fork_path).unwrap(), fork_bytes);
+                let reopened = Session::open(fork_path.to_str().unwrap()).await.unwrap();
+                let resumed = crate::cost::resolve_budget(&reopened, None, None, Some(2.0), None)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(resumed.spent(), 2.0);
+                assert!(matches!(resumed.admit(), Err(Error::CostCap { spent, cap })
+                    if spent == 2.0 && cap == 2.0));
+            });
+        }
+    }
+
+    #[test]
+    fn first_shutdown_keeps_original_billing_ancestry_in_a_copied_session() {
+        let tmp = tempdir().unwrap();
+        let mut handle = saving_handle(tmp.path());
+        let store = handle.session_store();
+        let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+        budget.record(0.25).unwrap();
+        let mut outstanding = budget.start_attempt().unwrap();
+        outstanding.observe(0.5).unwrap();
+        handle.session.agent.set_cost_budget(Some(budget.clone()));
+        run_async(async {
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+            let source = store.try_lock().unwrap().path.clone().unwrap();
+            let copy = tmp.path().join("copied-session.jsonl");
+            std::fs::copy(&source, &copy).unwrap();
+            let bytes = std::fs::read(&copy).unwrap();
+            outstanding.finish(0.75).unwrap();
+            drop(outstanding);
+            drop(budget);
+            let copied = Session::open(copy.to_str().unwrap()).await.unwrap();
+            let restored = crate::cost::resolve_budget(&copied, None, None, Some(1.0), None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.spent(), 1.0);
+            assert!(matches!(restored.admit(), Err(Error::CostCap { .. })));
+            assert_eq!(std::fs::read(copy).unwrap(), bytes);
+        });
+    }
+
+    #[test]
+    fn fresh_shared_replacement_watches_late_writers_at_its_new_saved_path() {
+        let tmp = tempdir().unwrap();
+        let mut handle = saving_handle(tmp.path());
+        let budget = crate::cost::CostBudget::new(None, Some(1.0), 0.0).unwrap();
+        budget.record(0.25).unwrap();
+        handle.session.agent.set_cost_budget(Some(budget.clone()));
+        run_async(async {
+            let prepared = handle.preflight_replacement().await.unwrap();
+            let mut next = saving_handle(tmp.path());
+            next.session.agent.set_cost_budget(Some(budget));
+            prepared.retire_cost_for(&mut next).await.unwrap();
+            let old = std::mem::replace(&mut handle, next);
+            assert!(
+                old.commit_resource_shutdown(prepared)
+                    .await
+                    .completed_cleanly()
+            );
+            let path = handle
+                .session_store()
+                .try_lock()
+                .unwrap()
+                .path
+                .clone()
+                .unwrap();
+            let mut independent = Session::open(path.to_str().unwrap()).await.unwrap();
+            let foreign = crate::cost::resolve_budget(&independent, None, None, Some(1.0), None)
+                .unwrap()
+                .unwrap();
+            foreign.checkpoint(&mut independent).unwrap();
+            independent.save().await.unwrap();
+            let foreign = foreign.prepare_handoff(&independent).unwrap();
+            foreign.checkpoint(&mut independent).unwrap();
+            independent.save().await.unwrap();
+            let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+            foreign.retire_session(&independent, owner.cx()).unwrap();
+
+            // This writer registered at the new target after installation.
+            // Reading only the account's original canonical sink misses it.
+            foreign.record(0.75).unwrap();
+            let active = handle.session.agent.cost_budget().unwrap();
+            assert_eq!(active.refresh().unwrap().spent, 1.0);
+            assert!(matches!(active.admit(), Err(Error::CostCap { .. })));
+            assert_eq!(active.refresh().unwrap().spent, 1.0);
+        });
+    }
+
+    #[test]
+    fn failed_shared_candidate_save_does_not_activate_prepared_cost_ancestry() {
+        let tmp = tempdir().unwrap();
+        let mut handle = saving_handle(tmp.path());
+        let budget = crate::cost::CostBudget::new(None, Some(2.0), 0.0).unwrap();
+        budget.record(0.25).unwrap();
+        handle.session.agent.set_cost_budget(Some(budget.clone()));
+        run_async(async {
+            let prepared = handle.preflight_replacement().await.unwrap();
+            let source_path = prepared.session.path.clone().unwrap();
+            let mut next = saving_handle(tmp.path());
+            next.session.agent.set_cost_budget(Some(budget.clone()));
+            let blocked = tmp.path().join("blocked-candidate.jsonl");
+            std::fs::create_dir(&blocked).unwrap();
+            next.session_store().try_lock().unwrap().path = Some(blocked);
+            assert!(prepared.retire_cost_for(&mut next).await.is_err());
+            drop(prepared);
+            assert!(
+                next.discard_uncommitted_resources()
+                    .await
+                    .completed_cleanly()
+            );
+
+            // The outgoing file is still a live source with an optional
+            // prospective self-reference; preparation must not start writes.
+            budget.record(0.5).unwrap();
+            let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
+            assert_eq!(crate::cost::recorded_spend(&reopened).unwrap(), 0.25);
+            assert_eq!(budget.spent(), 0.75);
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+        });
     }
 
     #[test]
@@ -8480,9 +9072,13 @@ mod tests {
             let mut next = saving_handle(tmp.path());
             *next.session.session.try_lock().unwrap() = prepared.session.clone();
             next.session.agent.set_cost_budget(Some(budget.clone()));
-            prepared.retire_cost_for(&next).unwrap();
+            prepared.retire_cost_for(&mut next).await.unwrap();
             let old = std::mem::replace(&mut handle, next);
-            assert!(old.commit_resource_shutdown(prepared).await.completed_cleanly());
+            assert!(
+                old.commit_resource_shutdown(prepared)
+                    .await
+                    .completed_cleanly()
+            );
             budget.record(0.25).unwrap();
             let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
             assert!(
