@@ -18326,6 +18326,7 @@ struct JsRuntimeRegistrySnapshot {
     pending_tasks: u64,
     pending_hostcalls: u64,
     pending_timers: u64,
+    timer_handles: u64,
     pending_event_listener_lists: u64,
     event_batch_contexts: u64,
     provider_streams: u64,
@@ -18734,7 +18735,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
         report.pending_tasks_before = reset_payload.before.pending_tasks;
         report.pending_hostcalls_before = reset_payload.before.pending_hostcalls;
-        report.pending_timers_before = reset_payload.before.pending_timers;
+        report.pending_timers_before = reset_payload
+            .before
+            .pending_timers
+            .max(reset_payload.before.timer_handles);
 
         let residual_after = reset_payload.after.extensions
             + reset_payload.after.tools
@@ -18748,6 +18752,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             + reset_payload.after.pending_tasks
             + reset_payload.after.pending_hostcalls
             + reset_payload.after.pending_timers
+            + reset_payload.after.timer_handles
             + reset_payload.after.pending_event_listener_lists
             + reset_payload.after.event_batch_contexts
             + reset_payload.after.provider_streams
@@ -20334,6 +20339,31 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 timer_origins.borrow_mut().insert(timer_id, origin);
                             }
                             Ok(timer_id)
+                        }
+                    }),
+                )?;
+
+                // A timer handle owns this opaque scheduler closure. Keeping
+                // provenance in the Rust closure preserves the original root
+                // across refresh/repeat, including after its first firing,
+                // without retaining expired timers in a global origin map.
+                global.set(
+                    "__pi_create_timer_scheduler_native",
+                    Func::from({
+                        let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
+                        let timer_origins = Rc::clone(&user_timer_origins);
+                        move || {
+                            let origin = active_origin.borrow().clone();
+                            let scheduler = Rc::clone(&scheduler);
+                            let timer_origins = Rc::clone(&timer_origins);
+                            Func::from(move |delay_ms: u64| -> u64 {
+                                let timer_id = scheduler.borrow_mut().set_timeout(delay_ms);
+                                if let Some(origin) = origin.clone() {
+                                    timer_origins.borrow_mut().insert(timer_id, origin);
+                                }
+                                timer_id
+                            })
                         }
                     }),
                 )?;
@@ -22230,6 +22260,7 @@ function __pi_runtime_registry_snapshot() {
         pendingTasks: __pi_map_size_primordial(__pi_tasks),
         pendingHostcalls: __pi_map_size_primordial(__pi_pending_hostcalls),
         pendingTimers: __pi_map_size_primordial(__pi_timer_callbacks),
+        timerHandles: __pi_timer_runtime.count(),
         pendingEventListenerLists: __pi_map_size_primordial(__pi_event_listeners),
         eventBatchContexts: __pi_map_size_primordial(__pi_event_batch_contexts),
         providerStreams:
@@ -22311,6 +22342,7 @@ function __pi_reset_extension_runtime_state(bridge_secret) {
     __pi_map_clear_primordial(__pi_tasks);
     __pi_map_clear_primordial(__pi_pending_hostcalls);
     __pi_map_clear_primordial(__pi_timer_callbacks);
+    __pi_timer_runtime.reset(bridge_secret);
     __pi_map_clear_primordial(__pi_event_listeners);
     __pi_map_clear_primordial(__pi_event_batch_contexts);
     __pi_session_identity.id = null;
@@ -22332,6 +22364,7 @@ function __pi_reset_extension_runtime_state(bridge_secret) {
         after.pendingTasks === 0 &&
         after.pendingHostcalls === 0 &&
         after.pendingTimers === 0 &&
+        after.timerHandles === 0 &&
         after.pendingEventListenerLists === 0 &&
         after.eventBatchContexts === 0 &&
         after.providerStreams === 0 &&
@@ -24107,6 +24140,35 @@ function __pi_project_model_entry(raw) {
         }
         return undefined;
     }
+
+	    if (eventName === 'context') {
+	        const base = event_payload && typeof event_payload === 'object' ? event_payload : {};
+	        let currentMessages = Array.isArray(base.messages) ? base.messages : [];
+	        for (const entry of handlers) {
+	            const handler = entry && entry.handler;
+	            if (typeof handler !== 'function') continue;
+	            const event = Object.assign({ type: 'context' }, base, { messages: currentMessages });
+	            let result = undefined;
+	            try {
+	                result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
+	            } catch (e) {
+	                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, e); } catch (_e) {}
+	                continue;
+	            }
+	            // A void handler keeps prior rewrites, including in-place array
+	            // changes. Each subsequent handler sees the current messages.
+	            if (Array.isArray(event.messages)) currentMessages = event.messages;
+	            if (result === undefined || result === null) continue;
+	            const next = Array.isArray(result)
+	                ? result
+	                : (typeof result === 'object' ? result.messages : undefined);
+	            if (Array.isArray(next)) currentMessages = next;
+	            else if (next === null) currentMessages = [];
+	        }
+	        // Return the messages even for in-place/void handlers so changes
+	        // survive the realm boundary and cannot be lost to a later owner.
+	        return { messages: currentMessages };
+	    }
 
 	    if (eventName === 'resources_discover') {
 	        const skillPaths = [];
@@ -26770,70 +26832,147 @@ if (typeof globalThis.Bun === 'undefined') {
     globalThis.Bun = Bun;
 }
 
-if (typeof globalThis.setTimeout !== 'function') {
-    globalThis.setTimeout = (callback, delay, ...args) => {
-        const ms = Number(delay || 0);
-        const timer_id = __pi_set_timeout_native(ms <= 0 ? 0 : Math.floor(ms));
-        const captured_id = __pi_get_current_extension_id();
-        __pi_register_timer(timer_id, () => {
-            const invoke = () => callback(...args);
-            const result = captured_id
-                ? __pi_with_extension_async(captured_id, invoke)
+// Timer ownership belongs to the embedding actor. ref/unref record the Node
+// handle preference; neither can retain a realm after host shutdown or cancel
+// a callback while its host is alive. State and trusted rescheduling closures
+// stay private, so inspecting a handle cannot reveal or replace provenance.
+const __pi_timer_runtime = (() => {
+    const states = new WeakMap();
+    const active = new Map();
+    const getState = Function.call.bind(WeakMap.prototype.get);
+    const setState = Function.call.bind(WeakMap.prototype.set);
+    const hasState = Function.call.bind(WeakMap.prototype.has);
+    const getActive = Function.call.bind(Map.prototype.get);
+    const setActive = Function.call.bind(Map.prototype.set);
+    const deleteActive = Function.call.bind(Map.prototype.delete);
+    const forEachActive = Function.call.bind(Map.prototype.forEach);
+    const clearActive = __pi_map_clear_primordial;
+    const activeCount = __pi_map_size_primordial;
+    const createScheduler = __pi_create_timer_scheduler_native;
+    Object.defineProperty(globalThis, '__pi_create_timer_scheduler_native', {
+        value: undefined, writable: false, configurable: false, enumerable: false,
+    });
+    let epoch = 0;
+
+    function stateOf(handle) {
+        const state = getState(states, handle);
+        if (!state) throw new TypeError('Invalid Timeout receiver');
+        return state;
+    }
+    function disarm(state) {
+        if (state.nativeId !== null) {
+            __pi_unregister_timer(state.nativeId);
+            __pi_clear_timeout_native(state.nativeId);
+            state.nativeId = null;
+        }
+    }
+    function cancel(handle) {
+        const state = stateOf(handle);
+        if (state.epoch !== epoch || state.cancelled) return;
+        disarm(state);
+        deleteActive(active, state.id);
+        state.active = false;
+        state.cancelled = true;
+        state.callback = null;
+        state.args = null;
+        state.schedule = null;
+    }
+    function arm(handle, state) {
+        disarm(state);
+        const version = ++state.version;
+        const nativeId = state.schedule(state.delay);
+        state.nativeId = nativeId;
+        // The initial native id is unique across both kinds of timer. Later
+        // re-arms get fresh native ids without changing the handle's identity.
+        if (state.id === null) state.id = nativeId;
+        state.active = true;
+        setActive(active, state.id, handle);
+        __pi_register_timer(nativeId, () => {
+            if (state.epoch !== epoch || !state.active || state.version !== version) return;
+            state.nativeId = null;
+            if (!state.repeat) {
+                state.active = false;
+                deleteActive(active, state.id);
+            }
+            const callback = state.callback;
+            const args = state.args;
+            const invoke = () => callback.apply(handle, args);
+            const result = state.owner
+                ? __pi_with_extension_async(state.owner, invoke)
                 : Promise.resolve().then(invoke);
-            result.catch((e) => {
-                console.error('setTimeout callback error:', e);
+            result.catch((error) => console.error('Timer callback error:', error)).then(() => {
+                // Keep the existing serialized interval callback behavior.
+                // A refresh or clear during that callback wins over re-arming.
+                if (state.repeat && state.active && !state.cancelled &&
+                    state.epoch === epoch && state.version === version) {
+                    arm(handle, state);
+                }
             });
         });
-        return timer_id;
-    };
-}
-
-if (typeof globalThis.clearTimeout !== 'function') {
-    globalThis.clearTimeout = (timer_id) => {
-        __pi_unregister_timer(timer_id);
-        try {
-            __pi_clear_timeout_native(timer_id);
-        } catch (_) {}
-    };
-}
-
-// setInterval polyfill using setTimeout
-const __pi_intervals = new Map();
-let __pi_interval_id = 0;
-
-if (typeof globalThis.setInterval !== 'function') {
-    globalThis.setInterval = (callback, delay, ...args) => {
-        const ms = Math.max(0, Number(delay || 0));
-        const id = ++__pi_interval_id;
-        const captured_id = __pi_get_current_extension_id();
-        const run = async () => {
-            if (!__pi_intervals.has(id)) return;
-            try {
-                if (captured_id) {
-                    await __pi_with_extension_async(captured_id, () => callback(...args));
-                } else {
-                    await callback(...args);
-                }
-            } catch (e) {
-                console.error('setInterval callback error:', e);
-            }
-            if (__pi_intervals.has(id)) {
-                __pi_intervals.set(id, globalThis.setTimeout(run, ms));
-            }
-        };
-        __pi_intervals.set(id, globalThis.setTimeout(run, ms));
-        return id;
-    };
-}
-
-if (typeof globalThis.clearInterval !== 'function') {
-    globalThis.clearInterval = (id) => {
-        const timerId = __pi_intervals.get(id);
-        if (timerId !== undefined) {
-            globalThis.clearTimeout(timerId);
-            __pi_intervals.delete(id);
+    }
+    class Timeout {
+        ref() { stateOf(this).referenced = true; return this; }
+        unref() { stateOf(this).referenced = false; return this; }
+        hasRef() { return stateOf(this).referenced; }
+        refresh() {
+            const state = stateOf(this);
+            if (state.epoch === epoch && !state.cancelled) arm(this, state);
+            return this;
         }
-    };
+        close() { cancel(this); return this; }
+        [Symbol.toPrimitive]() { return stateOf(this).id; }
+    }
+    if (typeof Symbol.dispose === 'symbol') {
+        Object.defineProperty(Timeout.prototype, Symbol.dispose, {
+            value() { cancel(this); }, configurable: true, writable: true,
+        });
+    }
+    function create(callback, delay, repeat, args) {
+        if (typeof callback !== 'function') throw new TypeError('Timer callback must be a function');
+        let ms = Number(delay || 0);
+        if (!Number.isFinite(ms) || ms < 0 || ms > 2147483647) ms = 1;
+        const handle = new Timeout();
+        const state = {
+            id: null, nativeId: null, delay: Math.floor(ms), repeat, callback, args,
+            owner: __pi_get_current_extension_id(),
+            schedule: createScheduler(),
+            referenced: true, active: false, cancelled: false, epoch, version: 0,
+        };
+        setState(states, handle, state);
+        arm(handle, state);
+        return handle;
+    }
+    function clear(handle) {
+        if (typeof handle === 'number' || typeof handle === 'string') {
+            handle = getActive(active, Number(handle));
+        }
+        if (handle && hasState(states, handle)) cancel(handle);
+    }
+    return Object.freeze({
+        setTimeout: (callback, delay, ...args) => create(callback, delay, false, args),
+        setInterval: (callback, delay, ...args) => create(callback, delay, true, args),
+        clear,
+        count: () => activeCount(active),
+        reset(secret) {
+            if (!__pi_bridge_secret_matches_native(secret)) throw new Error('Timer reset denied');
+            forEachActive(active, (handle) => cancel(handle));
+            epoch++;
+            clearActive(active);
+        },
+    });
+})();
+
+if (typeof globalThis.setTimeout !== 'function') {
+    globalThis.setTimeout = __pi_timer_runtime.setTimeout;
+}
+if (typeof globalThis.clearTimeout !== 'function') {
+    globalThis.clearTimeout = __pi_timer_runtime.clear;
+}
+if (typeof globalThis.setInterval !== 'function') {
+    globalThis.setInterval = __pi_timer_runtime.setInterval;
+}
+if (typeof globalThis.clearInterval !== 'function') {
+    globalThis.clearInterval = __pi_timer_runtime.clear;
 }
 
 if (typeof globalThis.fetch !== 'function') {
@@ -29535,6 +29674,201 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                     .is_none(),
                 "final completion must erase hostcall provenance"
             );
+        });
+    }
+
+    #[test]
+    fn timer_handles_share_cancellation_and_keep_private_state() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.timerResults = [];
+                    globalThis.keptTimer = setTimeout(function(value) {
+                        timerResults.push([value, this === keptTimer]);
+                    }, 10, 'kept');
+                    const interval = setInterval(() => timerResults.push('wrong interval'), 10);
+                    const cancelled = setTimeout(() => timerResults.push('wrong timeout'), 10);
+                    clearTimeout(Number(interval));
+                    clearInterval(String(Number(cancelled)));
+                    if (typeof Symbol.dispose === 'symbol') {
+                        const disposed = setTimeout(() => timerResults.push('wrong disposal'), 10);
+                        disposed[Symbol.dispose]();
+                        disposed.refresh();
+                    }
+                    globalThis.timerFeatures = {
+                        object: typeof keptTimer === 'object',
+                        private: Reflect.ownKeys(keptTimer).length === 0,
+                        unique: Number(keptTimer) !== Number(interval),
+                        referenced: keptTimer.hasRef(),
+                        same: keptTimer.unref() === keptTimer,
+                        unreferenced: !keptTimer.hasRef(),
+                        nativeFactoryHidden: typeof __pi_create_timer_scheduler_native === 'undefined',
+                    };
+                    const saved = [WeakMap.prototype.get, WeakMap.prototype.set, WeakMap.prototype.has];
+                    globalThis.timerStateIntercepts = 0;
+                    try {
+                        WeakMap.prototype.get = function(...args) { timerStateIntercepts++; return saved[0].apply(this, args); };
+                        WeakMap.prototype.set = function(...args) { timerStateIntercepts++; return saved[1].apply(this, args); };
+                        WeakMap.prototype.has = function(...args) { timerStateIntercepts++; return saved[2].apply(this, args); };
+                        const protectedTimer = setTimeout(() => {}, 100);
+                        protectedTimer.unref().ref();
+                        protectedTimer.hasRef();
+                        clearTimeout(protectedTimer);
+                    } finally {
+                        [WeakMap.prototype.get, WeakMap.prototype.set, WeakMap.prototype.has] = saved;
+                    }
+                    "#,
+                )
+                .await
+                .expect("create and clear timer handles");
+            let features = runtime.read_global_json("timerFeatures").await.unwrap();
+            assert!(
+                features
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(|value| value.as_bool() == Some(true))
+            );
+            assert_eq!(
+                runtime
+                    .read_global_json("timerStateIntercepts")
+                    .await
+                    .unwrap(),
+                0
+            );
+            clock.set(10);
+            runtime
+                .tick()
+                .await
+                .expect("fire retained unreferenced timer");
+            assert_eq!(
+                runtime.read_global_json("timerResults").await.unwrap(),
+                serde_json::json!([["kept", true]])
+            );
+            assert!(!runtime.has_pending());
+            runtime.eval("keptTimer.refresh();").await.unwrap();
+            clock.set(20);
+            runtime.tick().await.expect("refresh fired timer");
+            assert_eq!(
+                runtime.read_global_json("timerResults").await.unwrap(),
+                serde_json::json!([["kept", true], ["kept", true]])
+            );
+            runtime.eval("keptTimer.close().refresh();").await.unwrap();
+            assert!(!runtime.has_pending(), "closed handles must not re-arm");
+            let snapshot = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
+            assert_eq!(snapshot["timerHandles"], 0);
+        });
+    }
+
+    #[test]
+    fn refreshed_and_repeated_timers_preserve_original_hostcall_provenance() {
+        futures::executor::block_on(async {
+            for timer_function in ["setTimeout", "setInterval"] {
+                let clock = Arc::new(DeterministicClock::new(0));
+                let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                    .await
+                    .expect("create runtime");
+                let source = SessionActionOriginSource::default();
+                {
+                    let _origin_guard = runtime.enter_session_action_origin(Some(source.capture()));
+                    runtime
+                        .eval(&format!(
+                            "globalThis.refreshedTimer = {timer_function}(() => pi.log({{ from: 'refresh' }}), 10);"
+                        ))
+                        .await
+                        .unwrap();
+                }
+                source.advance();
+                clock.set(5);
+                {
+                    let _later_origin = runtime.enter_session_action_origin(Some(source.capture()));
+                    runtime.eval("refreshedTimer.refresh();").await.unwrap();
+                }
+                clock.set(10);
+                assert!(!runtime.tick().await.unwrap().ran_macrotask);
+                for deadline in [15, 25] {
+                    clock.set(deadline);
+                    runtime.tick().await.unwrap();
+                    let requests = runtime.drain_hostcall_requests();
+                    assert_eq!(requests.len(), 1, "{timer_function} at {deadline}");
+                    let call_id = &requests[0].call_id;
+                    let origin = runtime.session_action_origin_for_hostcall(call_id).unwrap();
+                    assert!(
+                        !source.accepts(&origin),
+                        "refresh must not replace a stale timer origin with its caller's fresh origin"
+                    );
+                    runtime.complete_hostcall(
+                        call_id,
+                        HostcallOutcome::Success(serde_json::Value::Null),
+                    );
+                    runtime.tick().await.unwrap();
+                    if deadline == 15 && timer_function == "setTimeout" {
+                        let _later_origin =
+                            runtime.enter_session_action_origin(Some(source.capture()));
+                        runtime.eval("refreshedTimer.refresh();").await.unwrap();
+                    }
+                }
+                runtime.eval("clearTimeout(refreshedTimer);").await.unwrap();
+                assert!(!runtime.has_pending());
+                assert!(runtime.user_timer_origins.borrow().is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn timer_reset_invalidates_held_handles_and_pending_interval_callbacks() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval("globalThis.expiredTimer = setTimeout(() => {}, 0);")
+                .await
+                .unwrap();
+            runtime.tick().await.unwrap();
+            assert!(
+                runtime
+                    .scrub_for_cold_drop()
+                    .await
+                    .unwrap()
+                    .inventoried_state_cleared
+            );
+            runtime.eval("expiredTimer.refresh();").await.unwrap();
+            assert!(
+                !runtime.has_pending(),
+                "a held pre-scrub timer cannot reactivate"
+            );
+
+            runtime.eval(
+                "globalThis.pendingInterval = setInterval(() => new Promise(resolve => { globalThis.releaseInterval = resolve; }), 0);"
+            ).await.unwrap();
+            runtime.tick().await.unwrap();
+            let snapshot = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
+            assert_eq!(snapshot["pendingTimers"], 0);
+            assert_eq!(snapshot["timerHandles"], 1);
+            let report = runtime.scrub_for_cold_drop().await.unwrap();
+            assert!(
+                !report.inventoried_state_cleared,
+                "pending callback remains hygiene evidence"
+            );
+            assert_eq!(report.reason_code.as_deref(), Some("pending_js_work"));
+            assert_eq!(report.pending_timers_before, 1);
+            assert_eq!(report.residual_entries_after, 0);
+            runtime
+                .eval("releaseInterval(); pendingInterval.refresh();")
+                .await
+                .unwrap();
+            assert!(
+                !runtime.has_pending(),
+                "settling a pre-scrub callback must not re-arm"
+            );
+            let snapshot = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
+            assert_eq!(snapshot["timerHandles"], 0);
         });
     }
 

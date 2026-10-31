@@ -71,6 +71,25 @@ with a clear error message identifying the unsupported call.
 |--------|-----------|-------------|-------|
 | `node:net` | `createConnection` (stub), `Socket` (stub) | `createServer` | Stubbed sockets (no network I/O); use `pi.http()` |
 | `node:readline` | `createInterface`, `promises.createInterface` | Full interactive readline | Uses `pi.ui('input')` when available; non-interactive prompts resolve to empty strings |
+| `node:timers` and global timers | Timeout handles, shared cancellation, `ref`, `unref`, `hasRef`, `refresh`, `close`, numeric coercion | Control over the host process's lifetime | Deterministic host scheduler; handles keep their original owner and session provenance |
+
+### Timer handles and lifecycle
+
+`setTimeout()` and `setInterval()` return opaque handles. Both cancellation
+functions accept either kind of handle, including its numeric ID; interval IDs
+cannot collide with unrelated timeout IDs. `refresh()` resets the deadline
+without changing the handle's identity and can reactivate a fired timeout.
+Explicit cancellation or runtime scrub prevents a handle from reactivating.
+When available, `Symbol.dispose` cancels the handle as well.
+
+`ref()`, `unref()`, and `hasRef()` track the handle's reference preference.
+PiJS is embedded: the host actor controls its lifetime, so an unreferenced timer
+still fires while that actor is running, and a referenced timer cannot keep a
+shut-down actor alive. This permits context-mode's bounded shutdown fallback
+without giving guest code control over the application lifecycle. Refreshes and
+interval repeats retain the original Rust-captured session provenance, including
+after a timeout has fired. Private state and scrub epochs prevent a retained
+handle from rescheduling work after its runtime has been reset.
 
 ### Blocked
 
@@ -114,6 +133,15 @@ and migration, parameterized statements, `run`, `get`, `all`, `values`,
 parser; their semantic checks happen when executed because the engine does not
 compile those statements into prepared programs. Query and DML statements use
 the engine's prepared programs.
+
+Connections select the engine's standard SQLite single-writer mode before
+accepting guest SQL. This applies to bare `BEGIN`, outermost `SAVEPOINT`, and
+autocommit writes, including databases also opened by a context-mode MCP child.
+The engine-specific concurrent-writer mode is not part of the Bun compatibility
+contract: `BEGIN CONCURRENT` and pragmas that re-enable it are rejected during
+admission. A separate-process stock SQLite regression covers shared-file
+behavior when Node's SQLite module is available; selecting this mode alone
+does not certify cross-engine interoperability.
 
 `INSERT`, `UPDATE`, and `DELETE ... RETURNING` produce real result rows,
 including the resume-state updates used by context-mode. A bridge row or
@@ -392,6 +420,22 @@ export default function activate(pi) {
   pi.registerProvider({ name: "my-provider", models: [...], streamSimple: async (model, context) => { ... } });
 }
 ```
+
+### Context message transforms
+
+Context hooks receive the message array produced by earlier handlers, across
+isolated extension realms and the direct/event-bus phases. Returning no value
+preserves earlier changes, including in-place array mutations. Wrapped
+`{ messages }` results and the existing bare-array form compose in order;
+`{ messages: null }` explicitly clears the request context.
+
+Context-mode appends ephemeral user messages without timestamps for routing,
+active memory, and compaction resumes. At the Agent request boundary, an absent
+user timestamp receives the original request's last message timestamp, or zero
+for an empty request. This deterministic normalization preserves explicit
+timestamps and does not repair malformed values or relax the persisted
+message schema. Context transformations affect the provider request without
+adding those injected messages to durable conversation history.
 
 ### Session and State APIs
 

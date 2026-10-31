@@ -814,6 +814,14 @@ fn admit_sql(sql: &str, single: bool) -> Result<AdmittedSql> {
     }
     for statement in &parsed {
         match statement {
+            SqlStatement::Begin(begin)
+                if matches!(begin.mode, Some(fsqlite_ast::TransactionMode::Concurrent)) =>
+            {
+                return Err(
+                    "BEGIN CONCURRENT is not supported by the bun:sqlite compatibility contract"
+                        .into(),
+                );
+            }
             SqlStatement::Select(_)
             | SqlStatement::Insert(_)
             | SqlStatement::Update(_)
@@ -1224,6 +1232,12 @@ fn execute_work(
             })
             .map_err(SqliteFailure::from)?;
             futures::executor::block_on(async {
+                // Bun and stock SQLite peers share a single-writer WAL
+                // contract. The engine otherwise defaults bare BEGIN,
+                // top-level SAVEPOINT and autocommit writes to its own MVCC
+                // mode. Keep that engine-specific choice host-owned so a
+                // context-mode MCP child sees ordinary SQLite lock behavior.
+                conn.execute("PRAGMA fsqlite.concurrent_mode = OFF").await?;
                 // Temporary tables remain in the engine's memory store. The
                 // guest cannot change either setting through PRAGMA. Schema
                 // admission remains mandatory: trusted_schema is not a SQL

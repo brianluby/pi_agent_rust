@@ -15093,6 +15093,59 @@ async fn dispatch_extension_event_across_shards_until(
         return Ok(Value::Object(result));
     }
 
+    if event_name == "context" {
+        let mut messages = event_payload
+            .get("messages")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let mut saw_handler_result = false;
+        for phase in ["direct", "event_bus"] {
+            for &shard_index in &owners {
+                let mut payload = event_payload.as_object().cloned().unwrap_or_default();
+                payload.insert("messages".to_string(), messages.clone());
+                let Some(value) = dispatch_extension_event_phase_sharded(
+                    shards,
+                    host,
+                    JsEventPhaseDispatch {
+                        shard_index,
+                        event_name,
+                        event_payload: Value::Object(payload),
+                        ctx_payload,
+                        phase,
+                        batch_id,
+                        origin,
+                        deadline,
+                    },
+                )
+                .await?
+                else {
+                    continue;
+                };
+                let next = if value.is_array() {
+                    Some(value)
+                } else {
+                    value.get("messages").cloned()
+                };
+                match next {
+                    Some(Value::Array(next)) => {
+                        messages = Value::Array(next);
+                        saw_handler_result = true;
+                    }
+                    Some(Value::Null) => {
+                        messages = Value::Array(Vec::new());
+                        saw_handler_result = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        return Ok(if saw_handler_result {
+            json!({ "messages": messages })
+        } else {
+            Value::Null
+        });
+    }
+
     if event_name == "resources_discover" {
         let mut skill_paths = Vec::new();
         let mut prompt_paths = Vec::new();

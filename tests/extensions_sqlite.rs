@@ -6,11 +6,137 @@ use pi::extensions::{ExtensionPolicy, ExtensionPolicyMode};
 use pi::extensions_js::{PiJsRuntime, PiJsRuntimeConfig};
 use pi::scheduler::DeterministicClock;
 use serde_json::{Value, json};
+use std::io::{BufRead as _, Write as _};
 use std::path::Path;
 
 // A process intentionally has at most eight SQLite workers. Keep these
 // independent runtime fixtures from competing for that production budget.
 static SQLITE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A separate stock SQLite process is essential here: POSIX file locks are
+/// process-wide, so loading a second SQLite implementation in this test process
+/// would not exercise the cross-process WAL locking contract.
+struct StockSqlitePeer {
+    child: std::process::Child,
+    input: std::process::ChildStdin,
+    output: std::sync::mpsc::Receiver<String>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StockSqlitePeer {
+    fn start(path: &Path) -> Option<Self> {
+        let executable = std::env::var_os("PI_TEST_NODE").unwrap_or_else(|| "node".into());
+        let script = r#"
+            let DatabaseSync;
+            try { ({ DatabaseSync } = await import('node:sqlite')); }
+            catch (error) {
+              if (error.code !== 'ERR_UNKNOWN_BUILTIN_MODULE') throw error;
+              console.log(JSON.stringify({unavailable:String(error)}));
+              process.exit(0);
+            }
+            const { createInterface } = await import('node:readline');
+            const database = new DatabaseSync(process.argv[1]);
+            database.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=0');
+            console.log(JSON.stringify({ready:true}));
+            for await (const line of createInterface({input:process.stdin, terminal:false})) {
+              try {
+                const { sql, mode = 'exec', bindings = [] } = JSON.parse(line);
+                if (mode === 'close') {
+                  database.close();
+                  console.log(JSON.stringify({ok:null}));
+                  break;
+                }
+                const result = mode === 'exec' ? database.exec(sql)
+                  : database.prepare(sql)[mode](...bindings);
+                console.log(JSON.stringify({ok:result ?? null}));
+              } catch (error) {
+                console.log(JSON.stringify({error:{
+                  message:error.message, code:error.code, errno:error.errcode,
+                }}));
+              }
+            }
+            // stdin EOF is also a normal close path for this trusted fixture.
+            try { database.close(); } catch {}
+        "#;
+        let mut child = match std::process::Command::new(executable)
+            .args(["--no-warnings", "--input-type=module", "--eval", script])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "SKIPPED SQLite interoperability: Node.js is unavailable (set PI_TEST_NODE)"
+                );
+                return None;
+            }
+            Err(error) => panic!("spawn stock SQLite peer: {error}"),
+        };
+        let input = child.stdin.take().expect("stock SQLite stdin");
+        let stdout = child.stdout.take().expect("stock SQLite stdout");
+        let (sender, output) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let peer = Self {
+            child,
+            input,
+            output,
+            reader: Some(reader),
+        };
+        let ready = peer.read();
+        if let Some(reason) = ready.get("unavailable") {
+            eprintln!(
+                "SKIPPED SQLite interoperability: Node's native node:sqlite is unavailable: {reason}"
+            );
+            return None;
+        }
+        assert_eq!(ready, json!({"ready":true}), "native peer startup");
+        Some(peer)
+    }
+
+    fn read(&self) -> Value {
+        let line = self
+            .output
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("stock SQLite peer must answer within 10 seconds");
+        serde_json::from_str(&line).expect("stock SQLite protocol JSON")
+    }
+
+    fn request(&mut self, sql: &str, mode: &str, bindings: Value) -> Value {
+        writeln!(
+            self.input,
+            "{}",
+            json!({"sql":sql, "mode":mode, "bindings":bindings})
+        )
+        .expect("write stock SQLite request");
+        self.input.flush().expect("flush stock SQLite request");
+        self.read()
+    }
+
+    fn execute(&mut self, sql: &str) {
+        assert_eq!(self.request(sql, "exec", json!([])), json!({"ok":null}));
+    }
+}
+
+impl Drop for StockSqlitePeer {
+    fn drop(&mut self) {
+        // Also reap on failed assertions; the child never launches descendants.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
 
 #[allow(clippy::future_not_send)]
 async fn runtime(
@@ -203,6 +329,249 @@ fn sqlite_busy_error_reaches_context_mode_retry_and_preserves_persistent_state()
         assert!(failure["code"].as_str().unwrap().starts_with("SQLITE_BUSY"));
         assert!(failure["message"].as_str().unwrap().contains("SQLITE_BUSY"));
         assert_eq!(failure["rolledBack"], true, "{result}");
+    });
+}
+
+#[test]
+fn sqlite_default_transactions_serialize_writers_and_publish_autocommit_results() {
+    let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let storage = root.join("storage");
+        std::fs::create_dir(&storage).expect("storage");
+        let path = serde_json::to_string(&storage.join("single-writer.db")).unwrap();
+        let runtime = runtime(&root, "single-writer", None).await;
+        runtime
+            .add_persistent_storage_root(storage, "single-writer")
+            .expect("storage grant");
+        let result = evaluate(&runtime, &format!(r#"
+            const writer = new sqlite.Database({path});
+            writer.exec('PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 0');
+            writer.exec('CREATE TABLE first_writer(id INTEGER PRIMARY KEY, data TEXT); CREATE TABLE second_writer(id INTEGER PRIMARY KEY, data TEXT)');
+            const peer = new sqlite.Database({path}, {{create:false}});
+            peer.exec('PRAGMA busy_timeout = 0');
+            const observePeer = writer.prepare('SELECT id, data FROM second_writer ORDER BY id');
+            const busy = [];
+            for (const [index, begin, finish] of [
+              [1, 'BEGIN', 'ROLLBACK'],
+              [2, 'SAVEPOINT held', 'ROLLBACK TO held; RELEASE held'],
+            ]) {{
+              writer.exec(begin);
+              writer.prepare('INSERT INTO first_writer VALUES (?, ?)').run(index, 'uncommitted');
+              try {{ peer.prepare('INSERT INTO second_writer VALUES (?, ?)').run(index, 'must wait'); }}
+              catch (error) {{ busy.push({{code:error.code, primaryCode:error.primaryCode}}); }}
+              if (busy.length !== index) throw new Error('a second writer entered an owned SQLite write transaction');
+              writer.exec(finish);
+              if (writer.inTransaction) throw new Error('transaction did not finish');
+              peer.prepare('INSERT INTO second_writer VALUES (?, ?)').run(index, 'committed');
+            }}
+            // Autocommit writes are visible through an already-prepared peer
+            // statement, without a close/checkpoint to make the data appear.
+            globalThis.sqliteResult = {{
+              busy, published: observePeer.all(),
+              rolledBack: writer.query('SELECT COUNT(*) AS n FROM first_writer').get().n,
+            }};
+            peer.close(); writer.close();
+        "#)).await;
+        assert_eq!(
+            result,
+            json!({
+                "busy": [
+                    {"code":"SQLITE_BUSY", "primaryCode":5},
+                    {"code":"SQLITE_BUSY", "primaryCode":5},
+                ],
+                "published": [
+                    {"id":1, "data":"committed"},
+                    {"id":2, "data":"committed"},
+                ],
+                "rolledBack":0,
+            })
+        );
+    });
+}
+
+#[test]
+fn sqlite_guest_sql_cannot_restore_engine_specific_concurrent_transactions() {
+    let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime(temp.path(), "concurrency-admission", None).await;
+        let result = evaluate(
+            &runtime,
+            r#"
+            const db = new sqlite.Database();
+            db.exec('CREATE TABLE evidence(value)');
+            const denied = [];
+            for (const sql of [
+              'BEGIN CONCURRENT',
+              'BEGIN /* engine extension */ CONCURRENT TRANSACTION',
+              'PRAGMA concurrent_mode = ON',
+              'PRAGMA fsqlite.concurrent_mode = ON',
+              'INSERT INTO evidence VALUES (1); BEGIN CONCURRENT',
+            ]) {
+              try { db.exec(sql); denied.push(false); }
+              catch (error) { denied.push(error.code === 'SQLITE_ERROR'); }
+            }
+            let prepareDenied = false;
+            try { db.prepare('BEGIN CONCURRENT'); }
+            catch (error) { prepareDenied = error.code === 'SQLITE_ERROR'; }
+            globalThis.sqliteResult = {
+              denied, prepareDenied, inTransaction:db.inTransaction,
+              changes:db.query('SELECT COUNT(*) AS n FROM evidence').get().n,
+            };
+            db.close();
+        "#,
+        )
+        .await;
+        assert_eq!(
+            result,
+            json!({
+                "denied":[true, true, true, true, true], "prepareDenied":true,
+                "inTransaction":false, "changes":0,
+            })
+        );
+    });
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn sqlite_native_wal_interoperates_with_a_live_stock_node_connection() {
+    let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let storage = root.join("storage");
+    std::fs::create_dir(&storage).expect("storage");
+    let database = storage.join("mixed-engines.db");
+    let Some(mut stock) = StockSqlitePeer::start(&database) else {
+        return;
+    };
+    futures::executor::block_on(async {
+        let runtime = runtime(&root, "mixed-engines", None).await;
+        runtime
+            .add_persistent_storage_root(storage, "mixed-engines")
+            .expect("storage grant");
+        let path = serde_json::to_string(&database).unwrap();
+        let claim = "UPDATE session_resume SET consumed = 1 WHERE id = (SELECT id FROM session_resume WHERE consumed = 0 AND session_id != ? ORDER BY created_at DESC, id DESC LIMIT 1) RETURNING session_id, snapshot";
+        let claim_literal = serde_json::to_string(claim).unwrap();
+        evaluate(&runtime, &format!(r#"
+            globalThis.sharedDb = new sqlite.Database({path}, {{create:false}});
+            sharedDb.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=0');
+            sharedDb.exec(`CREATE TABLE session_resume (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL UNIQUE,
+              snapshot TEXT NOT NULL, event_count INTEGER NOT NULL,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              consumed INTEGER NOT NULL DEFAULT 0
+            )`);
+            globalThis.saveSnapshot = sharedDb.prepare("INSERT INTO session_resume(session_id,snapshot,event_count,created_at) VALUES(?,?,?,'2026-10-31 00:00:00')");
+            globalThis.claimSnapshot = sharedDb.prepare({claim_literal});
+            saveSnapshot.run('session-1', 'first λ snapshot', 1);
+        "#)).await;
+
+        stock.execute("BEGIN");
+        assert_eq!(
+            stock.request("SELECT COUNT(*) AS n FROM session_resume", "get", json!([])),
+            json!({"ok":{"n":1}})
+        );
+        evaluate(
+            &runtime,
+            "saveSnapshot.run('session-2', 'second snapshot', 2);",
+        )
+        .await;
+        assert_eq!(
+            stock.request("SELECT COUNT(*) AS n FROM session_resume", "get", json!([])),
+            json!({"ok":{"n":1}}),
+            "the existing stock read transaction keeps its snapshot"
+        );
+        stock.execute("ROLLBACK");
+        assert_eq!(
+            stock.request("SELECT COUNT(*) AS n FROM session_resume", "get", json!([])),
+            json!({"ok":{"n":2}}),
+            "the same stock connection must see an acknowledged PiJS WAL commit"
+        );
+
+        stock.execute("BEGIN IMMEDIATE; UPDATE session_resume SET snapshot='uncommitted stock value' WHERE session_id='session-1'");
+        let blocked = evaluate(&runtime, r#"
+            try { saveSnapshot.run('blocked', 'must not commit', 0); }
+            catch (error) { globalThis.sqliteResult = {code:error.code, primaryCode:error.primaryCode}; }
+        "#).await;
+        assert_eq!(blocked, json!({"code":"SQLITE_BUSY", "primaryCode":5}));
+        stock.execute("ROLLBACK");
+        evaluate(
+            &runtime,
+            "saveSnapshot.run('session-3', 'third snapshot', 3);",
+        )
+        .await;
+
+        evaluate(
+            &runtime,
+            "sharedDb.exec('BEGIN'); saveSnapshot.run('session-4', 'fourth snapshot', 4);",
+        )
+        .await;
+        let blocked = stock.request(
+            "INSERT INTO session_resume(session_id,snapshot,event_count) VALUES('stock-blocked','must wait',0)",
+            "run", json!([]),
+        );
+        assert_eq!(
+            blocked["error"]["errno"], 5,
+            "stock writer must observe the native write lock: {blocked}"
+        );
+        assert_eq!(
+            stock.request("SELECT COUNT(*) AS n FROM session_resume", "get", json!([])),
+            json!({"ok":{"n":3}}),
+            "stock reads must not observe the native uncommitted row"
+        );
+        evaluate(&runtime, "sharedDb.exec('COMMIT');").await;
+
+        // Both engines execute context-mode's atomic resume claim against the
+        // same live file. Each must observe the other engine's consumed flag.
+        assert_eq!(
+            stock.request(claim, "get", json!(["session-1"])),
+            json!({"ok":{"session_id":"session-4", "snapshot":"fourth snapshot"}})
+        );
+        let claimed = evaluate(
+            &runtime,
+            "globalThis.sqliteResult = claimSnapshot.get('session-1');",
+        )
+        .await;
+        assert_eq!(
+            claimed,
+            json!({"session_id":"session-3", "snapshot":"third snapshot"})
+        );
+        assert_eq!(
+            stock.request(claim, "get", json!(["session-1"])),
+            json!({"ok":{"session_id":"session-2", "snapshot":"second snapshot"}})
+        );
+        let remaining = evaluate(
+            &runtime,
+            "globalThis.sqliteResult = claimSnapshot.get('session-1'); sharedDb.close();",
+        )
+        .await;
+        assert_eq!(
+            remaining,
+            Value::Null,
+            "a consumed snapshot must not be claimed twice"
+        );
+        assert_eq!(
+            stock.request("PRAGMA integrity_check", "get", json!([])),
+            json!({"ok":{"integrity_check":"ok"}})
+        );
+        assert_eq!(stock.request("", "close", json!([])), json!({"ok":null}));
+
+        let reopened = evaluate(&runtime, &format!(r#"
+            const db = new sqlite.Database({path}, {{readonly:true, create:false}});
+            globalThis.sqliteResult = db.prepare('SELECT session_id, snapshot, consumed FROM session_resume ORDER BY id').all();
+            db.close();
+        "#)).await;
+        assert_eq!(
+            reopened,
+            json!([
+                {"session_id":"session-1", "snapshot":"first λ snapshot", "consumed":0},
+                {"session_id":"session-2", "snapshot":"second snapshot", "consumed":1},
+                {"session_id":"session-3", "snapshot":"third snapshot", "consumed":1},
+                {"session_id":"session-4", "snapshot":"fourth snapshot", "consumed":1},
+            ])
+        );
     });
 }
 

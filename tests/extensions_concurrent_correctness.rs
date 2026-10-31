@@ -780,3 +780,172 @@ export default function activate(pi) {
 
     shutdown(&manager);
 }
+
+/// Context rewrites compose across handlers, isolated realms and the event-bus
+/// phase. context-mode's one-shot timestamp-less injection must survive a later
+/// extension, including observers that return nothing and in-place mutations.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn context_messages_compose_across_realms_and_event_phases() {
+    let harness = common::TestHarness::new("context_composition");
+    let cwd = harness.temp_dir().to_path_buf();
+    let manager = ExtensionManager::new();
+    let runtime = common::run_async(JsExtensionRuntimeHandle::start(
+        PiJsRuntimeConfig {
+            cwd: cwd.display().to_string(),
+            env: std::collections::HashMap::from([(
+                "PI_EXT_COMPAT_SCAN".to_string(),
+                "0".to_string(),
+            )]),
+            repair_mode: pi::extensions_js::RepairMode::Off,
+            disk_cache_dir: None,
+            ..Default::default()
+        },
+        Arc::new(ToolRegistry::new(&[], &cwd, None)),
+        manager.clone(),
+    ))
+    .expect("start context runtime");
+    manager.set_js_runtime(runtime);
+    let entries = [
+        ("extensions/context_first.mjs", r#"
+            export default function(pi) {
+                pi.on('context', event => ({ messages: [
+                    ...event.messages, { role: 'user', content: 'first', timestamp: 1 },
+                ] }));
+                pi.on('context', event => ({ messages: [
+                    ...event.messages,
+                    { role: 'user', content: 'second after ' + event.messages.length, timestamp: 2 },
+                ] }));
+                pi.events('on', { event: 'context', handler: event => [
+                    ...event.messages, { role: 'user', content: 'event bus', timestamp: 3 },
+                ] });
+            }
+        "#.to_string()),
+        ("extensions/context_mode.mjs", r#"
+            export default function(pi) {
+                let pendingContext = 'context-mode active.\n<resume>Resume the task</resume>';
+                pi.on('context', event => {
+                    if (!pendingContext) return;
+                    const content = pendingContext;
+                    pendingContext = '';
+                    event.messages.push({ role: 'user', content });
+                    return { messages: event.messages };
+                });
+            }
+        "#.to_string()),
+        ("extensions/context_observer.mjs", r#"
+            export default function(pi) {
+                let direct = [], bus = [];
+                pi.on('context', event => {
+                    direct = event.messages.map(message => message.content);
+                    if (event.clear) return { messages: null };
+                });
+                pi.events('on', { event: 'context', handler: event => {
+                    bus = event.messages.map(message => message.content);
+                    event.messages.push({ role: 'user', content: 'void mutation', timestamp: 4 });
+                } });
+                pi.registerCommand('context-observations', {
+                    handler: async () => ({ display: JSON.stringify({ direct, bus }) }),
+                });
+            }
+        "#.to_string()),
+    ];
+    assert!(load_inline_extensions(&harness, &manager, entries));
+    let (first, observations, second, cleared, stopped) = common::run_async(async move {
+        let original = json!([{ "role": "user", "content": "original", "timestamp": 0 }]);
+        let first = manager
+            .dispatch_event_with_response(
+                ExtensionEventName::Context,
+                Some(json!({ "messages": original.clone() })),
+                5000,
+            )
+            .await
+            .expect("first context dispatch")
+            .expect("first rewrite");
+        let observations = manager
+            .execute_command("context-observations", "", 5000)
+            .await
+            .expect("observer state");
+        let second = manager
+            .dispatch_event_with_response(
+                ExtensionEventName::Context,
+                Some(json!({ "messages": original.clone() })),
+                5000,
+            )
+            .await
+            .expect("second context dispatch")
+            .expect("second rewrite");
+        let cleared = manager
+            .dispatch_event_with_response(
+                ExtensionEventName::Context,
+                Some(json!({ "messages": original, "clear": true })),
+                5000,
+            )
+            .await
+            .expect("cleared context dispatch")
+            .expect("cleared rewrite");
+        let stopped = manager.shutdown(Duration::from_secs(5)).await;
+        (first, observations, second, cleared, stopped)
+    });
+    assert!(stopped);
+    let texts = |value: &serde_json::Value| {
+        value["messages"]
+            .as_array()
+            .expect("message array")
+            .iter()
+            .map(|message| {
+                message["content"]
+                    .as_str()
+                    .expect("message text")
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        texts(&first),
+        [
+            "original",
+            "first",
+            "second after 2",
+            "context-mode active.\n<resume>Resume the task</resume>",
+            "event bus",
+            "void mutation",
+        ]
+    );
+    assert!(
+        first["messages"][3].get("timestamp").is_none(),
+        "the Agent boundary supplies this field, not the realm dispatcher"
+    );
+    let observations: serde_json::Value =
+        serde_json::from_str(observations["display"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        observations["direct"],
+        json!([
+            "original",
+            "first",
+            "second after 2",
+            "context-mode active.\n<resume>Resume the task</resume>",
+        ])
+    );
+    assert_eq!(
+        observations["bus"],
+        json!([
+            "original",
+            "first",
+            "second after 2",
+            "context-mode active.\n<resume>Resume the task</resume>",
+            "event bus",
+        ])
+    );
+    assert_eq!(
+        texts(&second),
+        [
+            "original",
+            "first",
+            "second after 2",
+            "event bus",
+            "void mutation"
+        ]
+    );
+    assert_eq!(texts(&cleared), ["event bus", "void mutation"]);
+}

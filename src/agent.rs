@@ -146,6 +146,35 @@ fn normalize_before_provider_request_response(response: Value) -> Option<Value> 
     }
 }
 
+/// Context hooks may append ephemeral user messages without a timestamp, as
+/// context-mode does for routing, active memory and compaction resumes. Keep
+/// the persisted Message contract strict and normalize only that extension
+/// boundary. Reuse the request's last timestamp so replaying the same context
+/// never introduces wall-clock differences or changes caller-supplied values.
+fn deserialize_context_hook_messages(
+    mut value: Value,
+    original_messages: &[Message],
+) -> serde_json::Result<Vec<Message>> {
+    let timestamp = original_messages.last().map_or(0, |message| match message {
+        Message::User(message) => message.timestamp,
+        Message::Assistant(message) => message.timestamp,
+        Message::ToolResult(message) => message.timestamp,
+        Message::Custom(message) => message.timestamp,
+    });
+    if let Some(messages) = value.as_array_mut() {
+        for message in messages {
+            if let Some(object) = message.as_object_mut()
+                && object.get("role").and_then(Value::as_str) == Some("user")
+            {
+                object
+                    .entry("timestamp")
+                    .or_insert_with(|| json!(timestamp));
+            }
+        }
+    }
+    serde_json::from_value(value)
+}
+
 fn compatible_tool_parallelism_limit() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| {
@@ -4752,7 +4781,7 @@ impl Agent {
             return Some(Vec::new());
         }
 
-        match serde_json::from_value(messages_value) {
+        match deserialize_context_hook_messages(messages_value, messages) {
             Ok(messages) => Some(messages),
             Err(err) => {
                 tracing::warn!("context extension hook returned invalid messages: {err}");
@@ -9905,6 +9934,119 @@ mod extensions_integration_tests {
             normalize_before_provider_request_response(json!("not an object")),
             None
         );
+    }
+
+    #[test]
+    fn context_hook_timestamps_do_not_weaken_persisted_message_validation() {
+        let ephemeral = json!({ "role": "user", "content": "context-mode active." });
+        assert!(serde_json::from_value::<Message>(ephemeral.clone()).is_err());
+        let normalized = deserialize_context_hook_messages(json!([ephemeral]), &[])
+            .expect("ephemeral context message");
+        assert_eq!(
+            serde_json::to_value(normalized).unwrap(),
+            json!([{ "role": "user", "content": "context-mode active.", "timestamp": 0 }])
+        );
+
+        for timestamp in [Value::Null, json!("yesterday"), json!(1.5), json!({})] {
+            assert!(
+                deserialize_context_hook_messages(
+                    json!([{ "role": "user", "content": "invalid", "timestamp": timestamp }]),
+                    &[],
+                )
+                .is_err(),
+                "an explicit malformed timestamp must not be repaired"
+            );
+        }
+        assert!(
+            deserialize_context_hook_messages(json!([{ "role": "user" }]), &[]).is_err(),
+            "missing content must still fail validation"
+        );
+        let mut assistant =
+            serde_json::to_value(Message::Assistant(Arc::new(AssistantMessage::default())))
+                .unwrap();
+        assistant.as_object_mut().unwrap().remove("timestamp");
+        assert!(
+            deserialize_context_hook_messages(json!([assistant]), &[]).is_err(),
+            "the exception applies only to ephemeral user messages"
+        );
+    }
+
+    /// context-mode 1.0.169 appends this timestamp-less user-message shape from
+    /// its context hook. Exercise the real loader, actor and Agent boundary all
+    /// the way to the provider; inspecting only the JS array misses rejection
+    /// by Rust message deserialization.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn context_mode_ephemeral_injection_reaches_provider_without_changing_history() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let entry = temp.path().join("context-mode.mjs");
+            std::fs::write(&entry, r#"
+                export default function(pi) {
+                    let pendingContext = '';
+                    pi.on('before_agent_start', () => {
+                        pendingContext = 'context-mode active.\n<active_memory>Keep the decision</active_memory>\n<resume>Continue the task</resume>';
+                    });
+                    pi.on('context', event => {
+                        if (!pendingContext) return;
+                        const content = pendingContext;
+                        pendingContext = '';
+                        event.messages.push({ role: 'user', content });
+                        event.messages.push({ role: 'user', content: 'Explicit timestamp', timestamp: 99 });
+                        return { messages: event.messages };
+                    });
+                }
+            "#).expect("extension fixture");
+            let manager = ExtensionManager::new();
+            let js = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: temp.path().display().to_string(),
+                    env: std::collections::HashMap::from([("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string())]),
+                    repair_mode: RepairMode::Off,
+                    disk_cache_dir: None,
+                    ..Default::default()
+                },
+                Arc::new(ToolRegistry::new(&[], temp.path(), None)),
+                manager.clone(),
+            ).await.expect("extension runtime");
+            manager.set_js_runtime(js);
+            manager.load_js_extensions(vec![JsExtensionLoadSpec::from_entry_path(entry).unwrap()])
+                .await.expect("real extension load");
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            let provider = Arc::new(PiAiCaptureProvider { calls: Arc::clone(&calls) });
+            let mut agent = Agent::new(
+                provider,
+                ToolRegistry::new(&[], temp.path(), None),
+                AgentConfig { system_prompt: Some("stable system prompt".to_string()), ..Default::default() },
+            );
+            agent.extensions = Some(manager.clone());
+            agent.replace_messages(vec![Message::User(UserMessage {
+                content: UserContent::Text("Continue".to_string()),
+                timestamp: 42,
+            })]);
+            manager.dispatch_event(ExtensionEventName::BeforeAgentStart, Some(json!({
+                "prompt": "Continue", "systemPrompt": "stable system prompt",
+            }))).await.expect("prepare routing and resume injection");
+            let checkpoint = crate::agent_cx::AgentCx::for_request();
+            let result = agent.stream_assistant_attempt(Arc::new(|_| {}), None, &checkpoint, false).await;
+            let stopped = manager.shutdown(Duration::from_secs(5)).await;
+            assert!(matches!(result.expect("provider request"), AssistantStreamAttempt::Complete(_)));
+            assert!(stopped);
+            let captured = calls.lock().expect("captured requests");
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0].system_prompt.as_deref(), Some("stable system prompt"));
+            assert_eq!(serde_json::to_value(&captured[0].messages).unwrap(), json!([
+                { "role": "user", "content": "Continue", "timestamp": 42 },
+                { "role": "user", "content": "context-mode active.\n<active_memory>Keep the decision</active_memory>\n<resume>Continue the task</resume>", "timestamp": 42 },
+                { "role": "user", "content": "Explicit timestamp", "timestamp": 99 },
+            ]));
+            assert_eq!(
+                agent.messages.iter().filter(|message| matches!(message, Message::User(_))).count(),
+                1,
+                "request-only injection must not enter durable conversation history"
+            );
+        });
     }
 
     #[derive(Debug)]
