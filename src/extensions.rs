@@ -49,6 +49,7 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as StdOrdering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::thread;
@@ -11120,6 +11121,7 @@ impl JsRuntimeHost {
             inner,
             snapshot: Arc::clone(&self.manager_snapshot),
             snapshot_version: Arc::clone(&self.manager_snapshot_version),
+            runtime_owner_lifetime: None,
         })
     }
 }
@@ -11287,11 +11289,37 @@ enum JsRuntimeCommand {
 
 struct JsRuntimeShard {
     extension_id: String,
-    runtime: PiJsRuntime,
+    runtime: Rc<PiJsRuntime>,
     snapshot: JsExtensionSnapshot,
+    /// An idle turn polls at most one FIFO dispatch. Retaining its future here
+    /// preserves its admission lease, provenance and eventual completion while
+    /// the actor receives commands or advances another extension's timers.
+    pending_idle_dispatch: Option<PendingIdleHostcall>,
     /// Terminal pump failure retained so unrelated shards can continue while
     /// future calls targeting this shard still receive the original failure.
     pump_fault: Option<String>,
+}
+
+struct PendingIdleHostcall {
+    call_id: String,
+    future: futures::future::LocalBoxFuture<'static, Option<(String, HostcallOutcome, u64)>>,
+}
+
+impl JsRuntimeShard {
+    fn cancel_idle_dispatch(&mut self) {
+        if let Some(pending) = self.pending_idle_dispatch.take() {
+            self.runtime.cancel_hostcall(&pending.call_id);
+            // Dropping the dispatch also releases admission/UI leases and
+            // invokes native subprocess cancellation guards before shutdown.
+            drop(pending);
+        }
+    }
+}
+
+impl Drop for JsRuntimeShard {
+    fn drop(&mut self) {
+        self.cancel_idle_dispatch();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -11667,6 +11695,62 @@ fn short_warm_pool_fingerprint(fingerprint: &str) -> &str {
     fingerprint.get(..16).unwrap_or(fingerprint)
 }
 
+/// External ownership is separate from the manager's internal Arc count.
+/// A pending hostcall can retain a manager or UI lease across an await without
+/// keeping its own actor alive after all application owners have gone away.
+#[derive(Default)]
+struct JsRuntimeOwnerLifetime {
+    actors: Mutex<Vec<Weak<JsActorLifecycle>>>,
+}
+
+impl JsRuntimeOwnerLifetime {
+    fn register_actor(&self, actor: &Arc<JsActorLifecycle>) {
+        let mut actors = self
+            .actors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        actors.retain(|actor| actor.strong_count() > 0);
+        actors.push(Arc::downgrade(actor));
+    }
+}
+
+impl Drop for JsRuntimeOwnerLifetime {
+    fn drop(&mut self) {
+        for actor in self
+            .actors
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+        {
+            actor.stop();
+        }
+    }
+}
+
+struct JsActorLifecycle {
+    stopped: std::sync::atomic::AtomicBool,
+    // The actor must not keep its own command channel open. Dropping an
+    // unattached or replaced handle still closes the receiver naturally.
+    sender: mpsc::WeakSender<JsRuntimeCommand>,
+}
+
+impl JsActorLifecycle {
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(StdOrdering::Acquire)
+    }
+
+    fn stop(&self) {
+        // An empty receive must wake. A full queue already wakes the
+        // actor, which checks the latch before processing more work.
+        if !self.stopped.swap(true, StdOrdering::AcqRel)
+            && let Some(sender) = self.sender.upgrade()
+        {
+            let _ = sender.try_send(JsRuntimeCommand::Shutdown);
+        }
+    }
+}
+
 /// Handle to the JS extension runtime thread.
 ///
 /// Cloning shares the same underlying runtime. Call [`shutdown`](Self::shutdown)
@@ -11675,6 +11759,10 @@ fn short_warm_pool_fingerprint(fingerprint: &str) -> &str {
 /// `exit_signal`.
 pub struct JsExtensionRuntimeHandle {
     sender: mpsc::Sender<JsRuntimeCommand>,
+    actor_lifecycle: Weak<JsActorLifecycle>,
+    /// Only handles held by application code own this lifetime. The handle
+    /// stored inside the same manager is non-owning to avoid an actor cycle.
+    runtime_owner_lifetime: Option<Arc<JsRuntimeOwnerLifetime>>,
     /// Weak manager access used only to capture trusted Session provenance
     /// before root JS commands enter the runtime thread.
     manager_ref: Weak<Mutex<ExtensionManagerInner>>,
@@ -11692,6 +11780,8 @@ impl Clone for JsExtensionRuntimeHandle {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            actor_lifecycle: self.actor_lifecycle.clone(),
+            runtime_owner_lifetime: self.runtime_owner_lifetime.clone(),
             manager_ref: self.manager_ref.clone(),
             compat_scan_mode: self.compat_scan_mode,
             exit_signal: Arc::clone(&self.exit_signal),
@@ -11794,6 +11884,14 @@ impl JsExtensionRuntimeHandle {
         let policy = policy.unwrap_or_default();
         let runtime_policy = policy.clone();
 
+        let runtime_owner_lifetime = manager.runtime_owner_lifetime.clone().unwrap_or_default();
+        let actor_lifecycle = Arc::new(JsActorLifecycle {
+            stopped: std::sync::atomic::AtomicBool::new(false),
+            sender: tx.downgrade(),
+        });
+        runtime_owner_lifetime.register_actor(&actor_lifecycle);
+        let actor_lifecycle_ref = Arc::downgrade(&actor_lifecycle);
+
         apply_env_capability(&mut config, &policy);
 
         let manager_ref = Arc::downgrade(&manager.inner);
@@ -11850,7 +11948,46 @@ impl JsExtensionRuntimeHandle {
 
                 let mut shard_set = JsRuntimeShardSet::default();
 
-                while let Ok(cmd) = rx.recv(&cx).await {
+                while !actor_lifecycle.is_stopped() {
+                    // Commands, especially lifecycle operations, take priority
+                    // over idle JavaScript. Only the receive is timed: an idle
+                    // dispatch is retained in its shard across scheduler turns.
+                    let cmd = match rx.try_recv() {
+                        Ok(cmd) => cmd,
+                        Err(mpsc::RecvError::Empty) => {
+                            if let Some(delay) = idle_runtime_poll_delay(&shard_set) {
+                                match timeout(extension_wait_now(), delay, rx.recv(&cx)).await {
+                                    Ok(Ok(cmd)) => cmd,
+                                    Ok(Err(_)) => break,
+                                    Err(_) => {
+                                        if actor_lifecycle.is_stopped() {
+                                            break;
+                                        }
+                                        // A command may have arrived exactly at
+                                        // the timer boundary. Do not run an idle
+                                        // turn ahead of an already queued command.
+                                        match rx.try_recv() {
+                                            Ok(cmd) => cmd,
+                                            Err(mpsc::RecvError::Empty) => {
+                                                pump_idle_runtime_shards(&mut shard_set, &host).await;
+                                                continue;
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                }
+                            } else {
+                                let Ok(cmd) = rx.recv(&cx).await else {
+                                    break;
+                                };
+                                cmd
+                            }
+                        }
+                        Err(_) => break,
+                    };
+                    if actor_lifecycle.is_stopped() {
+                        break;
+                    }
                     match cmd {
                         JsRuntimeCommand::Shutdown => break,
                         JsRuntimeCommand::LoadExtensions {
@@ -12628,6 +12765,10 @@ impl JsExtensionRuntimeHandle {
                         }
                     }
                 }
+                // Release retained dispatch futures and their admission/UI
+                // leases before acknowledging shutdown to application code.
+                // Each shard cancels its pending call before dropping its realm.
+                drop(shard_set);
                 // Signal that the runtime thread has exited its event loop.
                 let _ = exit_tx.send(&cx, ());
                 tracing::info!(
@@ -12645,6 +12786,8 @@ impl JsExtensionRuntimeHandle {
 
         Ok(Self {
             sender: tx,
+            actor_lifecycle: actor_lifecycle_ref,
+            runtime_owner_lifetime: Some(runtime_owner_lifetime),
             manager_ref,
             compat_scan_mode,
             exit_signal: Arc::new(Mutex::new(Some(exit_rx))),
@@ -12684,15 +12827,21 @@ impl JsExtensionRuntimeHandle {
 
     /// Request the JS runtime thread to shut down gracefully.
     ///
-    /// Sends a `Shutdown` command and waits up to `budget` for the thread
+    /// Signals shutdown and waits up to `budget` for the thread
     /// to exit its event loop.  Returns `true` if the runtime exited
     /// within the budget.
     pub async fn shutdown(&self, budget: Duration) -> bool {
         let cx = Cx::for_request();
         let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
 
-        // Send shutdown command (ignore error if channel already closed).
-        let _ = self.sender.send(&cx, JsRuntimeCommand::Shutdown).await;
+        // Stop is a latch, not an ordinary queued command. In particular,
+        // waiting to send into a full queue must not consume an unbounded
+        // amount of time before the cleanup budget starts.
+        if let Some(actor) = self.actor_lifecycle.upgrade() {
+            actor.stop();
+        } else {
+            let _ = self.sender.try_send(JsRuntimeCommand::Shutdown);
+        }
 
         // Take the exit signal — only the first caller can await it.
         let exit_rx = {
@@ -14274,8 +14423,9 @@ async fn build_js_runtime_shards(
             require_single_shard_snapshot(snapshot_extensions(&runtime).await?, &extension_id)?;
         candidate.shards.push(JsRuntimeShard {
             extension_id,
-            runtime,
+            runtime: Rc::new(runtime),
             snapshot,
+            pending_idle_dispatch: None,
             pump_fault: None,
         });
     }
@@ -14343,7 +14493,8 @@ async fn scrub_and_drop_runtime_shards(
     warm_pool: &crate::extensions_js::WarmIsolatePool,
 ) -> Result<()> {
     let mut errors = Vec::new();
-    for shard in &shards.shards {
+    for shard in &mut shards.shards {
+        shard.cancel_idle_dispatch();
         match shard.runtime.scrub_for_cold_drop().await {
             Ok(report) if report.inventoried_state_cleared => {
                 warm_pool.record_reset();
@@ -14565,6 +14716,7 @@ fn quarantine_runtime_shard(
     );
     let fault = format!("JS extension shard {extension_id} quarantined: {reason}");
     if let Some(shard) = shards.shards.get_mut(shard_index) {
+        shard.cancel_idle_dispatch();
         shard.pump_fault = Some(fault.clone());
     }
     tracing::error!(
@@ -15738,6 +15890,94 @@ async fn cancel_active_provider_streams_for_replacement(
     }
 }
 
+/// Dispatch one request through the same identity, policy and admission gates
+/// for command-driven and idle actor work.
+#[allow(clippy::future_not_send)]
+async fn dispatch_js_hostcall_for_owner(
+    runtime: &PiJsRuntime,
+    host: &JsRuntimeHost,
+    expected_owner: Option<&str>,
+    root_deadline: Option<Instant>,
+    req: HostcallRequest,
+) -> Option<(String, HostcallOutcome, u64)> {
+    let call_id = req.call_id.clone();
+    if !runtime.is_hostcall_active(&call_id) {
+        tracing::debug!(
+            event = "pijs.hostcall.skip_cancelled",
+            call_id = %call_id,
+            "Skipping hostcall dispatch because call is no longer pending"
+        );
+        return None;
+    }
+    let extension_id = req.extension_id.clone();
+    let queue_wait_ms = runtime.hostcall_queue_wait_ms(&call_id).unwrap_or(0);
+    let dispatch_started = Instant::now();
+    let outcome = if let Some(expected_owner) = expected_owner
+        && req.extension_id.as_deref() != Some(expected_owner)
+    {
+        tracing::error!(
+            event = "pijs.hostcall.owner_mismatch",
+            call_id = %call_id,
+            expected_owner,
+            claimed_owner = ?req.extension_id,
+            "Rejected hostcall whose claimed extension owner does not match its runtime shard"
+        );
+        HostcallOutcome::Error {
+            code: "extension_identity_mismatch".to_string(),
+            message: format!(
+                "Runtime shard {expected_owner} rejected hostcall claiming extension {:?}",
+                req.extension_id
+            ),
+        }
+    } else if let Some(deadline) = root_deadline {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Some((
+                call_id,
+                HostcallOutcome::Error {
+                    code: "timeout".to_string(),
+                    message: "Root JavaScript task deadline elapsed before hostcall dispatch"
+                        .to_string(),
+                },
+                0,
+            ));
+        };
+        timeout(
+            wall_now(),
+            remaining,
+            Box::pin(dispatch_hostcall_with_runtime(Some(runtime), host, req)),
+        )
+        .await
+        .unwrap_or_else(|_| HostcallOutcome::Error {
+            code: "timeout".to_string(),
+            message: "Root JavaScript task deadline elapsed during hostcall dispatch".to_string(),
+        })
+    } else {
+        dispatch_hostcall_with_runtime(Some(runtime), host, req).await
+    };
+    if runtime.has_deferred_hostcall(&call_id) {
+        runtime.set_deferred_hostcall_deadline(&call_id, root_deadline);
+        return None;
+    }
+    let elapsed = dispatch_started.elapsed();
+    let execution_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+    let outcome_code = match &outcome {
+        HostcallOutcome::Success(_) => "success",
+        HostcallOutcome::StreamChunk { .. } => "stream",
+        HostcallOutcome::Error { code, .. } => code.as_str(),
+    };
+    tracing::debug!(
+        event = "pijs.hostcall.dispatch_timing",
+        call_id = %call_id,
+        extension_id = ?extension_id,
+        queue_wait_ms,
+        execution_ms,
+        outcome_code = %outcome_code,
+        "Hostcall dispatch timing"
+    );
+    Some((call_id, outcome, elapsed_ns))
+}
+
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn pump_js_runtime_once_for_owner(
     runtime: &PiJsRuntime,
@@ -15747,94 +15987,6 @@ async fn pump_js_runtime_once_for_owner(
 ) -> Result<bool> {
     fn drain_requests(runtime: &PiJsRuntime) -> std::collections::VecDeque<HostcallRequest> {
         runtime.drain_hostcall_requests()
-    }
-
-    /// Dispatch a single hostcall request, recording timing and returning
-    /// the completion pair plus elapsed nanoseconds for AMAC telemetry.
-    async fn dispatch_one(
-        runtime: &PiJsRuntime,
-        host: &JsRuntimeHost,
-        expected_owner: Option<&str>,
-        root_deadline: Option<Instant>,
-        req: HostcallRequest,
-    ) -> Option<(String, HostcallOutcome, u64)> {
-        let call_id = req.call_id.clone();
-        if !runtime.is_hostcall_active(&call_id) {
-            tracing::debug!(
-                event = "pijs.hostcall.skip_cancelled",
-                call_id = %call_id,
-                "Skipping hostcall dispatch because call is no longer pending"
-            );
-            return None;
-        }
-        let extension_id = req.extension_id.clone();
-        let queue_wait_ms = runtime.hostcall_queue_wait_ms(&call_id).unwrap_or(0);
-        let dispatch_started = Instant::now();
-        let outcome = if let Some(expected_owner) = expected_owner
-            && req.extension_id.as_deref() != Some(expected_owner)
-        {
-            tracing::error!(
-                event = "pijs.hostcall.owner_mismatch",
-                call_id = %call_id,
-                expected_owner,
-                claimed_owner = ?req.extension_id,
-                "Rejected hostcall whose claimed extension owner does not match its runtime shard"
-            );
-            HostcallOutcome::Error {
-                code: "extension_identity_mismatch".to_string(),
-                message: format!(
-                    "Runtime shard {expected_owner} rejected hostcall claiming extension {:?}",
-                    req.extension_id
-                ),
-            }
-        } else if let Some(deadline) = root_deadline {
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Some((
-                    call_id,
-                    HostcallOutcome::Error {
-                        code: "timeout".to_string(),
-                        message: "Root JavaScript task deadline elapsed before hostcall dispatch"
-                            .to_string(),
-                    },
-                    0,
-                ));
-            };
-            timeout(
-                wall_now(),
-                remaining,
-                Box::pin(dispatch_hostcall_with_runtime(Some(runtime), host, req)),
-            )
-            .await
-            .unwrap_or_else(|_| HostcallOutcome::Error {
-                code: "timeout".to_string(),
-                message: "Root JavaScript task deadline elapsed during hostcall dispatch"
-                    .to_string(),
-            })
-        } else {
-            dispatch_hostcall_with_runtime(Some(runtime), host, req).await
-        };
-        if runtime.has_deferred_hostcall(&call_id) {
-            runtime.set_deferred_hostcall_deadline(&call_id, root_deadline);
-            return None;
-        }
-        let elapsed = dispatch_started.elapsed();
-        let execution_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-        let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
-        let outcome_code = match &outcome {
-            HostcallOutcome::Success(_) => "success",
-            HostcallOutcome::StreamChunk { .. } => "stream",
-            HostcallOutcome::Error { code, .. } => code.as_str(),
-        };
-        tracing::debug!(
-            event = "pijs.hostcall.dispatch_timing",
-            call_id = %call_id,
-            extension_id = ?extension_id,
-            queue_wait_ms,
-            execution_ms,
-            outcome_code = %outcome_code,
-            "Hostcall dispatch timing"
-        );
-        Some((call_id, outcome, elapsed_ns))
     }
 
     async fn dispatch_requests(
@@ -15876,7 +16028,8 @@ async fn pump_js_runtime_once_for_owner(
         let mut completions = Vec::with_capacity(pending.len());
         for req in pending {
             if let Some((call_id, outcome, elapsed_ns)) =
-                dispatch_one(runtime, host, expected_owner, root_deadline, req).await
+                dispatch_js_hostcall_for_owner(runtime, host, expected_owner, root_deadline, req)
+                    .await
             {
                 // Feed timing to AMAC even when disabled, so telemetry
                 // is ready if toggled on later.
@@ -15926,8 +16079,14 @@ async fn pump_js_runtime_once_for_owner(
             );
 
             for req in group.requests {
-                if let Some((call_id, outcome, elapsed_ns)) =
-                    dispatch_one(runtime, host, expected_owner, root_deadline, req).await
+                if let Some((call_id, outcome, elapsed_ns)) = dispatch_js_hostcall_for_owner(
+                    runtime,
+                    host,
+                    expected_owner,
+                    root_deadline,
+                    req,
+                )
+                .await
                 {
                     AMAC_EXECUTOR.with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
                     completions.push((call_id, outcome));
@@ -15988,6 +16147,279 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
     pump_js_runtime_once_for_owner(runtime, host, None, None).await
 }
 
+/// Poll a retained dispatch exactly once. A pending hostcall keeps its future
+/// and all cancellation guards until a later turn or explicit shard teardown.
+#[allow(clippy::future_not_send)]
+async fn poll_idle_hostcall(shard: &mut JsRuntimeShard) {
+    let Some(mut pending) = shard.pending_idle_dispatch.take() else {
+        return;
+    };
+    if !shard.runtime.is_hostcall_active(&pending.call_id) {
+        return;
+    }
+    let outcome =
+        futures::future::poll_fn(|cx| std::task::Poll::Ready(pending.future.as_mut().poll(cx)))
+            .await;
+    match outcome {
+        std::task::Poll::Pending => shard.pending_idle_dispatch = Some(pending),
+        std::task::Poll::Ready(Some((call_id, outcome, elapsed_ns))) => {
+            AMAC_EXECUTOR.with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
+            shard.runtime.complete_hostcall(call_id, outcome);
+        }
+        std::task::Poll::Ready(None) => {}
+    }
+}
+
+/// Advance one shard without awaiting arbitrary host I/O. The per-turn bound
+/// is one FIFO dispatch poll and one scheduler tick, under the runtime's
+/// existing JavaScript interruption and microtask budgets.
+#[allow(clippy::future_not_send)]
+async fn pump_idle_runtime_shard(shard: &mut JsRuntimeShard, host: &JsRuntimeHost) -> Result<bool> {
+    let _ = shard.runtime.drain_microtasks().await?;
+    if shard.pending_idle_dispatch.is_none()
+        && let Some(request) = shard.runtime.pop_hostcall_request()
+    {
+        let call_id = request.call_id.clone();
+        let runtime = Rc::clone(&shard.runtime);
+        let host = host.clone();
+        let owner = shard.extension_id.clone();
+        shard.pending_idle_dispatch = Some(PendingIdleHostcall {
+            call_id,
+            future: Box::pin(async move {
+                // The dispatcher recovers saved Session provenance by call
+                // id; a later command's active origin cannot relabel it.
+                dispatch_js_hostcall_for_owner(&runtime, &host, Some(&owner), None, request).await
+            }),
+        });
+    }
+    poll_idle_hostcall(shard).await;
+    let _ = shard.runtime.tick().await?;
+    Ok(shard.pending_idle_dispatch.is_some() || shard.runtime.has_pending())
+}
+
+fn idle_runtime_poll_delay(shards: &JsRuntimeShardSet) -> Option<Duration> {
+    shards
+        .shards
+        .iter()
+        .filter(|shard| shard.pump_fault.is_none())
+        .filter_map(|shard| {
+            let delay = shard.runtime.idle_poll_delay_ms();
+            if shard.pending_idle_dispatch.is_some() {
+                Some(delay.unwrap_or(10).min(10))
+            } else {
+                delay
+            }
+        })
+        .min()
+        // Even immediately ready JavaScript yields to the native timer/I/O
+        // driver. Repeated self-wakes alone can starve subprocess readiness.
+        .map(|delay_ms| Duration::from_millis(delay_ms.max(1)))
+}
+
+/// Fair idle progress visits one ready shard per turn. A pending hostcall in
+/// one owner never prevents timers or completions in another from advancing.
+#[allow(clippy::future_not_send)]
+async fn pump_idle_runtime_shards(shards: &mut JsRuntimeShardSet, host: &JsRuntimeHost) {
+    let shard_count = shards.shards.len();
+    if shard_count == 0 {
+        return;
+    }
+    let start = shards.pump_cursor % shard_count;
+    for offset in 0..shard_count {
+        let shard_index = (start + offset) % shard_count;
+        let shard = &mut shards.shards[shard_index];
+        if shard.pump_fault.is_some()
+            || (shard.pending_idle_dispatch.is_none()
+                && shard.runtime.pending_hostcall_count() == 0
+                && shard.runtime.idle_poll_delay_ms() != Some(0))
+        {
+            continue;
+        }
+        let result = pump_idle_runtime_shard(shard, host).await;
+        shards.pump_cursor = (shard_index + 1) % shard_count;
+        if let Err(error) = result {
+            let _ = quarantine_runtime_shard(
+                shards,
+                shard_index,
+                &format!("idle runtime pump failed: {error}"),
+            );
+        }
+        break;
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn pump_runtime_shard_for_command(
+    shard: &mut JsRuntimeShard,
+    host: &JsRuntimeHost,
+    root_deadline: Option<Instant>,
+) -> Result<bool> {
+    if shard.pending_idle_dispatch.is_some() {
+        // A command may depend on idle initialization already in progress.
+        // Poll that same future without overtaking it with newer hostcalls or
+        // attaching the new command's deadline to the earlier operation.
+        pump_idle_runtime_shard(shard, host).await
+    } else {
+        pump_js_runtime_once_for_owner(
+            &shard.runtime,
+            host,
+            Some(&shard.extension_id),
+            root_deadline,
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod idle_runtime_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    struct CompletedHostcalls(Mutex<Vec<String>>);
+
+    impl HostcallInterceptor for CompletedHostcalls {
+        fn intercept(&self, request: &HostcallRequest) -> Option<HostcallOutcome> {
+            let HostcallKind::Tool { name } = &request.kind else {
+                panic!("unexpected hostcall in FIFO fixture");
+            };
+            self.0.lock().expect("hostcall log").push(name.clone());
+            Some(HostcallOutcome::Success(Value::Null))
+        }
+    }
+
+    struct PendingDrop(Rc<Cell<usize>>);
+
+    impl Drop for PendingDrop {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn command_pumps_retain_idle_future_and_preserve_hostcall_fifo() {
+        futures::executor::block_on(async {
+            let directory = tempfile::tempdir().expect("fixture directory");
+            let manager = ExtensionManager::new();
+            let intercepted = Arc::new(CompletedHostcalls(Mutex::new(Vec::new())));
+            let host = JsRuntimeHost {
+                tools: Arc::new(ToolRegistry::new(&[], directory.path(), None)).into(),
+                manager_ref: Arc::downgrade(&manager.inner),
+                manager_snapshot: Arc::clone(&manager.snapshot),
+                manager_snapshot_version: Arc::clone(&manager.snapshot_version),
+                http: Arc::new(HttpConnector::with_defaults()),
+                policy: ExtensionPolicy::default(),
+                interceptor: Some(intercepted.clone()),
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+                crate::scheduler::WallClock,
+                PiJsRuntimeConfig {
+                    cwd: directory.path().display().to_string(),
+                    disk_cache_dir: None,
+                    ..Default::default()
+                },
+                None,
+                "idle-fifo-fixture".to_string(),
+            )
+            .await
+            .expect("fixture runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.completed = [];
+                    pi.tool('first', {}).then(() => completed.push('first'));
+                    pi.tool('second', {}).then(() => completed.push('second'));
+                    "#,
+                )
+                .await
+                .expect("queue FIFO hostcalls");
+            let request = runtime.pop_hostcall_request().expect("first request");
+            assert!(matches!(&request.kind, HostcallKind::Tool { name } if name == "first"));
+            let gate = Rc::new(Cell::new(false));
+            let polls = Rc::new(Cell::new(0));
+            let drops = Rc::new(Cell::new(0));
+            let pending = {
+                let gate = Rc::clone(&gate);
+                let polls = Rc::clone(&polls);
+                let drops = Rc::clone(&drops);
+                PendingIdleHostcall {
+                    call_id: request.call_id.clone(),
+                    future: Box::pin(async move {
+                        let _guard = PendingDrop(drops);
+                        futures::future::poll_fn(|_cx| {
+                            polls.set(polls.get() + 1);
+                            if gate.get() {
+                                std::task::Poll::Ready(())
+                            } else {
+                                std::task::Poll::Pending
+                            }
+                        })
+                        .await;
+                        Some((request.call_id, HostcallOutcome::Success(Value::Null), 0))
+                    }),
+                }
+            };
+            let mut shard = JsRuntimeShard {
+                extension_id: "idle-fifo-fixture".to_string(),
+                runtime: Rc::new(runtime),
+                snapshot: serde_json::from_value(json!({ "id": "idle-fifo-fixture" }))
+                    .expect("fixture snapshot"),
+                pending_idle_dispatch: Some(pending),
+                pump_fault: None,
+            };
+            for _ in 0..3 {
+                assert!(
+                    pump_runtime_shard_for_command(&mut shard, &host, None)
+                        .await
+                        .expect("poll retained dispatch")
+                );
+            }
+            assert_eq!(polls.get(), 3, "each pump polls the same future once");
+            assert_eq!(drops.get(), 0, "Pending must keep its cleanup guard");
+            assert!(intercepted.0.lock().expect("hostcall log").is_empty());
+            assert_eq!(
+                shard
+                    .runtime
+                    .read_global_json("completed")
+                    .await
+                    .expect("pending state"),
+                json!([])
+            );
+
+            gate.set(true);
+            pump_runtime_shard_for_command(&mut shard, &host, None)
+                .await
+                .expect("complete earlier request");
+            assert_eq!(drops.get(), 1);
+            assert!(shard.pending_idle_dispatch.is_none());
+            assert!(intercepted.0.lock().expect("hostcall log").is_empty());
+            assert_eq!(
+                shard
+                    .runtime
+                    .read_global_json("completed")
+                    .await
+                    .expect("first completion"),
+                json!(["first"])
+            );
+
+            pump_runtime_shard_for_command(&mut shard, &host, None)
+                .await
+                .expect("dispatch later request");
+            assert_eq!(*intercepted.0.lock().expect("hostcall log"), ["second"]);
+            assert_eq!(
+                shard
+                    .runtime
+                    .read_global_json("completed")
+                    .await
+                    .expect("ordered completions"),
+                json!(["first", "second"])
+            );
+            assert_eq!(shard.runtime.pending_hostcall_count(), 0);
+            assert_eq!(shard.runtime.idle_poll_delay_ms(), None);
+        });
+    }
+}
+
 #[allow(clippy::future_not_send)]
 async fn pump_js_runtime_shards_once(
     shards: &mut JsRuntimeShardSet,
@@ -16012,19 +16444,13 @@ async fn pump_js_runtime_shards_once_for_target(
     // A target wait must not drain a peer's arbitrary hostcall queue before it
     // can re-check its own task/deadline. Pump only the target here; peers make
     // progress when they are targeted by their own command or by an explicit
-    // untargeted PumpOnce round. This keeps per-extension latency independent
+    // untargeted PumpOnce or idle turn. This keeps per-extension latency independent
     // from slow or adversarial work queued in another shard.
     if let Some(shard_index) = target_shard_index {
         shards.ensure_shard_healthy(shard_index)?;
         let pending = {
-            let shard = &shards.shards[shard_index];
-            pump_js_runtime_once_for_owner(
-                &shard.runtime,
-                host,
-                Some(&shard.extension_id),
-                root_deadline,
-            )
-            .await
+            let shard = &mut shards.shards[shard_index];
+            pump_runtime_shard_for_command(shard, host, root_deadline).await
         };
         return match pending {
             Ok(pending) => {
@@ -16036,6 +16462,7 @@ async fn pump_js_runtime_shards_once_for_target(
                 let fault = format!(
                     "JS extension shard {extension_id} quarantined after runtime pump failure: {err}"
                 );
+                shards.shards[shard_index].cancel_idle_dispatch();
                 shards.shards[shard_index].pump_fault = Some(fault.clone());
                 Err(Error::extension(fault))
             }
@@ -16051,14 +16478,8 @@ async fn pump_js_runtime_shards_once_for_target(
             continue;
         }
         let pump_result = {
-            let shard = &shards.shards[shard_index];
-            pump_js_runtime_once_for_owner(
-                &shard.runtime,
-                host,
-                Some(shard.extension_id.as_str()),
-                root_deadline,
-            )
-            .await
+            let shard = &mut shards.shards[shard_index];
+            pump_runtime_shard_for_command(shard, host, root_deadline).await
         };
         match pump_result {
             Ok(pending) => has_pending |= pending,
@@ -16067,6 +16488,7 @@ async fn pump_js_runtime_shards_once_for_target(
                 let fault = format!(
                     "JS extension shard {extension_id} quarantined after runtime pump failure: {err}"
                 );
+                shards.shards[shard_index].cancel_idle_dispatch();
                 shards.shards[shard_index].pump_fault = Some(fault.clone());
                 if first_fault.is_none() {
                     first_fault = Some(fault.clone());
@@ -19597,6 +20019,8 @@ export default async function(pi) {{
         let (sender, receiver) = mpsc::channel(4);
         let runtime = JsExtensionRuntimeHandle {
             sender,
+            actor_lifecycle: Weak::new(),
+            runtime_owner_lifetime: None,
             manager_ref: Weak::new(),
             compat_scan_mode: false,
             exit_signal: Arc::new(Mutex::new(None)),
@@ -21249,6 +21673,10 @@ pub(crate) struct RegistrySnapshot {
 #[derive(Clone)]
 pub struct ExtensionManager {
     inner: Arc<Mutex<ExtensionManagerInner>>,
+    /// Present for application-owned managers, absent for actor-internal
+    /// views reconstructed through weak references. Internal hostcalls and
+    /// subprocess accounting must not keep the runtime's external owner alive.
+    runtime_owner_lifetime: Option<Arc<JsRuntimeOwnerLifetime>>,
     /// Lock-free read path: immutable snapshot swapped via RCU.
     /// Readers grab the `Arc` via `RwLock::read()` (uncontended fast path).
     /// Writers hold the mutex, build a new snapshot, then swap under a brief
@@ -21277,6 +21705,7 @@ impl ExtensionManagerHandle {
     fn upgrade(&self) -> Option<ExtensionManager> {
         self.inner.upgrade().map(|inner| ExtensionManager {
             inner,
+            runtime_owner_lifetime: None,
             snapshot: self
                 .snapshot
                 .clone()
@@ -21490,13 +21919,12 @@ impl Drop for ExtensionRegion {
         if self.shutdown_done.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        // Best-effort: the Weak reference in JsRuntimeHost will fail to
-        // upgrade once the ExtensionManager's Arc refcount drops, causing
-        // the runtime thread to observe channel closure and exit.
+        // Releasing the final application manager/handle lifetime signals the
+        // actor even if a pending hostcall still retains an internal manager.
         tracing::debug!(
             event = "extension_region.drop_without_shutdown",
             "ExtensionRegion dropped without explicit shutdown; \
-             runtime thread will exit on Arc release"
+             runtime thread will exit when the last application owner releases it"
         );
     }
 }

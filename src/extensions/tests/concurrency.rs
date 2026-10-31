@@ -349,16 +349,27 @@ mod lifecycle {
             let (sender, _rx) = mpsc::channel(1);
             let (exit_tx, exit_rx) = oneshot::channel::<()>();
             drop(exit_tx);
+            sender
+                .try_send(JsRuntimeCommand::Shutdown)
+                .expect("fill the command queue without a receiving actor");
 
             let manager = crate::extensions::ExtensionManager::new();
             let runtime = JsExtensionRuntimeHandle {
                 sender,
+                actor_lifecycle: Weak::new(),
+                runtime_owner_lifetime: None,
                 manager_ref: Arc::downgrade(&manager.inner),
                 compat_scan_mode: false,
                 exit_signal: Arc::new(Mutex::new(Some(exit_rx))),
             };
 
-            let ok = runtime.shutdown(Duration::from_secs(1)).await;
+            let ok = timeout(
+                wall_now(),
+                Duration::from_secs(2),
+                runtime.shutdown(Duration::from_secs(1)),
+            )
+            .await
+            .expect("shutdown must not block sending to a full queue before its budget");
             assert!(
                 ok,
                 "closed exit signal means runtime is already gone; shutdown should succeed"

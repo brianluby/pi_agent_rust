@@ -19025,6 +19025,26 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         self.hostcall_queue.borrow_mut().drain_all()
     }
 
+    /// Take one request without disturbing the queue's FIFO or reclamation state.
+    pub(crate) fn pop_hostcall_request(&self) -> Option<HostcallRequest> {
+        self.hostcall_queue.borrow_mut().pop_front()
+    }
+
+    /// Delay until actor-owned work should next be polled. In-flight hostcalls
+    /// require periodic polls even when JavaScript has no user timer scheduled.
+    pub(crate) fn idle_poll_delay_ms(&self) -> Option<u64> {
+        let scheduler = self.scheduler.borrow();
+        if scheduler.macrotask_count() > 0 || !self.hostcall_queue.borrow().is_empty() {
+            return Some(0);
+        }
+        let timer_delay = scheduler.time_until_next_timer();
+        if self.pending_hostcall_count() > 0 {
+            Some(timer_delay.unwrap_or(10).min(10))
+        } else {
+            timer_delay
+        }
+    }
+
     /// Drain pending QuickJS jobs (Promise microtasks) until fixpoint.
     pub async fn drain_microtasks(&self) -> Result<usize> {
         self.drain_jobs().await

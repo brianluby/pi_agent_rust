@@ -171,6 +171,23 @@ accounting until cleanup finishes.
 Per-runtime process slots also remain reserved until the child and its I/O
 workers actually finish, including after a handle is closed or startup fails.
 
+The runtime services timers and subprocess callbacks while its command channel
+is idle. Healthy extension realms receive turns in stable round-robin order;
+each turn advances a scheduler step and at most one queued hostcall. A slow
+hostcall retains its dispatch future across turns, preserving capability
+checks, request ownership, and captured session provenance. A later command
+continues polling that same work instead of launching it again. Lifecycle
+commands take priority over idle work, and cancellation, replacement, and
+shutdown drop pending dispatch state before acknowledging completion.
+
+Application ownership is tracked separately from internal manager references.
+Dropping the last public manager or runtime handle signals the actor even when
+a pending hostcall or subprocess cleanup retains an internal manager. A public
+runtime handle can outlive its manager. Shutdown uses a stop latch so a full
+command queue cannot block the shutdown request before its cleanup budget.
+Existing JavaScript instruction and microtask limits remain in force; idle
+scheduling does not add a hard wall-time limit to synchronous guest code.
+
 The runtime recognizes only the exact conventional executable probes
 `command -v NAME` on POSIX and `where NAME` on Windows. It answers them using
 file metadata and the configured PATH/PATHEXT, without running a shell.

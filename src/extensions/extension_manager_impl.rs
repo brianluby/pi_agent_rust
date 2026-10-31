@@ -86,6 +86,7 @@ impl ExtensionManager {
         let snapshot_version = Arc::new(AtomicU64::new(0));
         Self {
             inner: Arc::new(Mutex::new(inner)),
+            runtime_owner_lifetime: Some(Arc::new(JsRuntimeOwnerLifetime::default())),
             snapshot,
             snapshot_version,
         }
@@ -102,6 +103,7 @@ impl ExtensionManager {
         let snapshot_version = Arc::new(AtomicU64::new(0));
         Self {
             inner: Arc::new(Mutex::new(inner)),
+            runtime_owner_lifetime: Some(Arc::new(JsRuntimeOwnerLifetime::default())),
             snapshot,
             snapshot_version,
         }
@@ -2874,7 +2876,19 @@ impl ExtensionManager {
         !guard.session_scoped_prompt_decisions
     }
 
-    pub fn set_runtime(&self, runtime: ExtensionRuntimeHandle) {
+    pub fn set_runtime(&self, mut runtime: ExtensionRuntimeHandle) {
+        if let ExtensionRuntimeHandle::Js(js) = &mut runtime
+            && let (Some(manager_owner), Some(handle_owner)) = (
+                self.runtime_owner_lifetime.as_ref(),
+                js.runtime_owner_lifetime.as_ref(),
+            )
+            && Arc::ptr_eq(manager_owner, handle_owner)
+        {
+            // This manager already owns the actor. Its internal handle must
+            // not create a second lifetime reachable from a pending hostcall.
+            // A handle belonging to another manager remains an external owner.
+            js.runtime_owner_lifetime = None;
+        }
         let mut guard = self
             .inner
             .lock()
@@ -2929,7 +2943,15 @@ impl ExtensionManager {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.runtime.clone()
+        let mut runtime = guard.runtime.clone();
+        if let Some(ExtensionRuntimeHandle::Js(js)) = &mut runtime
+            && js.runtime_owner_lifetime.is_none()
+        {
+            // Application callers can retain the handle after dropping the
+            // manager. Actor-internal manager views carry no lifetime to add.
+            js.runtime_owner_lifetime = self.runtime_owner_lifetime.clone();
+        }
+        runtime
     }
 
     pub fn js_runtime(&self) -> Option<JsExtensionRuntimeHandle> {
