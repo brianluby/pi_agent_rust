@@ -1151,3 +1151,185 @@ fn npm_invalid_state_namespace_does_not_block_unrelated_extension_loading() {
         "persistent"
     );
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn npm_peer_without_env_cannot_access_owner_state_under_configured_workspace_home() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let base = pi::extensions::safe_canonicalize(temp.path());
+    let workspace = base.join("workspace");
+    let home = workspace.join("configured-home");
+    let state_root = home.join(".pi/owned-state");
+    let state_path = state_root.join("counter.txt");
+    std::fs::create_dir_all(&state_root).unwrap();
+    // Existing state makes a peer loaded before the owner's factory a real
+    // disclosure test, rather than an ENOENT failure on an absent directory.
+    std::fs::write(&state_path, "0").unwrap();
+    let ordinary_path = workspace.join("ordinary.txt");
+    std::fs::write(&ordinary_path, "ordinary workspace content").unwrap();
+
+    let owner_package = base.join("npm/node_modules/owned-state");
+    let peer_package = base.join("npm/node_modules/state-peer");
+    for (package, name, entry) in [
+        (&owner_package, "owned-state", "owner.js"),
+        (&peer_package, "state-peer", "peer.js"),
+    ] {
+        std::fs::create_dir_all(package).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            serde_json::json!({
+                "name": name, "type": "module", "pi": {"extensions": [format!("./{entry}")]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let owner_entry = owner_package.join("owner.js");
+    std::fs::write(
+        &owner_entry,
+        r#"
+        import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+        import { homedir } from 'node:os';
+        import { join } from 'node:path';
+        export default function(pi) {
+            const root = join(homedir(), '.pi', 'owned-state');
+            mkdirSync(root, { recursive: true });
+            const path = join(root, 'counter.txt');
+            const previous = Number(readFileSync(path, 'utf8'));
+            writeFileSync(path, String(previous + 1));
+            pi.registerCommand('owned-state-count', {
+                handler: async () => ({ display: readFileSync(path, 'utf8') }),
+            });
+        }
+        "#,
+    )
+    .unwrap();
+    let state_json = serde_json::to_string(&state_path).unwrap();
+    let ordinary_json = serde_json::to_string(&ordinary_path).unwrap();
+    let peer_entry = peer_package.join("peer.js");
+    std::fs::write(
+        &peer_entry,
+        format!(
+            r#"
+        import {{ readFileSync, writeFileSync }} from 'node:fs';
+        export default function(pi) {{
+            const state = {state_json};
+            const ordinary = {ordinary_json};
+            const probes = {{}};
+            for (const name of ['__pi_host_check_read_access', '__pi_host_check_write_access',
+                '__pi_host_read_file_sync', '__pi_host_persistent_storage_mutate']) {{
+                if (typeof globalThis[name] !== 'function') throw new Error('missing native bridge ' + name);
+            }}
+            for (const [name, operation] of [
+                ['read', () => readFileSync(state, 'utf8')],
+                ['write', () => writeFileSync(state, 'peer corruption')],
+                ['nativeReadCheck', () => globalThis.__pi_host_check_read_access(state)],
+                ['nativeWriteCheck', () => globalThis.__pi_host_check_write_access(state)],
+                ['nativeRead', () => globalThis.__pi_host_read_file_sync(state)],
+                ['nativeWrite', () => globalThis.__pi_host_persistent_storage_mutate('write', state,
+                    JSON.stringify({{data: Buffer.from('peer corruption').toString('base64')}}))],
+            ]) {{
+                try {{ operation(); probes[name] = 'allowed'; }}
+                catch (error) {{ probes[name] = String(error && error.message || error); }}
+            }}
+            const workspaceRead = readFileSync(ordinary, 'utf8');
+            const workspaceNativeRead = Buffer.from(globalThis.__pi_host_read_file_sync(ordinary), 'base64').toString('utf8');
+            writeFileSync(ordinary + '.peer', 'permitted workspace write');
+            const workspaceWrite = readFileSync(ordinary + '.peer', 'utf8');
+            pi.registerCommand('state-peer-check', {{ handler: async () => ({{ display: JSON.stringify({{
+                probes, workspaceRead, workspaceNativeRead, workspaceWrite,
+                homeHidden: process.env.HOME === undefined && pi.env.get('HOME') === undefined,
+            }}) }}) }});
+        }}
+        "#
+        ),
+    )
+    .unwrap();
+    let owner_spec = JsExtensionLoadSpec::from_entry_path(owner_entry).unwrap();
+    let peer_spec = JsExtensionLoadSpec::from_entry_path(peer_entry).unwrap();
+    assert_ne!(owner_spec.extension_id, peer_spec.extension_id);
+
+    let load = || {
+        let manager = ExtensionManager::new();
+        let tools = Arc::new(ToolRegistry::new(&[], &workspace, None));
+        let mut policy = pi::extensions::ExtensionPolicy {
+            mode: pi::extensions::ExtensionPolicyMode::Strict,
+            deny_caps: Vec::new(),
+            default_caps: vec!["read".to_string(), "write".to_string()],
+            ..Default::default()
+        };
+        policy.per_extension.insert(
+            owner_spec.extension_id.clone(),
+            pi::extensions::ExtensionOverride {
+                allow: vec!["env".to_string()],
+                ..Default::default()
+            },
+        );
+        policy.per_extension.insert(
+            peer_spec.extension_id.clone(),
+            pi::extensions::ExtensionOverride {
+                deny: vec!["env".to_string()],
+                ..Default::default()
+            },
+        );
+        let config = PiJsRuntimeConfig {
+            cwd: workspace.display().to_string(),
+            env: std::collections::HashMap::from([(
+                "HOME".to_string(),
+                home.display().to_string(),
+            )]),
+            disk_cache_dir: None,
+            ..Default::default()
+        };
+        let runtime = common::run_async(JsExtensionRuntimeHandle::start_with_policy(
+            config,
+            tools,
+            manager.clone(),
+            policy,
+        ))
+        .expect("start mixed-policy runtime");
+        manager.set_js_runtime(runtime);
+        let loading_manager = manager.clone();
+        let specs = vec![peer_spec.clone(), owner_spec.clone()];
+        common::run_async(async move { loading_manager.load_js_extensions(specs).await })
+            .expect("load peer before storage owner with complete boundaries");
+        manager
+    };
+
+    for expected_count in [1, 2] {
+        let manager = load();
+        common::run_async(async move {
+            let response = manager
+                .execute_command("state-peer-check", "", 5000)
+                .await
+                .unwrap();
+            let checks: Value =
+                serde_json::from_str(response["display"].as_str().unwrap()).unwrap();
+            assert_eq!(checks["homeHidden"], true, "{checks}");
+            assert_eq!(checks["workspaceRead"], "ordinary workspace content");
+            assert_eq!(checks["workspaceNativeRead"], "ordinary workspace content");
+            assert_eq!(checks["workspaceWrite"], "permitted workspace write");
+            for (operation, error) in checks["probes"].as_object().unwrap() {
+                let error = error.as_str().unwrap();
+                assert!(
+                    error.contains("denied") || error.contains("not granted"),
+                    "{operation} must fail because of its storage boundary: {checks}"
+                );
+            }
+            assert_eq!(
+                manager
+                    .execute_command("owned-state-count", "", 5000)
+                    .await
+                    .unwrap()["display"],
+                expected_count.to_string(),
+                "only the owner can increment its persistent counter"
+            );
+            assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+        });
+        assert_eq!(
+            std::fs::read_to_string(&state_path).unwrap(),
+            expected_count.to_string(),
+            "owner state survives cold realm reloads without peer corruption"
+        );
+    }
+}

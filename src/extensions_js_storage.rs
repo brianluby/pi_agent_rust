@@ -274,6 +274,9 @@ impl PersistentStorage {
     }
 
     pub(super) fn resolve(&self, path: &Path, owner: Option<&str>) -> io::Result<Option<PathBuf>> {
+        if self.roots.is_empty() && self.foreign_roots.is_empty() {
+            return Ok(None);
+        }
         if self
             .foreign_roots
             .values()
@@ -678,7 +681,95 @@ fn mutate(
     }
 }
 
-pub(super) fn install(ctx: &Ctx<'_>, state: &Rc<RefCell<PiJsModuleState>>) -> rquickjs::Result<()> {
+#[allow(clippy::too_many_lines)]
+pub(super) fn install(
+    ctx: &Ctx<'_>,
+    state: &Rc<RefCell<PiJsModuleState>>,
+    cwd: &str,
+) -> rquickjs::Result<()> {
+    ctx.globals().set(
+        "__pi_host_persistent_storage_mkdtemp",
+        Func::from({
+            let state = Rc::clone(state);
+            move |ctx: Ctx<'_>, prefix: String| -> rquickjs::Result<String> {
+                let run = || -> io::Result<String> {
+                    let owner = current_extension_id(&ctx);
+                    let state = state.borrow();
+                    let registry = &state.persistent_storage;
+                    if !registry.allows(Path::new(&prefix), owner.as_deref(), "write") {
+                        return Err(denied(
+                            "persistent temporary directory prefix is outside the extension grant",
+                        ));
+                    }
+                    for _ in 0..16 {
+                        let suffix = uuid::Uuid::new_v4().simple().to_string();
+                        let candidate = PathBuf::from(format!("{prefix}{}", &suffix[..6]));
+                        if !registry.allows(&candidate, owner.as_deref(), "write") {
+                            return Err(denied("persistent temporary directory escaped its grant"));
+                        }
+                        match mutate(
+                            "mkdir",
+                            &candidate,
+                            &serde_json::json!({ "recursive": false }),
+                            None,
+                        ) {
+                            Ok(()) => return Ok(candidate.to_string_lossy().into_owned()),
+                            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "persistent temporary directory attempts exhausted",
+                    ))
+                };
+                run().map_err(|error| {
+                    rquickjs::Error::new_loading_message(
+                        &prefix,
+                        format!("persistent storage mkdtemp: {error}"),
+                    )
+                })
+            }
+        }),
+    )?;
+    ctx.globals().set(
+        "__pi_host_check_persistent_storage_input",
+        Func::from({
+            let state = Rc::clone(state);
+            let cwd = PathBuf::from(cwd);
+            move |ctx: Ctx<'_>, path: String, capability: String| -> rquickjs::Result<()> {
+                let run = || -> io::Result<()> {
+                    if !matches!(capability.as_str(), "read" | "write") {
+                        return Err(denied("invalid persistent storage input capability"));
+                    }
+                    let requested = Path::new(&path);
+                    let absolute = if requested.is_absolute() {
+                        requested.to_path_buf()
+                    } else {
+                        cwd.join(requested)
+                    };
+                    let owner = current_extension_id(&ctx);
+                    let state = state.borrow();
+                    let registry = &state.persistent_storage;
+                    // Inspect the original path before the JS overlay removes
+                    // dot components or resolves virtual symbolic links. Paths
+                    // unrelated to a storage grant keep their existing policy.
+                    if registry.resolve(&absolute, owner.as_deref())?.is_some()
+                        && !registry.allows(&absolute, owner.as_deref(), &capability)
+                    {
+                        return Err(denied("persistent storage capability denied"));
+                    }
+                    Ok(())
+                };
+                run().map_err(|error| {
+                    rquickjs::Error::new_loading_message(
+                        &path,
+                        format!("persistent storage input denied: {error}"),
+                    )
+                })
+            }
+        }),
+    )?;
     ctx.globals().set(
         "__pi_host_is_persistent_storage_path",
         Func::from({

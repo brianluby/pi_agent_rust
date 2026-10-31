@@ -414,6 +414,13 @@ struct AdmittedSql {
 }
 
 impl AdmittedSql {
+    fn is_dml(&self) -> bool {
+        matches!(
+            self.parsed.first(),
+            Some(SqlStatement::Insert(_) | SqlStatement::Update(_) | SqlStatement::Delete(_))
+        )
+    }
+
     fn uses_native_prepare(&self) -> bool {
         matches!(
             self.parsed.first(),
@@ -994,10 +1001,16 @@ struct EngineDatabase {
     safe_integers: bool,
     schema_version: Cell<Option<i64>>,
     namespace_valid: Cell<bool>,
+    poisoned: Cell<bool>,
 }
 
 impl EngineDatabase {
     fn verify_paths(&self) -> Result<()> {
+        if self.poisoned.get() {
+            return Err(
+                "SQLITE_ABORT: SQLite connection is unusable after failed statement cleanup".into(),
+            );
+        }
         if !self.namespace_valid.get() {
             return Err("SQLite database namespace was invalidated".into());
         }
@@ -1120,6 +1133,7 @@ fn execute_work(
                 safe_integers,
                 schema_version: Cell::new(None),
                 namespace_valid: Cell::new(true),
+                poisoned: Cell::new(false),
             };
             database.verify_paths()?;
             futures::executor::block_on(validate_schema(&database))?;
@@ -1154,6 +1168,11 @@ fn execute_work(
                 execute_request(database, request).await
             });
             drop(binding);
+            if database.poisoned.get() {
+                // Cleanup already failed and cancelled the connection. Keep
+                // its precise error, and do not perform further path/I/O work.
+                return result;
+            }
             database.verify_paths()?;
             result
         }
@@ -1268,11 +1287,22 @@ async fn execute_request(database: &EngineDatabase, request: Request) -> Result<
             let admitted = admit_sql(&sql, true)?;
             let params = bind_parameters(&admitted.parameters, bindings, database.strict)?;
             if !admitted.uses_native_prepare() {
-                database
-                    .conn
-                    .execute_with_params(&sql, &params)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                if params.is_empty() {
+                    // execute() retains the original DDL source for default
+                    // expressions and CHECK constraints. The parameterized
+                    // dispatcher does not publish that source in 0.4.10.
+                    database
+                        .conn
+                        .execute(&sql)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                } else {
+                    database
+                        .conn
+                        .execute_with_params(&sql, &params)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
                 return if matches!(mode, QueryMode::Run) {
                     change_result(database).await
                 } else {
@@ -1299,9 +1329,21 @@ async fn execute_request(database: &EngineDatabase, request: Request) -> Result<
             if columns.len() > 256 || bytes > MAX_RESULT_BYTES {
                 return Err("SQLite result has too many columns".into());
             }
+            let is_dml = admitted.is_dml();
+            if is_dml {
+                // The pinned engine materializes RETURNING before invoking
+                // row callbacks. Keep its writes uncommitted until every
+                // result has passed the bridge's row/encoding limits.
+                database
+                    .conn
+                    .execute("SAVEPOINT __pijs_row_result")
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
             let mut rows = Vec::new();
             let mut seen = 0_usize;
             let mut limit_error = None;
+            let mut stopped_after_first = false;
             let started = Instant::now();
             let mut accept = |row: &Row| -> std::result::Result<(), FrankenError> {
                 seen += 1;
@@ -1321,6 +1363,13 @@ async fn execute_request(database: &EngineDatabase, request: Request) -> Result<
                 {
                     Ok(row) => {
                         rows.push(row);
+                        if matches!(mode, QueryMode::Get) && !is_dml {
+                            // A read-only get() needs one row. The engine's
+                            // callback-abort path closes only its read cursor
+                            // and preserves an enclosing transaction.
+                            stopped_after_first = true;
+                            return Err(FrankenError::Abort);
+                        }
                         Ok(())
                     }
                     Err(error) => {
@@ -1329,16 +1378,36 @@ async fn execute_request(database: &EngineDatabase, request: Request) -> Result<
                     }
                 }
             };
-            // Consume the statement even for get(): aborting a RETURNING
-            // cursor after one row could roll back an otherwise valid write.
-            // Only the requested first row is retained in that mode.
-            let outcome = statement
-                .query_with_params_for_each(&params, &mut accept)
-                .await;
-            if let Some(error) = limit_error {
-                return Err(error);
+            // PreparedStatement's query API rejects DML, including RETURNING.
+            // The connection query dispatcher is its actual DML row interface.
+            // Consume all DML rows even for get(), retaining only the first.
+            let mut preserve_native_constraint = false;
+            let outcome = if is_dml {
+                // This API also applies the engine's DQS rewrites and error
+                // offsets. Its for_each variant omits those wrappers, while
+                // materializing DML rows in exactly the same way.
+                match database.conn.query_with_params(&sql, &params).await {
+                    Ok(native_rows) => native_rows.iter().try_for_each(&mut accept),
+                    Err(error) => {
+                        preserve_native_constraint = is_native_constraint_error(&error);
+                        Err(error)
+                    }
+                }
+            } else {
+                statement
+                    .query_with_params_for_each(&params, &mut accept)
+                    .await
+            };
+            let outcome = match (outcome, limit_error) {
+                (_, Some(error)) => Err(error),
+                (Err(FrankenError::Abort), None) if stopped_after_first => Ok(()),
+                (result, None) => result.map_err(|error| error.to_string()),
+            };
+            if is_dml {
+                finish_row_savepoint(database, outcome, preserve_native_constraint).await?;
+            } else {
+                outcome?;
             }
-            outcome.map_err(|error| error.to_string())?;
             Ok(json!({ "columns": columns, "rows": rows }))
         }
         Request::Exec { sql, .. } => {
@@ -1358,6 +1427,55 @@ async fn execute_request(database: &EngineDatabase, request: Request) -> Result<
         Request::InTransaction { .. } => Ok(json!(database.conn.in_transaction())),
         Request::Open { .. } | Request::Close { .. } => Err("Invalid SQLite operation".into()),
     }
+}
+
+fn is_native_constraint_error(error: &FrankenError) -> bool {
+    // Mirror the pinned engine's error_is_constraint_violation, including its
+    // VDBE fallback. 19 is SQLite's stable primary SQLITE_CONSTRAINT code.
+    error.error_code() as i32 == 19
+        || matches!(error, FrankenError::Internal(message) if message.starts_with("VDBE halted with code 19:"))
+}
+
+async fn finish_row_savepoint(
+    database: &EngineDatabase,
+    outcome: Result<()>,
+    preserve_native_constraint: bool,
+) -> Result<()> {
+    let failure = match outcome {
+        Ok(()) => match database.conn.execute("RELEASE __pijs_row_result").await {
+            Ok(_) => return Ok(()),
+            Err(error) => error.to_string(),
+        },
+        Err(error) if preserve_native_constraint => {
+            // The engine has already applied ABORT/FAIL/ROLLBACK policy.
+            // FAIL deliberately retains a successful row prefix; don't undo
+            // it merely because this bridge owns an additional savepoint.
+            if !database.conn.in_transaction() {
+                return Err(error);
+            }
+            match database.conn.execute("RELEASE __pijs_row_result").await {
+                Ok(_) => return Err(error),
+                Err(release) => format!("{error}; SQLite statement release failed: {release}"),
+            }
+        }
+        Err(error) => error,
+    };
+    // ON CONFLICT ROLLBACK may already have ended the complete transaction.
+    // Otherwise roll back just this host-owned savepoint, preserving caller
+    // writes that preceded it in an explicit transaction.
+    if database.conn.in_transaction()
+        && let Err(error) = database
+            .conn
+            .execute_batch("ROLLBACK TO __pijs_row_result; RELEASE __pijs_row_result")
+            .await
+    {
+        database.poisoned.set(true);
+        database.conn.root_cx().cancel();
+        return Err(format!(
+            "{failure}; SQLite statement rollback failed: {error}"
+        ));
+    }
+    Err(failure)
 }
 
 async fn change_result(database: &EngineDatabase) -> Result<Json> {

@@ -666,6 +666,10 @@ fn pijs_process_env_spread_filters_secrets_and_preserves_proxy_invariants() {
             ("PI_CONFIG_DIR", "/configured/pi"),
             ("OPENAI_API_KEY", "must-not-disclose"),
             ("PRIVATE_TOKEN", "also-private"),
+            ("NODE_OPTIONS", "--require=untrusted"),
+            ("LD_PRELOAD", "/untrusted.so"),
+            ("PYTHONPATH", "/untrusted/python"),
+            ("=D:", "D:\\project"),
         ]);
         let runtime = PiJsRuntime::with_clock_and_config(DeterministicClock::new(0), config)
             .await
@@ -682,6 +686,9 @@ fn pijs_process_env_spread_filters_secrets_and_preserves_proxy_invariants() {
             globalThis.envSnapshot = {
                 home: copied.HOME, path: copied.PATH, config: copied.PI_CONFIG_DIR,
                 secretPresent: 'OPENAI_API_KEY' in copied || 'PRIVATE_TOKEN' in copied,
+                unsafeCopied: ['NODE_OPTIONS', 'LD_PRELOAD', 'PYTHONPATH', '=D:'].some(key => key in copied),
+                individualRead: process.env.NODE_OPTIONS,
+                driveRead: process.env['=D:'],
                 sorted: JSON.stringify(keys) === JSON.stringify([...keys].sort()),
                 frozen: Object.isFrozen(process.env),
                 immutable: process.env[marker],
@@ -700,6 +707,7 @@ fn pijs_process_env_spread_filters_secrets_and_preserves_proxy_invariants() {
             serde_json::json!({
                 "home": "/home/test", "path": "/configured/bin", "config": "/configured/pi",
                 "secretPresent": false, "sorted": true, "frozen": true,
+                "unsafeCopied": false, "individualRead": "--require=untrusted", "driveRead": "D:\\project",
                 "immutable": 19, "getterless": true, "keysAfterFreeze": true,
                 "overwrite": false, "deleteHome": false, "stable": "/home/test",
             })
@@ -736,6 +744,58 @@ fn pijs_process_env_denial_applies_to_enumeration_and_config_metadata() {
 }
 
 #[test]
+fn pijs_env_disclosure_allowlist_does_not_implicitly_forward_secrets_to_children() {
+    use pi::extensions::{ExtensionPolicy, ExtensionPolicyMode};
+
+    futures::executor::block_on(async {
+        let mut policy = ExtensionPolicy {
+            mode: ExtensionPolicyMode::Permissive,
+            deny_caps: Vec::new(),
+            ..ExtensionPolicy::default()
+        };
+        policy
+            .secret_broker
+            .disclosure_allowlist
+            .push("OPENAI_API_KEY".to_string());
+        let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+            DeterministicClock::new(0),
+            config_with_env(vec![
+                ("OPENAI_API_KEY", "disclosure-fixture"),
+                ("PI_FIXTURE", "safe"),
+            ]),
+            Some(policy),
+            "disclosure-owner".to_string(),
+        )
+        .await
+        .expect("owned runtime");
+        runtime
+            .eval(
+                r#"
+            const copied = {...process.env};
+            globalThis.disclosureSnapshot = {
+                direct: process.env.OPENAI_API_KEY,
+                copiedSecret: 'OPENAI_API_KEY' in copied,
+                enumeratedSecret: __pi_env_keys_native().includes('OPENAI_API_KEY'),
+                copiedSafe: copied.PI_FIXTURE,
+            };
+        "#,
+            )
+            .await
+            .expect("disclosure versus child transfer");
+        assert_eq!(
+            runtime
+                .read_global_json("disclosureSnapshot")
+                .await
+                .unwrap(),
+            serde_json::json!({
+                "direct": "disclosure-fixture", "copiedSecret": false,
+                "enumeratedSecret": false, "copiedSafe": "safe",
+            })
+        );
+    });
+}
+
+#[test]
 fn pijs_process_config_metadata_uses_the_supplied_home_without_creating_directories() {
     futures::executor::block_on(async {
         let temp = tempfile::tempdir().expect("home fixture");
@@ -759,6 +819,118 @@ fn pijs_process_config_metadata_uses_the_supplied_home_without_creating_director
             !temp.path().join(".pi").exists(),
             "metadata must not create directories"
         );
+    });
+}
+
+#[test]
+fn pijs_environment_snapshot_is_bound_to_each_realms_immutable_policy_owner() {
+    use pi::extensions::{ExtensionOverride, ExtensionPolicy, ExtensionPolicyMode};
+
+    futures::executor::block_on(async {
+        let mut policy = ExtensionPolicy {
+            mode: ExtensionPolicyMode::Permissive,
+            deny_caps: Vec::new(),
+            ..ExtensionPolicy::default()
+        };
+        policy.per_extension.insert(
+            "restricted".to_string(),
+            ExtensionOverride {
+                deny: vec!["EnV".to_string()],
+                ..ExtensionOverride::default()
+            },
+        );
+        for (owner, visible) in [("permitted", true), ("restricted", false)] {
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+                DeterministicClock::new(0),
+                config_with_env(vec![
+                    ("PI_FIXTURE", "owner-scoped"),
+                    ("PRIVATE_TOKEN", "hidden"),
+                ]),
+                Some(policy.clone()),
+                owner.to_string(),
+            )
+            .await
+            .expect("owned runtime");
+            runtime
+                .eval(
+                    r#"
+                const copied = {...process.env};
+                globalThis.ownerEnvironment = {
+                    read: process.env.PI_FIXTURE ?? null,
+                    native: __pi_env_get_native('PI_FIXTURE'),
+                    enumerated: Object.keys(process.env).includes('PI_FIXTURE'),
+                    nativeEnumerated: __pi_env_keys_native().includes('PI_FIXTURE'),
+                    copied: copied.PI_FIXTURE ?? null,
+                    secretPresent: 'PRIVATE_TOKEN' in copied,
+                };
+            "#,
+                )
+                .await
+                .expect("read owned snapshot");
+            let value = if visible {
+                serde_json::json!("owner-scoped")
+            } else {
+                serde_json::Value::Null
+            };
+            assert_eq!(
+                runtime.read_global_json("ownerEnvironment").await.unwrap(),
+                serde_json::json!({
+                    "read": value, "native": value, "enumerated": visible,
+                    "nativeEnumerated": visible, "copied": value, "secretPresent": false,
+                }),
+                "owner {owner}"
+            );
+        }
+    });
+}
+
+#[test]
+fn pijs_environment_owner_grants_respect_global_and_explicit_host_denials() {
+    use pi::extensions::{ExtensionOverride, ExtensionPolicy, ExtensionPolicyMode};
+
+    futures::executor::block_on(async {
+        for (global_deny, host_deny, visible) in [
+            (false, false, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            let mut policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Strict,
+                default_caps: Vec::new(),
+                deny_caps: if global_deny {
+                    vec!["ENV".to_string()]
+                } else {
+                    Vec::new()
+                },
+                ..ExtensionPolicy::default()
+            };
+            policy.per_extension.insert(
+                "owner".to_string(),
+                ExtensionOverride {
+                    allow: vec!["env".to_string()],
+                    ..ExtensionOverride::default()
+                },
+            );
+            let mut config = config_with_env(vec![("PI_FIXTURE", "allowed-by-owner")]);
+            config.deny_env = host_deny;
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+                DeterministicClock::new(0),
+                config,
+                Some(policy),
+                "owner".to_string(),
+            )
+            .await
+            .expect("owned runtime");
+            runtime
+                .eval("globalThis.envVisible = {...process.env}.PI_FIXTURE === 'allowed-by-owner';")
+                .await
+                .expect("owner-granted environment");
+            assert_eq!(
+                runtime.read_global_json("envVisible").await.unwrap(),
+                visible,
+                "global deny={global_deny}, explicit host deny={host_deny}"
+            );
+        }
     });
 }
 
@@ -853,5 +1025,161 @@ fn pijs_node_process_module_exports_enhanced() {
         ] {
             assert_eq!(val[key], true, "node:process module should export {key}");
         }
+    });
+}
+
+#[test]
+fn pijs_windows_environment_aliases_select_one_deterministic_snapshot_binding() {
+    futures::executor::block_on(async {
+        for reverse in [false, true] {
+            for deny_env in [false, true] {
+                let mut bindings = vec![
+                    ("PI_PLATFORM", "win32"),
+                    ("Path", r"C:\mixed"),
+                    ("path", r"C:\lower"),
+                    ("PATH", r"C:\selected"),
+                    ("Api_Token", "hidden"),
+                ];
+                if reverse {
+                    bindings.reverse();
+                }
+                let mut config = config_with_env(bindings);
+                config.deny_env = deny_env;
+                let runtime =
+                    PiJsRuntime::with_clock_and_config(DeterministicClock::new(0), config)
+                        .await
+                        .expect("Windows snapshot runtime");
+                runtime
+                    .eval(
+                        r#"
+                        const copied = {...process.env};
+                        const alias = Object.getOwnPropertyDescriptor(process.env, 'pAtH');
+                        Object.freeze(process.env);
+                        globalThis.windowsEnvironment = {
+                            values: ['PATH', 'Path', 'path', 'pAtH'].map(key => process.env[key] ?? null),
+                            native: __pi_env_get_native('pAtH'),
+                            pi: pi.env.get('pAtH') ?? null,
+                            descriptor: alias?.value ?? null,
+                            present: 'pAtH' in process.env,
+                            keys: Object.keys(copied).filter(key => key.toLowerCase() === 'path'),
+                            copied: copied.PATH ?? null,
+                            secret: process.env.API_TOKEN ?? null,
+                            missing: process.env.PI_MISSING_CASE_TEST ?? null,
+                            frozen: Object.isFrozen(process.env),
+                        };
+                        "#,
+                    )
+                    .await
+                    .expect("read case aliases");
+                let value = if deny_env {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(r"C:\selected")
+                };
+                let keys = if deny_env {
+                    serde_json::json!([])
+                } else {
+                    serde_json::json!(["PATH"])
+                };
+                assert_eq!(
+                    runtime
+                        .read_global_json("windowsEnvironment")
+                        .await
+                        .unwrap(),
+                    serde_json::json!({
+                        "values": [value, value, value, value], "native": value,
+                        "pi": value, "descriptor": value, "present": !deny_env,
+                        "keys": keys, "copied": value, "secret": null,
+                        "missing": null, "frozen": true,
+                    }),
+                    "reverse insertion={reverse}, env denied={deny_env}"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn pijs_non_windows_environment_preserves_distinct_case_bindings() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock_and_config(
+            DeterministicClock::new(0),
+            config_with_env(vec![
+                ("PI_PLATFORM", "linux"),
+                ("PATH", "/upper"),
+                ("Path", "/mixed"),
+                ("path", "/lower"),
+            ]),
+        )
+        .await
+        .expect("case-sensitive snapshot runtime");
+        runtime
+            .eval(
+                r#"
+                globalThis.posixEnvironment = {
+                    values: ['PATH', 'Path', 'path', 'pAtH'].map(key => process.env[key] ?? null),
+                    native: __pi_env_get_native('pAtH'),
+                    keys: Object.keys(process.env).filter(key => key.toLowerCase() === 'path').sort(),
+                };
+                "#,
+            )
+            .await
+            .expect("read distinct bindings");
+        assert_eq!(
+            runtime.read_global_json("posixEnvironment").await.unwrap(),
+            serde_json::json!({
+                "values": ["/upper", "/mixed", "/lower", null],
+                "native": null, "keys": ["PATH", "Path", "path"],
+            })
+        );
+    });
+}
+
+#[test]
+fn pijs_windows_configured_home_aliases_drive_os_and_config_metadata() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("home fixture");
+        let selected = temp.path().join("selected").to_string_lossy().into_owned();
+        let ignored = temp.path().join("ignored").to_string_lossy().into_owned();
+        for (key, duplicate) in [("Home", "home"), ("UserProfile", "userprofile")] {
+            let runtime = PiJsRuntime::with_clock_and_config(
+                DeterministicClock::new(0),
+                config_with_env(vec![
+                    ("PI_PLATFORM", "win32"),
+                    (key, &selected),
+                    (duplicate, &ignored),
+                ]),
+            )
+            .await
+            .expect("configured home runtime");
+            runtime
+                .eval(
+                    r#"
+                    import('node:os').then(os => {
+                        globalThis.homeAliases = {
+                            home: os.homedir(),
+                            config: process.env.PI_CONFIG_DIR,
+                            alias: process.env.HOME || process.env.USERPROFILE,
+                        };
+                    });
+                    "#,
+                )
+                .await
+                .expect("read configured home metadata");
+            runtime.drain_microtasks().await.expect("load node:os");
+            assert_eq!(
+                runtime.read_global_json("homeAliases").await.unwrap(),
+                serde_json::json!({
+                    "home": selected,
+                    "config": temp.path().join("selected").join(".pi").join("agent"),
+                    "alias": selected,
+                }),
+                "configured {key} and {duplicate} aliases"
+            );
+        }
+        assert!(
+            !temp.path().join("selected").exists(),
+            "reading host metadata must not create directories"
+        );
     });
 }

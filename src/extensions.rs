@@ -11709,18 +11709,18 @@ impl Clone for JsExtensionRuntimeHandle {
 /// Per-key disclosure is still mediated inside `__pi_env_get_native` (the
 /// policy's `SecretBroker` with its `disclosure_allowlist`, or the default
 /// secret filter). The JS `process.env` snapshot enumerates only keys permitted
-/// by that same filter, allowing safe child-environment copies without exposing
-/// secret names or values.
+/// by that same filter and omits bindings unsuitable for child environments,
+/// allowing safe copies without exposing secret names or values.
 fn apply_env_capability(config: &mut PiJsRuntimeConfig, policy: &ExtensionPolicy) {
-    // Full capability model, mirroring check_exec_capability: global deny →
-    // default_caps allow → mode fallback (Strict/Prompt = deny). A bare
-    // deny-list check would grant a Strict policy without "env" in
-    // deny_caps a full process-env snapshot the mode says to withhold.
-    if policy.deny_caps.iter().any(|cap| cap == "env") {
-        return;
-    }
-    let allowed = policy.default_caps.iter().any(|cap| cap == "env")
-        || matches!(policy.mode, ExtensionPolicyMode::Permissive);
+    // Capture once when at least one realm can use the snapshot. Each runtime
+    // applies evaluate_for again with its immutable owner before exposing any
+    // keys, values or child environment. A global deny still defeats every
+    // extension override, and Prompt never becomes implicit permission.
+    let allowed = policy.evaluate("env").decision == PolicyDecision::Allow
+        || policy
+            .per_extension
+            .keys()
+            .any(|owner| policy.evaluate_for("env", Some(owner)).decision == PolicyDecision::Allow);
     if !allowed {
         return;
     }
@@ -14157,7 +14157,7 @@ fn js_runtime_shard_config(
     Ok(config)
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn build_js_runtime_shards(
     warm_pool: &crate::extensions_js::WarmIsolatePool,
     policy: &ExtensionPolicy,
@@ -14179,7 +14179,9 @@ async fn build_js_runtime_shards(
     let extension_roots_by_id = collect_js_extension_roots(&grouped_specs)?;
     let application_namespaces = collect_js_application_storage_namespaces(&grouped_specs);
 
-    let mut candidate = JsRuntimeShardSet::default();
+    let mut prepared = Vec::with_capacity(shard_count);
+    let mut application_roots_by_id = Vec::with_capacity(shard_count);
+    let mut denied_application_roots = BTreeSet::new();
     for (shard_index, (extension_id, extension_specs)) in grouped_specs.into_iter().enumerate() {
         let shard_config = js_runtime_shard_config(warm_pool, shard_count, shard_index)?;
 
@@ -14191,12 +14193,40 @@ async fn build_js_runtime_shards(
         )
         .await?;
 
-        for (owner, namespaces) in &application_namespaces.owned {
-            for namespace in namespaces {
-                let Some(root) = runtime.application_storage_root(namespace) else {
-                    continue;
-                };
-                if owner == &extension_id {
+        // Resolve a namespace only in its owner's realm. A peer may have a
+        // different env capability and therefore a different effective HOME;
+        // recomputing the owner's path there would leave its real files
+        // unprotected when they happen to be below the shared workspace.
+        let mut roots = Vec::new();
+        if let Some((_, namespaces)) = application_namespaces
+            .owned
+            .iter()
+            .find(|(owner, _)| owner == &extension_id)
+        {
+            roots.extend(
+                namespaces
+                    .iter()
+                    .filter_map(|namespace| runtime.application_storage_root(namespace)),
+            );
+        }
+        application_roots_by_id.push((extension_id.clone(), roots));
+        // Ambiguous namespaces have no owner. Protect every realm's possible
+        // base, so no peer can recover authority through workspace access.
+        denied_application_roots.extend(
+            application_namespaces
+                .denied
+                .iter()
+                .filter_map(|namespace| runtime.application_storage_root(namespace)),
+        );
+        prepared.push((extension_id, extension_specs, runtime));
+    }
+
+    // Establish the same complete boundaries in every realm before running
+    // any guest factory, including a peer loaded before the storage owner.
+    for (extension_id, _, runtime) in &prepared {
+        for (owner, roots) in &application_roots_by_id {
+            for root in roots {
+                if owner == extension_id {
                     if let Err(error) = runtime.add_persistent_storage_root(root.clone(), owner) {
                         tracing::warn!(
                             extension_id = %owner,
@@ -14204,22 +14234,20 @@ async fn build_js_runtime_shards(
                             %error,
                             "Automatic persistent storage disabled because its namespace is unsafe or inaccessible"
                         );
-                        runtime.register_foreign_persistent_storage_root(root, owner)?;
+                        runtime.register_foreign_persistent_storage_root(root.clone(), owner)?;
                     }
                 } else {
-                    runtime.register_foreign_persistent_storage_root(root, owner)?;
+                    runtime.register_foreign_persistent_storage_root(root.clone(), owner)?;
                 }
             }
         }
-        for namespace in &application_namespaces.denied {
-            if let Some(root) = runtime.application_storage_root(namespace) {
-                // Deny-only registration deliberately has no corresponding
-                // owned grant, even if an extension chose this sentinel ID.
-                runtime.register_foreign_persistent_storage_root(
-                    root,
-                    "<unassigned-persistent-storage>",
-                )?;
-            }
+        for root in &denied_application_roots {
+            // Deny-only registration deliberately has no corresponding
+            // owned grant, even if an extension chose this sentinel ID.
+            runtime.register_foreign_persistent_storage_root(
+                root.clone(),
+                "<unassigned-persistent-storage>",
+            )?;
         }
 
         // Files under another extension's root must remain a protected
@@ -14227,14 +14255,17 @@ async fn build_js_runtime_shards(
         // Register peer roots as metadata only; this intentionally grants no
         // read/write capability to the current shard.
         for (foreign_extension_id, roots) in &extension_roots_by_id {
-            if foreign_extension_id == &extension_id {
+            if foreign_extension_id == extension_id {
                 continue;
             }
             for root in roots {
                 runtime.register_foreign_extension_root_boundary(root, foreign_extension_id);
             }
         }
+    }
 
+    let mut candidate = JsRuntimeShardSet::default();
+    for (extension_id, extension_specs, runtime) in prepared {
         for (spec, entry_paths) in extension_specs {
             load_one_extension(&runtime, host, spec, &entry_paths, origin, root_deadline).await?;
         }

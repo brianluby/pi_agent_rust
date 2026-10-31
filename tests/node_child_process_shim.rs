@@ -902,6 +902,19 @@ fn persistent_stdio_peer() {
     if std::env::var("PIJS_STDIO_TEST_PEER").as_deref() != Ok("enabled") {
         return;
     }
+    assert_eq!(
+        std::env::var("PI_WORKSPACE_DIR").as_deref(),
+        Ok("snapshot-fixture")
+    );
+    for name in [
+        "NODE_OPTIONS",
+        "LD_PRELOAD",
+        "PYTHONPATH",
+        "PRIVATE_TOKEN",
+        "PRIVATE_SERVICE",
+    ] {
+        assert!(std::env::var_os(name).is_none(), "unsafe inherited {name}");
+    }
     for line in std::io::stdin().lock().lines() {
         let request: serde_json::Value =
             serde_json::from_str(&line.expect("peer stdin")).expect("peer JSON");
@@ -923,7 +936,7 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
     let cwd = harness.temp_dir().to_path_buf();
     let executable = serde_json::to_string(&std::env::current_exe().expect("test executable"))
         .expect("serialize executable");
-    let mut environment = serde_json::Map::new();
+    let mut environment = std::collections::HashMap::<String, String>::new();
     for name in [
         "PATH",
         "SystemRoot",
@@ -940,21 +953,35 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
             if cfg!(windows) && environment.keys().any(|key| key.eq_ignore_ascii_case(name)) {
                 continue;
             }
-            environment.insert(name.to_string(), serde_json::Value::String(value));
+            environment.insert(name.to_string(), value);
         }
     }
-    environment.insert(
-        "PIJS_STDIO_TEST_PEER".to_string(),
-        serde_json::json!("enabled"),
-    );
+    environment.insert("PIJS_STDIO_TEST_PEER".to_string(), "enabled".to_string());
+    // Real integrations copy the disclosed snapshot into child options. A
+    // host loader setting must not make that ordinary pattern fail admission,
+    // and it must not reach the child. Drive metadata remains readable to
+    // node:path but is not an ordinary child environment binding.
+    for (name, value) in [
+        ("PI_WORKSPACE_DIR", "snapshot-fixture"),
+        ("NODE_OPTIONS", "--require=untrusted"),
+        ("LD_PRELOAD", "/untrusted.so"),
+        ("PYTHONPATH", "/untrusted/python"),
+        ("PRIVATE_TOKEN", "must-not-reach-child"),
+        ("PRIVATE_SERVICE", "custom-secret-must-not-reach-child"),
+        ("=D:", "D:\\project"),
+    ] {
+        environment.insert(name.to_string(), value.to_string());
+    }
     let source = format!(
         r#"
         import {{ spawn }} from 'node:child_process';
         export default function(pi) {{
-            pi.on('agent_start', async () => {{
+            async function exchange(explicitEnvironment) {{
                 const child = spawn({executable},
                     ['--exact', 'persistent_stdio_peer', '--nocapture', '--quiet'],
-                    {{ env: {environment}, timeout: 10000 }});
+                    explicitEnvironment
+                        ? {{ env: {{ ...process.env }}, timeout: 10000 }}
+                        : {{ timeout: 10000 }});
                 const replies = new Map();
                 const acks = [];
                 let stdout = '', stderr = '', exits = 0, closes = 0;
@@ -991,23 +1018,44 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
                 child.stdin.end(() => acks.push('end'));
                 const status = await closed;
                 await Promise.resolve();
-                return {{ result: {{ first, second, third, acks, status, exits, closes,
-                    stderr, killAfterClose: child.kill(), ended: child.stdin.writableEnded }} }};
+                return {{ first, second, third, acks, status, exits, closes,
+                    stderr, killAfterClose: child.kill(), ended: child.stdin.writableEnded }};
+            }}
+            pi.on('agent_start', async () => {{
+                const visibility = {{
+                    getterHidden: process.env.PRIVATE_SERVICE === undefined,
+                    apiHidden: pi.env.get('PRIVATE_SERVICE') === undefined,
+                    keysHidden: !Object.keys(process.env).includes('PRIVATE_SERVICE'),
+                    spreadHidden: !Object.prototype.hasOwnProperty.call({{ ...process.env }}, 'PRIVATE_SERVICE'),
+                }};
+                const explicit = await exchange(true);
+                const inherited = await exchange(false);
+                return {{ result: {{ explicit, inherited, visibility }} }};
             }});
         }}
-    "#,
-        environment = serde_json::Value::Object(environment)
+    "#
     );
     let entry = harness.create_file("extensions/persistent.mjs", source.as_bytes());
     let spec = JsExtensionLoadSpec::from_entry_path(entry).expect("persistent extension spec");
     let manager = ExtensionManager::new();
     let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
     let mut policy = pi::extensions::ExtensionPolicy::default();
-    policy.deny_caps.retain(|cap| cap != "exec");
-    policy.default_caps.push("exec".to_string());
+    policy.deny_caps.retain(|cap| cap != "exec" && cap != "env");
+    policy
+        .default_caps
+        .extend(["exec".to_string(), "env".to_string()]);
+    assert!(
+        pi::extensions_js::is_env_var_allowed("PRIVATE_SERVICE"),
+        "the fixture must require its custom broker rule"
+    );
+    policy
+        .secret_broker
+        .secret_exact
+        .push("PRIVATE_SERVICE".to_string());
     let config = PiJsRuntimeConfig {
         cwd: cwd.display().to_string(),
         disk_cache_dir: None,
+        env: environment,
         ..Default::default()
     };
     let runtime = common::run_async(JsExtensionRuntimeHandle::start_with_policy(
@@ -1024,36 +1072,48 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
             .await
             .expect("load persistent extension");
         manager
-            .dispatch_event_with_response(ExtensionEventName::AgentStart, None, 15000)
+            .dispatch_event_with_response(ExtensionEventName::AgentStart, None, 25000)
             .await
             .expect("dispatch persistent exchange")
             .expect("exchange result")
     });
-    let result = &response["result"];
-    assert_eq!(result["first"]["method"], "initialize", "{response}");
-    assert_eq!(result["second"]["method"], "tools/list", "{response}");
-    assert_eq!(result["third"]["text"], "duplex λ", "{response}");
     assert_eq!(
-        result["acks"],
-        serde_json::json!([1, 2, 3, "end"]),
+        response["result"]["visibility"],
+        serde_json::json!({
+            "getterHidden": true,
+            "apiHidden": true,
+            "keysHidden": true,
+            "spreadHidden": true,
+        }),
         "{response}"
     );
-    assert_eq!(
-        result["status"],
-        serde_json::json!({"code":0,"signal":null}),
-        "{response}"
-    );
-    assert_eq!(result["exits"], 1);
-    assert_eq!(result["closes"], 1);
-    assert_eq!(result["killAfterClose"], false);
-    assert_eq!(result["ended"], true);
-    assert!(
-        result["stderr"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("pijs-stdio-peer-eof"),
-        "{response}"
-    );
+    for mode in ["explicit", "inherited"] {
+        let result = &response["result"][mode];
+        assert_eq!(result["first"]["method"], "initialize", "{response}");
+        assert_eq!(result["second"]["method"], "tools/list", "{response}");
+        assert_eq!(result["third"]["text"], "duplex λ", "{response}");
+        assert_eq!(
+            result["acks"],
+            serde_json::json!([1, 2, 3, "end"]),
+            "{response}"
+        );
+        assert_eq!(
+            result["status"],
+            serde_json::json!({"code":0,"signal":null}),
+            "{response}"
+        );
+        assert_eq!(result["exits"], 1, "{response}");
+        assert_eq!(result["closes"], 1, "{response}");
+        assert_eq!(result["killAfterClose"], false, "{response}");
+        assert_eq!(result["ended"], true, "{response}");
+        assert!(
+            result["stderr"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("pijs-stdio-peer-eof"),
+            "{response}"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1075,10 +1135,10 @@ fn child_process_state_persists_across_calls() {
 }
 
 #[test]
-fn killed_child_removed_from_state() {
+fn legacy_stream_killed_child_removed_from_state() {
     let result = eval_cp(
         r#"(() => {
-        const child = spawn("sleep", ["100"]);
+        const child = spawn("sleep", ["100"], { stdio: ["ignore", "pipe", "pipe"] });
         const pid = child.pid;
         child.kill();
         // After kill, trying to kill again via process bridge should fail
@@ -1091,4 +1151,134 @@ fn killed_child_removed_from_state() {
     })()"#,
     );
     assert_eq!(result, "ok");
+}
+
+#[test]
+fn pending_process_handles_do_not_collide_with_native_pids() {
+    futures::executor::block_on(async {
+        let clock = Arc::new(pi::scheduler::DeterministicClock::new(0));
+        let runtime = pi::extensions_js::PiJsRuntime::with_clock(clock)
+            .await
+            .expect("create process registry runtime");
+        runtime
+            .eval(
+                r#"
+                globalThis.registryResult = {};
+                import('node:child_process').then(({ spawn }) => {
+                    const first = spawn('registry-first');
+                    const second = spawn('registry-second');
+                    registryResult.provisional = [first.pid, second.pid];
+                    first.on('error', () => {});
+                    second.on('error', () => {});
+                    first.on('spawn', () => {
+                        registryResult.duringFirstSpawn = __pi_child_process_registry_size();
+                        registryResult.admittedPid = first.pid;
+                    });
+                    first.on('close', () => {
+                        registryResult.afterFirstClose = __pi_child_process_registry_size();
+                    });
+                    second.on('close', () => {
+                        registryResult.afterSecondClose = __pi_child_process_registry_size();
+                    });
+                });
+                "#,
+            )
+            .await
+            .expect("queue concurrent process admissions");
+        let mut requests = runtime.drain_hostcall_requests();
+        assert_eq!(requests.len(), 2);
+        let first = requests.pop_front().expect("first admission");
+        let second = requests.pop_front().expect("second admission");
+        // Exercise the registry transition with the PID that previously collided
+        // with the second provisional handle. No process or native session is
+        // fabricated: the real native poll rejects this absent session afterward.
+        runtime.complete_hostcall(
+            first.call_id,
+            pi::scheduler::HostcallOutcome::Success(serde_json::json!({
+                "session": "registry-fixture-no-native-session",
+                "pid": 1001
+            })),
+        );
+        runtime.tick().await.expect("deliver first admission");
+        runtime.complete_hostcall(
+            second.call_id,
+            pi::scheduler::HostcallOutcome::Error {
+                code: "denied".to_string(),
+                message: "registry fixture denies second admission".to_string(),
+            },
+        );
+        runtime.tick().await.expect("deliver second admission");
+        let result = runtime
+            .read_global_json("registryResult")
+            .await
+            .expect("read registry transition");
+        for pid in result["provisional"].as_array().expect("provisional PIDs") {
+            assert!(pid.as_u64().expect("numeric provisional PID") > u64::from(u32::MAX));
+        }
+        assert_eq!(result["duringFirstSpawn"], 2, "{result}");
+        assert_eq!(result["admittedPid"], 1001, "{result}");
+        assert_eq!(result["afterFirstClose"], 1, "{result}");
+        assert_eq!(result["afterSecondClose"], 0, "{result}");
+        assert_eq!(runtime.pending_hostcall_count(), 0);
+    });
+}
+
+#[test]
+fn stdin_end_callbacks_settle_after_denied_admission_and_close() {
+    futures::executor::block_on(async {
+        let clock = Arc::new(pi::scheduler::DeterministicClock::new(0));
+        let runtime = pi::extensions_js::PiJsRuntime::with_clock(clock)
+            .await
+            .expect("create stdin lifecycle runtime");
+        runtime
+            .eval(
+                r#"
+                globalThis.endResult = { pending: [], afterClose: [], finishes: 0, closes: 0 };
+                import('node:child_process').then(({ spawn }) => {
+                    const child = spawn('stdin-denied-fixture');
+                    child.on('error', () => {});
+                    child.stdin.on('finish', () => endResult.finishes++);
+                    child.stdin.end(error => endResult.pending.push(error?.code));
+                    child.stdin.end(error => endResult.pending.push(error?.code));
+                    child.on('close', () => {
+                        endResult.closes++;
+                        let synchronous = true;
+                        child.stdin.end(error => {
+                            endResult.afterClose.push({ code: error?.code, synchronous });
+                        });
+                        synchronous = false;
+                    });
+                });
+                "#,
+            )
+            .await
+            .expect("queue EOF callbacks before admission");
+        let mut requests = runtime.drain_hostcall_requests();
+        assert_eq!(requests.len(), 1);
+        runtime.complete_hostcall(
+            requests.pop_front().expect("pending admission").call_id,
+            pi::scheduler::HostcallOutcome::Error {
+                code: "denied".to_string(),
+                message: "stdin lifecycle fixture denies admission".to_string(),
+            },
+        );
+        runtime.tick().await.expect("deliver denied admission");
+        runtime
+            .drain_microtasks()
+            .await
+            .expect("settle EOF callbacks");
+        let result = runtime
+            .read_global_json("endResult")
+            .await
+            .expect("read EOF lifecycle result");
+        assert_eq!(result["pending"], serde_json::json!(["denied", "denied"]));
+        assert_eq!(
+            result["afterClose"],
+            serde_json::json!([{ "code": "ERR_STREAM_DESTROYED", "synchronous": false }]),
+            "{result}"
+        );
+        assert_eq!(result["finishes"], 0);
+        assert_eq!(result["closes"], 1);
+        assert_eq!(runtime.pending_hostcall_count(), 0);
+    });
 }

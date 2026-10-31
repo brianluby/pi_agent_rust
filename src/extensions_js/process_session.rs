@@ -590,7 +590,12 @@ impl ProcessSessions {
     }
 }
 
-fn safe_environment_name(name: &str) -> bool {
+/// Names that can be copied into a child environment without introducing a
+/// secret, loader hook or invalid OS binding. Snapshot enumeration shares
+/// this restriction so `{ ...process.env }` remains usable with the process
+/// bridge. Individual reads still use the realm's disclosure policy (for
+/// example, an allowlisted secret or a Windows per-drive `=D:` value).
+pub(super) fn safe_environment_name(name: &str) -> bool {
     if name.is_empty() || name.contains(['\0', '=']) || !super::is_env_var_allowed(name) {
         return false;
     }
@@ -888,6 +893,32 @@ mod tests {
             "PI_WORKSPACE_DIR",
         ] {
             assert!(safe_environment_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn inherited_environment_filters_loader_hooks_but_explicit_hooks_are_rejected() {
+        let sessions = ProcessSessions::new(
+            ".".into(),
+            HashMap::from([
+                ("PATH".to_string(), "/configured/bin".to_string()),
+                (
+                    "NODE_OPTIONS".to_string(),
+                    "--require=untrusted".to_string(),
+                ),
+                ("LD_PRELOAD".to_string(), "/untrusted.so".to_string()),
+                ("=D:".to_string(), "D:\\project".to_string()),
+            ]),
+            false,
+            Some(Arc::from("owner")),
+        );
+        assert_eq!(
+            sessions.environment(None).unwrap(),
+            BTreeMap::from([("PATH".to_string(), "/configured/bin".to_string())])
+        );
+        for name in ["NODE_OPTIONS", "LD_PRELOAD", "PYTHONPATH", "=D:"] {
+            let explicit = json!({name: "injected"});
+            assert!(sessions.environment(Some(&explicit)).is_err(), "{name}");
         }
     }
 

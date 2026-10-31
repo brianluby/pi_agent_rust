@@ -83,47 +83,16 @@ macro_rules! compressed_js_literal {
 // ============================================================================
 
 use crate::extensions::{
-    ExecMediationResult, ExtensionPolicy, ExtensionPolicyMode, SecretBrokerPolicy,
-    SessionActionOrigin, evaluate_exec_mediation,
+    ExecMediationResult, ExtensionPolicy, SecretBrokerPolicy, SessionActionOrigin,
+    evaluate_exec_mediation,
 };
 
 /// Helper to check `exec` capability for sync execution where we cannot prompt.
 fn check_exec_capability(policy: &ExtensionPolicy, extension_id: Option<&str>) -> bool {
-    let cap = "exec";
-
-    // 1. Per-extension overrides
-    if let Some(id) = extension_id
-        && let Some(override_config) = policy.per_extension.get(id)
-    {
-        if override_config.deny.iter().any(|c| c == cap) {
-            return false;
-        }
-        if override_config.allow.iter().any(|c| c == cap) {
-            return true;
-        }
-        if let Some(mode) = override_config.mode {
-            return match mode {
-                ExtensionPolicyMode::Permissive => true,
-                ExtensionPolicyMode::Strict | ExtensionPolicyMode::Prompt => false, // Prompt = deny for sync
-            };
-        }
-    }
-
-    // 2. Global deny
-    if policy.deny_caps.iter().any(|c| c == cap) {
-        return false;
-    }
-
-    // 3. Global allow (default_caps)
-    if policy.default_caps.iter().any(|c| c == cap) {
-        return true;
-    }
-
-    // 4. Mode fallback
-    match policy.mode {
-        ExtensionPolicyMode::Permissive => true,
-        ExtensionPolicyMode::Strict | ExtensionPolicyMode::Prompt => false, // Prompt = deny for sync
-    }
+    // Use the same precedence and case normalization as asynchronous exec.
+    // In particular, a per-extension allow cannot override a global deny.
+    // Synchronous calls have no prompt channel, so Prompt also fails closed.
+    policy.evaluate_for("exec", extension_id).decision == crate::extensions::PolicyDecision::Allow
 }
 
 /// Determine whether an environment variable is safe to expose to extensions.
@@ -135,6 +104,48 @@ pub fn is_env_var_allowed(key: &str) -> bool {
     // is_secret returns true if it IS a secret (should be blocked).
     // So we allow it if it is NOT a secret.
     !policy.is_secret(key)
+}
+
+fn configured_environment_value<'a>(
+    environment: &'a HashMap<String, String>,
+    key: &str,
+    windows: bool,
+) -> Option<&'a str> {
+    if windows {
+        // Synthetic host snapshots can contain aliases that the Windows OS
+        // environment would treat as one binding. Use the same winner for
+        // every spelling, independent of HashMap iteration or the query case.
+        environment
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(key))
+            .min_by(|(left, _), (right, _)| left.cmp(right))
+            .map(|(_, value)| value.as_str())
+    } else {
+        environment.get(key).map(String::as_str)
+    }
+}
+
+fn uses_windows_environment(environment: &HashMap<String, String>) -> bool {
+    configured_environment_value(environment, "PI_PLATFORM", cfg!(windows)).map_or(
+        cfg!(windows),
+        |platform| {
+            matches!(
+                platform.to_ascii_lowercase().as_str(),
+                "win32" | "windows" | "windows_nt" | "msys" | "cygwin"
+            )
+        },
+    )
+}
+
+fn normalize_windows_environment_snapshot(environment: &mut HashMap<String, String>) {
+    let mut entries: Vec<_> = std::mem::take(environment).into_iter().collect();
+    entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    let mut names = HashSet::new();
+    for (name, value) in entries {
+        if names.insert(name.to_ascii_uppercase()) {
+            environment.insert(name, value);
+        }
+    }
 }
 
 fn parse_truthy_flag(value: &str) -> bool {
@@ -150,8 +161,8 @@ fn is_global_compat_scan_mode() -> bool {
 }
 
 fn is_compat_scan_mode(env: &HashMap<String, String>) -> bool {
-    env.get("PI_EXT_COMPAT_SCAN")
-        .map_or_else(is_global_compat_scan_mode, |value| parse_truthy_flag(value))
+    configured_environment_value(env, "PI_EXT_COMPAT_SCAN", uses_windows_environment(env))
+        .map_or_else(is_global_compat_scan_mode, parse_truthy_flag)
 }
 
 /// Compatibility-mode fallback values for environment-gated extension registration.
@@ -7933,7 +7944,7 @@ for (let i = 0; i < _numCpus; i++) _cpus.push({{ model: "cpu", speed: 2400, time
 export function homedir() {{
   const env_home =
     globalThis.pi && globalThis.pi.env && typeof globalThis.pi.env.get === "function"
-      ? globalThis.pi.env.get("HOME")
+      ? globalThis.pi.env.get("HOME") || globalThis.pi.env.get("USERPROFILE")
       : undefined;
   return env_home || _homedir;
 }}
@@ -9876,7 +9887,7 @@ export function copyToClipboard(_text) {
 export function getAgentDir() {
   const home =
     globalThis.pi && globalThis.pi.env && typeof globalThis.pi.env.get === "function"
-      ? globalThis.pi.env.get("HOME")
+      ? globalThis.pi.env.get("HOME") || globalThis.pi.env.get("USERPROFILE")
       : undefined;
   return home ? `${home}/.pi/agent` : "/home/unknown/.pi/agent";
 }
@@ -11281,7 +11292,9 @@ export default nativePath;
         "node:child_process".to_string(),
         compressed_js_literal!(r#"
 const __pi_child_process_state = {
-  nextPid: 1000,
+  // Native process IDs are u32. Provisional handles must never collide with
+  // an admitted child's PID while another spawn is still awaiting admission.
+  nextPid: 0x100000000,
   children: new Map(),
 };
 
@@ -11489,6 +11502,7 @@ function __spawnPersistent(cmd, argv, opts) {
   let pendingKill = null;
   const pending = [];
   const writes = new Map();
+  let endWrite = null;
   const MAX_BUFFERED = 4 * 1024 * 1024;
   const MAX_CHUNK = 256 * 1024;
   const HIGH_WATER = 64 * 1024;
@@ -11504,8 +11518,13 @@ function __spawnPersistent(cmd, argv, opts) {
     if (!write) return;
     writes.delete(id);
     bufferedBytes -= write.size;
-    if (typeof write.callback === "function") Promise.resolve().then(() => write.callback(error || undefined));
+    const callbacks = write.callbacks || [write.callback];
+    for (const callback of callbacks) {
+      if (typeof callback === "function") Promise.resolve().then(() => callback(error || undefined));
+    }
+    if (write === endWrite) endWrite = null;
     if (write.end && child.stdin && !error) {
+      child.stdin.writableFinished = true;
       child.stdin.closed = true;
       child.stdin.emit("finish");
     }
@@ -11585,6 +11604,7 @@ function __spawnPersistent(cmd, argv, opts) {
   if (child.stdin) {
     child.stdin.destroyed = false;
     child.stdin.writableEnded = false;
+    child.stdin.writableFinished = false;
     child.stdin.closed = false;
     child.stdin.write = (chunk, encoding, callback) => {
       if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
@@ -11611,11 +11631,40 @@ function __spawnPersistent(cmd, argv, opts) {
     child.stdin.end = (chunk, encoding, callback) => {
       if (typeof chunk === "function") { callback = chunk; chunk = undefined; }
       else if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
-      if (child.stdin.writableEnded) return child.stdin;
-      if (chunk !== undefined && chunk !== null) child.stdin.write(chunk, encoding);
+      const hasChunk = chunk !== undefined && chunk !== null;
+      function rejectEnd(code, message) {
+        const error = pipeError(message);
+        error.code = code;
+        if (typeof callback === "function") Promise.resolve().then(() => callback(error));
+        else if (hasChunk) Promise.resolve().then(() => child.stdin.emit("error", error));
+        return child.stdin;
+      }
+      if (child.stdin.writableEnded) {
+        if (hasChunk) return rejectEnd("ERR_STREAM_WRITE_AFTER_END", "write after process stdin ended");
+        if (endWrite && !child.stdin.destroyed && !child.__pi_done) {
+          if (typeof callback === "function") {
+            if (endWrite.callbacks.length >= 1024) throw new RangeError("node:child_process stdin callback limit exceeded");
+            endWrite.callbacks.push(callback);
+          }
+          return child.stdin;
+        }
+        return child.stdin.writableFinished
+          ? rejectEnd("ERR_STREAM_ALREADY_FINISHED", "process stdin already finished")
+          : rejectEnd("ERR_STREAM_DESTROYED", "process stdin is closed");
+      }
+      if (child.stdin.destroyed || child.__pi_done) {
+        return rejectEnd("ERR_STREAM_DESTROYED", "process stdin is closed");
+      }
+      if (hasChunk) child.stdin.write(chunk, encoding);
+      // A synchronous native-write failure may have closed the child while
+      // accepting the final chunk. Never enqueue EOF after its close drain.
+      if (child.stdin.destroyed || child.__pi_done) {
+        return rejectEnd("ERR_STREAM_DESTROYED", "process stdin is closed");
+      }
       child.stdin.writableEnded = true;
       const id = nextWrite++;
-      const write = { id, size: 0, callback, end: true };
+      const write = { id, size: 0, callbacks: typeof callback === "function" ? [callback] : [], end: true };
+      endWrite = write;
       writes.set(id, write);
       pending.push(write);
       try { flushInput(); } catch (error) { close(null, null, error); }
@@ -12656,14 +12705,18 @@ const __pi_vfs = (() => {
     return { root: path.startsWith("/") ? "/" : "", tail: path.startsWith("/") ? path.slice(1) : path };
   }
 
-  function normalizePath(input) {
-    const raw = String(input ?? "").replace(/\\/g, "/");
+  function absoluteInputPath(raw) {
     // Detect Windows drive-letter absolute paths (e.g. "C:/Users/...")
     const hasDriveLetter = raw.length >= 3 && /^[A-Za-z]:\//.test(raw);
     const isAbsolute = raw.startsWith("/") || hasDriveLetter;
-    const base = isAbsolute
+    return isAbsolute
       ? raw
       : `${(globalThis.process && typeof globalThis.process.cwd === "function" ? globalThis.process.cwd() : "/").replace(/\\/g, "/")}/${raw}`;
+  }
+
+  function normalizePath(input) {
+    const raw = String(input ?? "").replace(/\\/g, "/");
+    const base = absoluteInputPath(raw);
     const { root, tail } = splitRoot(base);
     const parts = [];
     for (const part of tail.split("/")) {
@@ -12858,13 +12911,16 @@ const __pi_vfs = (() => {
     }
   }
 
-  function resolveSymlinkPath(linkPath, target) {
-    const raw = String(target ?? "");
+  function resolveSymlinkPath(linkPath, target, rawPaths) {
+    const raw = String(target ?? "").replace(/\\/g, "/");
     if (isAbsolutePathInput(raw)) {
+      rawPaths.push(raw);
       const normalized = normalizePath(raw);
       return mapExtensionTempPath(raw, normalized);
     }
-    return normalizePath(`${dirname(linkPath)}/${raw}`);
+    const absolute = `${dirname(linkPath)}/${raw}`;
+    rawPaths.push(absolute);
+    return normalizePath(absolute);
   }
 
   function firstSymlinkComponent(path) {
@@ -12881,10 +12937,13 @@ const __pi_vfs = (() => {
   }
 
   function resolvePathDetails(path, followSymlinks = true) {
-    let normalized = mapExtensionTempPath(path, normalizePath(path));
+    const raw = String(path ?? "").replace(/\\/g, "/");
+    const absolute = absoluteInputPath(raw);
+    const rawPaths = [absolute];
+    let normalized = mapExtensionTempPath(raw, normalizePath(absolute));
     const authorizationPaths = [normalized];
     if (!followSymlinks) {
-      return { resolved: normalized, authorizationPaths };
+      return { resolved: normalized, authorizationPaths, rawPaths };
     }
 
     const seen = new Set();
@@ -12898,32 +12957,38 @@ const __pi_vfs = (() => {
       authorizationPaths.push(component.linkPath);
       const target = resolveSymlinkPath(
         component.linkPath,
-        state.symlinks.get(component.linkPath)
+        state.symlinks.get(component.linkPath),
+        rawPaths,
       );
       normalized = component.remaining.length > 0
         ? normalizePath(`${target}/${component.remaining.join("/")}`)
         : target;
       authorizationPaths.push(normalized);
     }
-    return { resolved: normalized, authorizationPaths };
+    return { resolved: normalized, authorizationPaths, rawPaths };
   }
 
   function resolvePath(path, followSymlinks = true) {
     return resolvePathDetails(path, followSymlinks).resolved;
   }
 
-  function authorizeResolution(details, checkAccess) {
+  function authorizeResolution(details, checkAccess, capability) {
+    if (typeof globalThis.__pi_host_check_persistent_storage_input === "function") {
+      for (const raw of details.rawPaths || []) {
+        globalThis.__pi_host_check_persistent_storage_input(toHostPath(raw), capability);
+      }
+    }
     for (const candidate of details.authorizationPaths) {
       checkAccess(candidate);
     }
   }
 
   function authorizeReadResolution(details) {
-    authorizeResolution(details, checkReadAccess);
+    authorizeResolution(details, checkReadAccess, "read");
   }
 
   function authorizeWriteResolution(details) {
-    authorizeResolution(details, checkWriteAccess);
+    authorizeResolution(details, checkWriteAccess, "write");
   }
 
   function resolvePathForRead(path, followSymlinks = true) {
@@ -12994,11 +13059,19 @@ const __pi_vfs = (() => {
   }
 
   function authorizeFdRead(entry) {
-    authorizeReadResolution({ authorizationPaths: entry.authorizationPaths });
+    assertFdOwner(entry, "read");
+    authorizeReadResolution({ authorizationPaths: entry.authorizationPaths, rawPaths: entry.rawPaths });
   }
 
   function authorizeFdWrite(entry) {
-    authorizeWriteResolution({ authorizationPaths: entry.authorizationPaths });
+    assertFdOwner(entry, "write");
+    authorizeWriteResolution({ authorizationPaths: entry.authorizationPaths, rawPaths: entry.rawPaths });
+  }
+
+  function assertFdOwner(entry, capability) {
+    if (entry.extensionId !== currentExtensionId()) {
+      throw new Error(`host ${capability} denied: file descriptor belongs to another extension`);
+    }
   }
 
   function toWritableView(buffer) {
@@ -13236,6 +13309,8 @@ const __pi_vfs = (() => {
   state.checkWorkspaceWriteAccess = checkWorkspaceWriteAccess;
   state.parseOpenFlags = parseOpenFlags;
   state.getFdEntry = getFdEntry;
+  state.currentExtensionId = currentExtensionId;
+  state.assertFdOwner = assertFdOwner;
   state.authorizeFdRead = authorizeFdRead;
   state.authorizeFdWrite = authorizeFdWrite;
   state.toWritableView = toWritableView;
@@ -13416,18 +13491,53 @@ const __fakeStat = {
 };
 export function statSync(path) { return __pi_vfs.makeStat(path, true); }
 export function lstatSync(path) { return __pi_vfs.makeStat(path, false); }
-export function mkdtempSync(prefix, _opts) {
+function pathResult(path, opts) {
+  const encoding = typeof opts === "string" ? opts : opts && opts.encoding;
+  if (encoding === "buffer") return Buffer.from(path, "utf8");
+  return encoding && encoding !== "utf8" && encoding !== "utf-8"
+    ? Buffer.from(path, "utf8").toString(encoding) : path;
+}
+export function mkdtempSync(prefix, opts) {
   const p = String(prefix ?? "/tmp/tmp-");
+  const raw = p.replace(/\\/g, "/");
+  const separator = raw.lastIndexOf("/");
+  // Only the parent is a path to resolve: the final component is a literal
+  // prefix, including a trailing '.', and must not follow an existing link.
+  const parent = __pi_vfs.resolvePathForWrite(separator < 0 ? "." : raw.slice(0, separator + 1), true);
+  const resolvedPrefix = __pi_vfs.childPrefix(parent) + raw.slice(separator + 1);
+  if (__pi_vfs.isPersistentPath(resolvedPrefix)) {
+    if (typeof globalThis.__pi_host_persistent_storage_mkdtemp !== "function") {
+      throw new Error("PiJS persistent temporary directory bridge is unavailable");
+    }
+    return pathResult(globalThis.__pi_host_persistent_storage_mkdtemp(__pi_vfs.toHostPath(resolvedPrefix)), opts);
+  }
   const out = `${p}${Date.now().toString(36)}`;
-  const resolved = __pi_vfs.resolvePath(out, true);
+  const resolved = __pi_vfs.resolvePathForWrite(out, true);
   __pi_vfs.checkWorkspaceWriteAccess(resolved);
   __pi_vfs.ensureDir(resolved);
-  return out;
+  return pathResult(out, opts);
 }
-export function realpathSync(path, _opts) {
+export function realpathSync(path, opts) {
   const resolved = __pi_vfs.resolvePathForRead(path, true);
-  return __pi_vfs.unmapExtensionTempPath(resolved);
+  const virtual = __pi_vfs.files.has(resolved) || __pi_vfs.dirs.has(resolved);
+  let canonical = __pi_vfs.unmapExtensionTempPath(resolved);
+  if (!__pi_vfs.isCurrentExtensionTempPath(resolved)
+      && typeof globalThis.__pi_host_realpath_sync === "function") {
+    try {
+      canonical = globalThis.__pi_host_realpath_sync(__pi_vfs.toHostPath(resolved));
+    } catch (error) {
+      // Overlay-only entries have no host path. Never hide a denied host
+      // resolution behind a previously cached virtual directory or file.
+      const identified = typeof globalThis.__pi_get_current_extension_id === "function"
+        && !!globalThis.__pi_get_current_extension_id();
+      if (!virtual || (identified && String(error && error.message || error).includes("denied"))) throw error;
+    }
+  } else if (!virtual) {
+    throw new Error(`ENOENT: no such file or directory, realpath '${String(path ?? "")}'`);
+  }
+  return pathResult(canonical, opts);
 }
+realpathSync.native = realpathSync;
 export function unlinkSync(path) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
   if (__pi_vfs.isPersistentPath(normalized)) {
@@ -13680,7 +13790,9 @@ export function openSync(path, flags = "r", _mode) {
   const current = __pi_vfs.files.get(resolved) || host.bytes || new Uint8Array();
   __pi_vfs.fds.set(fd, {
     path: resolved,
+    extensionId: __pi_vfs.currentExtensionId(),
     authorizationPaths: resolution.authorizationPaths.slice(),
+    rawPaths: resolution.rawPaths.slice(),
     readable: opts.readable,
     writable: opts.writable,
     append: opts.append,
@@ -13691,12 +13803,9 @@ export function openSync(path, flags = "r", _mode) {
 }
 export function closeSync(fd) {
   const entry = __pi_vfs.getFdEntry(fd);
-  if (entry.readable) {
-    __pi_vfs.authorizeFdRead(entry);
-  }
-  if (entry.writable) {
-    __pi_vfs.authorizeFdWrite(entry);
-  }
+  // Releasing this virtual handle performs no filesystem I/O. Its owner must
+  // be able to discard cached bytes after a path or capability is revoked.
+  __pi_vfs.assertFdOwner(entry, entry.readable ? "read" : "write");
   __pi_vfs.fds.delete(fd);
 }
 export function readSync(fd, buffer, offset = 0, length, position = null) {
@@ -13908,8 +14017,8 @@ export function createWriteStream(path, opts) {
     try {
       closeSync(fd);
     } finally {
-      // closeSync authorizes before deleting. Cleanup must still release this
-      // virtual descriptor when authorization changes between open and close.
+      // A stream owns its exact descriptor even if cleanup runs under a
+      // different callback principal. Never release a reused numeric handle.
       if (__pi_vfs.fds.get(fd) === fdEntry) {
         __pi_vfs.fds.delete(fd);
       }
@@ -14095,6 +14204,7 @@ export function realpath(path, optOrCb, cb) {
     catch (err) { callback(err); }
   }
 }
+realpath.native = realpath;
 export function access(_path, modeOrCb, cb) {
   const callback = typeof modeOrCb === 'function' ? modeOrCb : cb;
   const mode = typeof modeOrCb === 'function' ? constants.F_OK : modeOrCb;
@@ -18093,55 +18203,67 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         policy: Option<ExtensionPolicy>,
         owner_extension_id: Option<Arc<str>>,
     ) -> Result<Self> {
-        // Inject target architecture so JS process.arch can read it
-        #[cfg(target_arch = "x86_64")]
-        config
-            .env
-            .entry("PI_TARGET_ARCH".to_string())
-            .or_insert_with(|| "x64".to_string());
-        #[cfg(target_arch = "aarch64")]
-        config
-            .env
-            .entry("PI_TARGET_ARCH".to_string())
-            .or_insert_with(|| "arm64".to_string());
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        config
-            .env
-            .entry("PI_TARGET_ARCH".to_string())
-            .or_insert_with(|| "x64".to_string());
+        // The production snapshot can serve several differently authorized
+        // realms. Bind disclosure to this immutable owner before creating the
+        // JS environment snapshot or a subprocess environment. A caller's
+        // explicit deny_env remains a stronger restriction.
+        if policy.as_ref().is_some_and(|policy| {
+            policy
+                .evaluate_for("env", owner_extension_id.as_deref())
+                .decision
+                != crate::extensions::PolicyDecision::Allow
+        }) {
+            config.deny_env = true;
+        }
 
-        // Inject target platform so JS process.platform matches os.platform().
-        // OSTYPE env var is a shell variable and not always exported.
-        {
-            let platform = match std::env::consts::OS {
-                "macos" => "darwin",
-                "windows" => "win32",
-                other => other,
-            };
-            config
-                .env
-                .entry("PI_PLATFORM".to_string())
-                .or_insert_with(|| platform.to_string());
+        let windows_environment = uses_windows_environment(&config.env);
+        if windows_environment {
+            // Normalize before exposing values, enumerating the snapshot, or
+            // copying it into child processes. Retain the selected spelling
+            // so ordinary Windows `Path` snapshots still enumerate as `Path`.
+            normalize_windows_environment_snapshot(&mut config.env);
+        }
+
+        // Inject host metadata without creating a second Windows spelling of
+        // an explicitly configured binding.
+        let architecture = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "x64"
+        };
+        let platform = match std::env::consts::OS {
+            "macos" => "darwin",
+            "windows" => "win32",
+            other => other,
+        };
+        for (key, value) in [("PI_TARGET_ARCH", architecture), ("PI_PLATFORM", platform)] {
+            if configured_environment_value(&config.env, key, windows_environment).is_none() {
+                config.env.insert(key.to_string(), value.to_string());
+            }
         }
 
         // This is host metadata, not a filesystem grant. Child integrations
         // identify Pi from it without probing a parent of their data root.
         // Preserve explicit snapshots and avoid ambient HOME when supplied.
-        if !config.env.contains_key("PI_CONFIG_DIR") {
-            let config_dir = config
-                .env
-                .get("PI_CODING_AGENT_DIR")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .or_else(|| {
-                    config
-                        .env
-                        .get("HOME")
-                        .or_else(|| config.env.get("USERPROFILE"))
-                        .filter(|value| !value.is_empty())
-                        .map(|home| PathBuf::from(home).join(".pi").join("agent"))
-                })
-                .unwrap_or_else(crate::config::Config::global_dir);
+        if configured_environment_value(&config.env, "PI_CONFIG_DIR", windows_environment).is_none()
+        {
+            let config_dir = configured_environment_value(
+                &config.env,
+                "PI_CODING_AGENT_DIR",
+                windows_environment,
+            )
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                ["HOME", "USERPROFILE"]
+                    .into_iter()
+                    .find_map(|key| {
+                        configured_environment_value(&config.env, key, windows_environment)
+                            .filter(|value| !value.is_empty())
+                    })
+                    .map(|home| PathBuf::from(home).join(".pi").join("agent"))
+            })
+            .unwrap_or_else(crate::config::Config::global_dir);
             config.env.insert(
                 "PI_CONFIG_DIR".to_string(),
                 config_dir.to_string_lossy().into_owned(),
@@ -18222,7 +18344,19 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let runtime_id = uuid::Uuid::new_v4().simple().to_string();
         let process_sessions = process_session::ProcessSessions::new(
             config.cwd.clone(),
-            config.env.clone(),
+            // Inheritance must not disclose custom broker secrets through a
+            // child's stdout after process.env has correctly hidden them.
+            // ProcessSessions applies its transfer restrictions afterwards.
+            config
+                .env
+                .iter()
+                .filter(|(name, _)| {
+                    policy
+                        .as_ref()
+                        .is_none_or(|policy| !policy.secret_broker.is_secret(name))
+                })
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
             config.deny_env,
             owner_extension_id.clone(),
         );
@@ -19418,19 +19552,20 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// Resolve host-supplied state configuration before any guest code runs.
     /// Mutable JavaScript process.env values cannot expand these grants.
     pub(crate) fn application_storage_root(&self, namespace: &Path) -> Option<PathBuf> {
-        let host_env = |key: &str| {
-            if self.config.deny_env {
-                return None;
-            }
-            self.config
-                .env
-                .get(key)
-                .cloned()
-                .or_else(|| std::env::var(key).ok())
+        let configured_home = if self.config.deny_env {
+            None
+        } else {
+            ["HOME", "USERPROFILE"].into_iter().find_map(|key| {
+                configured_environment_value(
+                    &self.config.env,
+                    key,
+                    uses_windows_environment(&self.config.env),
+                )
                 .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+            })
         };
-        let home = host_env("HOME")
-            .or_else(|| host_env("USERPROFILE"))
+        let home = configured_home
             // node:os.homedir exposes this host metadata even when generic
             // environment access is denied. Match its HOME/USERPROFILE order.
             .or_else(|| std::env::var("HOME").ok().filter(|value| !value.is_empty()))
@@ -19525,12 +19660,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let process_args = self.config.args.clone();
         // Platform is runtime metadata, independent of permission to read env.
         // PI_PLATFORM was supplied by the host at runtime construction above.
-        let process_platform = self
-            .config
-            .env
-            .get("PI_PLATFORM")
-            .cloned()
-            .unwrap_or_else(|| std::env::consts::OS.to_string());
+        let windows_environment = uses_windows_environment(&self.config.env);
+        let process_platform =
+            configured_environment_value(&self.config.env, "PI_PLATFORM", windows_environment)
+                .map(str::to_string)
+                .unwrap_or_else(|| std::env::consts::OS.to_string());
         let env = self.config.env.clone();
         let deny_env = self.config.deny_env;
         let repair_mode = self.config.repair_mode;
@@ -19542,11 +19676,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let owner_extension_id = self.owner_extension_id.clone();
         let mut extension_temp_roots = vec![std::env::temp_dir().to_string_lossy().into_owned()];
         for key in ["TMPDIR", "TEMP", "TMP"] {
-            if let Some(value) = env.get(key)
+            if let Some(value) = configured_environment_value(&env, key, windows_environment)
                 && !value.trim().is_empty()
-                && !extension_temp_roots.contains(value)
+                && !extension_temp_roots.iter().any(|root| root == value)
             {
-                extension_temp_roots.push(value.clone());
+                extension_temp_roots.push(value.to_string());
             }
         }
         if !extension_temp_roots.iter().any(|root| root == "/tmp") {
@@ -19559,7 +19693,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             .with(|ctx| {
                 let global = ctx.globals();
 
-                storage::install(&ctx, &module_state)?;
+                storage::install(&ctx, &module_state, &process_cwd)?;
                 sqlite::install(
                     &ctx,
                     Rc::clone(&self.sqlite_state),
@@ -20113,9 +20247,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     }),
                 )?;
 
-                // Enumerate only snapshot keys whose values the same getter
-                // may disclose. Sorting avoids HashMap iteration nondeterminism
-                // and neither secret names nor ambient keys cross this bridge.
+                // Enumerate only permitted snapshot bindings safe to copy into
+                // child environments. Loader hooks and Windows per-drive keys
+                // remain individually readable under the same env policy, but
+                // cannot poison `{ ...process.env }` at process admission.
+                // Sorting avoids HashMap iteration nondeterminism.
                 global.set(
                     "__pi_env_keys_native",
                     Func::from({
@@ -20126,10 +20262,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 return Vec::new();
                             }
                             let mut keys: Vec<String> = env.keys().filter(|key| {
-                                policy_for_env.as_ref().map_or_else(
-                                    || is_env_var_allowed(key),
-                                    |policy| !policy.secret_broker.is_secret(key),
-                                )
+                                process_session::safe_environment_name(key)
+                                    && policy_for_env.as_ref().map_or_else(
+                                        || is_env_var_allowed(key),
+                                        |policy| !policy.secret_broker.is_secret(key),
+                                    )
                             }).cloned().collect();
                             keys.sort();
                             keys
@@ -20176,7 +20313,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             if !allowed {
                                 return Ok(None);
                             }
-                            Ok(env.get(&key).cloned())
+                            Ok(configured_environment_value(&env, &key, windows_environment)
+                                .map(str::to_string))
                         }
                     }),
                 )?;
@@ -20611,6 +20749,37 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 "size": metadata.len(),
                             })
                             .to_string())
+                        }
+                    }),
+                )?;
+
+                // __pi_host_realpath_sync(path) -> canonical existing host path.
+                // Project identity must follow real host aliases; data grants
+                // retain their stricter prohibition on linked path components.
+                global.set(
+                    "__pi_host_realpath_sync",
+                    Func::from({
+                        let process_cwd = process_cwd.clone();
+                        let allowed_read_roots = Arc::clone(&allowed_read_roots);
+                        let module_state = Rc::clone(&module_state);
+                        move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<String> {
+                            let extension_id = current_extension_id(&ctx);
+                            let workspace_root = crate::extensions::safe_canonicalize(Path::new(&process_cwd));
+                            let requested = PathBuf::from(&path);
+                            let requested = if requested.is_absolute() { requested } else { workspace_root.join(requested) };
+                            let allowed = |path: &Path| path_is_allowed_extension_fs_path(
+                                path, &workspace_root, extension_id.as_deref(), &module_state, &allowed_read_roots,
+                            );
+                            if !allowed(&requested) {
+                                return Err(rquickjs::Error::new_loading_message(&path, "host realpath denied: path outside extension root"));
+                            }
+                            let canonical = std::fs::canonicalize(&requested)
+                                .map(crate::extensions::strip_unc_prefix)
+                                .map_err(|error| rquickjs::Error::new_loading_message(&path, format!("host realpath: {error}")))?;
+                            if !allowed(&requested) || !allowed(&canonical) {
+                                return Err(rquickjs::Error::new_loading_message(&path, "host realpath denied: path changed during resolution"));
+                            }
+                            Ok(canonical.to_string_lossy().into_owned())
                         }
                     }),
                 )?;
@@ -33927,6 +34096,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             std::fs::create_dir_all(&ext_a).expect("mkdir ext-a");
             std::fs::create_dir_all(&ext_b).expect("mkdir ext-b");
             let fd_path = ext_a.join("fd-secret.txt");
+            let shared_path = workspace.join("shared-fd.txt");
 
             let config = PiJsRuntimeConfig {
                 cwd: workspace.display().to_string(),
@@ -33949,10 +34119,13 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     const require = createRequire('/tmp/example.js');
                     const fs = require('node:fs');
                     let fd;
+                    let sharedFd;
                     return __pi_with_extension_async(__pi_test_secret, "ext.a", async () => {{
                         fs.mkdirSync({ext_a:?}, {{ recursive: true }});
                         fs.writeFileSync({fd_path:?}, 'fd-secret');
                         fd = fs.openSync({fd_path:?}, 'r+');
+                        fs.writeFileSync({shared_path:?}, 'workspace-content');
+                        sharedFd = fs.openSync({shared_path:?}, 'r');
                     }}).then(() => __pi_with_extension_async(__pi_test_secret, "ext.b", async () => {{
                         for (const [name, operation] of [
                             ['read', () => fs.readSync(fd, Buffer.alloc(9), 0, 9, 0)],
@@ -33971,11 +34144,21 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                                     String((err && err.message) || err || '');
                             }}
                         }}
+                        // Workspace paths are readable by both principals;
+                        // the open descriptor itself still belongs to ext.a.
+                        for (const [name, operation] of [
+                            ['sharedRead', () => fs.readSync(sharedFd, Buffer.alloc(32), 0, 32, 0)],
+                            ['sharedClose', () => fs.closeSync(sharedFd)],
+                        ]) {{
+                            try {{ operation(); globalThis.fdScope[name] = true; }}
+                            catch (_) {{ globalThis.fdScope[name] = false; }}
+                        }}
                     }})).then(() => __pi_with_extension_async(__pi_test_secret, "ext.a", async () => {{
                         globalThis.fdScope.ownerValue =
                             fs.readFileSync({fd_path:?}, 'utf8');
                         globalThis.fdScope.ownerSize = fs.fstatSync(fd).size;
                         fs.closeSync(fd);
+                        fs.closeSync(sharedFd);
                     }}));
                 }}).finally(() => {{
                     globalThis.fdScope.done = true;
@@ -34007,6 +34190,8 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             }
             assert_eq!(result["ownerValue"], serde_json::json!("fd-secret"));
             assert_eq!(result["ownerSize"], serde_json::json!(9));
+            assert_eq!(result["sharedRead"], serde_json::json!(false));
+            assert_eq!(result["sharedClose"], serde_json::json!(false));
         });
     }
 

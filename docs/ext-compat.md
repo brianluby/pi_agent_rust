@@ -115,6 +115,12 @@ parser; their semantic checks happen when executed because the engine does not
 compile those statements into prepared programs. Query and DML statements use
 the engine's prepared programs.
 
+`INSERT`, `UPDATE`, and `DELETE ... RETURNING` produce real result rows,
+including the resume-state updates used by context-mode. A bridge row or
+encoding-limit failure rolls back that statement's changes while preserving
+earlier work in an outer transaction. Native constraint failures retain
+SQLite's `ABORT`, `FAIL`, and `ROLLBACK` semantics.
+
 File-backed databases require an extension-owned persistent storage grant and
 the corresponding read/write capabilities. `:memory:` databases acquire no
 filesystem permission. Database handles cannot be transferred to another
@@ -158,12 +164,22 @@ The runtime recognizes only the exact conventional executable probes
 file metadata and the configured PATH/PATHEXT, without running a shell.
 General synchronous process execution retains its existing opt-in requirement.
 Child environments are explicit and filtered for secrets and loader injection.
-Spreading `process.env` copies only the permitted environment snapshot, in
-stable key order; denied environment access exposes no snapshot keys. Pi
+Spreading `process.env` copies only the owner-permitted environment snapshot,
+in stable key order. Loader hooks (such as `NODE_OPTIONS` and `LD_PRELOAD`) and
+invalid child bindings are omitted from enumeration, while individual reads
+remain subject to environment disclosure policy. A secret disclosure allowlist
+permits individual reads without enabling implicit secret forwarding; custom
+secret rules also filter the inherited child snapshot. Explicitly supplying unsafe
+child bindings is rejected. A global or per-extension environment denial
+exposes no snapshot keys or values. Pi
 advertises its configuration directory through `PI_CONFIG_DIR` metadata while
 preserving an explicitly configured value. This lets child integrations
 identify their host without receiving read access to a parent data directory.
 Context-mode's MCP server still needs a real Node or Bun executable on PATH.
+Its process launch and environment snapshot require the existing `exec` and
+`env` permissions; installing a package or granting storage does not enable
+those capabilities. See the [extension security operator handbook](security/operator-handbook.md#dangerous-capability-opt-in)
+for the existing opt-in and policy precedence rules.
 An allowed external process runs with the host user's OS authority, as with
 the existing `exec` capability; the extension's data-directory grants do not
 constitute a sandbox for external executables.
@@ -388,6 +404,11 @@ extension IDs suppress automatic grants and emit diagnostics; unrelated
 extensions retain their own grants. Invalid or linked automatic roots remain
 deny-only boundaries.
 
+Each owner's storage paths are resolved once using that owner's runtime
+configuration. Every realm receives the same protected path boundaries before
+extension factories run, including when environment permissions differ or a
+configured home directory lies beneath the workspace.
+
 The host embedding API `PiJsRuntime::add_persistent_storage_root` can assign an
 explicit absolute directory to one extension. Guest code, package metadata,
 and environment changes cannot add arbitrary paths. A custom
@@ -398,8 +419,14 @@ Persistent reads and mutations check ownership and read/write policy. Mutations
 use no-follow directory handles on Unix and pinned, reparse-checked directory
 handles on Windows. Traversal, linked targets, Windows device paths/names,
 alternate data streams, and overlapping grants to different owners are
-rejected. These directories support durable mkdir, file reads/writes/appends,
-copy, rename, unlink, and empty-directory removal. Writable descriptors,
+rejected. Checks inspect original inputs and virtual symlink targets before
+normalization can discard forbidden components. These directories support
+durable mkdir/mkdtemp, file reads/writes/appends, copy, rename, unlink, and
+empty-directory removal. Read-only descriptors belong to the extension that
+opened them and can still be closed by that owner after a path is revoked.
+`realpath` and `realpathSync.native` resolve authorized existing host paths,
+including project aliases, with a fallback for genuine virtual files.
+Writable descriptors,
 symlink creation, recursive directory deletion, and cross-filesystem rename
 are explicitly unsupported within a persistent grant.
 

@@ -167,3 +167,56 @@ fn discovery_requires_exec_capability_and_never_uses_an_ambient_path() {
         );
     });
 }
+
+#[test]
+fn discovery_uses_the_canonical_exec_policy_precedence() {
+    use pi::extensions::{ExtensionOverride, ExtensionPolicyMode};
+
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let directory = temp.path().join("bin");
+        metadata_fixture(&directory);
+        let env = HashMap::from([
+            ("PATH".to_string(), directory.to_string_lossy().into_owned()),
+            ("PATHEXT".to_string(), ".EXE".to_string()),
+        ]);
+        // A global denial defeats an owner's allow, including differently
+        // cased capability spellings. A strict owner mode still honors a
+        // global default capability when neither layer denies it.
+        for (global_deny, visible) in [(true, false), (false, true)] {
+            let mut policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Prompt,
+                default_caps: vec!["EXEC".to_string()],
+                deny_caps: if global_deny {
+                    vec!["eXeC".to_string()]
+                } else {
+                    Vec::new()
+                },
+                ..ExtensionPolicy::default()
+            };
+            policy.per_extension.insert(
+                "discovery-fixture".to_string(),
+                ExtensionOverride {
+                    mode: Some(ExtensionPolicyMode::Strict),
+                    allow: if global_deny {
+                        vec!["exec".to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    ..ExtensionOverride::default()
+                },
+            );
+            let runtime = discovery_runtime(temp.path(), env.clone(), Some(policy)).await;
+            let result = evaluate(&runtime, r#"
+                let resolved = false;
+                try { resolved = execSync(command).includes('discovery-fixture'); } catch (_) {}
+                globalThis.discoveryResult = {resolved, which: Bun.which('discovery-fixture') !== null};
+            "#).await;
+            assert_eq!(
+                result,
+                json!({"resolved": visible, "which": visible}),
+                "global deny={global_deny}"
+            );
+        }
+    });
+}

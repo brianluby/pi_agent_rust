@@ -198,6 +198,188 @@ fn sqlite_transactions_returning_bindings_and_binary_values_are_real() {
 }
 
 #[test]
+fn sqlite_dml_row_methods_execute_returning_and_commit_once() {
+    let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime(temp.path(), "returning", None).await;
+        let result = evaluate(&runtime, r#"
+            const db = new sqlite.Database(':memory:');
+            db.prepare('CREATE TABLE claims(id INTEGER PRIMARY KEY, consumed INTEGER DEFAULT 0)').run();
+            const inserted = db.prepare('INSERT INTO claims(id) VALUES (1), (2), (3) RETURNING id, consumed').all();
+            const updated = db.prepare('UPDATE claims SET consumed = consumed + 1 WHERE id <= ? RETURNING id, consumed').values(2);
+            const removed = [...db.prepare('DELETE FROM claims WHERE id = ? RETURNING id').iterate(3)];
+            const first = db.prepare('UPDATE claims SET consumed = consumed + 1 RETURNING id, consumed').get();
+            const ignoredRows = db.prepare('UPDATE claims SET consumed = consumed + 1 RETURNING id').run();
+            const noProjection = db.prepare('INSERT INTO claims(id, consumed) VALUES (?, ?)').all(4, 7);
+            const noMatch = db.prepare('UPDATE claims SET consumed = 99 WHERE id = 99 RETURNING id').get();
+            globalThis.sqliteResult = {
+              inserted: inserted.sort((a,b) => a.id-b.id), updated: updated.sort((a,b) => a[0]-b[0]),
+              removed, firstConsumed: first.consumed, firstIsOneRow: [1,2].includes(first.id),
+              changes: ignoredRows.changes, noProjection, noMatch,
+              rows: db.query('SELECT id, consumed FROM claims ORDER BY id').all(), inTransaction: db.inTransaction,
+            };
+            db.close();
+        "#).await;
+        assert_eq!(
+            result,
+            json!({
+                "inserted": [{"id":1,"consumed":0},{"id":2,"consumed":0},{"id":3,"consumed":0}],
+                "updated": [[1,1],[2,1]], "removed": [{"id":3}], "firstConsumed":2, "firstIsOneRow":true,
+                "changes":2, "noProjection":[], "noMatch":null,
+                "rows":[{"id":1,"consumed":3},{"id":2,"consumed":3},{"id":4,"consumed":7}],
+                "inTransaction":false,
+            })
+        );
+    });
+}
+
+#[test]
+fn sqlite_returning_encoding_failure_rolls_back_only_its_own_statement() {
+    let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime(temp.path(), "returning-limit", None).await;
+        let result = evaluate(&runtime, r#"
+            const db = new sqlite.Database(':memory:');
+            db.exec('CREATE TABLE state(value INTEGER, payload TEXT); CREATE TABLE audit(value TEXT)');
+            db.prepare('INSERT INTO state VALUES(0, ?)').run('x'.repeat(600 * 1024));
+            const tooLarge = db.prepare('UPDATE state SET value = value + 1 RETURNING payload || payload AS expanded');
+            let autocommitRejected = false;
+            try { tooLarge.all(); } catch (error) { autocommitRejected = /cell exceeds/.test(error.message); }
+            const afterAutocommit = db.query('SELECT value FROM state').get().value;
+            const noLeakedTransaction = !db.inTransaction;
+            db.prepare('BEGIN IMMEDIATE').run();
+            db.prepare('INSERT INTO audit VALUES(?)').run('before');
+            let nestedRejected = false;
+            try { tooLarge.get(); } catch (error) { nestedRejected = /cell exceeds/.test(error.message); }
+            const enclosingTransactionSurvived = db.inTransaction;
+            db.prepare('INSERT INTO audit VALUES(?)').run('after');
+            db.prepare('COMMIT').run();
+            globalThis.sqliteResult = {
+              autocommitRejected, afterAutocommit, noLeakedTransaction,
+              nestedRejected, enclosingTransactionSurvived,
+              finalValue: db.query('SELECT value FROM state').get().value,
+              audit: db.query('SELECT value FROM audit ORDER BY rowid').values(),
+            };
+            db.close();
+        "#).await;
+        assert_eq!(
+            result,
+            json!({
+                "autocommitRejected":true, "afterAutocommit":0, "noLeakedTransaction":true,
+                "nestedRejected":true, "enclosingTransactionSurvived":true,
+                "finalValue":0, "audit":[["before"],["after"]],
+            })
+        );
+    });
+}
+
+#[test]
+fn sqlite_returning_row_limit_rolls_back_and_select_get_stops_after_one_row() {
+    let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime(temp.path(), "returning-rows", None).await;
+        let result = evaluate(
+            &runtime,
+            r#"
+            const db = new sqlite.Database(':memory:');
+            db.exec('CREATE TABLE many_rows(value INTEGER)');
+            // Each seed batch remains below the SQL token limit. Two copies
+            // reach 10,004 rows without 10,004 separate native calls.
+            db.exec('INSERT INTO many_rows(value) VALUES ' + Array(2501).fill('(0)').join(','));
+            db.exec('INSERT INTO many_rows SELECT value FROM many_rows');
+            db.exec('INSERT INTO many_rows SELECT value FROM many_rows');
+            const first = db.query('SELECT value FROM many_rows').get();
+            let rejected = false;
+            try { db.prepare('UPDATE many_rows SET value = 1 RETURNING value').all(); }
+            catch (error) { rejected = /row or time limit/.test(error.message); }
+            globalThis.sqliteResult = {
+              first, rejected, inTransaction: db.inTransaction,
+              state: db.query('SELECT count(*) AS count, sum(value) AS sum FROM many_rows').get(),
+            };
+            db.close();
+        "#,
+        )
+        .await;
+        assert_eq!(
+            result,
+            json!({"first":{"value":0}, "rejected":true, "inTransaction":false,
+            "state":{"count":10004,"sum":0}})
+        );
+    });
+}
+
+#[test]
+fn sqlite_prepared_ddl_preserves_defaults_and_checks_from_its_original_source() {
+    let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime(temp.path(), "ddl-source", None).await;
+        let result = evaluate(&runtime, r#"
+            const db = new sqlite.Database(':memory:');
+            db.prepare("/* original source offsets */ CREATE TABLE quoted(value TEXT DEFAULT ('semi;''quote λ'), n INTEGER CHECK(n > 3))").run();
+            db.prepare('INSERT INTO quoted(n) VALUES(?)').run(4);
+            let constraintRejected = false;
+            try { db.prepare('INSERT INTO quoted(n) VALUES(?)').run(2); } catch { constraintRejected = true; }
+            globalThis.sqliteResult = {constraintRejected, rows: db.query('SELECT value, n FROM quoted').all()};
+            db.close();
+        "#).await;
+        assert_eq!(
+            result,
+            json!({"constraintRejected":true, "rows":[{"value":"semi;'quote λ","n":4}]})
+        );
+    });
+}
+
+#[test]
+fn sqlite_returning_preserves_native_conflict_policies_and_dqs_literals() {
+    let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime(temp.path(), "conflict-policy", None).await;
+        let result = evaluate(&runtime, r#"
+            const db = new sqlite.Database(':memory:');
+            db.exec('CREATE TABLE conflicts(id INTEGER PRIMARY KEY, value TEXT)');
+            const quoted = db.prepare('INSERT INTO conflicts VALUES (9, "DQS literal") RETURNING id, value').get();
+            let failRejected = false;
+            try { db.prepare("INSERT OR FAIL INTO conflicts VALUES (1,'kept'), (9,'duplicate'), (2,'unreached') RETURNING id").all(); }
+            catch { failRejected = true; }
+            const afterFail = db.query('SELECT id FROM conflicts ORDER BY id').values();
+            db.exec('BEGIN IMMEDIATE');
+            db.run("INSERT INTO conflicts VALUES (5,'outer transaction')");
+            try { db.prepare("INSERT OR FAIL INTO conflicts VALUES (3,'kept in transaction'), (9,'duplicate') RETURNING id").all(); } catch {}
+            try { db.prepare("INSERT OR ABORT INTO conflicts VALUES (6,'must roll back'), (9,'duplicate') RETURNING id").all(); } catch {}
+            const duringTransaction = db.query('SELECT id FROM conflicts ORDER BY id').values();
+            const stillInTransaction = db.inTransaction;
+            let rollbackRejected = false;
+            try { db.prepare("INSERT OR ROLLBACK INTO conflicts VALUES (7,'must roll back'), (9,'duplicate') RETURNING id").all(); }
+            catch { rollbackRejected = true; }
+            db.exec('CREATE TABLE schema_fail(id INTEGER UNIQUE ON CONFLICT FAIL)');
+            db.run('INSERT INTO schema_fail VALUES (9)');
+            try { db.prepare('INSERT INTO schema_fail VALUES (1), (9), (2) RETURNING id').all(); } catch {}
+            globalThis.sqliteResult = {
+              quoted, failRejected, afterFail, duringTransaction, stillInTransaction,
+              rollbackRejected, transactionEnded: !db.inTransaction,
+              finalRows: db.query('SELECT id FROM conflicts ORDER BY id').values(),
+              schemaFailRows: db.query('SELECT id FROM schema_fail ORDER BY id').values(),
+            };
+            db.close();
+        "#).await;
+        assert_eq!(
+            result,
+            json!({
+                "quoted":{"id":9,"value":"DQS literal"}, "failRejected":true,
+                "afterFail":[[1],[9]], "duringTransaction":[[1],[3],[5],[9]], "stillInTransaction":true,
+                "rollbackRejected":true, "transactionEnded":true, "finalRows":[[1],[9]],
+                "schemaFailRows":[[1],[9]],
+            })
+        );
+    });
+}
+
+#[test]
 fn sqlite_schema_and_sql_cannot_bypass_file_capabilities() {
     let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
     futures::executor::block_on(async {
