@@ -5954,7 +5954,12 @@ impl JsModuleResolver for PiJsResolver {
                 ));
             }
 
-            return Ok(canonical.to_string_lossy().replace('\\', "/"));
+            let name = canonical.to_string_lossy();
+            return Ok(if cfg!(windows) {
+                name.replace('\\', "/")
+            } else {
+                name.into_owned()
+            });
         }
 
         // Pattern 3 (bd-k5q5.8.4): monorepo sibling module stubs.
@@ -6205,7 +6210,7 @@ fn compile_module_source(
 /// The source file metadata can remain unchanged across a Pi upgrade while the
 /// transformed output changes. Versioning the key prevents a newer binary from
 /// reusing stale compiled JavaScript emitted by an older compiler pipeline.
-const COMPILED_MODULE_CACHE_VERSION: u8 = 4;
+const COMPILED_MODULE_CACHE_VERSION: u8 = 5;
 
 fn module_cache_key(
     static_virtual_modules: &HashMap<String, String>,
@@ -6439,21 +6444,59 @@ impl Default for WarmIsolatePool {
 }
 
 fn prefix_import_meta_url(module_name: &str, body: &str) -> Vec<u8> {
-    let url = if module_name.starts_with('/') {
-        format!("file://{module_name}")
-    } else if module_name.starts_with("file://") {
+    let url = if module_name.starts_with("file:") {
         module_name.to_string()
+    } else if let Ok(url) = url::Url::from_file_path(module_name) {
+        url.to_string()
+    } else if module_name.starts_with('/') {
+        let mut url = url::Url::parse("file:///").expect("static file URL");
+        url.set_path(module_name);
+        url.to_string()
     } else if module_name.len() > 2
         && module_name.as_bytes()[1] == b':'
+        && module_name.as_bytes()[0].is_ascii_alphabetic()
         && (module_name.as_bytes()[2] == b'/' || module_name.as_bytes()[2] == b'\\')
     {
-        // Windows absolute path: `C:/Users/...` or `C:\Users\...`
-        format!("file:///{module_name}")
+        // Also encode Windows paths correctly in host-independent diagnostics.
+        let mut url = url::Url::parse("file:///").expect("static file URL");
+        url.set_path(&format!("/{}", module_name.replace('\\', "/")));
+        url.to_string()
     } else {
         format!("pi://{module_name}")
     };
     let url_literal = serde_json::to_string(&url).unwrap_or_else(|_| "\"\"".to_string());
     format!("import.meta.url = {url_literal};\n{body}").into_bytes()
+}
+
+fn module_path_from_file_url(specifier: &str) -> Option<PathBuf> {
+    let url = url::Url::parse(specifier).ok()?;
+    if url.scheme() != "file" || url.query().is_some() || url.fragment().is_some() {
+        // Module identity is a canonical path in PiJS. Do not silently merge
+        // distinct query/fragment module instances into that cache identity.
+        return None;
+    }
+    let encoded = url.path().as_bytes();
+    let mut index = 0;
+    while index < encoded.len() {
+        if encoded[index] == b'%' {
+            let hex = encoded.get(index + 1..index + 3)?;
+            let high = char::from(hex[0]).to_digit(16)?;
+            let low = char::from(hex[1]).to_digit(16)?;
+            let decoded = high * 16 + low;
+            if decoded == 0
+                || decoded == u32::from(b'/')
+                || (cfg!(windows) && decoded == u32::from(b'\\'))
+            {
+                return None;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    let path = url.to_file_path().ok()?;
+    path.to_str()?;
+    Some(path)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6468,11 +6511,14 @@ fn resolve_module_path(
         return None;
     }
 
-    if let Some(path) = specifier.strip_prefix("file://") {
+    if specifier
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+    {
         if canonical_roots.is_empty() {
             return None;
         }
-        let path_buf = PathBuf::from(path);
+        let path_buf = module_path_from_file_url(specifier)?;
         let canonical = crate::extensions::safe_canonicalize(&path_buf);
         let allowed = canonical_roots
             .iter()
@@ -7100,13 +7146,84 @@ fn source_declares_binding(source: &str, name: &str) -> bool {
     false
 }
 
-/// Extract static `require("specifier")` calls from JavaScript source.
+/// Extract free static `require("specifier")` calls from JavaScript source.
 ///
-/// This scanner is intentionally lexical: it ignores matches inside comments
-/// and string/template literals so code-generation strings like
-/// `` `require("pkg/path").default` `` do not become false-positive imports.
-#[allow(clippy::too_many_lines)]
+/// A locally bound require, including createRequire inside a function, owns
+/// its own resolution and conditional execution. Hoisting those calls would
+/// load inactive platform dependencies before their guards can run.
 fn extract_static_require_specifiers(source: &str) -> Vec<String> {
+    scoped_static_require_specifiers(source)
+        .unwrap_or_else(|| lexical_static_require_specifiers(source))
+}
+
+fn scoped_static_require_specifiers(source: &str) -> Option<Vec<String>> {
+    use swc_ecma_ast::{CallExpr, Callee, Expr, Lit};
+    use swc_ecma_visit::{Visit, VisitWith as _};
+
+    struct RequireCollector {
+        unresolved: Mark,
+        seen: HashSet<String>,
+        specifiers: Vec<String>,
+    }
+
+    impl Visit for RequireCollector {
+        fn visit_call_expr(&mut self, call: &CallExpr) {
+            call.visit_children_with(self);
+            let Callee::Expr(callee) = &call.callee else {
+                return;
+            };
+            let Expr::Ident(identifier) = callee.as_ref() else {
+                return;
+            };
+            if identifier.sym.as_ref() != "require"
+                || !identifier.ctxt.has_mark(self.unresolved)
+                || call.args.len() != 1
+                || call.args[0].spread.is_some()
+            {
+                return;
+            }
+            let Expr::Lit(Lit::Str(literal)) = call.args[0].expr.as_ref() else {
+                return;
+            };
+            let specifier = literal.value.to_string_lossy().into_owned();
+            if self.seen.insert(specifier.clone()) {
+                self.specifiers.push(specifier);
+            }
+        }
+    }
+
+    GLOBALS.set(&Globals::new(), || {
+        let cm: Lrc<SourceMap> = Lrc::default();
+        let file = cm.new_source_file(
+            FileName::Custom("pijs-require-analysis.js".to_string()).into(),
+            source.to_string(),
+        );
+        let mut parser = SwcParser::new(
+            Syntax::Es(Default::default()),
+            StringInput::from(&*file),
+            None,
+        );
+        let module = parser.parse_module().ok()?;
+        if !parser.take_errors().is_empty() {
+            return None;
+        }
+        let unresolved = Mark::new();
+        let mut program = SwcProgram::Module(module);
+        resolver(unresolved, Mark::new(), false).process(&mut program);
+        let mut collector = RequireCollector {
+            unresolved,
+            seen: HashSet::new(),
+            specifiers: Vec::new(),
+        };
+        program.visit_with(&mut collector);
+        Some(collector.specifiers)
+    })
+}
+
+/// Preserve the existing lexical fallback for source accepted only after the
+/// legacy syntax repair pass. Valid JavaScript always uses scope analysis.
+#[allow(clippy::too_many_lines)]
+fn lexical_static_require_specifiers(source: &str) -> Vec<String> {
     const REQUIRE: &[u8] = b"require";
 
     let bytes = source.as_bytes();
@@ -7310,7 +7427,7 @@ fn is_native_addon_require(specifier: &str) -> bool {
 ///    for require targets and a `require()` function, preserving existing ESM
 #[allow(clippy::too_many_lines)]
 fn maybe_cjs_to_esm(source: &str) -> String {
-    let has_require = source.contains("require(");
+    let has_require = source.contains("require");
     let has_module_exports = source.contains("module.exports")
         || source.contains("module[\"exports\"]")
         || source.contains("module['exports']");
@@ -7380,8 +7497,7 @@ fn maybe_cjs_to_esm(source: &str) -> String {
             "function require(s) {\n\
              \x20 const m = __cjs_req_map[s];\n\
              \x20 if (!m) throw new Error('Cannot find module: ' + s);\n\
-             \x20 return m.default !== undefined && typeof m.default === 'object' \
-                  ? m.default : m;\n\
+             \x20 return Object.prototype.hasOwnProperty.call(m, 'default') ? m.default : m;\n\
              }\n",
         );
     }
@@ -7392,25 +7508,31 @@ fn maybe_cjs_to_esm(source: &str) -> String {
     let has_exports_binding = source_declares_binding(source, "exports");
     let needs_filename = has_filename_refs && !has_filename_binding;
     let needs_dirname = has_dirname_refs && !has_dirname_binding;
-    let needs_module = (has_module_exports || has_exports_usage) && !has_module_binding;
+    let exports_cjs_default =
+        !has_export_default && (!has_esm || has_module_exports || has_exports_usage);
+    let needs_module =
+        (has_module_exports || has_exports_usage || exports_cjs_default) && !has_module_binding;
     let needs_exports = (has_module_exports || has_exports_usage) && !has_exports_binding;
 
+    if needs_filename || needs_dirname {
+        output.push_str("import { fileURLToPath as __cjs_file_url_to_path } from 'node:url';\n");
+    }
+    if needs_dirname {
+        output.push_str("import { dirname as __cjs_path_dirname } from 'node:path';\n");
+    }
     if needs_filename || needs_dirname || needs_module || needs_exports {
         // Provide CJS compatibility globals only for bindings not declared by source.
         if needs_filename {
             output.push_str(
                 "const __filename = (() => {\n\
-                 \x20 try { return new URL(import.meta.url).pathname || ''; } catch { return ''; }\n\
+                 \x20 return __cjs_file_url_to_path(import.meta.url);\n\
                  })();\n",
             );
         }
         if needs_dirname {
             output.push_str(
                 "const __dirname = (() => {\n\
-                 \x20 try {\n\
-                 \x20\x20 const __pi_pathname = new URL(import.meta.url).pathname || '';\n\
-                 \x20\x20 return __pi_pathname ? __pi_pathname.replace(/[/\\\\][^/\\\\]*$/, '') : '.';\n\
-                 \x20 } catch { return '.'; }\n\
+                 \x20 return __cjs_path_dirname(__cjs_file_url_to_path(import.meta.url));\n\
                  })();\n",
             );
         }
@@ -7439,7 +7561,7 @@ fn maybe_cjs_to_esm(source: &str) -> String {
         }
     }
 
-    if !has_export_default && (!has_esm || has_module_exports || has_exports_usage) {
+    if exports_cjs_default {
         // Export CommonJS entrypoint for loaders that require a default init fn.
         output.push_str("export default module.exports;\n");
     }
@@ -11580,7 +11702,16 @@ function __spawnPersistent(cmd, argv, opts) {
         } else if (frame.writeId !== undefined) {
           const error = frame.error ? pipeError(frame.error) : null;
           settleWrite(frame.writeId, error);
-          if (error && child.stdin) child.stdin.emit("error", error);
+          if (error && child.stdin) {
+            // The native writer closes its endpoint after an I/O failure.
+            // Settle every queued fragment and EOF callback once, including
+            // fragments already accepted by that writer's bounded channel.
+            child.stdin.destroyed = true;
+            child.stdin.closed = true;
+            for (const id of [...writes.keys()]) settleWrite(id, error);
+            pending.length = 0;
+            child.stdin.emit("error", error);
+          }
         }
       }
       if (result.terminal) {
@@ -11615,13 +11746,33 @@ function __spawnPersistent(cmd, argv, opts) {
         return false;
       }
       const bytes = typeof chunk === "string" ? Buffer.from(chunk, encoding || "utf8") : Buffer.from(chunk);
-      if (bytes.length > MAX_CHUNK || bufferedBytes + bytes.length > MAX_BUFFERED || writes.size >= 1024) {
+      const fragments = Math.max(1, Math.ceil(bytes.length / MAX_CHUNK));
+      if (bufferedBytes + bytes.length > MAX_BUFFERED || writes.size + fragments > 1024) {
         throw new RangeError("node:child_process stdin buffer limit exceeded");
       }
-      const id = nextWrite++;
-      const write = { id, data: bytes.toString("base64"), size: bytes.length, callback, end: false };
-      writes.set(id, write);
-      pending.push(write);
+      // A logical JSON-RPC frame can exceed one native pipe message. Validate
+      // the entire write and prepare every bounded fragment before publishing
+      // any of it, preserving byte order and one completion callback.
+      let remaining = fragments;
+      let completed = false;
+      const fragmentCallback = typeof callback === "function" ? (error) => {
+        remaining--;
+        if (!completed && (error || remaining === 0)) {
+          completed = true;
+          callback(error);
+        }
+      } : undefined;
+      const staged = [];
+      for (let index = 0; index < fragments; index++) {
+        const start = index * MAX_CHUNK;
+        const part = Buffer.from(bytes.subarray(start, Math.min(start + MAX_CHUNK, bytes.length)));
+        staged.push({ id: nextWrite++, data: part.toString("base64"), size: part.length,
+          callback: fragmentCallback, end: false });
+      }
+      for (const write of staged) {
+        writes.set(write.id, write);
+        pending.push(write);
+      }
       bufferedBytes += bytes.length;
       try { flushInput(); }
       catch (error) { close(null, null, error); return false; }
@@ -14637,18 +14788,96 @@ export default { createInterface };
     modules.insert(
         "node:url".to_string(),
         compressed_js_literal!(r"
-export function fileURLToPath(url) {
-  const u = String(url ?? '');
-  if (u.startsWith('file://')) {
-    let p = decodeURIComponent(u.slice(7));
-    // file:///C:/... → C:/... (strip leading / before Windows drive letter)
-    if (p.length >= 3 && p[0] === '/' && p[2] === ':') { p = p.slice(1); }
-    return p;
-  }
-  return u;
+import { win32 as __fileWindowsPath } from 'node:path';
+
+function __fileUrlError(code, message) {
+  const error = new TypeError(message);
+  error.code = code;
+  return error;
 }
-export function pathToFileURL(path) {
-  return new URL('file://' + encodeURI(String(path ?? '')));
+function __fileUrlWindows(options) {
+  return options?.windows === undefined
+    ? globalThis.process?.platform === 'win32'
+    : Boolean(options.windows);
+}
+
+export function fileURLToPath(value, options) {
+  let url;
+  if (typeof value === 'string') {
+    try { url = new _URL(value); }
+    catch (_) { throw __fileUrlError('ERR_INVALID_URL', 'Invalid URL'); }
+  } else if (value instanceof _URL) {
+    url = value;
+  } else {
+    throw __fileUrlError('ERR_INVALID_ARG_TYPE', 'The url argument must be a string or URL');
+  }
+  if (url.protocol !== 'file:') {
+    throw __fileUrlError('ERR_INVALID_URL_SCHEME', 'The URL must be of scheme file');
+  }
+  const windows = __fileUrlWindows(options);
+  // Reject encoded separators before decoding. Filesystem and module-loader
+  // authorization still applies to the resulting path, including dot segments.
+  if (/%2f/i.test(url.pathname) || (windows && /%5c/i.test(url.pathname))) {
+    throw __fileUrlError('ERR_INVALID_FILE_URL_PATH', 'File URL path contains an encoded separator');
+  }
+  const path = decodeURIComponent(url.pathname);
+  if (windows) {
+    const normalized = path.replace(/\//g, '\\');
+    if (url.hostname) return '\\\\' + url.hostname + normalized;
+    if (!/^\/[A-Za-z]:/.test(path)) {
+      throw __fileUrlError('ERR_INVALID_FILE_URL_PATH', 'File URL path must be absolute');
+    }
+    return normalized.slice(1);
+  }
+  if (url.hostname && url.hostname !== 'localhost') {
+    throw __fileUrlError('ERR_INVALID_FILE_URL_HOST', 'File URL host must be localhost or empty');
+  }
+  return path;
+}
+
+function __encodeFilePath(path) {
+  // encodeURI preserves URL delimiters that are literal filename characters.
+  // Encode them separately so query/hash parsing cannot change the target.
+  return encodeURI(path).replace(/[?#~]/g, (ch) => '%' + ch.charCodeAt(0).toString(16).toUpperCase());
+}
+export function pathToFileURL(path, options) {
+  if (typeof path !== 'string') {
+    throw __fileUrlError('ERR_INVALID_ARG_TYPE', 'The path argument must be a string');
+  }
+  const windows = __fileUrlWindows(options);
+  let resolved;
+  if (windows) {
+    let input = path.replace(/\\/g, '/');
+    if (/^\/\/\?\/UNC\//i.test(input)) input = '//' + input.slice(8);
+    else if (/^\/\/\?\/[A-Za-z]:\//.test(input)) input = input.slice(4);
+    if (input.startsWith('//') && input.indexOf('/', 2) < 0) {
+      throw __fileUrlError('ERR_INVALID_ARG_VALUE', 'Missing UNC resource path');
+    }
+    if (/^\/\/[^/]+\/$/.test(input)) return new _URL('file:' + input);
+    resolved = __fileWindowsPath.resolve(input).replace(/\\/g, '/');
+    if (/^\/\/[^/]+\/[^/]+$/.test(input) && resolved.endsWith('/')) {
+      resolved = resolved.slice(0, -1);
+    }
+    if (/[\\/]$/.test(path) && !resolved.endsWith('/')) resolved += '/';
+    if (resolved.startsWith('//')) {
+      const slash = resolved.indexOf('/', 2);
+      return new _URL('file://' + resolved.slice(2, slash) + __encodeFilePath(resolved.slice(slash)));
+    }
+    return new _URL('file://' + (resolved.startsWith('/') ? '' : '/') + __encodeFilePath(resolved));
+  }
+  // POSIX backslashes are filename characters. Avoid the legacy cross-platform
+  // node:path normalization that treats them as Windows separators.
+  const cwd = globalThis.process?.cwd?.() ?? '/';
+  const input = path.startsWith('/') ? path : cwd + '/' + path;
+  const parts = [];
+  for (const part of input.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') parts.pop();
+    else parts.push(part);
+  }
+  resolved = '/' + parts.join('/');
+  if (path.endsWith('/') && !resolved.endsWith('/')) resolved += '/';
+  return new _URL('file://' + __encodeFilePath(resolved));
 }
 
 // Use built-in URL if available (QuickJS may have it), else provide polyfill
@@ -28913,6 +29142,55 @@ const path = require('path');
     }
 
     #[test]
+    fn extract_static_require_specifiers_respects_nested_lexical_bindings() {
+        let source = r#"
+import { createRequire } from 'node:module';
+export function loadDatabase() {
+    const require = createRequire(import.meta.url);
+    if (globalThis.Bun) return require(['bun', 'sqlite'].join(':')).Database;
+    return require('better-sqlite3');
+}
+function parameter(require) { return require('parameter-local'); }
+function destructured({ require }) { return require('destructured-local'); }
+const arrow = (require) => require('arrow-local');
+{
+    const require = () => {};
+    require('block-local');
+}
+const fs = require /* whitespace must not hide a free call */ ('node:fs');
+function freeCall() { return require('node:path'); }
+const escaped = require('node:\u006f\u0073');
+"#;
+        assert_eq!(
+            extract_static_require_specifiers(source),
+            vec!["node:fs", "node:path", "node:os"]
+        );
+    }
+
+    #[test]
+    fn maybe_cjs_to_esm_preserves_lazy_create_require_driver_selection() {
+        let source = r#"
+import { createRequire } from 'node:module';
+export function loadDatabase() {
+    const require = createRequire(import.meta.url);
+    if (globalThis.Bun) return require(['bun', 'sqlite'].join(':')).Database;
+    return require('better-sqlite3');
+}
+"#;
+        assert_eq!(maybe_cjs_to_esm(source), source);
+    }
+
+    #[test]
+    fn maybe_cjs_to_esm_provides_empty_exports_for_side_effect_modules() {
+        let rewritten = maybe_cjs_to_esm(
+            "const path = require ('node:path'); globalThis.loadedName = path.basename('/fixture/value');",
+        );
+        assert!(rewritten.contains("const module = { exports: {} };"));
+        assert!(rewritten.contains("export default module.exports;"));
+        assert!(rewritten.contains("from \"node:path\";"));
+    }
+
+    #[test]
     fn maybe_cjs_to_esm_ignores_codegen_string_requires() {
         let source = r#"
 const fs = require("fs");
@@ -30487,6 +30765,77 @@ import { isIPv4 as netIsIpv4 } from "node:net";
             &canonical_roots,
         );
         assert_eq!(resolved, Some(inside));
+    }
+
+    #[test]
+    fn resolve_module_path_decodes_file_urls_and_preserves_scope() {
+        let temp = tempfile::tempdir().expect("file URL fixture");
+        let root = temp.path().join("extension # % λ");
+        std::fs::create_dir_all(&root).expect("create encoded-name root");
+        let base = root.join("index.mjs");
+        let module = root.join("helper #%.mjs");
+        let outside = temp.path().join("outside.mjs");
+        std::fs::write(&base, "export {};\n").unwrap();
+        std::fs::write(&module, "export const answer = 42;\n").unwrap();
+        std::fs::write(&outside, "throw new Error('outside executed');\n").unwrap();
+        let roots = [crate::extensions::safe_canonicalize(&root)];
+        let module_url = url::Url::from_file_path(&module).unwrap();
+        assert!(module_url.as_str().contains("%23"));
+        assert!(module_url.as_str().contains("%25"));
+        assert_eq!(
+            resolve_module_path(
+                base.to_str().unwrap(),
+                module_url.as_str(),
+                RepairMode::Off,
+                &roots
+            ),
+            Some(module.clone())
+        );
+        let outside_url = url::Url::from_file_path(&outside).unwrap();
+        assert!(
+            resolve_module_path(
+                base.to_str().unwrap(),
+                outside_url.as_str(),
+                RepairMode::Off,
+                &roots
+            )
+            .is_none()
+        );
+        for suffix in ["#fragment", "?variant=2", "%2fsecret.mjs", "%00", "%zz"] {
+            let invalid = format!("{}{suffix}", module_url.as_str());
+            assert!(module_path_from_file_url(&invalid).is_none(), "{invalid}");
+        }
+        let traversal = format!(
+            "{}/%2e%2e/outside.mjs",
+            url::Url::from_directory_path(&root)
+                .unwrap()
+                .as_str()
+                .trim_end_matches('/')
+        );
+        assert!(
+            resolve_module_path(base.to_str().unwrap(), &traversal, RepairMode::Off, &roots)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn import_meta_url_encodes_paths_for_native_and_windows_modules() {
+        for (path, expected) in [
+            (
+                "/tmp/extension # % λ/entry.mjs",
+                "file:///tmp/extension%20%23%20%25%20%CE%BB/entry.mjs",
+            ),
+            (
+                r"C:\Users\reporter # % λ\entry.mjs",
+                "file:///C:/Users/reporter%20%23%20%25%20%CE%BB/entry.mjs",
+            ),
+        ] {
+            let compiled = String::from_utf8(prefix_import_meta_url(path, "export {};")).unwrap();
+            assert!(
+                compiled.starts_with(&format!("import.meta.url = {expected:?};\n")),
+                "{compiled}"
+            );
+        }
     }
 
     #[test]
@@ -36253,8 +36602,8 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     r"
                     globalThis.urlResults = {};
                     import('node:url').then((url) => {
-                        globalThis.urlResults.fileToPath = url.fileURLToPath('file:///home/user/test.txt');
-                        globalThis.urlResults.pathToFile = url.pathToFileURL('/home/user/test.txt').href;
+                        globalThis.urlResults.fileToPath = url.fileURLToPath('file:///home/user/test.txt', { windows: false });
+                        globalThis.urlResults.pathToFile = url.pathToFileURL('/home/user/test.txt', { windows: false }).href;
 
                         const u = new url.URL('https://example.com/path?key=val#frag');
                         globalThis.urlResults.href = u.href;

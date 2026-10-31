@@ -5,11 +5,16 @@ if (typeof native !== "function") throw new Error("PiJS SQLite host is unavailab
 
 function request(value) {
   const result = JSON.parse(native(JSON.stringify(value)));
-  if (typeof result.error === "string") {
-    const error = new Error(result.error);
+  if (result.error !== undefined) {
+    // Engine codes cross the host boundary as typed metadata. Never infer
+    // corruption or retryability from SQL/filenames embedded in error text.
+    const failure = typeof result.error === "string"
+      ? { message: result.error, code: "SQLITE_ERROR" } : result.error;
+    const error = new Error(failure.message);
     error.name = "SQLiteError";
-    error.code = result.error.includes("SQLITE_INTERRUPT") ? "SQLITE_INTERRUPT"
-      : /database is (locked|busy)|SQLITE_BUSY/.test(result.error) ? "SQLITE_BUSY" : "SQLITE_ERROR";
+    error.code = failure.code;
+    if (Number.isInteger(failure.errno)) error.errno = failure.errno;
+    if (Number.isInteger(failure.primaryCode)) error.primaryCode = failure.primaryCode;
     throw error;
   }
   return result.ok;
@@ -225,10 +230,16 @@ export class Database {
           return result;
         } catch (error) {
           try {
-            if (nested) {
-              database.exec(`ROLLBACK TO ${savepoint}`);
-              database.exec(`RELEASE ${savepoint}`);
-            } else if (database.inTransaction) database.exec("ROLLBACK");
+            // ON CONFLICT ROLLBACK can already have ended the entire
+            // transaction, including this nested savepoint. Preserve that
+            // original engine error instead of replacing it with a failed
+            // ROLLBACK TO against a savepoint which no longer exists.
+            if (database.inTransaction) {
+              if (nested) {
+                database.exec(`ROLLBACK TO ${savepoint}`);
+                database.exec(`RELEASE ${savepoint}`);
+              } else database.exec("ROLLBACK");
+            }
           } catch (rollbackError) {
             throw new Error(`SQLite transaction rollback failed: ${rollbackError.message}`, { cause: error });
           }

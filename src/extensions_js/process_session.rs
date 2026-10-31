@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -37,11 +37,16 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-struct Completion(Option<Box<dyn FnOnce() + Send>>);
+struct Completion(Mutex<Option<Box<dyn FnOnce() + Send>>>);
 
 impl Drop for Completion {
     fn drop(&mut self) {
-        if let Some(finish) = self.0.take() {
+        if let Some(finish) = self
+            .0
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
             finish();
         }
     }
@@ -52,12 +57,26 @@ impl Drop for Completion {
 /// before returning its subprocess budget to the admission controller.
 struct OwnedProcess {
     child: crate::tools::ProcessGuard,
-    _completion: Completion,
+    _slot: Arc<SessionSlot>,
 }
 
 impl Drop for OwnedProcess {
     fn drop(&mut self) {
         let _ = self.child.terminate_and_wait();
+    }
+}
+
+/// Closing a guest handle requests termination; it does not mean the process
+/// and its I/O workers have exited. Keep the per-runtime admission slot until
+/// teardown completes so rapid close/spawn cycles cannot exceed the budget.
+struct SessionSlot {
+    active: Arc<AtomicUsize>,
+    _completion: Completion,
+}
+
+impl Drop for SessionSlot {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -135,6 +154,7 @@ impl Drop for Session {
 
 struct Registry {
     sessions: Mutex<HashMap<String, Session>>,
+    active_sessions: Arc<AtomicUsize>,
     default_cwd: String,
     environment: HashMap<String, String>,
     deny_env: bool,
@@ -153,6 +173,7 @@ impl ProcessSessions {
     ) -> Self {
         Self(Arc::new(Registry {
             sessions: Mutex::new(HashMap::new()),
+            active_sessions: Arc::new(AtomicUsize::new(0)),
             default_cwd,
             environment,
             deny_env,
@@ -278,7 +299,7 @@ impl ProcessSessions {
         options: &Value,
         on_exit: Box<dyn FnOnce() + Send>,
     ) -> Result<Value, String> {
-        let completion = Completion(Some(on_exit));
+        let completion = Completion(Mutex::new(Some(on_exit)));
         self.check_owner(owner)?;
         let opts = options
             .as_object()
@@ -341,9 +362,18 @@ impl ProcessSessions {
             _ => return Err("Persistent process stdio must contain three entries".to_string()),
         };
         let mut sessions = lock(&self.0.sessions);
-        if sessions.len() >= MAX_SESSIONS {
+        if sessions.len() >= MAX_SESSIONS
+            || self.0.active_sessions.load(Ordering::Acquire) >= MAX_SESSIONS
+        {
             return Err("Persistent process session limit reached (8 per runtime)".to_string());
         }
+        // Spawn admission is serialized by the session registry. Workers only
+        // decrement this count, after the child and all pipe workers retire.
+        self.0.active_sessions.fetch_add(1, Ordering::AcqRel);
+        let slot = Arc::new(SessionSlot {
+            active: Arc::clone(&self.0.active_sessions),
+            _completion: completion,
+        });
         let mut builder = crate::tools::command_with_default_sigpipe_in_dir(
             executable
                 .to_str()
@@ -368,7 +398,7 @@ impl ProcessSessions {
                 child,
                 crate::tools::ProcessCleanupMode::ProcessGroupTree,
             ),
-            _completion: completion,
+            _slot: Arc::clone(&slot),
         };
         let stdin = process
             .child
@@ -400,13 +430,29 @@ impl ProcessSessions {
             .map_err(|error| format!("Persistent process pipe setup: {error}"))?;
             (pipes.stdin, pipes.stdout, pipes.stderr)
         };
-        let stdout_worker = start_reader(stdout, Arc::clone(&state), "stdout", stdio[1] == "pipe")?;
-        let stderr_worker = start_reader(stderr, Arc::clone(&state), "stderr", stdio[2] == "pipe")?;
+        let stdout_worker = start_reader(
+            stdout,
+            Arc::clone(&state),
+            "stdout",
+            stdio[1] == "pipe",
+            Arc::clone(&slot),
+        )?;
+        let stderr_worker = start_reader(
+            stderr,
+            Arc::clone(&state),
+            "stderr",
+            stdio[2] == "pipe",
+            Arc::clone(&slot),
+        )?;
         let input_worker = {
             let state = Arc::clone(&state);
+            let slot = Arc::clone(&slot);
             std::thread::Builder::new()
                 .name("pi-ext-stdin".to_string())
-                .spawn(move || write_input(stdin, receiver, &state))
+                .spawn(move || {
+                    let _slot = slot;
+                    write_input(stdin, receiver, &state);
+                })
                 .map_err(|error| format!("Persistent process stdin worker: {error}"))?
         };
         let worker_state = Arc::clone(&state);
@@ -732,10 +778,12 @@ fn start_reader(
     state: Arc<SessionState>,
     stream: &'static str,
     visible: bool,
+    slot: Arc<SessionSlot>,
 ) -> Result<std::thread::JoinHandle<()>, String> {
     std::thread::Builder::new()
         .name(format!("pi-ext-{stream}"))
         .spawn(move || {
+            let _slot = slot;
             let mut buffer = [0u8; 8192];
             loop {
                 match reader.read(&mut buffer) {
@@ -947,6 +995,144 @@ mod tests {
         );
         sessions.close_all();
         assert!(sessions.poll(Some("owner"), "handle").is_err());
+    }
+
+    #[test]
+    fn failed_process_start_releases_both_admission_leases() {
+        let directory = tempfile::tempdir().expect("process fixture");
+        let sessions = ProcessSessions::new(
+            directory.path().display().to_string(),
+            HashMap::new(),
+            true,
+            Some(Arc::from("owner")),
+        );
+        let finished = Arc::new(AtomicUsize::new(0));
+        let marker = Arc::clone(&finished);
+        let result = sessions.spawn(
+            Some("owner"),
+            std::env::current_exe()
+                .expect("test executable")
+                .to_str()
+                .expect("UTF-8 executable"),
+            &[],
+            &json!({"cwd": directory.path().join("missing")}),
+            Box::new(move || {
+                marker.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        assert!(result.is_err(), "a missing working directory must fail");
+        assert_eq!(sessions.0.active_sessions.load(Ordering::Acquire), 0);
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
+        assert!(lock(&sessions.0.sessions).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn closed_handles_keep_process_slots_until_blocked_workers_are_reaped() {
+        let directory = tempfile::tempdir().expect("process fixture");
+        let sessions = ProcessSessions::new(
+            directory.path().display().to_string(),
+            HashMap::new(),
+            true,
+            Some(Arc::from("owner")),
+        );
+        let finished = Arc::new(AtomicUsize::new(0));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut handles = Vec::new();
+        for _ in 0..MAX_SESSIONS {
+            let marker = Arc::clone(&finished);
+            let spawned = sessions
+                .spawn(
+                    Some("owner"),
+                    "/bin/sh",
+                    &[
+                        "-c".to_string(),
+                        "trap '' TERM; printf 'ready\\n'; while :; do sleep 1; done".to_string(),
+                    ],
+                    &json!({"env": {"PATH": "/usr/bin:/bin"}, "timeout": 10000}),
+                    Box::new(move || {
+                        marker.fetch_add(1, Ordering::SeqCst);
+                    }),
+                )
+                .expect("spawn process that ignores graceful termination");
+            let handle = spawned["session"].as_str().expect("handle").to_string();
+            let mut output = String::new();
+            loop {
+                let batch = sessions
+                    .poll(Some("owner"), &handle)
+                    .expect("poll readiness");
+                collect_frames(&batch, &mut output, &mut String::new(), &mut Vec::new());
+                if output.contains("ready\n") {
+                    break;
+                }
+                assert!(batch["terminal"].is_null(), "child exited early: {batch}");
+                assert!(Instant::now() < deadline, "process readiness timed out");
+                std::thread::sleep(WORKER_POLL);
+            }
+            handles.push(handle);
+        }
+
+        // The child never reads stdin. Fill the bounded input channel so a
+        // real pipe writer is blocked during cancellation, not just sleeping.
+        let encoded = BASE64.encode(vec![b'x'; MAX_INPUT_BYTES]);
+        let mut saturated = false;
+        for id in 1..=u64::try_from(INPUT_QUEUE_CAP + 2).unwrap() {
+            if !sessions
+                .write(Some("owner"), &handles[0], id, &encoded)
+                .expect("enqueue blocked input")
+            {
+                saturated = true;
+                break;
+            }
+        }
+        assert!(saturated, "the unread pipe must exert bounded backpressure");
+        sessions.close_all();
+        assert!(lock(&sessions.0.sessions).is_empty());
+        let refused = sessions.spawn(
+            Some("owner"),
+            "/bin/sh",
+            &["-c".to_string(), "exit 0".to_string()],
+            &json!({"env": {"PATH": "/usr/bin:/bin"}}),
+            Box::new(|| {}),
+        );
+        assert!(
+            refused.unwrap_err().contains("session limit"),
+            "closing handles must not admit more live/retiring workers"
+        );
+        while finished.load(Ordering::SeqCst) < MAX_SESSIONS {
+            assert!(
+                Instant::now() < deadline,
+                "cancelled process workers were not reaped"
+            );
+            std::thread::sleep(WORKER_POLL);
+        }
+        assert_eq!(sessions.0.active_sessions.load(Ordering::Acquire), 0);
+
+        let spawned = sessions
+            .spawn(
+                Some("owner"),
+                "/bin/sh",
+                &["-c".to_string(), "exit 0".to_string()],
+                &json!({"env": {"PATH": "/usr/bin:/bin"}}),
+                Box::new(|| {}),
+            )
+            .expect("admission resumes after actual teardown");
+        let handle = spawned["session"].as_str().expect("handle");
+        loop {
+            let batch = sessions
+                .poll(Some("owner"), handle)
+                .expect("poll replacement");
+            if !batch["terminal"].is_null() {
+                assert_eq!(batch["terminal"]["code"], 0, "{batch}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replacement process did not finish"
+            );
+            std::thread::sleep(WORKER_POLL);
+        }
     }
 
     #[test]

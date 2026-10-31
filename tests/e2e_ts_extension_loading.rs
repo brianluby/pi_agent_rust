@@ -1333,3 +1333,140 @@ fn npm_peer_without_env_cannot_access_owner_state_under_configured_workspace_hom
         );
     }
 }
+
+/// Follow context-mode's driver selection and JSON imports through the real
+/// compiler/resolver, with repairs disabled. Optional native drivers must not
+/// become eager imports when the Bun SQLite branch supplies the real database.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn context_mode_driver_selection_and_encoded_module_paths_load_without_stubs() {
+    let harness = common::TestHarness::new("context_mode_module_graph");
+    let cwd = harness.temp_dir().to_path_buf();
+    let prefix = "extensions/context # % λ";
+    harness.create_file(
+        &format!("{prefix}/package.json"),
+        br#"{"name":"context-mode-loader-fixture","type":"module","pi":{"extensions":["./entry.mjs"]}}"#,
+    );
+    harness.create_file(
+        &format!("{prefix}/driver.mjs"),
+        br"
+import { createRequire } from 'node:module';
+export function openDatabase() {
+    const require = createRequire(import.meta.url);
+    if (globalThis.Bun) {
+        const Database = require(['bun', 'sqlite'].join(':')).Database;
+        return new Database(':memory:');
+    }
+    return new (require('better-sqlite3'))(':memory:');
+}
+",
+    );
+    let factory = harness.create_file(
+        &format!("{prefix}/factory.cjs"),
+        br"
+const { basename } = require('node:path');
+module.exports = value => ({ value, filename: __filename, directory: __dirname, basename: basename(__filename) });
+",
+    );
+    harness.create_file(&format!("{prefix}/value.cjs"), b"module.exports = 41;\n");
+    harness.create_file(
+        &format!("{prefix}/side-effect.cjs"),
+        b"const path = require ('node:path'); globalThis.loaderSideEffect = path.basename('/fixture/loaded');\n",
+    );
+    harness.create_file(
+        &format!("{prefix}/consumer.cjs"),
+        br"
+require('./side-effect.cjs');
+const createValue = require('./factory.cjs');
+const value = require('./value.cjs');
+module.exports = createValue(value);
+",
+    );
+    harness.create_file(&format!("{prefix}/prices.json"), br#"{"price":3}"#);
+    harness.create_file(
+        &format!("{prefix}/helper #%.mjs"),
+        b"export const count = 7;\n",
+    );
+    let entry = harness.create_file(
+        &format!("{prefix}/entry.mjs"),
+        br"
+import { openDatabase } from './driver.mjs';
+import importedValue from './consumer.cjs';
+import './side-effect.cjs';
+import catalog from './prices.json' with { type: 'json' };
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+export default async function (pi) {
+    const filename = fileURLToPath(import.meta.url);
+    const helperUrl = pathToFileURL(join(dirname(filename), 'helper #%.mjs')).href;
+    const { count } = await import(helperUrl);
+    const database = openDatabase();
+    database.exec('CREATE TABLE usage (count INTEGER NOT NULL)');
+    database.query('INSERT INTO usage (count) VALUES (?)').run(count);
+    const row = database.query('SELECT count * ? AS cost FROM usage').get(catalog.price);
+    database.close();
+    const result = { row, importedValue, filename, helperUrl, sideEffect: globalThis.loaderSideEffect };
+    pi.registerCommand('loaded-module-result', {
+        handler: async () => ({ display: JSON.stringify(result) }),
+    });
+}
+",
+    );
+    let spec = JsExtensionLoadSpec::from_entry_path(&entry).expect("module fixture load spec");
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let config = PiJsRuntimeConfig {
+        cwd: cwd.display().to_string(),
+        repair_mode: pi::extensions_js::RepairMode::Off,
+        disk_cache_dir: None,
+        env: std::collections::HashMap::from([("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string())]),
+        ..Default::default()
+    };
+    let runtime = common::run_async(JsExtensionRuntimeHandle::start(
+        config,
+        tools,
+        manager.clone(),
+    ))
+    .expect("start strict module loader runtime");
+    manager.set_js_runtime(runtime);
+    let response = common::run_async(async move {
+        manager
+            .load_js_extensions(vec![spec])
+            .await
+            .expect("load real module graph without optional native driver");
+        let response = manager
+            .execute_command("loaded-module-result", "", 5000)
+            .await
+            .expect("execute command registered after SQLite initialization");
+        assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+        response
+    });
+    let result: Value = serde_json::from_str(response["display"].as_str().unwrap()).unwrap();
+    assert_eq!(result["row"]["cost"], 21, "{result}");
+    assert_eq!(result["sideEffect"], "loaded", "{result}");
+    assert_eq!(result["importedValue"]["value"], 41, "{result}");
+    assert_eq!(result["importedValue"]["basename"], "factory.cjs");
+    assert_eq!(
+        result["filename"],
+        pi::extensions::safe_canonicalize(&entry)
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        result["importedValue"]["filename"],
+        pi::extensions::safe_canonicalize(&factory)
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        result["importedValue"]["directory"],
+        pi::extensions::safe_canonicalize(factory.parent().unwrap())
+            .display()
+            .to_string()
+    );
+    let helper_url = result["helperUrl"].as_str().unwrap();
+    assert!(
+        helper_url.contains("%23") && helper_url.contains("%25") && helper_url.contains("%CE%BB"),
+        "{helper_url}"
+    );
+}

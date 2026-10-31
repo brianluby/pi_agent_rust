@@ -121,6 +121,13 @@ encoding-limit failure rolls back that statement's changes while preserving
 earlier work in an outer transaction. Native constraint failures retain
 SQLite's `ABORT`, `FAIL`, and `ROLLBACK` semantics.
 
+Native SQLite errors retain their canonical `code`, extended `errno`, and
+`primaryCode`. The message includes the canonical code so integrations such
+as context-mode can recognize a busy database and retry. Host admission
+failures remain separate; SQL text and filenames cannot impersonate native
+error classifications. Nested transactions preserve the original error when
+SQLite has already rolled back the entire transaction.
+
 File-backed databases require an extension-owned persistent storage grant and
 the corresponding read/write capabilities. `:memory:` databases acquire no
 filesystem permission. Database handles cannot be transferred to another
@@ -152,12 +159,17 @@ stronger boundary need an OS sandbox or a descriptor-based engine VFS.
 
 `spawn()` supports real piped stdin/stdout/stderr for protocols such as MCP,
 including writes queued before admission, write callbacks, backpressure, EOF,
-and process exit. Creation goes through the existing `exec` policy, command
+and process exit. Logical stdin writes up to the existing pending-byte budget
+are segmented into bounded native chunks, with one callback after the entire
+write completes. This supports large MCP requests without a partial write
+when admission rejects an oversized request. Creation goes through the existing `exec` policy, command
 mediation, and admission accounting. Native callbacks operate only on opaque,
 extension-owned handles; they cannot launch another process or signal an
 arbitrary PID. Input, output, session counts, environment size, and lifetime
 are bounded. Shutdown retires the owned process group and retains admission
 accounting until cleanup finishes.
+Per-runtime process slots also remain reserved until the child and its I/O
+workers actually finish, including after a handle is closed or startup fails.
 
 The runtime recognizes only the exact conventional executable probes
 `command -v NAME` on POSIX and `where NAME` on Windows. It answers them using
@@ -187,6 +199,19 @@ constitute a sandbox for external executables.
 ---
 
 ## 4. Virtual npm Module Stubs
+
+The CommonJS transform hoists only free `require()` calls. A locally bound
+`createRequire()` or function parameter keeps its normal scope and lazy
+execution, so an inactive optional native dependency does not prevent a Bun
+SQLite extension from loading. CommonJS function and primitive exports retain
+their actual values when consumed by another transformed module.
+
+File URL helpers preserve spaces, Unicode, and literal URL delimiters in
+filenames, with explicit POSIX/Windows conversion and drive/UNC handling.
+The resolver decodes file URLs before applying the existing import-root
+policy; encoded separators and malformed encodings are rejected. Module
+metadata and CommonJS filenames use the same conversion, including dynamic
+imports built from `pathToFileURL()`.
 
 Extensions that import popular npm packages get virtual stubs that expose the
 package's public API shape. These stubs allow extensions to load and register

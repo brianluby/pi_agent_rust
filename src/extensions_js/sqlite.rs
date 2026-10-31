@@ -32,7 +32,7 @@ use fsqlite_ast::Statement as SqlStatement;
 use fsqlite_parser::Parser;
 use rquickjs::Ctx;
 use rquickjs::function::Func;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
@@ -79,7 +79,111 @@ const SIDECARS: &[&str] = &[
 ];
 
 type Result<T> = std::result::Result<T, String>;
+type NativeResult<T> = std::result::Result<T, SqliteFailure>;
 type Cancel = Arc<dyn Fn() + Send + Sync>;
+
+/// Keep native result codes separate from host admission failures. In
+/// particular, context-mode retries by inspecting a message for SQLITE_BUSY;
+/// the engine's Display text alone is "database is busy" and is insufficient.
+#[derive(Debug, Serialize)]
+struct SqliteFailure {
+    message: String,
+    code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    errno: Option<i32>,
+    #[serde(rename = "primaryCode", skip_serializing_if = "Option::is_none")]
+    primary_code: Option<i32>,
+}
+
+impl SqliteFailure {
+    fn interrupted(message: impl Into<String>) -> Self {
+        Self {
+            message: format!("SQLITE_INTERRUPT: {}", message.into()),
+            code: "SQLITE_INTERRUPT",
+            errno: None,
+            primary_code: None,
+        }
+    }
+
+    fn with_context(mut self, context: &str) -> Self {
+        self.message.push_str("; ");
+        self.message.push_str(context);
+        self
+    }
+}
+
+impl std::fmt::Display for SqliteFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl From<String> for SqliteFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            code: "SQLITE_ERROR",
+            errno: None,
+            primary_code: None,
+        }
+    }
+}
+
+impl From<&str> for SqliteFailure {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+impl From<FrankenError> for SqliteFailure {
+    fn from(error: FrankenError) -> Self {
+        let primary_code = error.error_code() as i32;
+        let errno = error.extended_error_code();
+        // Only classify using the engine's actual numeric results. SQL,
+        // filenames and error prose may themselves contain a code's name.
+        let code = match errno {
+            261 => "SQLITE_BUSY_RECOVERY",
+            517 => "SQLITE_BUSY_SNAPSHOT",
+            3091 => "SQLITE_CONSTRAINT_DATATYPE",
+            32_526 => "SQLITE_OPEN_NEWER_FORMAT",
+            32_270 => "SQLITE_OPEN_INCOMPATIBLE_PEER",
+            _ => match primary_code {
+                2 => "SQLITE_INTERNAL",
+                3 => "SQLITE_PERM",
+                4 => "SQLITE_ABORT",
+                5 => "SQLITE_BUSY",
+                6 => "SQLITE_LOCKED",
+                7 => "SQLITE_NOMEM",
+                8 => "SQLITE_READONLY",
+                9 => "SQLITE_INTERRUPT",
+                10 => "SQLITE_IOERR",
+                11 => "SQLITE_CORRUPT",
+                12 => "SQLITE_NOTFOUND",
+                13 => "SQLITE_FULL",
+                14 => "SQLITE_CANTOPEN",
+                15 => "SQLITE_PROTOCOL",
+                16 => "SQLITE_EMPTY",
+                17 => "SQLITE_SCHEMA",
+                18 => "SQLITE_TOOBIG",
+                19 => "SQLITE_CONSTRAINT",
+                20 => "SQLITE_MISMATCH",
+                21 => "SQLITE_MISUSE",
+                22 => "SQLITE_NOLFS",
+                23 => "SQLITE_AUTH",
+                24 => "SQLITE_FORMAT",
+                25 => "SQLITE_RANGE",
+                26 => "SQLITE_NOTADB",
+                _ => "SQLITE_ERROR",
+            },
+        };
+        Self {
+            message: format!("{code}: {error}"),
+            code,
+            errno: Some(errno),
+            primary_code: Some(primary_code),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
@@ -179,7 +283,9 @@ impl SqliteRuntime {
             return Err("SQLite worker timed out; this PiJS runtime cannot be reused".into());
         }
         if let Some(worker) = self.worker.as_mut() {
-            worker.call(Command::Reset)?;
+            worker
+                .call(Command::Reset)
+                .map_err(|error| error.to_string())?;
         }
         self.worker.take();
         self.databases.clear();
@@ -195,9 +301,11 @@ impl SqliteRuntime {
         cwd: &Path,
         modules: &Rc<RefCell<PiJsModuleState>>,
         policy: Option<&ExtensionPolicy>,
-    ) -> Result<Json> {
+    ) -> NativeResult<Json> {
         if self.poisoned {
-            return Err("SQLITE_INTERRUPT: this runtime's SQLite worker is poisoned".into());
+            return Err(SqliteFailure::interrupted(
+                "this runtime's SQLite worker is poisoned",
+            ));
         }
         if let Some(id) = request.database_id() {
             let db = self
@@ -217,7 +325,7 @@ impl SqliteRuntime {
                         let _ = worker.call(Command::Retire { id });
                     }
                     self.databases.remove(&id);
-                    return Err(error);
+                    return Err(error.into());
                 }
             }
         }
@@ -315,7 +423,9 @@ pub(super) fn install(
                 Err("SQLite request exceeds 8 MiB".into())
             } else {
                 serde_json::from_str::<Request>(&wire)
-                    .map_err(|error| format!("Invalid SQLite request: {error}"))
+                    .map_err(|error| {
+                        SqliteFailure::from(format!("Invalid SQLite request: {error}"))
+                    })
                     .and_then(|request| {
                         state.borrow_mut().dispatch(
                             request,
@@ -849,7 +959,7 @@ enum Command {
 
 struct Work {
     command: Command,
-    reply: mpsc::SyncSender<Result<Json>>,
+    reply: mpsc::SyncSender<NativeResult<Json>>,
 }
 
 struct WorkerPermit;
@@ -928,13 +1038,13 @@ impl Worker {
         })
     }
 
-    fn call(&mut self, command: Command) -> Result<Json> {
+    fn call(&mut self, command: Command) -> NativeResult<Json> {
         self.call_with_timeout(command, OPERATION_TIMEOUT)
     }
 
-    fn call_with_timeout(&mut self, command: Command, timeout: Duration) -> Result<Json> {
+    fn call_with_timeout(&mut self, command: Command, timeout: Duration) -> NativeResult<Json> {
         if self.stopped.load(Ordering::Acquire) {
-            return Err("SQLITE_INTERRUPT: SQLite worker is poisoned".into());
+            return Err(SqliteFailure::interrupted("SQLite worker is poisoned"));
         }
         let (reply, response) = mpsc::sync_channel(1);
         if self
@@ -960,10 +1070,10 @@ impl Worker {
                 // permit remains live until the thread actually exits, so
                 // repeated timeouts cannot create unlimited detached work.
                 let _ = response.recv_timeout(CANCEL_GRACE);
-                Err(format!(
-                    "SQLITE_INTERRUPT: SQLite operation exceeded {} milliseconds; connection and runtime are poisoned",
+                Err(SqliteFailure::interrupted(format!(
+                    "SQLite operation exceeded {} milliseconds; connection and runtime are poisoned",
                     timeout.as_millis()
-                ))
+                )))
             }
         }
     }
@@ -1062,7 +1172,7 @@ fn execute_work(
     databases: &mut HashMap<u64, EngineDatabase>,
     cancel: &Mutex<Option<Cancel>>,
     stopped: &AtomicBool,
-) -> Result<Json> {
+) -> NativeResult<Json> {
     match command {
         Command::Open {
             id,
@@ -1112,7 +1222,7 @@ fn execute_work(
                     Connection::open_with_env(path, env).await
                 }
             })
-            .map_err(|error| error.to_string())?;
+            .map_err(SqliteFailure::from)?;
             futures::executor::block_on(async {
                 // Temporary tables remain in the engine's memory store. The
                 // guest cannot change either setting through PRAGMA. Schema
@@ -1125,7 +1235,7 @@ fn execute_work(
                 }
                 Ok::<_, FrankenError>(())
             })
-            .map_err(|error| error.to_string())?;
+            .map_err(SqliteFailure::from)?;
             let database = EngineDatabase {
                 conn,
                 parent,
@@ -1148,7 +1258,7 @@ fn execute_work(
             let cx = database.conn.root_cx().clone();
             set_cancel(cancel, stopped, Arc::new(move || cx.cancel()));
             futures::executor::block_on(database.conn.close_in_place())
-                .map_err(|error| error.to_string())?;
+                .map_err(SqliteFailure::from)?;
             database.verify_paths()?;
             databases.remove(&id);
             Ok(Json::Null)
@@ -1185,19 +1295,19 @@ fn execute_work(
             Ok(Json::Null)
         }
         Command::Reset => {
-            let mut first_error = None;
+            let mut first_error: Option<SqliteFailure> = None;
             for (_, mut database) in databases.drain() {
                 if let Err(error) = database.verify_paths() {
-                    first_error.get_or_insert(error);
+                    first_error.get_or_insert_with(|| error.into());
                     continue;
                 }
                 let cx = database.conn.root_cx().clone();
                 set_cancel(cancel, stopped, Arc::new(move || cx.cancel()));
                 if let Err(error) = futures::executor::block_on(database.conn.close_in_place()) {
-                    first_error.get_or_insert_with(|| error.to_string());
+                    first_error.get_or_insert_with(|| error.into());
                 }
                 if let Err(error) = database.verify_paths() {
-                    first_error.get_or_insert(error);
+                    first_error.get_or_insert_with(|| error.into());
                 }
             }
             first_error.map_or(Ok(Json::Null), Err)
@@ -1217,12 +1327,12 @@ fn set_cancel(slot: &Mutex<Option<Cancel>>, stopped: &AtomicBool, cancel: Cancel
     *slot = Some(cancel);
 }
 
-async fn validate_schema(database: &EngineDatabase) -> Result<()> {
+async fn validate_schema(database: &EngineDatabase) -> NativeResult<()> {
     let rows = database
         .conn
         .query("PRAGMA schema_version")
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(SqliteFailure::from)?;
     let version = rows
         .first()
         .and_then(|row| row.get(0))
@@ -1241,7 +1351,7 @@ async fn validate_schema(database: &EngineDatabase) -> Result<()> {
         .conn
         .query("SELECT type, sql FROM sqlite_master WHERE sql IS NOT NULL LIMIT 1025")
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(SqliteFailure::from)?;
     if rows.len() > 1024 {
         return Err("SQLite schema exceeds 1024 objects".into());
     }
@@ -1259,7 +1369,7 @@ async fn validate_schema(database: &EngineDatabase) -> Result<()> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn execute_request(database: &EngineDatabase, request: Request) -> Result<Json> {
+async fn execute_request(database: &EngineDatabase, request: Request) -> NativeResult<Json> {
     match request {
         Request::Prepare { sql, .. } => {
             let admitted = admit_sql(&sql, true)?;
@@ -1268,7 +1378,7 @@ async fn execute_request(database: &EngineDatabase, request: Request) -> Result<
                     .conn
                     .prepare(&sql)
                     .await
-                    .map_err(|error| error.to_string())?
+                    .map_err(SqliteFailure::from)?
                     .column_names()
             } else {
                 // DDL/control syntax was parsed above, with no mutations.
@@ -1295,13 +1405,13 @@ async fn execute_request(database: &EngineDatabase, request: Request) -> Result<
                         .conn
                         .execute(&sql)
                         .await
-                        .map_err(|error| error.to_string())?;
+                        .map_err(SqliteFailure::from)?;
                 } else {
                     database
                         .conn
                         .execute_with_params(&sql, &params)
                         .await
-                        .map_err(|error| error.to_string())?;
+                        .map_err(SqliteFailure::from)?;
                 }
                 return if matches!(mode, QueryMode::Run) {
                     change_result(database).await
@@ -1313,12 +1423,12 @@ async fn execute_request(database: &EngineDatabase, request: Request) -> Result<
                 .conn
                 .prepare(&sql)
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(SqliteFailure::from)?;
             if matches!(mode, QueryMode::Run) {
                 statement
                     .execute_with_params(&params)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(SqliteFailure::from)?;
                 return change_result(database).await;
             }
             let columns = statement.column_names();
@@ -1338,7 +1448,7 @@ async fn execute_request(database: &EngineDatabase, request: Request) -> Result<
                     .conn
                     .execute("SAVEPOINT __pijs_row_result")
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(SqliteFailure::from)?;
             }
             let mut rows = Vec::new();
             let mut seen = 0_usize;
@@ -1399,9 +1509,9 @@ async fn execute_request(database: &EngineDatabase, request: Request) -> Result<
                     .await
             };
             let outcome = match (outcome, limit_error) {
-                (_, Some(error)) => Err(error),
+                (_, Some(error)) => Err(error.into()),
                 (Err(FrankenError::Abort), None) if stopped_after_first => Ok(()),
-                (result, None) => result.map_err(|error| error.to_string()),
+                (result, None) => result.map_err(SqliteFailure::from),
             };
             if is_dml {
                 finish_row_savepoint(database, outcome, preserve_native_constraint).await?;
@@ -1420,7 +1530,7 @@ async fn execute_request(database: &EngineDatabase, request: Request) -> Result<
                     .conn
                     .execute_batch(&sql)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(SqliteFailure::from)?;
             }
             change_result(database).await
         }
@@ -1438,13 +1548,13 @@ fn is_native_constraint_error(error: &FrankenError) -> bool {
 
 async fn finish_row_savepoint(
     database: &EngineDatabase,
-    outcome: Result<()>,
+    outcome: NativeResult<()>,
     preserve_native_constraint: bool,
-) -> Result<()> {
+) -> NativeResult<()> {
     let failure = match outcome {
         Ok(()) => match database.conn.execute("RELEASE __pijs_row_result").await {
             Ok(_) => return Ok(()),
-            Err(error) => error.to_string(),
+            Err(error) => SqliteFailure::from(error),
         },
         Err(error) if preserve_native_constraint => {
             // The engine has already applied ABORT/FAIL/ROLLBACK policy.
@@ -1455,7 +1565,9 @@ async fn finish_row_savepoint(
             }
             match database.conn.execute("RELEASE __pijs_row_result").await {
                 Ok(_) => return Err(error),
-                Err(release) => format!("{error}; SQLite statement release failed: {release}"),
+                Err(release) => {
+                    error.with_context(&format!("SQLite statement release failed: {release}"))
+                }
             }
         }
         Err(error) => error,
@@ -1471,19 +1583,17 @@ async fn finish_row_savepoint(
     {
         database.poisoned.set(true);
         database.conn.root_cx().cancel();
-        return Err(format!(
-            "{failure}; SQLite statement rollback failed: {error}"
-        ));
+        return Err(failure.with_context(&format!("SQLite statement rollback failed: {error}")));
     }
     Err(failure)
 }
 
-async fn change_result(database: &EngineDatabase) -> Result<Json> {
+async fn change_result(database: &EngineDatabase) -> NativeResult<Json> {
     let rows = database
         .conn
         .query("SELECT changes()")
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(SqliteFailure::from)?;
     let changes = rows
         .first()
         .and_then(|row| row.get(0))
@@ -1682,7 +1792,8 @@ mod tests {
             bindings: Bindings::default(),
             mode: QueryMode::Get,
         }), Duration::from_millis(100)).expect_err("unbounded recursive query must time out");
-        assert!(error.contains("SQLITE_INTERRUPT"), "{error}");
+        assert!(error.message.contains("SQLITE_INTERRUPT"), "{error}");
+        assert_eq!(error.code, "SQLITE_INTERRUPT");
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(
             worker

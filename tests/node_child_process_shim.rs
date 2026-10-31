@@ -898,6 +898,7 @@ fn exec_file_accepts_callback_only() {
 /// PIJS_STDIO_TEST_PEER set produces genuine newline-delimited responses.
 #[test]
 fn persistent_stdio_peer() {
+    use sha2::Digest as _;
     use std::io::{BufRead as _, Write as _};
     if std::env::var("PIJS_STDIO_TEST_PEER").as_deref() != Ok("enabled") {
         return;
@@ -918,11 +919,22 @@ fn persistent_stdio_peer() {
     for line in std::io::stdin().lock().lines() {
         let request: serde_json::Value =
             serde_json::from_str(&line.expect("peer stdin")).expect("peer JSON");
+        let result = if request["method"] == "tools/index-large" {
+            let text = request["params"]["text"]
+                .as_str()
+                .expect("large tool input");
+            serde_json::json!({
+                "bytes": text.len(), "characters": text.chars().count(),
+                "sha256": format!("{:x}", sha2::Sha256::digest(text.as_bytes())),
+            })
+        } else {
+            serde_json::json!({"method": request["method"], "text": request["params"]["text"]})
+        };
         println!(
             "{}",
             serde_json::json!({
                 "jsonrpc": "2.0", "id": request["id"],
-                "result": {"method": request["method"], "text": request["params"]["text"]},
+                "result": result,
             })
         );
         std::io::stdout().flush().expect("peer response flush");
@@ -932,6 +944,7 @@ fn persistent_stdio_peer() {
 
 #[test]
 fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
+    use sha2::Digest as _;
     let harness = common::TestHarness::new("cp_persistent_stdio");
     let cwd = harness.temp_dir().to_path_buf();
     let executable = serde_json::to_string(&std::env::current_exe().expect("test executable"))
@@ -984,7 +997,9 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
                         : {{ timeout: 10000 }});
                 const replies = new Map();
                 const acks = [];
-                let stdout = '', stderr = '', exits = 0, closes = 0;
+                const writeResults = [];
+                let stdout = '', stderr = '', exits = 0, closes = 0, drains = 0;
+                child.stdin.on('drain', () => {{ drains++; }});
                 child.stdout.on('data', (chunk) => {{
                     stdout += chunk.toString('utf8');
                     let newline;
@@ -1003,11 +1018,12 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
                     child.on('error', reject);
                     child.on('close', (code, signal) => {{ closes++; resolve({{ code, signal }}); }});
                 }});
-                function request(id, method) {{
+                function request(id, method, text = 'duplex λ') {{
                     const response = new Promise((resolve, reject) => {{
                         replies.set(id, resolve);
-                        child.stdin.write(JSON.stringify({{jsonrpc:'2.0', id, method, params:{{text:'duplex λ'}}}}) + '\n',
+                        const ready = child.stdin.write(JSON.stringify({{jsonrpc:'2.0', id, method, params:{{text}}}}) + '\n',
                             (error) => {{ if (error) reject(error); else acks.push(id); }});
+                        writeResults.push({{id, ready}});
                     }});
                     return response;
                 }}
@@ -1015,10 +1031,20 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
                 const first = await request(1, 'initialize');
                 const second = await request(2, 'tools/list');
                 const third = await request(3, 'tools/call');
+                let oversizedRejected = false;
+                try {{ child.stdin.write(new Uint8Array(4 * 1024 * 1024 + 1)); }}
+                catch (error) {{ oversizedRejected = error instanceof RangeError; }}
+                // context-mode writes each JSON-RPC tool request in one call.
+                // Index input can span several bounded native pipe messages.
+                const drained = new Promise(resolve => child.stdin.once('drain', resolve));
+                const large = await request(4, 'tools/index-large', 'λ🚀Z'.repeat(60000));
+                await drained;
+                const afterLarge = await request(5, 'tools/call');
                 child.stdin.end(() => acks.push('end'));
                 const status = await closed;
                 await Promise.resolve();
-                return {{ first, second, third, acks, status, exits, closes,
+                return {{ first, second, third, large, afterLarge, acks, status, exits, closes,
+                    oversizedRejected, writeResults, drains,
                     stderr, killAfterClose: child.kill(), ended: child.stdin.writableEnded }};
             }}
             pi.on('agent_start', async () => {{
@@ -1092,9 +1118,33 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
         assert_eq!(result["first"]["method"], "initialize", "{response}");
         assert_eq!(result["second"]["method"], "tools/list", "{response}");
         assert_eq!(result["third"]["text"], "duplex λ", "{response}");
+        let large_text = "λ🚀Z".repeat(60000);
+        assert_eq!(
+            result["large"],
+            serde_json::json!({
+                "bytes": large_text.len(), "characters": large_text.chars().count(),
+                "sha256": format!("{:x}", sha2::Sha256::digest(large_text.as_bytes())),
+            }),
+            "large UTF-8 frames must reach the peer without truncation or interleaving"
+        );
+        assert_eq!(result["afterLarge"]["text"], "duplex λ", "{response}");
+        assert_eq!(result["oversizedRejected"], true, "{response}");
+        assert_eq!(
+            result["writeResults"],
+            serde_json::json!([
+                {"id": 1, "ready": true}, {"id": 2, "ready": true},
+                {"id": 3, "ready": true}, {"id": 4, "ready": false},
+                {"id": 5, "ready": true},
+            ]),
+            "{response}"
+        );
+        assert!(
+            result["drains"].as_u64().unwrap_or_default() >= 1,
+            "{response}"
+        );
         assert_eq!(
             result["acks"],
-            serde_json::json!([1, 2, 3, "end"]),
+            serde_json::json!([1, 2, 3, 4, 5, "end"]),
             "{response}"
         );
         assert_eq!(
@@ -1233,11 +1283,12 @@ fn stdin_end_callbacks_settle_after_denied_admission_and_close() {
         runtime
             .eval(
                 r#"
-                globalThis.endResult = { pending: [], afterClose: [], finishes: 0, closes: 0 };
+                globalThis.endResult = { writes: [], pending: [], afterClose: [], finishes: 0, closes: 0 };
                 import('node:child_process').then(({ spawn }) => {
                     const child = spawn('stdin-denied-fixture');
                     child.on('error', () => {});
                     child.stdin.on('finish', () => endResult.finishes++);
+                    child.stdin.write('λ'.repeat(200000), error => endResult.writes.push(error?.code));
                     child.stdin.end(error => endResult.pending.push(error?.code));
                     child.stdin.end(error => endResult.pending.push(error?.code));
                     child.on('close', () => {
@@ -1271,6 +1322,7 @@ fn stdin_end_callbacks_settle_after_denied_admission_and_close() {
             .read_global_json("endResult")
             .await
             .expect("read EOF lifecycle result");
+        assert_eq!(result["writes"], serde_json::json!(["denied"]));
         assert_eq!(result["pending"], serde_json::json!(["denied", "denied"]));
         assert_eq!(
             result["afterClose"],

@@ -144,6 +144,157 @@ fn sqlite_imports_initialize_a_persistent_session_database_and_reopen_it() {
 }
 
 #[test]
+fn sqlite_busy_error_reaches_context_mode_retry_and_preserves_persistent_state() {
+    let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let storage = root.join("storage");
+        std::fs::create_dir(&storage).expect("storage");
+        let path = serde_json::to_string(&storage.join("retry.db")).unwrap();
+        let runtime = runtime(&root, "retry", None).await;
+        runtime
+            .add_persistent_storage_root(storage, "retry")
+            .expect("storage grant");
+        let result = evaluate(&runtime, &format!(r#"
+            const locker = new sqlite.Database({path});
+            locker.exec('PRAGMA journal_mode = WAL');
+            locker.exec('CREATE TABLE events (id INTEGER PRIMARY KEY, data TEXT)');
+            const db = new sqlite.Database({path}, {{ create: false }});
+            db.exec('PRAGMA busy_timeout = 0');
+            const insert = db.prepare('INSERT INTO events VALUES (?, ?)');
+            const save = db.transaction(() => insert.run(1, 'persisted after retry'));
+            locker.exec('BEGIN IMMEDIATE');
+            locker.prepare('INSERT INTO events VALUES (?, ?)').run(99, 'uncommitted owner');
+            const failures = [];
+            let attempts = 0;
+            // Match context-mode 1.0.169 db-base.withRetry's message test.
+            // Release the genuine competing writer only after that test
+            // recognizes the first failure, then retry the same transaction.
+            for (;;) {{
+              attempts++;
+              try {{ save(); break; }}
+              catch (error) {{
+                if (!error.message.includes('SQLITE_BUSY') && !error.message.includes('database is locked')) throw error;
+                if (attempts !== 1) throw error;
+                failures.push({{code:error.code, errno:error.errno, primary:error.primaryCode,
+                  message:error.message, rolledBack:!db.inTransaction}});
+                locker.exec('ROLLBACK');
+              }}
+            }}
+            const inTransaction = db.inTransaction;
+            db.close();
+            locker.close();
+            const reopened = new sqlite.Database({path}, {{ readonly: true }});
+            globalThis.sqliteResult = {{ attempts, failures, inTransaction,
+              rows: reopened.query('SELECT id, data FROM events ORDER BY id').values() }};
+            reopened.close();
+        "#)).await;
+        assert_eq!(result["attempts"], 2, "{result}");
+        assert_eq!(result["inTransaction"], false, "{result}");
+        assert_eq!(
+            result["rows"],
+            json!([[1, "persisted after retry"]]),
+            "{result}"
+        );
+        let failure = &result["failures"][0];
+        assert_eq!(failure["primary"], 5, "{result}");
+        assert_eq!(failure["errno"].as_i64().unwrap() & 0xff, 5);
+        assert!(failure["code"].as_str().unwrap().starts_with("SQLITE_BUSY"));
+        assert!(failure["message"].as_str().unwrap().contains("SQLITE_BUSY"));
+        assert_eq!(failure["rolledBack"], true, "{result}");
+    });
+}
+
+#[test]
+fn sqlite_engine_errors_remain_distinct_from_admission_and_nested_rollback_errors() {
+    let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let storage = root.join("storage");
+        std::fs::create_dir(&storage).expect("storage");
+        let invalid = storage.join("invalid.db");
+        std::fs::write(&invalid, [0x61_u8; 4096]).expect("invalid database fixture");
+        let invalid_path = serde_json::to_string(&invalid).unwrap();
+        let missing_path = serde_json::to_string(&storage.join("missing.db")).unwrap();
+        let runtime = runtime(&root, "errors", None).await;
+        runtime
+            .add_persistent_storage_root(storage, "errors")
+            .expect("storage grant");
+        let result = evaluate(
+            &runtime,
+            &format!(
+                r#"
+            const db = new sqlite.Database(':memory:');
+            const errors = {{}};
+            function capture(name, operation) {{
+              try {{ operation(); throw new Error('expected SQLite rejection'); }}
+              catch (error) {{
+                errors[name] = {{code:error.code, errno:error.errno ?? null,
+                  primary:error.primaryCode ?? null, message:error.message}};
+              }}
+            }}
+            // A table name that looks like lock prose must not alter its
+            // actual native SQLITE_ERROR classification.
+            capture('missingTable', () => db.prepare('SELECT * FROM "database is locked"'));
+            capture('admission', () => db.exec("ATTACH ':memory:' AS other"));
+            capture('missingFile', () => new sqlite.Database({missing_path}, {{create:false}}));
+            capture('invalidFile', () => new sqlite.Database({invalid_path}, {{create:false}}));
+            const readonly = new sqlite.Database(':memory:', {{readonly:true}});
+            capture('readonly', () => readonly.exec('CREATE TABLE denied(value)'));
+            readonly.close();
+            db.exec('CREATE TABLE entries(id INTEGER PRIMARY KEY)');
+            db.run('INSERT INTO entries VALUES (1)');
+            capture('nestedRollback', () => db.transaction(() => {{
+              db.run('INSERT INTO entries VALUES (2)');
+              db.transaction(() => db.run('INSERT OR ROLLBACK INTO entries VALUES (1)'))();
+            }})());
+            const ended = !db.inTransaction;
+            db.transaction(() => db.run('INSERT INTO entries VALUES (3)'))();
+            globalThis.sqliteResult = {{ errors, ended,
+              rows:db.query('SELECT id FROM entries ORDER BY id').values() }};
+            db.close();
+        "#
+            ),
+        )
+        .await;
+        assert_eq!(result["ended"], true, "{result}");
+        assert_eq!(result["rows"], json!([[1], [3]]), "{result}");
+        for (name, code, primary) in [
+            ("missingTable", "SQLITE_ERROR", 1),
+            ("missingFile", "SQLITE_CANTOPEN", 14),
+            ("readonly", "SQLITE_READONLY", 8),
+            ("nestedRollback", "SQLITE_CONSTRAINT", 19),
+        ] {
+            let error = &result["errors"][name];
+            assert_eq!(error["code"], code, "{name}: {result}");
+            assert_eq!(error["primary"], primary, "{name}: {result}");
+            assert_eq!(error["errno"].as_i64().unwrap() & 0xff, primary);
+            assert!(error["message"].as_str().unwrap().starts_with(code));
+        }
+        let admission = &result["errors"]["admission"];
+        assert_eq!(admission["code"], "SQLITE_ERROR", "{result}");
+        assert_eq!(admission["errno"], Value::Null, "{result}");
+        assert_eq!(admission["primary"], Value::Null, "{result}");
+        let invalid = &result["errors"]["invalidFile"];
+        assert!(
+            matches!(
+                invalid["code"].as_str(),
+                Some("SQLITE_CORRUPT" | "SQLITE_NOTADB")
+            ),
+            "native corruption/open failure must keep its actual code: {result}"
+        );
+        assert!(
+            invalid["message"]
+                .as_str()
+                .unwrap()
+                .starts_with(invalid["code"].as_str().unwrap())
+        );
+    });
+}
+
+#[test]
 fn sqlite_transactions_returning_bindings_and_binary_values_are_real() {
     let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
     futures::executor::block_on(async {
