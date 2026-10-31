@@ -60,6 +60,12 @@ use swc_ecma_parser::{Parser as SwcParser, StringInput, Syntax, TsSyntax};
 use swc_ecma_transforms_base::resolver;
 use swc_ecma_transforms_typescript::strip;
 
+mod executable;
+mod process_session;
+mod sqlite;
+#[path = "extensions_js_storage.rs"]
+mod storage;
+
 macro_rules! compressed_js_literal {
     ($source:expr) => {{
         const RAW_LEN: usize = ($source).len();
@@ -4966,6 +4972,9 @@ struct PiJsModuleState {
     /// workspace-boundary checks, but never grant filesystem or resolver
     /// access to this runtime.
     foreign_extension_root_boundaries_by_id: HashMap<String, Vec<PathBuf>>,
+    /// Host-granted persistent data directories, deliberately excluded from
+    /// executable module resolution and missing-asset repair.
+    persistent_storage: storage::PersistentStorage,
     /// Shared handle for recording repair events from the resolver.
     repair_events: Arc<std::sync::Mutex<Vec<ExtensionRepairEvent>>>,
     /// Directory for persistent transpiled-source disk cache.
@@ -5016,6 +5025,7 @@ impl PiJsModuleState {
             extension_roots_by_id: HashMap::new(),
             extension_roots_without_id: Vec::new(),
             foreign_extension_root_boundaries_by_id: HashMap::new(),
+            persistent_storage: storage::PersistentStorage::default(),
             repair_events: Arc::new(std::sync::Mutex::new(Vec::new())),
             disk_cache_dir: None,
             compiled_sources_bytes: 0,
@@ -5279,6 +5289,22 @@ fn path_is_in_workspace_or_registered_extension_root(
     let checked_path = crate::extensions::safe_canonicalize(path);
     checked_path.starts_with(workspace_root)
         || path_is_in_registered_extension_root(&checked_path, module_state)
+        || module_state.borrow().persistent_storage.is_registered(path)
+        || module_state
+            .borrow()
+            .persistent_storage
+            .is_registered(&checked_path)
+}
+
+fn persistent_storage_path(
+    path: &Path,
+    extension_id: Option<&str>,
+    module_state: &Rc<RefCell<PiJsModuleState>>,
+) -> std::io::Result<Option<PathBuf>> {
+    module_state
+        .borrow()
+        .persistent_storage
+        .resolve(path, extension_id)
 }
 
 fn path_is_in_leaf_allowed_extension_root(
@@ -5309,6 +5335,19 @@ fn path_is_allowed_extension_fs_path(
     module_state: &Rc<RefCell<PiJsModuleState>>,
     fallback_roots: &Arc<std::sync::Mutex<Vec<PathBuf>>>,
 ) -> bool {
+    let checked_path = crate::extensions::safe_canonicalize(path);
+    if module_state.borrow().persistent_storage.is_registered(path)
+        || module_state
+            .borrow()
+            .persistent_storage
+            .is_registered(&checked_path)
+    {
+        return module_state
+            .borrow()
+            .persistent_storage
+            .allows(path, extension_id, "read");
+    }
+    let path = checked_path.as_path();
     let in_owned_root =
         path_is_in_allowed_extension_root(path, extension_id, module_state, fallback_roots);
     if path_is_in_registered_extension_root(path, module_state) {
@@ -6243,6 +6282,18 @@ fn load_compiled_module_source(
     state: &mut PiJsModuleState,
     name: &str,
 ) -> rquickjs::Result<Vec<u8>> {
+    if !state.static_virtual_modules.contains_key(name)
+        && !state.dynamic_virtual_modules.contains_key(name)
+        && (state.persistent_storage.is_registered(Path::new(name))
+            || state
+                .persistent_storage
+                .is_registered(&crate::extensions::safe_canonicalize(Path::new(name))))
+    {
+        return Err(rquickjs::Error::new_loading_message(
+            name,
+            "Persistent application storage is data-only and cannot be imported as executable code",
+        ));
+    }
     let cache_key = module_cache_key(
         &state.static_virtual_modules,
         &state.dynamic_virtual_modules,
@@ -7954,6 +8005,7 @@ fn read_proc_uid_gid() -> Option<(u32, u32)> {
 #[allow(clippy::too_many_lines)]
 fn default_virtual_modules() -> HashMap<String, String> {
     let mut modules = HashMap::new();
+    modules.insert("bun:sqlite".to_string(), sqlite::MODULE_SOURCE.to_string());
 
     // Some extensions import Agent unconditionally but feature-detect native
     // Undici before using it. Keep that import resolvable without advertising
@@ -11287,7 +11339,7 @@ function __emitCloseOnce(child, code, signal = null) {
 
 function __parseSpawnOptions(raw) {
   const options = raw && typeof raw === "object" ? raw : {};
-  const allowed = new Set(["cwd", "detached", "shell", "stdio", "timeout"]);
+  const allowed = new Set(["cwd", "detached", "shell", "stdio", "timeout", "env"]);
   for (const key of Object.keys(options)) {
     if (!allowed.has(key)) {
       throw new Error(`node:child_process.spawn: unsupported option '${key}'`);
@@ -11340,6 +11392,7 @@ function __parseSpawnOptions(raw) {
     detached: Boolean(options.detached),
     stdio,
     timeoutMs,
+    env: options.env,
   };
 }
 
@@ -11405,6 +11458,213 @@ function __installProcessKillBridge() {
 
 __installProcessKillBridge();
 
+function __spawnPersistent(cmd, argv, opts) {
+  if (opts.detached) {
+    throw new Error("node:child_process.spawn: persistent piped processes cannot be detached");
+  }
+  if (opts.env !== undefined && (!opts.env || typeof opts.env !== "object" || Array.isArray(opts.env))) {
+    throw new TypeError("node:child_process.spawn: env must be an object");
+  }
+  const child = __makeEmitter();
+  child.pid = __pi_child_process_state.nextPid++;
+  child.killed = false;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.__pi_done = false;
+  child.stdout = opts.stdio[1] === "pipe" ? __makeEmitter() : null;
+  child.stderr = opts.stdio[2] === "pipe" ? __makeEmitter() : null;
+  child.stdin = opts.stdio[0] === "pipe" ? __makeEmitter() : null;
+  const streams = [child.stdout, child.stderr];
+  for (const stream of streams) {
+    if (!stream) continue;
+    stream.setEncoding = (encoding) => { stream.encoding = String(encoding); return stream; };
+  }
+  let handle = null;
+  let timer = null;
+  let referenced = true;
+  let spawned = false;
+  let nextWrite = 1;
+  let bufferedBytes = 0;
+  let needsDrain = false;
+  let pendingKill = null;
+  const pending = [];
+  const writes = new Map();
+  const MAX_BUFFERED = 4 * 1024 * 1024;
+  const MAX_CHUNK = 256 * 1024;
+  const HIGH_WATER = 64 * 1024;
+
+  function pipeError(message) {
+    const error = message instanceof Error ? message : new Error(String(message?.message || message));
+    if (!error.code && message && typeof message === "object" && message.code) error.code = String(message.code);
+    if (!error.code) error.code = "EPIPE";
+    return error;
+  }
+  function settleWrite(id, error) {
+    const write = writes.get(id);
+    if (!write) return;
+    writes.delete(id);
+    bufferedBytes -= write.size;
+    if (typeof write.callback === "function") Promise.resolve().then(() => write.callback(error || undefined));
+    if (write.end && child.stdin && !error) {
+      child.stdin.closed = true;
+      child.stdin.emit("finish");
+    }
+  }
+  function close(code, signal, error) {
+    if (child.__pi_done) return;
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+    if (handle) {
+      try { __pi_process_session_close_native(handle); } catch (_) {}
+    }
+    for (const id of [...writes.keys()]) settleWrite(id, pipeError(error || "Process stdin closed"));
+    pending.length = 0;
+    if (child.stdin) {
+      child.stdin.destroyed = true;
+      child.stdin.closed = true;
+    }
+    for (const stream of streams) if (stream) stream.emit("end");
+    if (error) child.emit("error", pipeError(error));
+    if (spawned) {
+      __emitCloseOnce(child, code, signal);
+    } else {
+      child.__pi_done = true;
+      child.exitCode = code;
+      child.signalCode = signal;
+      __pi_child_process_state.children.delete(child.pid);
+      child.emit("close", code, signal);
+    }
+  }
+  function flushInput() {
+    if (!handle || child.__pi_done) return;
+    while (pending.length) {
+      const next = pending[0];
+      const accepted = next.end
+        ? __pi_process_session_end_native(handle, next.id)
+        : __pi_process_session_write_native(handle, next.id, next.data);
+      if (!accepted) return;
+      pending.shift();
+    }
+  }
+  function poll() {
+    timer = null;
+    if (!handle || child.__pi_done) return;
+    try {
+      const result = JSON.parse(__pi_process_session_poll_native(handle));
+      for (const frame of result.frames || []) {
+        if (frame.stream) {
+          const stream = frame.stream === "stdout" ? child.stdout : child.stderr;
+          if (stream) {
+            const bytes = Buffer.from(frame.data, "base64");
+            stream.emit("data", stream.encoding ? bytes.toString(stream.encoding) : bytes);
+          }
+        } else if (frame.writeId !== undefined) {
+          const error = frame.error ? pipeError(frame.error) : null;
+          settleWrite(frame.writeId, error);
+          if (error && child.stdin) child.stdin.emit("error", error);
+        }
+      }
+      if (result.terminal) {
+        const terminal = result.terminal;
+        close(terminal.code ?? null, terminal.signal ?? null, terminal.error);
+        return;
+      }
+      flushInput();
+      if (needsDrain && bufferedBytes < HIGH_WATER && child.stdin) {
+        needsDrain = false;
+        child.stdin.emit("drain");
+      }
+    } catch (error) {
+      try { __pi_process_session_kill_native(handle, "SIGKILL"); } catch (_) {}
+      close(null, null, error);
+      return;
+    }
+    timer = setTimeout(poll, 10);
+    if (!referenced && timer && typeof timer.unref === "function") timer.unref();
+  }
+  if (child.stdin) {
+    child.stdin.destroyed = false;
+    child.stdin.writableEnded = false;
+    child.stdin.closed = false;
+    child.stdin.write = (chunk, encoding, callback) => {
+      if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+      if (child.stdin.writableEnded || child.stdin.destroyed || child.__pi_done) {
+        const error = pipeError("write after process stdin closed");
+        if (typeof callback === "function") Promise.resolve().then(() => callback(error));
+        else Promise.resolve().then(() => child.stdin.emit("error", error));
+        return false;
+      }
+      const bytes = typeof chunk === "string" ? Buffer.from(chunk, encoding || "utf8") : Buffer.from(chunk);
+      if (bytes.length > MAX_CHUNK || bufferedBytes + bytes.length > MAX_BUFFERED || writes.size >= 1024) {
+        throw new RangeError("node:child_process stdin buffer limit exceeded");
+      }
+      const id = nextWrite++;
+      const write = { id, data: bytes.toString("base64"), size: bytes.length, callback, end: false };
+      writes.set(id, write);
+      pending.push(write);
+      bufferedBytes += bytes.length;
+      try { flushInput(); }
+      catch (error) { close(null, null, error); return false; }
+      if (bufferedBytes >= HIGH_WATER) needsDrain = true;
+      return bufferedBytes < HIGH_WATER;
+    };
+    child.stdin.end = (chunk, encoding, callback) => {
+      if (typeof chunk === "function") { callback = chunk; chunk = undefined; }
+      else if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+      if (child.stdin.writableEnded) return child.stdin;
+      if (chunk !== undefined && chunk !== null) child.stdin.write(chunk, encoding);
+      child.stdin.writableEnded = true;
+      const id = nextWrite++;
+      const write = { id, size: 0, callback, end: true };
+      writes.set(id, write);
+      pending.push(write);
+      try { flushInput(); } catch (error) { close(null, null, error); }
+      return child.stdin;
+    };
+  }
+  child.kill = (signal = "SIGTERM") => {
+    if (child.__pi_done) return false;
+    const requested = String(signal || "SIGTERM");
+    if (requested !== "SIGTERM" && requested !== "SIGKILL") throw new Error("Unsupported process signal");
+    if (!handle) {
+      pendingKill = requested;
+      child.killed = true;
+      return true;
+    }
+    const accepted = __pi_process_session_kill_native(handle, requested);
+    if (accepted) child.killed = true;
+    return accepted;
+  };
+  child.ref = () => { referenced = true; if (timer && typeof timer.ref === "function") timer.ref(); return child; };
+  child.unref = () => { referenced = false; if (timer && typeof timer.unref === "function") timer.unref(); return child; };
+  child.stdio = [child.stdin, child.stdout, child.stderr];
+  __pi_child_process_state.children.set(child.pid, child);
+  const execOptions = { persistent: true, stdio: opts.stdio, shell: false };
+  if (opts.cwd !== undefined) execOptions.cwd = opts.cwd;
+  if (opts.timeoutMs !== undefined) execOptions.timeout = opts.timeoutMs;
+  if (opts.env !== undefined) {
+    execOptions.env = Object.create(null);
+    for (const [name, value] of Object.entries(opts.env)) {
+      if (value !== undefined) execOptions.env[name] = value === null ? null : String(value);
+    }
+  }
+  globalThis.pi.exec(cmd, argv, execOptions).then((result) => {
+    if (!result || typeof result.session !== "string") throw new Error("Persistent process session was not created");
+    handle = result.session;
+    if (child.__pi_done) { __pi_process_session_close_native(handle); return; }
+    __pi_child_process_state.children.delete(child.pid);
+    child.pid = result.pid;
+    __pi_child_process_state.children.set(child.pid, child);
+    spawned = true;
+    child.emit("spawn");
+    if (pendingKill) __pi_process_session_kill_native(handle, pendingKill);
+    if (!child.stdin) pending.push({ id: 0, end: true });
+    flushInput();
+    poll();
+  }).catch((error) => close(null, null, error));
+  return child;
+}
+
 export function spawn(command, args = [], options = {}) {
   const cmd = String(command ?? "").trim();
   if (!cmd) {
@@ -11416,6 +11676,13 @@ export function spawn(command, args = [], options = {}) {
 
   const argv = args.map((arg) => String(arg));
   const opts = __parseSpawnOptions(options);
+
+  if (opts.stdio[0] === "pipe" || opts.env !== undefined) {
+    if (typeof __pi_process_session_poll_native !== "function") {
+      throw new Error("node:child_process.spawn: persistent process host is unavailable");
+    }
+    return __spawnPersistent(cmd, argv, opts);
+  }
 
   const child = __makeEmitter();
   child.pid = __pi_child_process_state.nextPid++;
@@ -11602,8 +11869,22 @@ export function execSync(command, options) {
   const timeout = typeof opts.timeout === "number" ? opts.timeout : 0;
   const maxBuffer = typeof opts.maxBuffer === "number" ? opts.maxBuffer : 1024 * 1024;
 
-  // execSync runs through a shell, so pass via sh -c
-  const raw = __pi_exec_sync_native("sh", JSON.stringify(["-c", cmdStr]), cwd, timeout, maxBuffer);
+  // Resolve the conventional PATH probe without running a shell. All other
+  // sync execution retains its existing opt-in and capability checks.
+  const probePattern = globalThis.process && globalThis.process.platform === "win32"
+    ? /^where[ \t]+([A-Za-z0-9][A-Za-z0-9._+-]*)$/
+    : /^command[ \t]+-v[ \t]+([A-Za-z0-9][A-Za-z0-9._+-]*)$/;
+  const probe = probePattern.exec(cmdStr);
+  const discoveryOptions = Object.keys(opts).every((key) =>
+    ["cwd", "encoding", "stdio", "timeout", "maxBuffer"].includes(key));
+  let raw;
+  if (probe && discoveryOptions && typeof __pi_find_executables_native === "function") {
+    const matches = JSON.parse(__pi_find_executables_native(probe[1], cwd));
+    const hits = globalThis.process.platform === "win32" ? matches : matches.slice(0, 1);
+    raw = JSON.stringify({ stdout: hits.length ? hits.join("\n") + "\n" : "", stderr: "", status: hits.length ? 0 : 1, pid: 0 });
+  } else {
+    raw = __pi_exec_sync_native("sh", JSON.stringify(["-c", cmdStr]), cwd, timeout, maxBuffer);
+  }
   const result = __parseExecSyncResult(raw, cmdStr);
 
   if (result.error) {
@@ -11924,6 +12205,7 @@ import * as vm from "node:vm";
 import * as v8 from "node:v8";
 import * as workerThreads from "node:worker_threads";
 import * as testMod from "node:test";
+import * as bunSqlite from "bun:sqlite";
 
 function __normalizeBuiltin(id) {
   const spec = String(id ?? "");
@@ -12039,6 +12321,7 @@ function __normalizeBuiltin(id) {
 }
 
 const __builtinModules = {
+  "bun:sqlite": bunSqlite,
   "node:fs": fs,
   "node:fs/promises": fsPromises,
   "node:path": path,
@@ -12131,6 +12414,7 @@ export function createRequire(_path) {
     const normalized = __normalizeBuiltin(id);
     const builtIn = __builtinModules[normalized];
     if (builtIn) {
+      if (normalized === "bun:sqlite") return builtIn;
       if (builtIn && Object.prototype.hasOwnProperty.call(builtIn, "default") && builtIn.default !== undefined) {
         return builtIn.default;
       }
@@ -12217,6 +12501,18 @@ const __pi_vfs = (() => {
     if (typeof globalThis.__pi_host_check_read_access === "function") {
       globalThis.__pi_host_check_read_access(toHostPath(normalized));
     }
+  }
+
+  function isPersistentPath(path) {
+    return typeof globalThis.__pi_host_is_persistent_storage_path === "function"
+      && globalThis.__pi_host_is_persistent_storage_path(toHostPath(path));
+  }
+
+  function persistentMutation(op, path, options = {}) {
+    if (typeof globalThis.__pi_host_persistent_storage_mutate !== "function") {
+      throw new Error("PiJS persistent storage bridge is unavailable");
+    }
+    globalThis.__pi_host_persistent_storage_mutate(op, toHostPath(path), JSON.stringify(options));
   }
 
   function checkWorkspaceWriteAccess(resolved) {
@@ -12802,8 +13098,9 @@ const __pi_vfs = (() => {
       return makeStat(resolvePath(normalized, true), true);
     }
 
-    const isDir = state.dirs.has(normalized);
-    let bytes = state.files.get(normalized);
+    const persistent = isPersistentPath(normalized);
+    const isDir = !persistent && state.dirs.has(normalized);
+    let bytes = persistent ? undefined : state.files.get(normalized);
     let hostStat = null;
     if (!isDir && bytes === undefined && !isCurrentExtensionTempPath(normalized) && typeof globalThis.__pi_host_stat_sync === "function") {
       try {
@@ -12934,6 +13231,8 @@ const __pi_vfs = (() => {
   state.isCurrentExtensionTempPath = isCurrentExtensionTempPath;
   state.checkReadAccess = checkReadAccess;
   state.checkWriteAccess = checkWriteAccess;
+  state.isPersistentPath = isPersistentPath;
+  state.persistentMutation = persistentMutation;
   state.checkWorkspaceWriteAccess = checkWorkspaceWriteAccess;
   state.parseOpenFlags = parseOpenFlags;
   state.getFdEntry = getFdEntry;
@@ -12993,7 +13292,7 @@ export function existsSync(path) {
 
 export function readFileSync(path, encoding) {
   const resolved = __pi_vfs.resolvePathForRead(path, true);
-  let bytes = __pi_vfs.files.get(resolved);
+  let bytes = __pi_vfs.isPersistentPath(resolved) ? undefined : __pi_vfs.files.get(resolved);
   let hostError = "";
   if (bytes === undefined) {
     const host = __pi_vfs.readHostBytes(resolved);
@@ -13008,6 +13307,15 @@ export function readFileSync(path, encoding) {
 }
 
 export function appendFileSync(path, data, opts) {
+  const persistentPath = __pi_vfs.resolvePathForWrite(path, true);
+  if (__pi_vfs.isPersistentPath(persistentPath)) {
+    const bytes = __pi_vfs.toBytes(data, opts);
+    __pi_vfs.persistentMutation("append", persistentPath, {
+      data: Buffer.from(bytes).toString("base64"),
+      flag: opts && typeof opts === "object" ? opts.flag : undefined,
+    });
+    return;
+  }
   const flags =
     opts && typeof opts === "object" && typeof opts.flag === "string"
       ? opts.flag
@@ -13023,6 +13331,14 @@ export function appendFileSync(path, data, opts) {
 
 export function writeFileSync(path, data, opts) {
   const resolved = __pi_vfs.resolvePathForWrite(path, true);
+  if (__pi_vfs.isPersistentPath(resolved)) {
+    const bytes = __pi_vfs.toBytes(data, opts);
+    __pi_vfs.persistentMutation("write", resolved, {
+      data: Buffer.from(bytes).toString("base64"),
+      flag: opts && typeof opts === "object" ? opts.flag : undefined,
+    });
+    return;
+  }
   if (
     __pi_vfs.dirs.has(resolved) ||
     __pi_vfs.readHostStat(resolved, true)?.kind === "dir"
@@ -13114,6 +13430,10 @@ export function realpathSync(path, _opts) {
 }
 export function unlinkSync(path) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
+  if (__pi_vfs.isPersistentPath(normalized)) {
+    __pi_vfs.persistentMutation("unlink", normalized);
+    return;
+  }
   if (__pi_vfs.symlinks.delete(normalized)) {
     return;
   }
@@ -13123,6 +13443,11 @@ export function unlinkSync(path) {
 }
 export function rmdirSync(path, _opts) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
+  if (__pi_vfs.isPersistentPath(normalized)) {
+    if (_opts && _opts.recursive) throw new Error("PiJS persistent recursive directory removal is unsupported");
+    __pi_vfs.persistentMutation("rmdir", normalized);
+    return;
+  }
   const prefix = __pi_vfs.childPrefix(normalized);
   if (normalized === "/") {
     throw new Error("EBUSY: resource busy or locked, rmdir '/'");
@@ -13152,6 +13477,13 @@ export function rmdirSync(path, _opts) {
 }
 export function rmSync(path, opts) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
+  if (__pi_vfs.isPersistentPath(normalized)) {
+    if (opts && opts.recursive) throw new Error("PiJS persistent recursive directory removal is unsupported");
+    if (opts && opts.force && !existsSync(normalized)) return;
+    const op = statSync(normalized).isDirectory() ? "rmdir" : "unlink";
+    __pi_vfs.persistentMutation(op, normalized);
+    return;
+  }
   const prefix = __pi_vfs.childPrefix(normalized);
   if (__pi_vfs.files.has(normalized)) {
     __pi_vfs.files.delete(normalized);
@@ -13196,6 +13528,13 @@ export function copyFileSync(src, dest, _mode) {
 export function renameSync(oldPath, newPath) {
   const src = __pi_vfs.resolvePathForWrite(oldPath, false);
   const dst = __pi_vfs.resolvePathForWrite(newPath, false);
+  if (__pi_vfs.isPersistentPath(src) || __pi_vfs.isPersistentPath(dst)) {
+    if (!__pi_vfs.isPersistentPath(src) || !__pi_vfs.isPersistentPath(dst)) {
+      throw new Error("PiJS cannot rename across persistent and virtual filesystems");
+    }
+    __pi_vfs.persistentMutation("rename", src, { target: __pi_vfs.toHostPath(dst) });
+    return;
+  }
   const linkTarget = __pi_vfs.symlinks.get(src);
   if (linkTarget !== undefined) {
     __pi_vfs.ensureDir(__pi_vfs.dirname(dst));
@@ -13214,6 +13553,10 @@ export function renameSync(oldPath, newPath) {
 }
 export function mkdirSync(path, _opts) {
   const resolved = __pi_vfs.resolvePathForWrite(path, true);
+  if (__pi_vfs.isPersistentPath(resolved)) {
+    __pi_vfs.persistentMutation("mkdir", resolved, { recursive: !!(_opts && _opts.recursive) });
+    return undefined;
+  }
   if (__pi_vfs.files.has(resolved) || __pi_vfs.symlinks.has(resolved)) {
     throw new Error(`EEXIST: file already exists, mkdir '${String(path ?? "")}'`);
   }
@@ -13262,6 +13605,9 @@ export function readlinkSync(path, opts) {
 }
 export function symlinkSync(target, path, _type) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
+  if (__pi_vfs.isPersistentPath(normalized)) {
+    throw new Error("PiJS persistent storage does not permit symlinks");
+  }
   const parent = __pi_vfs.dirname(normalized);
   if (!__pi_vfs.dirs.has(parent)) {
     throw new Error(`ENOENT: no such file or directory, symlink '${String(path ?? "")}'`);
@@ -13283,6 +13629,10 @@ export function openSync(path, flags = "r", _mode) {
     __pi_vfs.authorizeWriteResolution(resolution);
   }
   const resolved = resolution.resolved;
+
+  if (needsWriteAccess && __pi_vfs.isPersistentPath(resolved)) {
+    throw new Error("PiJS persistent file descriptors are unsupported; use writeFileSync or appendFileSync");
+  }
 
   const hostStat = __pi_vfs.readHostStat(resolved, true);
   if (__pi_vfs.dirs.has(resolved) || hostStat?.kind === "dir") {
@@ -17618,6 +17968,8 @@ pub struct PiJsRuntime<C: SchedulerClock = WallClock> {
     /// Immutable principal for production extension isolates. Harness runtimes
     /// leave this unset so low-level bridge tests can model multiple identities.
     owner_extension_id: Option<Arc<str>>,
+    sqlite_state: Rc<RefCell<sqlite::SqliteRuntime>>,
+    process_sessions: process_session::ProcessSessions,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -17772,6 +18124,30 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 .or_insert_with(|| platform.to_string());
         }
 
+        // This is host metadata, not a filesystem grant. Child integrations
+        // identify Pi from it without probing a parent of their data root.
+        // Preserve explicit snapshots and avoid ambient HOME when supplied.
+        if !config.env.contains_key("PI_CONFIG_DIR") {
+            let config_dir = config
+                .env
+                .get("PI_CODING_AGENT_DIR")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| {
+                    config
+                        .env
+                        .get("HOME")
+                        .or_else(|| config.env.get("USERPROFILE"))
+                        .filter(|value| !value.is_empty())
+                        .map(|home| PathBuf::from(home).join(".pi").join("agent"))
+                })
+                .unwrap_or_else(crate::config::Config::global_dir);
+            config.env.insert(
+                "PI_CONFIG_DIR".to_string(),
+                config_dir.to_string_lossy().into_owned(),
+            );
+        }
+
         let runtime = AsyncRuntime::new().map_err(|err| map_js_error(&err))?;
         if let Some(limit) = config.limits.memory_limit_bytes {
             runtime.set_memory_limit(limit).await;
@@ -17800,6 +18176,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 .with_disk_cache_dir(config.disk_cache_dir.clone())
                 .with_compiled_cache_limit_bytes(compiled_cache_limit_bytes),
         ));
+        module_state
+            .borrow_mut()
+            .persistent_storage
+            .set_policy(policy.clone());
         runtime
             .set_loader(
                 PiJsResolver {
@@ -17840,6 +18220,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let trace_seq = Arc::new(AtomicU64::new(1));
         let bridge_secret = uuid::Uuid::new_v4().simple().to_string();
         let runtime_id = uuid::Uuid::new_v4().simple().to_string();
+        let process_sessions = process_session::ProcessSessions::new(
+            config.cwd.clone(),
+            config.env.clone(),
+            config.deny_env,
+            owner_extension_id.clone(),
+        );
 
         let instance = Self {
             runtime,
@@ -17865,6 +18251,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             bridge_secret,
             runtime_id,
             owner_extension_id,
+            sqlite_state: Rc::new(RefCell::new(sqlite::SqliteRuntime::default())),
+            process_sessions,
         };
 
         instance.install_pi_bridge().await?;
@@ -17938,6 +18326,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// registry inventory, so callers must cold-create the next realm even
     /// after a clean scrub.
     pub async fn scrub_for_cold_drop(&self) -> Result<PiJsRealmScrubReport> {
+        self.process_sessions.close_all();
+        self.sqlite_state
+            .borrow_mut()
+            .reset()
+            .map_err(Error::extension)?;
         let rust_pending_hostcalls =
             u64::try_from(self.hostcall_tracker.borrow().pending_count()).unwrap_or(u64::MAX);
         let rust_pending_hostcall_queue =
@@ -18029,6 +18422,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             state.extension_roots_by_id.clear();
             state.extension_roots_without_id.clear();
             state.foreign_extension_root_boundaries_by_id.clear();
+            state.persistent_storage.clear();
 
             for spec in dynamic_specs {
                 if remove_compiled_source(&mut state, &spec).is_some() {
@@ -18164,6 +18558,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// JavaScript realm and must never authorize realm reuse.
     #[cfg(test)]
     fn reset_host_bookkeeping_before_drop(&self) {
+        self.process_sessions.close_all();
+        self.sqlite_state
+            .borrow_mut()
+            .reset()
+            .expect("reset SQLite before dropping test runtime");
         let mut state = self.module_state.borrow_mut();
         state.extension_roots.clear();
         state.canonical_extension_roots.clear();
@@ -18172,6 +18571,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         state.extension_roots_by_id.clear();
         state.extension_roots_without_id.clear();
         state.foreign_extension_root_boundaries_by_id.clear();
+        state.persistent_storage.clear();
         state.dynamic_virtual_modules.clear();
         state.dynamic_virtual_named_exports.clear();
         state.module_cache_counters = ModuleCacheCounters::default();
@@ -18981,6 +19381,73 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         }
     }
 
+    /// Grant one extension a persistent data directory. This is a host-only
+    /// capability: guest metadata cannot add roots, and data roots never grant
+    /// module-import authority. The path must be absolute and contain no links.
+    pub fn add_persistent_storage_root(&self, root: PathBuf, extension_id: &str) -> Result<()> {
+        if self
+            .owner_extension_id
+            .as_deref()
+            .is_some_and(|owner| owner != extension_id)
+        {
+            return Err(Error::extension(
+                "Persistent storage owner does not match runtime owner",
+            ));
+        }
+        self.module_state
+            .borrow_mut()
+            .persistent_storage
+            .register(root, extension_id, false)
+            .map_err(|error| Error::extension(format!("Invalid persistent storage grant: {error}")))
+    }
+
+    pub(crate) fn register_foreign_persistent_storage_root(
+        &self,
+        root: PathBuf,
+        extension_id: &str,
+    ) -> Result<()> {
+        self.module_state
+            .borrow_mut()
+            .persistent_storage
+            .register(root, extension_id, true)
+            .map_err(|error| {
+                Error::extension(format!("Invalid persistent storage boundary: {error}"))
+            })
+    }
+
+    /// Resolve host-supplied state configuration before any guest code runs.
+    /// Mutable JavaScript process.env values cannot expand these grants.
+    pub(crate) fn application_storage_root(&self, namespace: &Path) -> Option<PathBuf> {
+        let host_env = |key: &str| {
+            if self.config.deny_env {
+                return None;
+            }
+            self.config
+                .env
+                .get(key)
+                .cloned()
+                .or_else(|| std::env::var(key).ok())
+                .filter(|value| !value.trim().is_empty())
+        };
+        let home = host_env("HOME")
+            .or_else(|| host_env("USERPROFILE"))
+            // node:os.homedir exposes this host metadata even when generic
+            // environment access is denied. Match its HOME/USERPROFILE order.
+            .or_else(|| std::env::var("HOME").ok().filter(|value| !value.is_empty()))
+            .or_else(|| {
+                std::env::var("USERPROFILE")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            })
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir)?;
+        Some(
+            crate::extensions::safe_canonicalize(&home)
+                .join(".pi")
+                .join(namespace),
+        )
+    }
+
     /// Register a peer extension root as an ownership boundary without
     /// granting this runtime filesystem or module-resolver access to it.
     ///
@@ -19026,6 +19493,20 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         if !roots.contains(&canonical_root) {
             roots.push(canonical_root);
         }
+    }
+
+    /// Called only after the shared exec dispatcher has admitted and mediated
+    /// this request. Native JS session callbacks cannot create new processes.
+    pub(crate) fn spawn_process_session(
+        &self,
+        extension_id: Option<&str>,
+        command: &str,
+        args: &[String],
+        options: &serde_json::Value,
+        on_exit: Box<dyn FnOnce() + Send>,
+    ) -> std::result::Result<serde_json::Value, String> {
+        self.process_sessions
+            .spawn(extension_id, command, args, options, on_exit)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -19077,6 +19558,17 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         self.context
             .with(|ctx| {
                 let global = ctx.globals();
+
+                storage::install(&ctx, &module_state)?;
+                sqlite::install(
+                    &ctx,
+                    Rc::clone(&self.sqlite_state),
+                    Rc::clone(&module_state),
+                    process_cwd.clone(),
+                    policy.clone(),
+                )?;
+                self.process_sessions.install(&ctx)?;
+                executable::install(&ctx, env.clone(), process_cwd.clone(), policy.clone())?;
 
                 global.set(
                     "__pi_bridge_secret_matches_native",
@@ -19621,6 +20113,30 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     }),
                 )?;
 
+                // Enumerate only snapshot keys whose values the same getter
+                // may disclose. Sorting avoids HashMap iteration nondeterminism
+                // and neither secret names nor ambient keys cross this bridge.
+                global.set(
+                    "__pi_env_keys_native",
+                    Func::from({
+                        let env = env.clone();
+                        let policy_for_env = policy.clone();
+                        move || -> Vec<String> {
+                            if deny_env {
+                                return Vec::new();
+                            }
+                            let mut keys: Vec<String> = env.keys().filter(|key| {
+                                policy_for_env.as_ref().map_or_else(
+                                    || is_env_var_allowed(key),
+                                    |policy| !policy.secret_broker.is_secret(key),
+                                )
+                            }).cloned().collect();
+                            keys.sort();
+                            keys
+                        }
+                    }),
+                )?;
+
                 // __pi_env_get_native(key) -> string | null
                 global.set(
                     "__pi_env_get_native",
@@ -19915,7 +20431,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 crate::extensions::safe_canonicalize(&requested_abs);
 
                             let allowed = path_is_allowed_extension_fs_path(
-                                &checked_path,
+                                &requested_abs,
                                 &workspace_root,
                                 extension_id.as_deref(),
                                 &module_state,
@@ -19975,13 +20491,20 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let checked_path =
                                 crate::extensions::safe_canonicalize(&requested_abs);
 
-                            let allowed = path_is_allowed_extension_fs_path(
-                                &checked_path,
-                                &workspace_root,
-                                extension_id.as_deref(),
-                                &module_state,
-                                &allowed_read_roots,
-                            );
+                            let storage = &module_state.borrow().persistent_storage;
+                            let allowed = if storage.is_registered(&requested_abs)
+                                || storage.is_registered(&checked_path)
+                            {
+                                storage.allows(&requested_abs, extension_id.as_deref(), "write")
+                            } else {
+                                path_is_allowed_extension_fs_path(
+                                    &requested_abs,
+                                    &workspace_root,
+                                    extension_id.as_deref(),
+                                    &module_state,
+                                    &allowed_read_roots,
+                                )
+                            };
                             log_host_fs_decision(
                                 "write",
                                 allowed,
@@ -20035,7 +20558,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 crate::extensions::safe_canonicalize(&requested_abs);
 
                             let allowed = path_is_allowed_extension_fs_path(
-                                &checked_path,
+                                &requested_abs,
                                 &workspace_root,
                                 extension_id.as_deref(),
                                 &module_state,
@@ -20117,7 +20640,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 crate::extensions::safe_canonicalize(&requested_abs);
 
                             let allowed = path_is_allowed_extension_fs_path(
-                                &checked_path,
+                                &requested_abs,
                                 &workspace_root,
                                 extension_id.as_deref(),
                                 &module_state,
@@ -20219,6 +20742,16 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 workspace_root.join(requested)
                             };
 
+                            if let Some(bytes) = storage::read_file(
+                                &requested_abs,
+                                extension_id.as_deref(),
+                                &module_state,
+                            ).map_err(|error| rquickjs::Error::new_loading_message(
+                                &path, format!("persistent storage read: {error}"),
+                            ))? {
+                                return Ok(BASE64_STANDARD.encode(bytes));
+                            }
+
                             let apply_missing_asset_fallback = |checked_path: &Path, error_msg: &str| -> rquickjs::Result<String> {
                                 let in_ext_root = path_is_in_leaf_allowed_extension_root(
                                     checked_path,
@@ -20280,7 +20813,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 let prechecked_path =
                                     crate::extensions::safe_canonicalize(&requested_abs);
                                 if !path_is_allowed_extension_fs_path(
-                                    &prechecked_path,
+                                    &requested_abs,
                                     &workspace_root,
                                     extension_id.as_deref(),
                                     &module_state,
@@ -20315,7 +20848,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         let checked_path = crate::extensions::safe_canonicalize(&requested_abs);
 
                                         let allowed = path_is_allowed_extension_fs_path(
-                                            &checked_path,
+                                            &requested_abs,
                                             &workspace_root,
                                             extension_id.as_deref(),
                                             &module_state,
@@ -20414,7 +20947,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     &allowed_read_roots,
                                 );
                                 let allowed = path_is_allowed_extension_fs_path(
-                                    &checked_path,
+                                    &requested_abs,
                                     &workspace_root,
                                     extension_id.as_deref(),
                                     &module_state,
@@ -25137,34 +25670,56 @@ if (typeof globalThis.process === 'undefined') {
     const detHome = __pi_env_get_native('PI_DETERMINISTIC_HOME');
     const detCwd = __pi_env_get_native('PI_DETERMINISTIC_CWD');
 
+    // Materialize only the capability-filtered, immutable host snapshot.
+    // Libraries can spread process.env into child options without exposing
+    // credentials or receiving permission to enumerate the ambient host env.
+    const envTarget = Object.create(null);
+    for (const key of __pi_env_keys_native()) {
+        const value = __pi_env_get_native(key);
+        if (value !== null && value !== undefined) envTarget[key] = value;
+    }
+    if (detHome) envTarget.HOME = detHome;
     const envProxy = new Proxy(
-        {},
+        envTarget,
         {
-            get(_target, prop) {
+            get(target, prop, receiver) {
+                if (Reflect.getOwnPropertyDescriptor(target, prop)) {
+                    return Reflect.get(target, prop, receiver);
+                }
                 if (typeof prop !== 'string') return undefined;
-                if (prop === 'HOME' && detHome) return detHome;
                 const value = __pi_env_get_native(prop);
                 return value === null || value === undefined ? undefined : value;
             },
-            set(_target, prop, _value) {
+            set(target, prop, value) {
+                const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+                if (descriptor && descriptor.configurable === false) {
+                    if ('value' in descriptor && descriptor.writable === false) {
+                        return Object.is(value, descriptor.value);
+                    }
+                    if ('set' in descriptor && descriptor.set === undefined) return false;
+                }
                 // Read-only in PiJS — silently ignore writes
                 return typeof prop === 'string';
             },
-            deleteProperty(_target, prop) {
+            deleteProperty(target, prop) {
+                const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+                if (descriptor && (!descriptor.configurable || !Reflect.isExtensible(target))) return false;
                 // Read-only — silently ignore deletes
                 return typeof prop === 'string';
             },
-            has(_target, prop) {
+            has(target, prop) {
+                if (Reflect.has(target, prop)) return true;
                 if (typeof prop !== 'string') return false;
-                if (prop === 'HOME' && detHome) return true;
                 const value = __pi_env_get_native(prop);
                 return value !== null && value !== undefined;
             },
-            ownKeys() {
-                // Cannot enumerate real env — return empty
-                return [];
+            ownKeys(target) {
+                return Reflect.ownKeys(target);
             },
-            getOwnPropertyDescriptor(_target, prop) {
+            getOwnPropertyDescriptor(target, prop) {
+                const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+                if (descriptor) return descriptor;
+                if (!Reflect.isExtensible(target)) return undefined;
                 if (typeof prop !== 'string') return undefined;
                 const value = __pi_env_get_native(prop);
                 if (value === null || value === undefined) return undefined;
@@ -25594,12 +26149,9 @@ if (typeof globalThis.Bun === 'undefined') {
             globalThis.process && typeof globalThis.process.cwd === 'function'
                 ? globalThis.process.cwd()
                 : '/';
-        const raw = __pi_exec_sync_native('which', JSON.stringify([name]), cwd, 2000, 1024 * 1024);
         try {
-            const parsed = JSON.parse(raw || '{}');
-            if (Number(parsed && parsed.code) !== 0) return null;
-            const out = String((parsed && parsed.stdout) || '').trim();
-            return out ? out.split('\n')[0] : null;
+            const matches = JSON.parse(__pi_find_executables_native(name, cwd));
+            return matches.length ? matches[0] : null;
         } catch (_) {
             return null;
         }

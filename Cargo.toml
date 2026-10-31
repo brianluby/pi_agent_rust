@@ -332,6 +332,11 @@ crossbeam-queue = "0.3"
 # asupersync (0.4.11) and its franken-kernel/decision/evidence 0.4.11
 # companions leave the dependency graph.
 fsqlite = { version = "0.4.10", default-features = false, features = ["native", "fts5"] }
+# The pinned engine's prepare API excludes DDL and transaction statements.
+# Use its own parser/AST for side-effect-free validation of Bun statements and
+# structural sandbox admission; both crates are already engine dependencies.
+fsqlite-ast = "=0.4.10"
+fsqlite-parser = "=0.4.10"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

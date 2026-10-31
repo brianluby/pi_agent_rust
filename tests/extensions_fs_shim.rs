@@ -1389,3 +1389,211 @@ fn fs_default_export_complete() {
         );
     });
 }
+
+async fn persistent_storage_runtime(
+    workspace: &std::path::Path,
+    storage: &std::path::Path,
+    policy: pi::extensions::ExtensionPolicy,
+) -> PiJsRuntime<DeterministicClock> {
+    let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+        DeterministicClock::new(0),
+        PiJsRuntimeConfig {
+            cwd: workspace.display().to_string(),
+            disk_cache_dir: None,
+            ..Default::default()
+        },
+        Some(policy),
+        "storage.owner".to_string(),
+    )
+    .await
+    .expect("runtime");
+    runtime.add_extension_root_with_id(workspace.to_path_buf(), Some("storage.owner"));
+    runtime
+        .add_persistent_storage_root(storage.to_path_buf(), "storage.owner")
+        .expect("host storage grant");
+    runtime
+}
+
+#[test]
+fn fs_persistent_namespace_survives_cold_runtime_restart() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = pi::extensions::safe_canonicalize(temp.path());
+        let workspace = base.join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let storage = base.join("home/.pi/context-mode");
+        let dir = serde_json::to_string(&storage.join("sessions").display().to_string()).unwrap();
+        let runtime = persistent_storage_runtime(&workspace, &storage, Default::default()).await;
+        runtime
+            .eval(&format!(
+                r#"
+            import('node:fs').then((fs) => {{
+                const dir = {dir};
+                fs.mkdirSync(dir, {{ recursive: true }});
+                fs.writeFileSync(dir + '/session.json', '{{"turn":1}}');
+                fs.appendFileSync(dir + '/session.json', '\n');
+                fs.renameSync(dir + '/session.json', dir + '/saved.json');
+                fs.copyFileSync(dir + '/saved.json', dir + '/copy.json');
+                fs.unlinkSync(dir + '/copy.json');
+                globalThis.persisted = {{
+                    text: fs.readFileSync(dir + '/saved.json', 'utf8'),
+                    names: fs.readdirSync(dir),
+                    size: fs.statSync(dir + '/saved.json').size,
+                }};
+            }});
+        "#
+            ))
+            .await
+            .expect("persistent fs initialization");
+        runtime.drain_microtasks().await.expect("drain");
+        let result = runtime.read_global_json("persisted").await.unwrap();
+        assert_eq!(result["text"], "{\"turn\":1}\n");
+        assert_eq!(result["names"], serde_json::json!(["saved.json"]));
+        assert_eq!(
+            std::fs::read_to_string(storage.join("sessions/saved.json")).unwrap(),
+            "{\"turn\":1}\n"
+        );
+        drop(runtime);
+
+        let runtime = persistent_storage_runtime(&workspace, &storage, Default::default()).await;
+        runtime
+            .eval(&format!(
+                r#"
+            import('node:fs').then(async (fs) => {{
+                globalThis.reloaded = await fs.promises.readFile({dir} + '/saved.json', 'utf8');
+            }});
+        "#
+            ))
+            .await
+            .expect("cold reload");
+        runtime.drain_microtasks().await.expect("drain");
+        assert_eq!(
+            runtime.read_global_json("reloaded").await.unwrap(),
+            "{\"turn\":1}\n"
+        );
+    });
+}
+
+#[test]
+fn fs_persistent_namespace_preserves_scope_capabilities_and_module_isolation() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = pi::extensions::safe_canonicalize(temp.path());
+        let workspace = base.join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let storage = base.join("home/.pi/context-mode");
+        let root = serde_json::to_string(&storage.display().to_string()).unwrap();
+        let runtime = persistent_storage_runtime(&workspace, &storage, Default::default()).await;
+        runtime.eval(&format!(r#"
+            import('node:fs').then(async (fs) => {{
+                const root = {root};
+                fs.mkdirSync(root, {{ recursive: true }});
+                fs.writeFileSync(root + '/payload.mjs', 'globalThis.executedStorage = true;');
+                const denied = [];
+                for (const path of [root + '/../agent/auth.json', root + '/../peer/data.txt', root + '-peer/file.txt']) {{
+                    try {{ fs.writeFileSync(path, 'forbidden'); denied.push(false); }}
+                    catch (_) {{ denied.push(true); }}
+                }}
+                let importDenied = false;
+                try {{ await import(root + '/payload.mjs'); }} catch (_) {{ importDenied = true; }}
+                globalThis.scopeResult = {{ denied, importDenied, executed: !!globalThis.executedStorage }};
+            }});
+        "#)).await.expect("scope checks");
+        runtime.drain_microtasks().await.expect("drain");
+        let result = runtime.read_global_json("scopeResult").await.unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({"denied": [true, true, true], "importDenied": true, "executed": false})
+        );
+        assert!(!base.join("home/.pi/agent/auth.json").exists());
+
+        runtime.add_extension_root_with_id(base.clone(), Some("storage.owner"));
+        runtime
+            .eval(&format!(
+                r#"
+            import({root} + '/payload.mjs').then(
+                () => {{ globalThis.overlappingImportDenied = false; }},
+                () => {{ globalThis.overlappingImportDenied = true; }},
+            );
+        "#
+            ))
+            .await
+            .expect("overlapping executable root check");
+        runtime.drain_microtasks().await.expect("drain");
+        assert_eq!(
+            runtime
+                .read_global_json("overlappingImportDenied")
+                .await
+                .unwrap(),
+            true
+        );
+
+        let mut policy = pi::extensions::ExtensionPolicy::default();
+        policy.deny_caps.push("write".to_string());
+        let denied_runtime = persistent_storage_runtime(&workspace, &storage, policy).await;
+        denied_runtime.eval(&format!(r#"
+            import('node:fs').then((fs) => {{
+                try {{ fs.writeFileSync({root} + '/denied.txt', 'forbidden'); globalThis.writeDenied = false; }}
+                catch (_) {{ globalThis.writeDenied = true; }}
+            }});
+        "#)).await.expect("capability check");
+        denied_runtime.drain_microtasks().await.expect("drain");
+        assert_eq!(
+            denied_runtime
+                .read_global_json("writeDenied")
+                .await
+                .unwrap(),
+            true
+        );
+        assert!(!storage.join("denied.txt").exists());
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_persistent_namespace_rejects_existing_and_late_symlink_escapes() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = pi::extensions::safe_canonicalize(temp.path());
+        let workspace = base.join("workspace");
+        let storage = base.join("home/.pi/context-mode");
+        let outside = base.join("outside");
+        for dir in [&workspace, &storage, &outside] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(outside.join("secret"), b"unchanged").unwrap();
+        let runtime = persistent_storage_runtime(&workspace, &storage, Default::default()).await;
+        std::os::unix::fs::symlink(&outside, storage.join("escape")).unwrap();
+        std::fs::hard_link(outside.join("secret"), storage.join("hardlink")).unwrap();
+        let root = serde_json::to_string(&storage.display().to_string()).unwrap();
+        runtime.eval(&format!(r#"
+            import('node:fs').then((fs) => {{
+                const root = {root};
+                globalThis.linkResults = [
+                    () => fs.readFileSync(root + '/escape/secret', 'utf8'),
+                    () => fs.writeFileSync(root + '/escape/secret', 'changed'),
+                    () => fs.mkdirSync(root + '/escape/new/dir', {{ recursive: true }}),
+                    () => fs.writeFileSync(root + '/hardlink', 'changed'),
+                ].map((action) => {{ try {{ action(); return false; }} catch (_) {{ return true; }} }});
+            }});
+        "#)).await.expect("link checks");
+        runtime.drain_microtasks().await.expect("drain");
+        assert_eq!(
+            runtime.read_global_json("linkResults").await.unwrap(),
+            serde_json::json!([true, true, true, true])
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("secret")).unwrap(),
+            "unchanged"
+        );
+        assert!(!outside.join("new").exists());
+
+        let symlink_root = base.join("linked-root");
+        std::os::unix::fs::symlink(&outside, &symlink_root).unwrap();
+        assert!(
+            runtime
+                .add_persistent_storage_root(symlink_root, "storage.owner")
+                .is_err()
+        );
+    });
+}

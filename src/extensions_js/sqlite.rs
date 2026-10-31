@@ -1,0 +1,1590 @@
+//! Synchronous SQLite for PiJS, backed by the existing FrankenSQLite engine.
+//!
+//! The engine runs on one lazily created, bounded worker per runtime. Database
+//! handles belong to the active extension; file-backed databases require a
+//! host-granted persistent storage root. SQL cannot acquire another filesystem
+//! capability through ATTACH, native functions, virtual-table modules or PRAGMA.
+//! Cancellation reaches the engine's actual operation context. A timed-out
+//! worker is poisoned and cannot accept further work; the process-wide worker
+//! permit stays with the thread until it has really exited.
+//!
+//! Native fsqlite uses a cooperative directory namespace. Guest code has no
+//! host symlink/hardlink primitive and cannot name a database outside its grant.
+//! We reject links and recheck pinned parents and all companions around each
+//! operation. On Unix this does not make fsqlite's pathname-based VFS safe
+//! against a separate, same-UID native process replacing directories mid-call.
+//!
+//! The request, result, page-cache and memory-VFS budgets below do not bound
+//! every SQL intermediate allocation. The native file-family limit is checked
+//! around operations, not by a hard VFS write quota. A stronger resource or
+//! same-UID race boundary requires upstream engine controls or a subprocess.
+
+// The existing engine deliberately exposes !Send, deeply nested futures. They
+// are awaited only on the owned worker with its explicit 16 MiB stack.
+#![allow(clippy::future_not_send, clippy::large_futures)]
+
+use super::{PiJsModuleState, current_extension_id, persistent_storage_path, storage};
+use crate::extensions::{ExtensionPolicy, PolicyDecision};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use fsqlite::{Connection, ConnectionEnv, FrankenError, Row, SqliteValue};
+use fsqlite_ast::Statement as SqlStatement;
+use fsqlite_parser::Parser;
+use rquickjs::Ctx;
+use rquickjs::function::Func;
+use serde::Deserialize;
+use serde_json::{Value as Json, json};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+pub(super) const MODULE_SOURCE: &str = include_str!("sqlite.mjs");
+
+const MAX_SQL_BYTES: usize = 64 * 1024;
+const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_VALUE_BYTES: usize = 1024 * 1024;
+const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RESULT_ROWS: usize = 10_000;
+const MAX_PARAMETERS: usize = 999;
+const MAX_DATABASES: usize = 16;
+const MAX_WORKERS: usize = 8;
+const MAX_DATABASE_BYTES: u64 = 128 * 1024 * 1024;
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const CANCEL_GRACE: Duration = Duration::from_millis(250);
+static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+// The native engine has more companions than libsqlite3. Include its FEC,
+// namespace/certificate artifacts and Windows advisory locks, on every host.
+const SIDECARS: &[&str] = &[
+    "-wal",
+    "-shm",
+    "-journal",
+    "-wal-fec",
+    "-fsqlite-ns-gate",
+    "-fsqlite-ns-use",
+    "-wal-cert",
+    "-wal-cert-head",
+    ".fsqlite-shm",
+    "-lock-shared",
+    "-lock-reserved",
+    "-lock-pending",
+    "-wal-lock-shared",
+    "-wal-lock-reserved",
+    "-wal-lock-pending",
+];
+
+type Result<T> = std::result::Result<T, String>;
+type Cancel = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum Bindings {
+    Positional(Vec<Json>),
+    Named(BTreeMap<String, Json>),
+}
+
+impl Default for Bindings {
+    fn default() -> Self {
+        Self::Positional(Vec::new())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum QueryMode {
+    All,
+    Get,
+    Values,
+    Run,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+enum Request {
+    Open {
+        path: String,
+        #[serde(default)]
+        readonly: bool,
+        #[serde(default = "default_create")]
+        create: bool,
+        #[serde(default)]
+        strict: bool,
+        #[serde(default)]
+        safe_integers: bool,
+    },
+    Prepare {
+        id: u64,
+        sql: String,
+    },
+    Query {
+        id: u64,
+        sql: String,
+        bindings: Bindings,
+        mode: QueryMode,
+    },
+    Exec {
+        id: u64,
+        sql: String,
+    },
+    InTransaction {
+        id: u64,
+    },
+    Close {
+        id: u64,
+    },
+}
+
+const fn default_create() -> bool {
+    true
+}
+
+impl Request {
+    const fn database_id(&self) -> Option<u64> {
+        match self {
+            Self::Open { .. } => None,
+            Self::Prepare { id, .. }
+            | Self::Query { id, .. }
+            | Self::Exec { id, .. }
+            | Self::InTransaction { id }
+            | Self::Close { id } => Some(*id),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DatabaseOwner {
+    extension_id: Option<String>,
+    path: Option<PathBuf>,
+    readonly: bool,
+}
+
+#[derive(Default)]
+pub(super) struct SqliteRuntime {
+    worker: Option<Worker>,
+    databases: HashMap<u64, DatabaseOwner>,
+    next_id: u64,
+    poisoned: bool,
+}
+
+impl SqliteRuntime {
+    /// Called before a warm runtime loses its extension identity/storage grants.
+    /// An interrupted engine is never recycled as a clean runtime.
+    pub(super) fn reset(&mut self) -> Result<()> {
+        if self.poisoned {
+            return Err("SQLite worker timed out; this PiJS runtime cannot be reused".into());
+        }
+        if let Some(worker) = self.worker.as_mut() {
+            worker.call(Command::Reset)?;
+        }
+        self.worker.take();
+        self.databases.clear();
+        // Never recycle database ids: a retained JS object must not acquire a
+        // new owner's connection after a runtime reset.
+        Ok(())
+    }
+
+    fn dispatch(
+        &mut self,
+        request: Request,
+        owner: Option<String>,
+        cwd: &Path,
+        modules: &Rc<RefCell<PiJsModuleState>>,
+        policy: Option<&ExtensionPolicy>,
+    ) -> Result<Json> {
+        if self.poisoned {
+            return Err("SQLITE_INTERRUPT: this runtime's SQLite worker is poisoned".into());
+        }
+        if let Some(id) = request.database_id() {
+            let db = self
+                .databases
+                .get(&id)
+                .ok_or("SQLite database is closed or belongs to another runtime")?;
+            if db.extension_id != owner {
+                return Err("SQLite database belongs to another extension".into());
+            }
+            if let Some(path) = &db.path {
+                if let Err(error) =
+                    authorize_database(path, owner.as_deref(), modules, policy, db.readonly)
+                {
+                    // Once authority or the namespace changes, do not leave
+                    // an engine handle that could later flush through it.
+                    if let Some(worker) = self.worker.as_mut() {
+                        let _ = worker.call(Command::Retire { id });
+                    }
+                    self.databases.remove(&id);
+                    return Err(error);
+                }
+            }
+        }
+
+        let mut opened = None;
+        let command = match request {
+            Request::Open {
+                path,
+                readonly,
+                create,
+                strict,
+                safe_integers,
+            } => {
+                if self.databases.len() >= MAX_DATABASES {
+                    return Err("SQLite runtime exceeds its 16-database limit".into());
+                }
+                let memory = path.is_empty() || path == ":memory:";
+                if path.contains('\0') || (!memory && path.starts_with("file:")) {
+                    return Err("SQLite filenames must be plain paths, not URI filenames".into());
+                }
+                let path = if memory {
+                    None
+                } else {
+                    let input = PathBuf::from(path);
+                    let path = if input.is_absolute() {
+                        input
+                    } else {
+                        cwd.join(input)
+                    };
+                    Some(authorize_database(
+                        &path,
+                        owner.as_deref(),
+                        modules,
+                        policy,
+                        readonly,
+                    )?)
+                };
+                self.next_id = self
+                    .next_id
+                    .checked_add(1)
+                    .ok_or("SQLite database id exhausted")?;
+                let id = self.next_id;
+                opened = Some((
+                    id,
+                    DatabaseOwner {
+                        extension_id: owner,
+                        path: path.clone(),
+                        readonly,
+                    },
+                ));
+                Command::Open {
+                    id,
+                    path,
+                    readonly,
+                    create,
+                    strict,
+                    safe_integers,
+                }
+            }
+            other => Command::Request(other),
+        };
+        let closing = match &command {
+            Command::Request(Request::Close { id }) => Some(*id),
+            _ => None,
+        };
+        if self.worker.is_none() {
+            self.worker = Some(Worker::start()?);
+        }
+        let worker = self.worker.as_mut().ok_or("SQLite worker unavailable")?;
+        let result = worker.call(command);
+        self.poisoned = worker.stopped.load(Ordering::Acquire);
+        if result.is_ok() {
+            if let Some((id, db)) = opened {
+                self.databases.insert(id, db);
+            }
+            if let Some(id) = closing {
+                self.databases.remove(&id);
+            }
+        }
+        result
+    }
+}
+
+pub(super) fn install(
+    ctx: &Ctx<'_>,
+    state: Rc<RefCell<SqliteRuntime>>,
+    modules: Rc<RefCell<PiJsModuleState>>,
+    cwd: String,
+    policy: Option<ExtensionPolicy>,
+) -> rquickjs::Result<()> {
+    ctx.globals().set(
+        "__pi_sqlite_native",
+        Func::from(move |ctx: Ctx<'_>, wire: String| -> String {
+            let result = if wire.len() > MAX_REQUEST_BYTES {
+                Err("SQLite request exceeds 8 MiB".into())
+            } else {
+                serde_json::from_str::<Request>(&wire)
+                    .map_err(|error| format!("Invalid SQLite request: {error}"))
+                    .and_then(|request| {
+                        state.borrow_mut().dispatch(
+                            request,
+                            current_extension_id(&ctx),
+                            Path::new(&cwd),
+                            &modules,
+                            policy.as_ref(),
+                        )
+                    })
+            };
+            match result {
+                Ok(value) => json!({ "ok": value }).to_string(),
+                Err(error) => json!({ "error": error }).to_string(),
+            }
+        }),
+    )
+}
+
+fn companion_paths(path: &Path) -> Vec<PathBuf> {
+    let mut paths = SIDECARS
+        .iter()
+        .map(|suffix| {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(suffix);
+            PathBuf::from(name)
+        })
+        .collect::<Vec<_>>();
+    let mut fec = path.as_os_str().to_os_string();
+    fec.push("-wal-fec");
+    paths.push(PathBuf::from(fec).with_extension("wal-fec.tmp"));
+    paths
+}
+
+fn authorize_database(
+    path: &Path,
+    owner: Option<&str>,
+    modules: &Rc<RefCell<PiJsModuleState>>,
+    policy: Option<&ExtensionPolicy>,
+    readonly: bool,
+) -> Result<PathBuf> {
+    for capability in if readonly {
+        &["read"][..]
+    } else {
+        &["read", "write"][..]
+    } {
+        if policy.is_some_and(|policy| {
+            policy.evaluate_for(capability, owner).decision != PolicyDecision::Allow
+        }) {
+            return Err(format!("SQLite {capability} capability denied"));
+        }
+    }
+    let path = persistent_storage_path(path, owner, modules)
+        .map_err(|error| error.to_string())?
+        .ok_or("File-backed SQLite requires a host-granted persistent storage root")?;
+    for companion in companion_paths(&path) {
+        persistent_storage_path(&companion, owner, modules)
+            .map_err(|error| error.to_string())?
+            .ok_or("SQLite companion escaped its persistent storage root")?;
+    }
+    Ok(path)
+}
+
+// SQLite has no sandbox-authorizer API in the pinned engine. Admission is a
+// deliberately restricted SQL token grammar, not substring matching. Decode
+// quoted identifiers, skip comments and string contents, and validate EVERY
+// statement before dispatch so a later forbidden statement cannot follow an
+// already committed prefix. Engine parsing still owns SQL syntax/semantics.
+#[derive(Debug, Clone)]
+enum Token {
+    Word(String),
+    Text(String),
+    Parameter(String),
+    Symbol(char),
+}
+
+impl Token {
+    fn name(&self) -> Option<&str> {
+        match self {
+            Self::Word(value) | Self::Text(value) => Some(value),
+            _ => None,
+        }
+    }
+    fn word(&self) -> Option<&str> {
+        match self {
+            Self::Word(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AdmittedSql {
+    statements: Vec<Vec<Token>>,
+    parsed: Vec<SqlStatement>,
+    parameters: Vec<Option<String>>,
+}
+
+impl AdmittedSql {
+    fn uses_native_prepare(&self) -> bool {
+        matches!(
+            self.parsed.first(),
+            Some(
+                SqlStatement::Select(_)
+                    | SqlStatement::Insert(_)
+                    | SqlStatement::Update(_)
+                    | SqlStatement::Delete(_)
+                    | SqlStatement::Pragma(_)
+            )
+        )
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn sql_tokens(sql: &str) -> Result<Vec<Vec<Token>>> {
+    if sql.is_empty() || sql.len() > MAX_SQL_BYTES || sql.contains('\0') {
+        return Err("SQL must contain 1 to 65536 bytes and no NUL".into());
+    }
+    let mut chars = sql.chars().peekable();
+    let mut statements = Vec::new();
+    let mut current = Vec::new();
+    let mut depth = 0_usize;
+    let mut count = 0_usize;
+    while let Some(ch) = chars.next() {
+        if ch.is_ascii_whitespace() {
+            continue;
+        }
+        if ch == '-' && chars.peek() == Some(&'-') {
+            chars.next();
+            for ch in chars.by_ref() {
+                if ch == '\n' || ch == '\r' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut closed = false;
+            while let Some(ch) = chars.next() {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    closed = true;
+                    break;
+                }
+            }
+            if !closed {
+                return Err("Unterminated SQL comment".into());
+            }
+            continue;
+        }
+        if ch == ';' {
+            if depth != 0 {
+                return Err("Statement separator inside SQL parentheses".into());
+            }
+            if !current.is_empty() {
+                statements.push(std::mem::take(&mut current));
+            }
+            if statements.len() > 128 {
+                return Err("SQL batch exceeds 128 statements".into());
+            }
+            continue;
+        }
+        let token = if matches!(ch, '\'' | '"' | '`' | '[') {
+            let close = if ch == '[' { ']' } else { ch };
+            let mut value = String::new();
+            let mut closed = false;
+            while let Some(next) = chars.next() {
+                if next == close {
+                    if close != ']' && chars.peek() == Some(&close) {
+                        chars.next();
+                        value.push(close);
+                    } else {
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    value.push(next);
+                }
+            }
+            if !closed {
+                return Err("Unterminated SQL string or identifier".into());
+            }
+            if ch == '\'' {
+                Token::Text(value)
+            } else {
+                Token::Word(value.to_ascii_lowercase())
+            }
+        } else if matches!(ch, '?' | ':' | '@' | '$') {
+            let mut value = ch.to_string();
+            while let Some(&next) = chars.peek() {
+                if (ch == '?' && next.is_ascii_digit())
+                    || (ch != '?' && (next.is_alphanumeric() || next == '_'))
+                {
+                    value.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if ch != '?' && value.len() == 1 {
+                return Err("Empty named SQL parameter".into());
+            }
+            // Tcl-style $name::suffix(...) parameters are deliberately not
+            // admitted: their lexer rules differ from ordinary named binds.
+            if ch == '$' && matches!(chars.peek(), Some(':' | '(')) {
+                return Err("Tcl-style SQL parameters are unsupported".into());
+            }
+            Token::Parameter(value)
+        } else if ch.is_alphanumeric() || ch == '_' {
+            let mut value = ch.to_string();
+            while let Some(&next) = chars.peek() {
+                if next.is_alphanumeric() || next == '_' || next == '$' {
+                    value.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            Token::Word(value.to_ascii_lowercase())
+        } else {
+            if ch == '(' {
+                depth += 1;
+                if depth > 64 {
+                    return Err("SQL nesting exceeds 64 levels".into());
+                }
+            } else if ch == ')' {
+                depth = depth.checked_sub(1).ok_or("Unbalanced SQL parentheses")?;
+            } else if !".,+-*/%=<>!|&~".contains(ch) {
+                return Err(format!("Unsupported SQL character {ch:?}"));
+            }
+            Token::Symbol(ch)
+        };
+        current.push(token);
+        count += 1;
+        if count > 16_384 {
+            return Err("SQL token limit exceeded".into());
+        }
+    }
+    if depth != 0 {
+        return Err("Unbalanced SQL parentheses".into());
+    }
+    if !current.is_empty() {
+        statements.push(current);
+    }
+    if statements.len() > 128 {
+        return Err("SQL batch exceeds 128 statements".into());
+    }
+    Ok(statements)
+}
+
+#[allow(clippy::too_many_lines)]
+fn admit_sql(sql: &str, single: bool) -> Result<AdmittedSql> {
+    let statements = sql_tokens(sql)?;
+    if single && statements.len() != 1 {
+        return Err("SQLite prepare requires exactly one statement".into());
+    }
+    let mut parameters = Vec::new();
+    let mut named = HashMap::<String, usize>::new();
+    for tokens in &statements {
+        let first = tokens
+            .first()
+            .and_then(Token::word)
+            .ok_or("SQL must start with a statement keyword")?;
+        if !matches!(
+            first,
+            "select"
+                | "values"
+                | "with"
+                | "insert"
+                | "replace"
+                | "update"
+                | "delete"
+                | "create"
+                | "alter"
+                | "drop"
+                | "begin"
+                | "commit"
+                | "end"
+                | "rollback"
+                | "savepoint"
+                | "release"
+                | "pragma"
+        ) {
+            return Err(format!(
+                "SQLite statement {first:?} is not permitted in the extension sandbox"
+            ));
+        }
+        for (index, token) in tokens.iter().enumerate() {
+            if let Some(name) = token.name() {
+                let name = name.to_ascii_lowercase();
+                let identifier = matches!(token, Token::Word(_));
+                let callable_string = matches!(tokens.get(index + 1), Some(Token::Symbol('(')));
+                if (identifier || callable_string)
+                    && (matches!(
+                        name.as_str(),
+                        "attach"
+                            | "detach"
+                            | "vacuum"
+                            | "load_extension"
+                            | "readfile"
+                            | "writefile"
+                            | "fsdir"
+                            | "edit"
+                            | "eval"
+                            | "shell"
+                            | "fts3_tokenizer"
+                    ) || name.starts_with("pragma_")
+                        || name.starts_with("fsqlite"))
+                {
+                    return Err(format!(
+                        "SQLite operation {name:?} cannot acquire host filesystem authority"
+                    ));
+                }
+                if identifier && name == "trigger" {
+                    return Err("SQLite triggers are not supported in extension databases".into());
+                }
+                if callable_string
+                    && matches!(
+                        name.as_str(),
+                        "randomblob" | "zeroblob" | "printf" | "format"
+                    )
+                {
+                    // These scalar functions can allocate gigabytes from a
+                    // tiny request before the engine reaches a checkpoint.
+                    // Do not expose them until the engine has a cell budget.
+                    return Err(format!(
+                        "SQLite allocating function {name:?} is unsupported in PiJS"
+                    ));
+                }
+            }
+            if let Token::Parameter(name) = token {
+                let ordinal = if name == "?" {
+                    parameters.len() + 1
+                } else if let Some(index) = name.strip_prefix('?') {
+                    index
+                        .parse()
+                        .map_err(|_| "Invalid numbered SQL parameter")?
+                } else if let Some(index) = named.get(name) {
+                    *index
+                } else {
+                    let index = parameters.len() + 1;
+                    named.insert(name.clone(), index);
+                    index
+                };
+                if ordinal == 0 || ordinal > MAX_PARAMETERS {
+                    return Err("SQL parameter limit exceeded (1 through 999)".into());
+                }
+                parameters.resize(parameters.len().max(ordinal), None);
+                if name != "?" && parameters[ordinal - 1].is_none() {
+                    parameters[ordinal - 1] = Some(name.clone());
+                }
+            }
+        }
+        if first == "pragma" {
+            admit_pragma(tokens)?;
+        }
+        if first == "create" && tokens.iter().any(|token| token.word() == Some("virtual")) {
+            let module = tokens
+                .windows(2)
+                .find(|pair| pair[0].word() == Some("using"))
+                .and_then(|pair| pair[1].name());
+            if !module.is_some_and(|module| module.eq_ignore_ascii_case("fts5")) {
+                return Err("Only the built-in fts5 virtual-table module is permitted".into());
+            }
+        }
+    }
+    if statements.len() > 1 && !parameters.is_empty() {
+        return Err("Bound parameters require one SQLite statement".into());
+    }
+    // The engine's parser is the final authority on statement boundaries and
+    // syntax. This also validates DDL at prepare time without executing it:
+    // fsqlite 0.4.10's native PreparedStatement supports only DML and PRAGMA.
+    let (parsed, errors) = Parser::from_sql(sql).parse_all();
+    if let Some(error) = errors.first() {
+        return Err(format!("Invalid SQLite SQL: {error}"));
+    }
+    if parsed.len() != statements.len() {
+        return Err("SQLite lexer and parser disagree about statement boundaries".into());
+    }
+    for statement in &parsed {
+        match statement {
+            SqlStatement::Select(_)
+            | SqlStatement::Insert(_)
+            | SqlStatement::Update(_)
+            | SqlStatement::Delete(_)
+            | SqlStatement::CreateTable(_)
+            | SqlStatement::CreateIndex(_)
+            | SqlStatement::CreateView(_)
+            | SqlStatement::Drop(_)
+            | SqlStatement::AlterTable(_)
+            | SqlStatement::Begin(_)
+            | SqlStatement::Commit
+            | SqlStatement::Rollback(_)
+            | SqlStatement::Savepoint(_)
+            | SqlStatement::Release(_)
+            | SqlStatement::Pragma(_) => {}
+            SqlStatement::CreateVirtualTable(table)
+                if table.module.eq_ignore_ascii_case("fts5") => {}
+            _ => {
+                return Err(
+                    "SQLite statement is outside the permitted extension SQL grammar".into(),
+                );
+            }
+        }
+    }
+    Ok(AdmittedSql {
+        statements,
+        parsed,
+        parameters,
+    })
+}
+
+fn admit_pragma(tokens: &[Token]) -> Result<()> {
+    let name = tokens
+        .get(1)
+        .and_then(Token::name)
+        .ok_or("PRAGMA requires a name")?
+        .to_ascii_lowercase();
+    // A schema qualifier or dotted fsqlite PRAGMA would bypass a name-only
+    // allowlist; these are never necessary for an isolated one-file database.
+    if matches!(tokens.get(2), Some(Token::Symbol('.'))) {
+        return Err("Schema-qualified PRAGMAs are not permitted".into());
+    }
+    let args = &tokens[2..];
+    let value = |allowed: &[&str]| -> Result<()> {
+        if args.is_empty() {
+            return Ok(());
+        }
+        let scalar = match args {
+            [Token::Symbol('='), token] | [Token::Symbol('('), token, Token::Symbol(')')] => {
+                token.name()
+            }
+            _ => None,
+        }
+        .ok_or("PRAGMA requires a literal scalar argument")?;
+        if allowed
+            .iter()
+            .any(|value| scalar.eq_ignore_ascii_case(value))
+        {
+            Ok(())
+        } else {
+            Err(format!("Unsupported value for PRAGMA {name}"))
+        }
+    };
+    match name.as_str() {
+        "journal_mode" => value(&["wal", "delete"]),
+        "synchronous" => value(&["normal", "full", "extra", "1", "2", "3"]),
+        "foreign_keys" | "defer_foreign_keys" => value(&["on", "off", "0", "1"]),
+        "wal_checkpoint" => value(&["passive", "full", "restart", "truncate"]),
+        "busy_timeout" => {
+            if args.is_empty() {
+                return Ok(());
+            }
+            let scalar = match args {
+                [Token::Symbol('='), token] | [Token::Symbol('('), token, Token::Symbol(')')] => {
+                    token.name()
+                }
+                _ => None,
+            }
+            .and_then(|value| value.parse::<u64>().ok());
+            if scalar.is_some_and(|value| value <= 30_000) {
+                Ok(())
+            } else {
+                Err("SQLite busy_timeout must be between 0 and 30000 milliseconds".into())
+            }
+        }
+        "table_info" | "table_xinfo" | "index_list" | "index_info" | "index_xinfo"
+        | "foreign_key_list" => {
+            if matches!(
+                args,
+                [
+                    Token::Symbol('('),
+                    Token::Word(_) | Token::Text(_),
+                    Token::Symbol(')')
+                ]
+            ) {
+                Ok(())
+            } else {
+                Err("Schema inspection PRAGMA requires one literal object name".into())
+            }
+        }
+        "user_version" => {
+            if args.is_empty() {
+                return Ok(());
+            }
+            if matches!(args, [Token::Symbol('='), Token::Word(value)] if value.parse::<i32>().is_ok())
+            {
+                Ok(())
+            } else {
+                Err("user_version requires an integer literal".into())
+            }
+        }
+        "database_list" | "schema_version" | "page_count" | "freelist_count"
+        | "compile_options" => {
+            if args.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "PRAGMA {name} is read-only in the extension sandbox"
+                ))
+            }
+        }
+        _ => Err(format!(
+            "PRAGMA {name:?} is unsupported in the extension sandbox"
+        )),
+    }
+}
+
+enum Command {
+    Open {
+        id: u64,
+        path: Option<PathBuf>,
+        readonly: bool,
+        create: bool,
+        strict: bool,
+        safe_integers: bool,
+    },
+    Request(Request),
+    Retire {
+        id: u64,
+    },
+    Reset,
+}
+
+struct Work {
+    command: Command,
+    reply: mpsc::SyncSender<Result<Json>>,
+}
+
+struct WorkerPermit;
+
+impl Drop for WorkerPermit {
+    fn drop(&mut self) {
+        ACTIVE_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct Worker {
+    sender: Option<mpsc::SyncSender<Work>>,
+    thread: Option<JoinHandle<()>>,
+    cancel: Arc<Mutex<Option<Cancel>>>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl Worker {
+    fn start() -> Result<Self> {
+        ACTIVE_WORKERS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_WORKERS).then_some(active + 1)
+            })
+            .map_err(|_| "SQLite process worker limit reached")?;
+        let permit = WorkerPermit;
+        let (sender, receiver) = mpsc::sync_channel::<Work>(1);
+        let cancel = Arc::new(Mutex::new(None::<Cancel>));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_stopped = Arc::clone(&stopped);
+        let thread = std::thread::Builder::new()
+            .name("pijs-sqlite".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let _permit = permit;
+                let mut databases = HashMap::<u64, EngineDatabase>::new();
+                while let Ok(work) = receiver.recv() {
+                    if worker_stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let result = execute_work(
+                        work.command,
+                        &mut databases,
+                        &worker_cancel,
+                        &worker_stopped,
+                    );
+                    worker_cancel
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    let _ = work.reply.send(result);
+                    if worker_stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+                // The worker owns every !Send engine and its cleanup. A timed
+                // out caller never drops connections on the QuickJS thread.
+                for (_, mut database) in databases {
+                    database.conn.root_cx().cancel();
+                    if database.verify_paths().is_ok() {
+                        let _ = futures::executor::block_on(
+                            database.conn.close_without_checkpoint_in_place(),
+                        );
+                    }
+                    // If the namespace changed, skip async close: it may
+                    // flush retained state. Connection::drop only cancels
+                    // and reclaims runtime state without disk I/O.
+                }
+            })
+            .map_err(|error| format!("Cannot start SQLite worker: {error}"))?;
+        Ok(Self {
+            sender: Some(sender),
+            thread: Some(thread),
+            cancel,
+            stopped,
+        })
+    }
+
+    fn call(&mut self, command: Command) -> Result<Json> {
+        self.call_with_timeout(command, OPERATION_TIMEOUT)
+    }
+
+    fn call_with_timeout(&mut self, command: Command, timeout: Duration) -> Result<Json> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err("SQLITE_INTERRUPT: SQLite worker is poisoned".into());
+        }
+        let (reply, response) = mpsc::sync_channel(1);
+        if self
+            .sender
+            .as_ref()
+            .ok_or("SQLite worker is closed")?
+            .send(Work { command, reply })
+            .is_err()
+        {
+            self.stopped.store(true, Ordering::Release);
+            return Err("SQLite worker terminated".into());
+        }
+        match response.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.stopped.store(true, Ordering::Release);
+                Err("SQLite worker terminated while executing a statement".into())
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.stop();
+                // Cooperative engine checkpoints acknowledge cancellation.
+                // Never join an unacknowledged thread on the UI path. Its
+                // permit remains live until the thread actually exits, so
+                // repeated timeouts cannot create unlimited detached work.
+                let _ = response.recv_timeout(CANCEL_GRACE);
+                Err(format!(
+                    "SQLITE_INTERRUPT: SQLite operation exceeded {} milliseconds; connection and runtime are poisoned",
+                    timeout.as_millis()
+                ))
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        if let Some(cancel) = self
+            .cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            cancel();
+        }
+        self.sender.take();
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.stop();
+        if let Some(thread) = self.thread.take()
+            && thread.is_finished()
+        {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct EngineDatabase {
+    conn: Connection,
+    // Drop/close the engine before releasing its directory guards.
+    parent: Option<storage::StorageParent>,
+    strict: bool,
+    safe_integers: bool,
+    schema_version: Cell<Option<i64>>,
+    namespace_valid: Cell<bool>,
+}
+
+impl EngineDatabase {
+    fn verify_paths(&self) -> Result<()> {
+        if !self.namespace_valid.get() {
+            return Err("SQLite database namespace was invalidated".into());
+        }
+        let result = self.parent.as_ref().map_or(Ok(()), |parent| {
+            parent
+                .verify()
+                .map_err(|error| format!("SQLite namespace changed: {error}"))?;
+            verify_database_family(parent.path())
+        });
+        if result.is_err() {
+            self.namespace_valid.set(false);
+            self.conn.root_cx().cancel();
+        }
+        result
+    }
+}
+
+fn verify_database_family(path: &Path) -> Result<()> {
+    let mut total = 0_u64;
+    for candidate in std::iter::once(path.to_path_buf()).chain(companion_paths(path)) {
+        // This repeats no-follow/reparse/hardlink checks immediately before
+        // the native engine can open or checkpoint any companion.
+        storage::pin_parent(&candidate, false)
+            .map_err(|error| format!("Unsafe SQLite file: {error}"))?
+            .verify()
+            .map_err(|error| error.to_string())?;
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => {
+                if !metadata.is_file() {
+                    return Err("SQLite paths must name regular files".into());
+                }
+                total = total
+                    .checked_add(metadata.len())
+                    .ok_or("SQLite size overflow")?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    if total > MAX_DATABASE_BYTES {
+        return Err("SQLite database and companions exceed 128 MiB".into());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_work(
+    command: Command,
+    databases: &mut HashMap<u64, EngineDatabase>,
+    cancel: &Mutex<Option<Cancel>>,
+    stopped: &AtomicBool,
+) -> Result<Json> {
+    match command {
+        Command::Open {
+            id,
+            path,
+            readonly,
+            create,
+            strict,
+            safe_integers,
+        } => {
+            let parent = path
+                .as_deref()
+                .map(|path| {
+                    verify_database_family(path)?;
+                    storage::pin_parent(path, false).map_err(|error| error.to_string())
+                })
+                .transpose()?;
+            let path = path
+                .as_deref()
+                .map(|path| {
+                    path.to_str()
+                        .map(str::to_owned)
+                        .ok_or("SQLite native path is not Unicode")
+                })
+                .transpose()?
+                .unwrap_or_else(|| ":memory:".into());
+            let defaults = ConnectionEnv::default();
+            let open_cx = defaults.runtime().root_cx().create_child();
+            let cancel_cx = open_cx.clone();
+            set_cancel(cancel, stopped, Arc::new(move || cancel_cx.cancel()));
+            let mut env =
+                ConnectionEnv::new_with_root_cx(fsqlite::RuntimeConfig::default(), &open_cx);
+            env.mark_blocking_io_inline_safe();
+            env.set_strict_multi_process(true);
+            env.set_page_buffer_max(8192);
+            env.set_memory_vfs_config(fsqlite::fsqlite_vfs::MemoryVfsConfig {
+                max_bytes: Some(128 * 1024 * 1024),
+                ..Default::default()
+            });
+            let conn = futures::executor::block_on(async {
+                if readonly && path != ":memory:" {
+                    // readonly always means existing-only; context-mode's
+                    // adapter also passes create:true for read-only opens.
+                    Connection::open_schema_only_with_env(path, env).await
+                } else if !create && path != ":memory:" {
+                    Connection::open_existing_with_env(path, env).await
+                } else {
+                    Connection::open_with_env(path, env).await
+                }
+            })
+            .map_err(|error| error.to_string())?;
+            futures::executor::block_on(async {
+                // Temporary tables remain in the engine's memory store. The
+                // guest cannot change either setting through PRAGMA. Schema
+                // admission remains mandatory: trusted_schema is not a SQL
+                // authorizer in the pinned engine.
+                conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA temp_store = MEMORY")
+                    .await?;
+                if readonly {
+                    conn.execute("PRAGMA query_only = ON").await?;
+                }
+                Ok::<_, FrankenError>(())
+            })
+            .map_err(|error| error.to_string())?;
+            let database = EngineDatabase {
+                conn,
+                parent,
+                strict,
+                safe_integers,
+                schema_version: Cell::new(None),
+                namespace_valid: Cell::new(true),
+            };
+            database.verify_paths()?;
+            futures::executor::block_on(validate_schema(&database))?;
+            databases.insert(id, database);
+            Ok(json!({ "id": id }))
+        }
+        Command::Request(Request::Close { id }) => {
+            let database = databases.get_mut(&id).ok_or("SQLite database is closed")?;
+            database.verify_paths()?;
+            // Close cannot borrow a binding guard and &mut Connection at once;
+            // cancelling this terminal operation cancels the connection root.
+            let cx = database.conn.root_cx().clone();
+            set_cancel(cancel, stopped, Arc::new(move || cx.cancel()));
+            futures::executor::block_on(database.conn.close_in_place())
+                .map_err(|error| error.to_string())?;
+            database.verify_paths()?;
+            databases.remove(&id);
+            Ok(Json::Null)
+        }
+        Command::Request(request) => {
+            let id = request
+                .database_id()
+                .ok_or("Invalid SQLite worker request")?;
+            let database = databases.get(&id).ok_or("SQLite database is closed")?;
+            database.verify_paths()?;
+            let operation_cx = database.conn.root_cx().create_child();
+            let cancel_cx = operation_cx.clone();
+            set_cancel(cancel, stopped, Arc::new(move || cancel_cx.cancel()));
+            let binding = database.conn.bind_operation_cx(&operation_cx);
+            let result = futures::executor::block_on(async {
+                validate_schema(database).await?;
+                execute_request(database, request).await
+            });
+            drop(binding);
+            database.verify_paths()?;
+            result
+        }
+        Command::Retire { id } => {
+            if let Some(database) = databases.remove(&id) {
+                database.conn.root_cx().cancel();
+                // Deliberately use non-I/O Drop, never close/flush, after
+                // filesystem or capability authority has been revoked.
+            }
+            Ok(Json::Null)
+        }
+        Command::Reset => {
+            let mut first_error = None;
+            for (_, mut database) in databases.drain() {
+                if let Err(error) = database.verify_paths() {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+                let cx = database.conn.root_cx().clone();
+                set_cancel(cancel, stopped, Arc::new(move || cx.cancel()));
+                if let Err(error) = futures::executor::block_on(database.conn.close_in_place()) {
+                    first_error.get_or_insert_with(|| error.to_string());
+                }
+                if let Err(error) = database.verify_paths() {
+                    first_error.get_or_insert(error);
+                }
+            }
+            first_error.map_or(Ok(Json::Null), Err)
+        }
+    }
+}
+
+fn set_cancel(slot: &Mutex<Option<Cancel>>, stopped: &AtomicBool, cancel: Cancel) {
+    let mut slot = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Cover the handoff race where the caller's deadline expired during path
+    // preflight, before the engine had published its cancellation context.
+    if stopped.load(Ordering::Acquire) {
+        cancel();
+    }
+    *slot = Some(cancel);
+}
+
+async fn validate_schema(database: &EngineDatabase) -> Result<()> {
+    let rows = database
+        .conn
+        .query("PRAGMA schema_version")
+        .await
+        .map_err(|error| error.to_string())?;
+    let version = rows
+        .first()
+        .and_then(|row| row.get(0))
+        .and_then(|value| {
+            if let SqliteValue::Integer(value) = value {
+                Some(*value)
+            } else {
+                None
+            }
+        })
+        .ok_or("SQLite schema version is unavailable")?;
+    if database.schema_version.get() == Some(version) {
+        return Ok(());
+    }
+    let rows = database
+        .conn
+        .query("SELECT type, sql FROM sqlite_master WHERE sql IS NOT NULL LIMIT 1025")
+        .await
+        .map_err(|error| error.to_string())?;
+    if rows.len() > 1024 {
+        return Err("SQLite schema exceeds 1024 objects".into());
+    }
+    for row in rows {
+        if matches!(row.get(0), Some(SqliteValue::Text(kind)) if kind.as_ref() == "trigger") {
+            return Err("Existing SQLite triggers are not permitted in extension databases".into());
+        }
+        let Some(SqliteValue::Text(sql)) = row.get(1) else {
+            return Err("Invalid SQLite schema text".into());
+        };
+        admit_sql(sql.as_ref(), true)?;
+    }
+    database.schema_version.set(Some(version));
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn execute_request(database: &EngineDatabase, request: Request) -> Result<Json> {
+    match request {
+        Request::Prepare { sql, .. } => {
+            let admitted = admit_sql(&sql, true)?;
+            let columns = if admitted.uses_native_prepare() {
+                database
+                    .conn
+                    .prepare(&sql)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .column_names()
+            } else {
+                // DDL/control syntax was parsed above, with no mutations.
+                // Those statements produce no result columns; native engine
+                // semantic validation happens when the statement is stepped.
+                Vec::new()
+            };
+            Ok(json!({ "columns": columns, "parameters": admitted.parameters.len() }))
+        }
+        Request::Query {
+            sql,
+            bindings,
+            mode,
+            ..
+        } => {
+            let admitted = admit_sql(&sql, true)?;
+            let params = bind_parameters(&admitted.parameters, bindings, database.strict)?;
+            if !admitted.uses_native_prepare() {
+                database
+                    .conn
+                    .execute_with_params(&sql, &params)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                return if matches!(mode, QueryMode::Run) {
+                    change_result(database).await
+                } else {
+                    Ok(json!({ "columns": [], "rows": [] }))
+                };
+            }
+            let statement = database
+                .conn
+                .prepare(&sql)
+                .await
+                .map_err(|error| error.to_string())?;
+            if matches!(mode, QueryMode::Run) {
+                statement
+                    .execute_with_params(&params)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                return change_result(database).await;
+            }
+            let columns = statement.column_names();
+            let mut bytes = serde_json::to_vec(&columns)
+                .map_err(|error| error.to_string())?
+                .len()
+                + 64;
+            if columns.len() > 256 || bytes > MAX_RESULT_BYTES {
+                return Err("SQLite result has too many columns".into());
+            }
+            let mut rows = Vec::new();
+            let mut seen = 0_usize;
+            let mut limit_error = None;
+            let started = Instant::now();
+            let mut accept = |row: &Row| -> std::result::Result<(), FrankenError> {
+                seen += 1;
+                if seen > MAX_RESULT_ROWS || started.elapsed() >= OPERATION_TIMEOUT {
+                    limit_error = Some("SQLite result exceeds the row or time limit".to_string());
+                    return Err(FrankenError::Abort);
+                }
+                if matches!(mode, QueryMode::Get) && !rows.is_empty() {
+                    return Ok(());
+                }
+                bytes += 3; // enclosing row brackets and its separator
+                match row
+                    .values()
+                    .iter()
+                    .map(|value| encode_value(value, database.safe_integers, &mut bytes))
+                    .collect::<Result<Vec<_>>>()
+                {
+                    Ok(row) => {
+                        rows.push(row);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        limit_error = Some(error);
+                        Err(FrankenError::Abort)
+                    }
+                }
+            };
+            // Consume the statement even for get(): aborting a RETURNING
+            // cursor after one row could roll back an otherwise valid write.
+            // Only the requested first row is retained in that mode.
+            let outcome = statement
+                .query_with_params_for_each(&params, &mut accept)
+                .await;
+            if let Some(error) = limit_error {
+                return Err(error);
+            }
+            outcome.map_err(|error| error.to_string())?;
+            Ok(json!({ "columns": columns, "rows": rows }))
+        }
+        Request::Exec { sql, .. } => {
+            let admitted = admit_sql(&sql, false)?;
+            if !admitted.parameters.is_empty() {
+                return Err("Use a prepared statement for SQL parameters".into());
+            }
+            if !admitted.statements.is_empty() {
+                database
+                    .conn
+                    .execute_batch(&sql)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            change_result(database).await
+        }
+        Request::InTransaction { .. } => Ok(json!(database.conn.in_transaction())),
+        Request::Open { .. } | Request::Close { .. } => Err("Invalid SQLite operation".into()),
+    }
+}
+
+async fn change_result(database: &EngineDatabase) -> Result<Json> {
+    let rows = database
+        .conn
+        .query("SELECT changes()")
+        .await
+        .map_err(|error| error.to_string())?;
+    let changes = rows
+        .first()
+        .and_then(|row| row.get(0))
+        .and_then(|value| {
+            if let SqliteValue::Integer(value) = value {
+                Some(*value)
+            } else {
+                None
+            }
+        })
+        .ok_or("SQLite did not report the change count")?;
+    let mut bytes = 0;
+    Ok(
+        json!({ "changes": changes, "lastInsertRowid": encode_value(&SqliteValue::Integer(database.conn.last_insert_rowid()), database.safe_integers, &mut bytes)? }),
+    )
+}
+
+fn bind_parameters(
+    parameters: &[Option<String>],
+    bindings: Bindings,
+    strict: bool,
+) -> Result<Vec<SqliteValue>> {
+    let values = match bindings {
+        Bindings::Positional(mut values) => {
+            if values.len() > parameters.len() || (strict && values.len() != parameters.len()) {
+                return Err(format!(
+                    "SQLite expected {} parameters, received {}",
+                    parameters.len(),
+                    values.len()
+                ));
+            }
+            values.resize(parameters.len(), Json::Null);
+            values
+        }
+        Bindings::Named(values) => {
+            if values.len() > MAX_PARAMETERS {
+                return Err("Too many named SQL parameters".into());
+            }
+            parameters
+                .iter()
+                .map(|name| {
+                    let value = name.as_ref().and_then(|name| {
+                        values
+                            .get(name)
+                            .or_else(|| strict.then(|| values.get(&name[1..])).flatten())
+                    });
+                    if strict && value.is_none() {
+                        return Err(format!("Missing SQLite parameter {name:?}"));
+                    }
+                    Ok(value.cloned().unwrap_or(Json::Null))
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+    values.into_iter().map(decode_value).collect()
+}
+
+fn decode_value(value: Json) -> Result<SqliteValue> {
+    match value {
+        Json::Null => Ok(SqliteValue::Null),
+        Json::Bool(value) => Ok(SqliteValue::Integer(i64::from(value))),
+        Json::Number(value) => {
+            if let Some(value) = value.as_i64() { Ok(SqliteValue::Integer(value)) }
+            else { value.as_f64().filter(|value| value.is_finite()).map(SqliteValue::Float).ok_or("Invalid SQLite number".into()) }
+        }
+        Json::String(value) if value.len() <= MAX_VALUE_BYTES => Ok(SqliteValue::Text(value.into())),
+        Json::Object(value) if value.len() == 1 => {
+            if let Some(value) = value.get("$sqliteInteger").and_then(Json::as_str) {
+                return value.parse::<i64>().map(SqliteValue::Integer).map_err(|_| "SQLite integer is outside the signed 64-bit range".into());
+            }
+            if let Some(value) = value.get("$sqliteBlob").and_then(Json::as_str) {
+                if value.len() > MAX_VALUE_BYTES.saturating_mul(4).div_ceil(3) + 4 { return Err("SQLite blob exceeds 1 MiB".into()); }
+                let bytes = BASE64.decode(value).map_err(|error| error.to_string())?;
+                if bytes.len() > MAX_VALUE_BYTES { return Err("SQLite blob exceeds 1 MiB".into()); }
+                return Ok(SqliteValue::Blob(bytes.into()));
+            }
+            Err("Unsupported SQLite parameter object".into())
+        }
+        _ => Err("SQLite parameters must be null, booleans, numbers, strings, bigint or byte arrays (at most 1 MiB each)".into()),
+    }
+}
+
+fn encode_value(value: &SqliteValue, integers: bool, bytes: &mut usize) -> Result<Json> {
+    let raw_size = match value {
+        SqliteValue::Text(value) => value.len(),
+        SqliteValue::Blob(value) => value.len(),
+        _ => 32,
+    };
+    if raw_size > MAX_VALUE_BYTES {
+        return Err("SQLite result cell exceeds 1 MiB".into());
+    }
+    let encoded = match value {
+        SqliteValue::Null => Json::Null,
+        SqliteValue::Integer(value) if integers => {
+            json!({ "$sqliteInteger": value.to_string() })
+        }
+        SqliteValue::Integer(value) => json!(value),
+        SqliteValue::Float(value) => serde_json::Number::from_f64(*value)
+            .map(Json::Number)
+            .ok_or("SQLite returned a non-finite number")?,
+        SqliteValue::Text(value) => Json::String(value.to_string()),
+        SqliteValue::Blob(value) => json!({ "$sqliteBlob": BASE64.encode(value) }),
+    };
+    // Count actual wire bytes: control characters need JSON escaping and
+    // blobs need base64. Raw value lengths would undercount by up to 6x.
+    *bytes = bytes
+        .checked_add(encoded.to_string().len() + 1)
+        .ok_or("SQLite result size overflow")?;
+    if *bytes > MAX_RESULT_BYTES {
+        return Err("SQLite result exceeds 8 MiB".into());
+    }
+    Ok(encoded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sql_admission_decodes_identifiers_and_validates_every_statement() {
+        for sql in [
+            "SELECT \"load_extension\"('/tmp/no.so')",
+            "SELECT 'readfile'('/tmp/private')",
+            "SELECT `writefile`('/tmp/private', 'bad')",
+            "SELECT [pragma_temp_store_directory]('/tmp')",
+            "SELECT randomblob(2000000000)",
+            "CREATE /* split */ TRIGGER bad AFTER INSERT ON t BEGIN SELECT 1; END",
+            "CREATE VIRTUAL TABLE files USING \"csv\"(filename='/tmp/private')",
+            "PRAGMA \"main\".\"temp_store_directory\" = '/tmp'",
+            "INSERT INTO t VALUES('prefix'); /* tail */ ATTACH '/tmp/no.db' AS other",
+            "INSERT INTO t VALUES('prefix'); CREATE TABLE missing_paren (",
+        ] {
+            assert!(admit_sql(sql, false).is_err(), "must reject {sql:?}");
+        }
+        assert!(
+            admit_sql(
+                "SELECT 'ATTACH; readfile(''only text'')' -- ; ATTACH ignored\n",
+                true
+            )
+            .is_ok()
+        );
+        assert!(
+            admit_sql(
+                "CREATE VIRTUAL TABLE chunks USING fts5(body, tokenize='porter unicode61')",
+                true
+            )
+            .is_ok()
+        );
+        assert!(
+            admit_sql(
+                "CREATE TABLE valid(id INTEGER PRIMARY KEY, payload BLOB)",
+                true
+            )
+            .is_ok()
+        );
+        assert!(admit_sql("CREATE TABLE invalid(", true).is_err());
+        assert!(admit_sql("SELECT 1; SELECT 2", true).is_err());
+        assert_eq!(
+            admit_sql("SELECT :same, ?1", true).unwrap().parameters,
+            [Some(":same".to_owned())]
+        );
+    }
+
+    #[test]
+    fn result_budget_counts_json_escaping_and_raw_cell_sizes() {
+        let mut bytes = MAX_RESULT_BYTES - 5;
+        assert!(encode_value(&SqliteValue::Text("\0".into()), false, &mut bytes).is_err());
+        let mut bytes = 0;
+        assert!(
+            encode_value(
+                &SqliteValue::Text("x".repeat(MAX_VALUE_BYTES + 1).into()),
+                false,
+                &mut bytes
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn actual_recursive_sql_is_cancelled_and_poisoned_worker_is_not_reused() {
+        let mut worker = Worker::start().expect("worker");
+        worker
+            .call(Command::Open {
+                id: 1,
+                path: None,
+                readonly: false,
+                create: true,
+                strict: false,
+                safe_integers: false,
+            })
+            .expect("real memory database");
+        let started = Instant::now();
+        let error = worker.call_with_timeout(Command::Request(Request::Query {
+            id: 1,
+            sql: "WITH RECURSIVE counter(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM counter) SELECT sum(n) FROM counter".into(),
+            bindings: Bindings::default(),
+            mode: QueryMode::Get,
+        }), Duration::from_millis(100)).expect_err("unbounded recursive query must time out");
+        assert!(error.contains("SQLITE_INTERRUPT"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            worker
+                .call(Command::Request(Request::InTransaction { id: 1 }))
+                .is_err()
+        );
+        // This is a real engine acknowledgment check, not merely a host
+        // recv_timeout assertion. The worker must also release its connection.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while worker
+            .thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            worker.thread.as_ref().is_some_and(JoinHandle::is_finished),
+            "engine did not acknowledge cancellation"
+        );
+    }
+}

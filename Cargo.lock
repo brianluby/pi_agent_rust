@@ -5811,6 +5811,8 @@ dependencies = [
  "flate2",
  "fs4",
  "fsqlite",
+ "fsqlite-ast",
+ "fsqlite-parser",
  "ftui",
  "ftui-extras",
  "futures",

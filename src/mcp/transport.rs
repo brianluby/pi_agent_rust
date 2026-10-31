@@ -31,7 +31,7 @@ use crate::tools::{ProcessCleanupMode, ProcessGuard};
 mod progress_tests;
 
 #[cfg(unix)]
-mod cancellable_stdio;
+pub(crate) mod cancellable_stdio;
 
 #[path = "sse_transport.rs"]
 mod legacy_sse;

@@ -871,3 +871,283 @@ export default function init(pi: any): void {
 
     write_jsonl_artifacts(&harness);
 }
+
+/// Reproduces the package, storage and SQLite initialization sequence used by
+/// context-mode 1.0.169 (build/adapters/base.js, build/db-base.js and
+/// build/session/db.js). This is a real database across two cold PiJS realms;
+/// no hostcall interceptor or database stub participates in this test.
+#[test]
+fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let base = pi::extensions::safe_canonicalize(temp.path());
+    let workspace = base.join("workspace");
+    let home = base.join("home");
+    let package = base.join("npm/node_modules/context-mode");
+    let entry = package.join("build/adapters/pi/extension.js");
+    std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        package.join("package.json"),
+        r#"{
+        "name": "context-mode", "version": "1.0.169", "type": "module",
+        "pi": { "extensions": ["./build/adapters/pi/extension.js"] }
+    }"#,
+    )
+    .unwrap();
+    std::fs::write(package.join("build/db.js"), r#"
+        import { createRequire } from 'node:module';
+        import { Database as ESMDatabase } from 'bun:sqlite';
+        const require = createRequire(import.meta.url);
+        const { Database } = require('bun:sqlite');
+        if (Database !== ESMDatabase) throw new Error('SQLite module identities diverged');
+
+        export function openSessionDB(path) {
+            const db = new Database(path);
+            db.prepare('PRAGMA journal_mode = WAL').all();
+            db.prepare('PRAGMA busy_timeout = 5000').all();
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS session_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    data_hash TEXT NOT NULL,
+                    UNIQUE(session_id, type, data_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id);
+            `);
+            const insert = db.prepare('INSERT OR IGNORE INTO session_events (session_id, type, data, data_hash) VALUES (?, ?, ?, ?)');
+            const write = db.transaction((type, data) => {
+                insert.run('fixture-session', type, data, data);
+                insert.run('fixture-session', type, data, data);
+            });
+            return { db, write };
+        }
+    "#).unwrap();
+    std::fs::write(&entry, r#"
+        import { mkdirSync } from 'node:fs';
+        import { homedir } from 'node:os';
+        import { join } from 'node:path';
+        import { openSessionDB } from '../../db.js';
+        export default function piExtension(pi) {
+            const directory = join(homedir(), '.pi', 'context-mode', 'sessions');
+            mkdirSync(directory, { recursive: true });
+            const { db, write } = openSessionDB(join(directory, 'project-fixture.db'));
+            pi.on('session_start', () => write('session_start', 'started'));
+            pi.on('tool_result', (event) => write('tool_result', event.toolName));
+            pi.registerCommand('ctx-storage-stats', {
+                description: 'Only registers after persistent SQLite initialization',
+                handler: async () => ({ display: JSON.stringify({
+                    count: db.prepare('SELECT count(*) AS count FROM session_events').get().count,
+                    rows: db.prepare('SELECT type, data FROM session_events ORDER BY id').all(),
+                }) }),
+            });
+            pi.registerCommand('ctx-storage-close', { handler: async () => { db.close(); return { display: 'closed' }; } });
+        }
+    "#).unwrap();
+
+    let load = || {
+        let manager = ExtensionManager::new();
+        let tools = Arc::new(ToolRegistry::new(&[], &workspace, None));
+        let mut policy = pi::extensions::ExtensionPolicy::default();
+        policy.deny_caps.retain(|cap| cap != "env");
+        policy.default_caps.push("env".to_string());
+        let config = PiJsRuntimeConfig {
+            cwd: workspace.display().to_string(),
+            env: std::collections::HashMap::from([(
+                "HOME".to_string(),
+                home.display().to_string(),
+            )]),
+            disk_cache_dir: None,
+            ..Default::default()
+        };
+        let runtime = common::run_async(JsExtensionRuntimeHandle::start_with_policy(
+            config,
+            tools,
+            manager.clone(),
+            policy,
+        ))
+        .expect("start runtime");
+        manager.set_js_runtime(runtime);
+        let spec = JsExtensionLoadSpec::from_entry_path(&entry).unwrap();
+        let loading_manager = manager.clone();
+        common::run_async(async move { loading_manager.load_js_extensions(vec![spec]).await })
+            .expect("load npm-style extension through production loader");
+        assert!(manager.has_command("ctx-storage-stats"));
+        manager
+    };
+    let stats = |manager: &ExtensionManager| {
+        let manager = manager.clone();
+        let result = common::run_async(async move {
+            manager.execute_command("ctx-storage-stats", "", 5000).await
+        })
+        .unwrap();
+        serde_json::from_str::<Value>(result["display"].as_str().unwrap()).unwrap()
+    };
+    let close = |manager: ExtensionManager| {
+        common::run_async(async move {
+            manager
+                .execute_command("ctx-storage-close", "", 5000)
+                .await
+                .unwrap();
+            assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+        });
+    };
+    let dispatch = |manager: &ExtensionManager, event, data| {
+        let manager = manager.clone();
+        common::run_async(async move { manager.dispatch_event(event, data).await }).unwrap();
+    };
+
+    let manager = load();
+    assert_eq!(stats(&manager)["count"], 0);
+    dispatch(
+        &manager,
+        pi::extensions::ExtensionEventName::SessionStart,
+        None,
+    );
+    assert_eq!(stats(&manager)["count"], 1);
+    close(manager);
+    assert!(
+        home.join(".pi/context-mode/sessions/project-fixture.db")
+            .is_file()
+    );
+
+    let manager = load();
+    assert_eq!(
+        stats(&manager)["rows"],
+        serde_json::json!([{"type":"session_start","data":"started"}])
+    );
+    dispatch(
+        &manager,
+        pi::extensions::ExtensionEventName::SessionStart,
+        None,
+    );
+    assert_eq!(
+        stats(&manager)["count"],
+        1,
+        "unique event dedup survives a cold reload"
+    );
+    dispatch(
+        &manager,
+        pi::extensions::ExtensionEventName::ToolResult,
+        Some(serde_json::json!({"toolName":"read"})),
+    );
+    assert_eq!(
+        stats(&manager)["rows"],
+        serde_json::json!([
+            {"type":"session_start","data":"started"},
+            {"type":"tool_result","data":"read"},
+        ])
+    );
+    close(manager);
+}
+
+#[test]
+fn npm_invalid_state_namespace_does_not_block_unrelated_extension_loading() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let base = pi::extensions::safe_canonicalize(temp.path());
+    let home = base.join("home");
+    std::fs::create_dir_all(home.join(".pi")).unwrap();
+    let invalid = home.join(".pi/broken-state");
+    #[cfg(unix)]
+    {
+        let outside = base.join("private-data");
+        std::fs::write(&outside, "must remain inaccessible").unwrap();
+        std::os::unix::fs::symlink(outside, &invalid).unwrap();
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&invalid, "must remain inaccessible").unwrap();
+
+    let mut specs = Vec::new();
+    for (package_name, entry_name, source) in [
+        (
+            "broken-state",
+            "broken.js",
+            r#"
+            import { readFileSync } from 'node:fs';
+            import { homedir } from 'node:os';
+            import { join } from 'node:path';
+            export default function(pi) {
+                let denied = false;
+                try { readFileSync(join(homedir(), '.pi', 'broken-state'), 'utf8'); }
+                catch (_) { denied = true; }
+                pi.registerCommand('broken-state-check', { handler: async () => ({ display: denied ? 'denied' : 'escaped' }) });
+            }
+        "#,
+        ),
+        (
+            "healthy-state",
+            "healthy.js",
+            r#"
+            import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+            import { homedir } from 'node:os';
+            import { join } from 'node:path';
+            export default function(pi) {
+                const root = join(homedir(), '.pi', 'healthy-state');
+                mkdirSync(root, { recursive: true });
+                writeFileSync(join(root, 'state.txt'), 'persistent');
+                let peerDenied = false;
+                try { readFileSync(join(homedir(), '.pi', 'broken-state'), 'utf8'); }
+                catch (_) { peerDenied = true; }
+                pi.registerCommand('healthy-state-check', { handler: async () => ({ display: peerDenied ? readFileSync(join(root, 'state.txt'), 'utf8') : 'escaped' }) });
+            }
+        "#,
+        ),
+    ] {
+        let package = base.join("npm/node_modules").join(package_name);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("package.json"), serde_json::json!({
+            "name": package_name, "type": "module", "pi": {"extensions": [format!("./{entry_name}")]}
+        }).to_string()).unwrap();
+        let entry = package.join(entry_name);
+        std::fs::write(&entry, source).unwrap();
+        specs.push(JsExtensionLoadSpec::from_entry_path(entry).unwrap());
+    }
+
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], &home, None));
+    let mut policy = pi::extensions::ExtensionPolicy::default();
+    policy.deny_caps.retain(|cap| cap != "env");
+    policy.default_caps.push("env".to_string());
+    let config = PiJsRuntimeConfig {
+        // The protected namespaces are deliberately below cwd: ordinary
+        // workspace access must not override a denied storage capability.
+        cwd: home.display().to_string(),
+        env: std::collections::HashMap::from([("HOME".to_string(), home.display().to_string())]),
+        disk_cache_dir: None,
+        ..Default::default()
+    };
+    let runtime = common::run_async(JsExtensionRuntimeHandle::start_with_policy(
+        config,
+        tools,
+        manager.clone(),
+        policy,
+    ))
+    .expect("start runtime");
+    manager.set_js_runtime(runtime);
+    let loading_manager = manager.clone();
+    common::run_async(async move { loading_manager.load_js_extensions(specs).await })
+        .expect("invalid storage namespace must not block either factory");
+    common::run_async(async move {
+        assert_eq!(
+            manager
+                .execute_command("broken-state-check", "", 5000)
+                .await
+                .unwrap()["display"],
+            "denied"
+        );
+        assert_eq!(
+            manager
+                .execute_command("healthy-state-check", "", 5000)
+                .await
+                .unwrap()["display"],
+            "persistent"
+        );
+        assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+    });
+    assert_eq!(
+        std::fs::read_to_string(home.join(".pi/healthy-state/state.txt")).unwrap(),
+        "persistent"
+    );
+}

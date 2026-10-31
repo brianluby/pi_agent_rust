@@ -11708,9 +11708,9 @@ impl Clone for JsExtensionRuntimeHandle {
 /// explicit maps), capture the Pi process environment once at runtime start.
 /// Per-key disclosure is still mediated inside `__pi_env_get_native` (the
 /// policy's `SecretBroker` with its `disclosure_allowlist`, or the default
-/// secret filter), and the JS `process.env` proxy deliberately cannot
-/// enumerate keys, so this only lets policy-permitted lookups observe real
-/// values.
+/// secret filter). The JS `process.env` snapshot enumerates only keys permitted
+/// by that same filter, allowing safe child-environment copies without exposing
+/// secret names or values.
 fn apply_env_capability(config: &mut PiJsRuntimeConfig, policy: &ExtensionPolicy) {
     // Full capability model, mirroring check_exec_capability: global deny →
     // default_caps allow → mode fallback (Strict/Prompt = deny). A bare
@@ -13770,6 +13770,352 @@ fn collect_js_extension_roots(
     Ok(roots_by_id)
 }
 
+/// Only an installed npm package may claim its matching application namespace.
+/// A name in an unrelated ancestor manifest grants no filesystem authority.
+fn npm_application_storage_namespace(package_dir: &Path, name: &str) -> Option<PathBuf> {
+    fn safe_component(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 100
+            && value.as_bytes()[0].is_ascii_alphanumeric()
+            && value
+                .bytes()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == b'-')
+            && !matches!(
+                value,
+                "con"
+                    | "prn"
+                    | "aux"
+                    | "nul"
+                    | "com1"
+                    | "com2"
+                    | "com3"
+                    | "com4"
+                    | "com5"
+                    | "com6"
+                    | "com7"
+                    | "com8"
+                    | "com9"
+                    | "lpt1"
+                    | "lpt2"
+                    | "lpt3"
+                    | "lpt4"
+                    | "lpt5"
+                    | "lpt6"
+                    | "lpt7"
+                    | "lpt8"
+                    | "lpt9"
+            )
+    }
+    if let Some(scoped) = name.strip_prefix('@') {
+        let (scope, package) = scoped.split_once('/')?;
+        if !safe_component(scope) || !safe_component(package) {
+            return None;
+        }
+        let scope_dir = package_dir.parent()?;
+        if package_dir.file_name()?.to_str()? != package
+            || scope_dir.file_name()?.to_str()? != format!("@{scope}")
+            || scope_dir.parent()?.file_name()? != "node_modules"
+        {
+            return None;
+        }
+        return Some(PathBuf::from(format!("@{scope}")).join(package));
+    }
+    if !safe_component(name)
+        || matches!(
+            name,
+            "agent"
+                | "agents"
+                | "extensions"
+                | "extension-data"
+                | "cache"
+                | "config"
+                | "auth"
+                | "settings"
+                | "models"
+                | "sessions"
+                | "skills"
+                | "prompts"
+                | "themes"
+        )
+        || package_dir.file_name()?.to_str()? != name
+        || package_dir.parent()?.file_name()? != "node_modules"
+    {
+        return None;
+    }
+    Some(PathBuf::from(name))
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct JsApplicationStorageNamespaces {
+    owned: Vec<(String, Vec<PathBuf>)>,
+    denied: Vec<PathBuf>,
+}
+
+fn collect_js_application_storage_namespaces(
+    grouped_specs: &GroupedJsExtensionSpecs<'_>,
+) -> JsApplicationStorageNamespaces {
+    let mut namespace_owners: HashMap<PathBuf, (String, PathBuf)> = HashMap::new();
+    let mut owner_origins: HashMap<String, PathBuf> = HashMap::new();
+    let mut ambiguous_owners = BTreeSet::new();
+    let mut unclassified_owners = BTreeSet::new();
+    let mut out = Vec::new();
+    for (extension_id, specs) in grouped_specs {
+        let mut namespaces = BTreeSet::new();
+        for (_, entry_paths) in specs {
+            for entry in entry_paths {
+                let mut classified = false;
+                for manifest in find_package_json_ancestors(entry.parent()) {
+                    let Some(package_dir) = manifest.parent() else {
+                        continue;
+                    };
+                    if !entry.starts_with(package_dir) {
+                        continue;
+                    }
+                    let Ok(Some(declared)) = read_pi_extensions_from_package(&manifest) else {
+                        continue;
+                    };
+                    if !resolve_package_declared_entries(package_dir, &declared).contains(entry) {
+                        continue;
+                    }
+                    let Some(json) = fs::read_to_string(&manifest)
+                        .ok()
+                        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                    else {
+                        continue;
+                    };
+                    let Some(namespace) = json
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .and_then(|name| npm_application_storage_namespace(package_dir, name))
+                    else {
+                        continue;
+                    };
+                    let origin = (extension_id.clone(), package_dir.to_path_buf());
+                    if let Some(previous) =
+                        owner_origins.insert(extension_id.clone(), package_dir.to_path_buf())
+                        && previous != package_dir
+                    {
+                        ambiguous_owners.insert(extension_id.clone());
+                        tracing::warn!(
+                            extension_id,
+                            previous_origin = %previous.display(),
+                            origin = %package_dir.display(),
+                            "Automatic persistent storage disabled for an ambiguous npm owner; distinct host-assigned extension identities are required"
+                        );
+                    }
+                    if let Some(previous) =
+                        namespace_owners.insert(namespace.clone(), origin.clone())
+                        && previous != origin
+                    {
+                        ambiguous_owners.insert(previous.0.clone());
+                        ambiguous_owners.insert(extension_id.clone());
+                        tracing::warn!(
+                            extension_id,
+                            previous_owner = %previous.0,
+                            namespace = %namespace.display(),
+                            previous_origin = %previous.1.display(),
+                            origin = %package_dir.display(),
+                            "Automatic persistent storage disabled for conflicting namespace owners; explicit host storage configuration is required"
+                        );
+                    }
+                    namespaces.insert(namespace);
+                    classified = true;
+                    break;
+                }
+                if !classified {
+                    unclassified_owners.insert(extension_id.clone());
+                }
+            }
+        }
+        out.push((extension_id.clone(), namespaces));
+    }
+    let mut result = JsApplicationStorageNamespaces::default();
+    let mut denied = BTreeSet::new();
+    for (owner, namespaces) in out {
+        if !namespaces.is_empty() && unclassified_owners.contains(&owner) {
+            ambiguous_owners.insert(owner.clone());
+            tracing::warn!(
+                extension_id = %owner,
+                "Automatic persistent storage disabled because an npm owner also groups unrelated entries; distinct host-assigned extension identities are required"
+            );
+        }
+        if ambiguous_owners.contains(&owner) {
+            // Suppress every grant for a colliding principal, including its
+            // otherwise unique namespaces. Keep denied namespaces as foreign
+            // boundaries so workspace access cannot restore the lost grant.
+            denied.extend(namespaces);
+            result.owned.push((owner, Vec::new()));
+        } else {
+            result.owned.push((owner, namespaces.into_iter().collect()));
+        }
+    }
+    result.denied = denied.into_iter().collect();
+    result
+}
+
+#[cfg(test)]
+mod application_storage_tests {
+    use super::*;
+
+    #[test]
+    fn npm_storage_namespaces_require_matching_install_identity_and_reserve_pi_data() {
+        assert_eq!(
+            npm_application_storage_namespace(
+                Path::new("npm/node_modules/context-mode"),
+                "context-mode"
+            ),
+            Some(PathBuf::from("context-mode"))
+        );
+        assert_eq!(
+            npm_application_storage_namespace(
+                Path::new("npm/node_modules/@scope/state"),
+                "@scope/state"
+            ),
+            Some(PathBuf::from("@scope/state"))
+        );
+        for (path, name) in [
+            ("some/project", "context-mode"),
+            ("node_modules/other", "context-mode"),
+            ("node_modules/agent", "agent"),
+            ("node_modules/auth", "auth"),
+            ("node_modules/auth.json", "auth.json"),
+            ("node_modules/nul", "nul"),
+            ("node_modules/com1", "com1"),
+            ("node_modules/context-mode", "../context-mode"),
+            ("node_modules/context-mode", "context-mode:stream"),
+            ("node_modules/@scope/state", "@scope/../agent"),
+        ] {
+            assert!(
+                npm_application_storage_namespace(Path::new(path), name).is_none(),
+                "{path}: {name}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn npm_storage_namespaces_support_windows_drive_and_unc_install_paths() {
+        for path in [
+            r"C:\Users\alice\AppData\Roaming\npm\node_modules\context-mode",
+            r"\\server\share\npm\node_modules\context-mode",
+        ] {
+            assert_eq!(
+                npm_application_storage_namespace(Path::new(path), "context-mode"),
+                Some(PathBuf::from("context-mode"))
+            );
+        }
+    }
+
+    #[test]
+    fn storage_discovery_requires_declared_entry_and_suppresses_ambiguous_owners() {
+        let temp = tempfile::tempdir().unwrap();
+        let make_package = |prefix: &str, declaration: &str| {
+            let root = temp.path().join(prefix).join("node_modules/context-mode");
+            fs::create_dir_all(root.join("build/adapters/pi")).unwrap();
+            fs::write(
+                root.join("package.json"),
+                json!({
+                    "name": "context-mode", "pi": {"extensions": [declaration]}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let entry = root.join("build/adapters/pi/extension.js");
+            fs::write(&entry, "export default function(pi) {}").unwrap();
+            JsExtensionLoadSpec::from_entry_path(entry).unwrap()
+        };
+        let valid = make_package("a", "./build/adapters/pi/extension.js");
+        let unrelated = make_package("b", "./different.js");
+        let specs = vec![valid.clone()];
+        let explicit = specs.iter().map(|spec| spec.entry_path.clone()).collect();
+        let grouped = group_js_extension_specs(&specs, &explicit).unwrap();
+        assert_eq!(
+            collect_js_application_storage_namespaces(&grouped),
+            JsApplicationStorageNamespaces {
+                owned: vec![(
+                    valid.extension_id.clone(),
+                    vec![PathBuf::from("context-mode")]
+                )],
+                denied: Vec::new(),
+            }
+        );
+
+        let specs = vec![unrelated];
+        let explicit = specs.iter().map(|spec| spec.entry_path.clone()).collect();
+        let grouped = group_js_extension_specs(&specs, &explicit).unwrap();
+        assert!(
+            collect_js_application_storage_namespaces(&grouped).owned[0]
+                .1
+                .is_empty()
+        );
+
+        let collision = make_package("c", "./build/adapters/pi/extension.js");
+        let other_root = temp.path().join("d/node_modules/independent-state");
+        fs::create_dir_all(&other_root).unwrap();
+        fs::write(
+            other_root.join("package.json"),
+            json!({
+                "name": "independent-state", "pi": {"extensions": ["./independent.js"]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            other_root.join("independent.js"),
+            "export default function(pi) {}",
+        )
+        .unwrap();
+        let independent =
+            JsExtensionLoadSpec::from_entry_path(other_root.join("independent.js")).unwrap();
+        let specs = vec![valid.clone(), collision.clone(), independent.clone()];
+        let explicit = specs.iter().map(|spec| spec.entry_path.clone()).collect();
+        let grouped = group_js_extension_specs(&specs, &explicit).unwrap();
+        let discovered = collect_js_application_storage_namespaces(&grouped);
+        assert_eq!(
+            discovered.owned,
+            vec![
+                (valid.extension_id.clone(), Vec::new()),
+                (
+                    independent.extension_id.clone(),
+                    vec![PathBuf::from("independent-state")]
+                ),
+            ]
+        );
+        assert_eq!(discovered.denied, vec![PathBuf::from("context-mode")]);
+
+        // Distinct principals claiming the same namespace both lose all
+        // automatic authority, including a unique namespace of either owner.
+        let mut collision = collision;
+        collision.extension_id = "different-owner".to_string();
+        let mut shared_identity = independent;
+        shared_identity.extension_id.clone_from(&valid.extension_id);
+        let specs = vec![valid.clone(), collision, shared_identity];
+        let explicit = specs.iter().map(|spec| spec.entry_path.clone()).collect();
+        let grouped = group_js_extension_specs(&specs, &explicit).unwrap();
+        let discovered = collect_js_application_storage_namespaces(&grouped);
+        assert!(discovered.owned.iter().all(|(_, roots)| roots.is_empty()));
+        assert_eq!(
+            discovered.denied,
+            vec![
+                PathBuf::from("context-mode"),
+                PathBuf::from("independent-state")
+            ]
+        );
+
+        // A loose entry with the same legacy filename-derived ID cannot
+        // borrow the verified package's persistent storage capability.
+        let loose = temp.path().join("loose/extension.js");
+        fs::create_dir_all(loose.parent().unwrap()).unwrap();
+        fs::write(&loose, "export default function(pi) {}").unwrap();
+        let specs = vec![valid, JsExtensionLoadSpec::from_entry_path(loose).unwrap()];
+        let explicit = specs.iter().map(|spec| spec.entry_path.clone()).collect();
+        let grouped = group_js_extension_specs(&specs, &explicit).unwrap();
+        let discovered = collect_js_application_storage_namespaces(&grouped);
+        assert!(discovered.owned.iter().all(|(_, roots)| roots.is_empty()));
+        assert_eq!(discovered.denied, vec![PathBuf::from("context-mode")]);
+    }
+}
+
 fn js_runtime_shard_config(
     warm_pool: &crate::extensions_js::WarmIsolatePool,
     shard_count: usize,
@@ -13831,6 +14177,7 @@ async fn build_js_runtime_shards(
     let grouped_specs = group_js_extension_specs(specs, &explicit_entry_paths)?;
     let shard_count = grouped_specs.len();
     let extension_roots_by_id = collect_js_extension_roots(&grouped_specs)?;
+    let application_namespaces = collect_js_application_storage_namespaces(&grouped_specs);
 
     let mut candidate = JsRuntimeShardSet::default();
     for (shard_index, (extension_id, extension_specs)) in grouped_specs.into_iter().enumerate() {
@@ -13843,6 +14190,37 @@ async fn build_js_runtime_shards(
             extension_id.clone(),
         )
         .await?;
+
+        for (owner, namespaces) in &application_namespaces.owned {
+            for namespace in namespaces {
+                let Some(root) = runtime.application_storage_root(namespace) else {
+                    continue;
+                };
+                if owner == &extension_id {
+                    if let Err(error) = runtime.add_persistent_storage_root(root.clone(), owner) {
+                        tracing::warn!(
+                            extension_id = %owner,
+                            root = %root.display(),
+                            %error,
+                            "Automatic persistent storage disabled because its namespace is unsafe or inaccessible"
+                        );
+                        runtime.register_foreign_persistent_storage_root(root, owner)?;
+                    }
+                } else {
+                    runtime.register_foreign_persistent_storage_root(root, owner)?;
+                }
+            }
+        }
+        for namespace in &application_namespaces.denied {
+            if let Some(root) = runtime.application_storage_root(namespace) {
+                // Deny-only registration deliberately has no corresponding
+                // owned grant, even if an extension chose this sentinel ID.
+                runtime.register_foreign_persistent_storage_root(
+                    root,
+                    "<unassigned-persistent-storage>",
+                )?;
+            }
+        }
 
         // Files under another extension's root must remain a protected
         // boundary even when both extensions live below the workspace cwd.
@@ -17961,6 +18339,34 @@ async fn dispatch_shared_allowed_legacy(
             } else {
                 None
             };
+            if call
+                .params
+                .get("options")
+                .and_then(|options| options.get("persistent"))
+                == Some(&Value::Bool(true))
+            {
+                let Some(runtime) = ctx.js_runtime else {
+                    return HostcallOutcome::Error {
+                        code: "invalid_request".to_string(),
+                        message: "Persistent exec requires an owning JavaScript runtime"
+                            .to_string(),
+                    };
+                };
+                let options = &call.params["options"];
+                return match runtime.spawn_process_session(
+                    ctx.extension_id,
+                    cmd,
+                    &args,
+                    options,
+                    Box::new(move || drop(subprocess_accounting)),
+                ) {
+                    Ok(value) => HostcallOutcome::Success(value),
+                    Err(message) => HostcallOutcome::Error {
+                        code: "io".to_string(),
+                        message,
+                    },
+                };
+            }
             dispatch_hostcall_exec_ref(
                 ctx.js_runtime,
                 &call.call_id,

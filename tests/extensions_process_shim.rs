@@ -648,8 +648,116 @@ fn pijs_process_env_has_operator() {
 
         let own_keys: serde_json::Value = runtime.read_global_json("ownKeys").await.unwrap();
         assert!(
-            own_keys.as_array().unwrap().is_empty(),
-            "ownKeys returns []"
+            own_keys
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("HOME")),
+            "permitted snapshot keys are enumerable"
+        );
+    });
+}
+
+#[test]
+fn pijs_process_env_spread_filters_secrets_and_preserves_proxy_invariants() {
+    futures::executor::block_on(async {
+        let config = config_with_env(vec![
+            ("HOME", "/home/test"),
+            ("PATH", "/configured/bin"),
+            ("PI_CONFIG_DIR", "/configured/pi"),
+            ("OPENAI_API_KEY", "must-not-disclose"),
+            ("PRIVATE_TOKEN", "also-private"),
+        ]);
+        let runtime = PiJsRuntime::with_clock_and_config(DeterministicClock::new(0), config)
+            .await
+            .expect("runtime");
+        runtime
+            .eval(
+                r#"
+            const copied = {...process.env};
+            const keys = Object.keys(process.env);
+            const marker = Symbol('immutable');
+            Object.defineProperty(process.env, marker, {value: 19});
+            Object.defineProperty(process.env, 'getterless', {get: undefined});
+            Object.freeze(process.env);
+            globalThis.envSnapshot = {
+                home: copied.HOME, path: copied.PATH, config: copied.PI_CONFIG_DIR,
+                secretPresent: 'OPENAI_API_KEY' in copied || 'PRIVATE_TOKEN' in copied,
+                sorted: JSON.stringify(keys) === JSON.stringify([...keys].sort()),
+                frozen: Object.isFrozen(process.env),
+                immutable: process.env[marker],
+                getterless: process.env.getterless === undefined,
+                keysAfterFreeze: Reflect.ownKeys(process.env).includes(marker),
+                overwrite: Reflect.set(process.env, 'HOME', '/changed'),
+                deleteHome: Reflect.deleteProperty(process.env, 'HOME'),
+                stable: {...process.env}.HOME,
+            };
+        "#,
+            )
+            .await
+            .expect("enumeration, spread and freeze");
+        assert_eq!(
+            runtime.read_global_json("envSnapshot").await.unwrap(),
+            serde_json::json!({
+                "home": "/home/test", "path": "/configured/bin", "config": "/configured/pi",
+                "secretPresent": false, "sorted": true, "frozen": true,
+                "immutable": 19, "getterless": true, "keysAfterFreeze": true,
+                "overwrite": false, "deleteHome": false, "stable": "/home/test",
+            })
+        );
+    });
+}
+
+#[test]
+fn pijs_process_env_denial_applies_to_enumeration_and_config_metadata() {
+    futures::executor::block_on(async {
+        let mut config = config_with_env(vec![("HOME", "/home/test"), ("PATH", "/bin")]);
+        config.deny_env = true;
+        let runtime = PiJsRuntime::with_clock_and_config(DeterministicClock::new(0), config)
+            .await
+            .expect("runtime");
+        runtime
+            .eval(
+                r#"
+            globalThis.deniedEnv = {
+                keys: Object.keys(process.env), spread: {...process.env},
+                configHidden: process.env.PI_CONFIG_DIR === undefined,
+            };
+        "#,
+            )
+            .await
+            .expect("denied enumeration");
+        assert_eq!(
+            runtime.read_global_json("deniedEnv").await.unwrap(),
+            serde_json::json!({
+                "keys": [], "spread": {}, "configHidden": true,
+            })
+        );
+    });
+}
+
+#[test]
+fn pijs_process_config_metadata_uses_the_supplied_home_without_creating_directories() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("home fixture");
+        let home = temp.path().to_string_lossy().into_owned();
+        let expected = temp.path().join(".pi/agent").to_string_lossy().into_owned();
+        let runtime = PiJsRuntime::with_clock_and_config(
+            DeterministicClock::new(0),
+            config_with_env(vec![("HOME", &home)]),
+        )
+        .await
+        .expect("runtime");
+        runtime
+            .eval("globalThis.piConfigMetadata = {...process.env}.PI_CONFIG_DIR;")
+            .await
+            .expect("config metadata");
+        assert_eq!(
+            runtime.read_global_json("piConfigMetadata").await.unwrap(),
+            expected
+        );
+        assert!(
+            !temp.path().join(".pi").exists(),
+            "metadata must not create directories"
         );
     });
 }

@@ -8,6 +8,10 @@ use this matrix to determine whether their extension will run unmodified.
 
 ## Conformance Snapshot
 
+These are the existing corpus results, not a new conformance run for the
+context-mode compatibility changes described below. Adding a module or passing
+a focused fixture does not establish compatibility with every npm dependency.
+
 | Surface | Result | Details |
 |---|---:|---|
 | Extension corpus (223 extensions) | 205/223 pass (91.9%) | 100% Tier 1, 95.4% Tier 2 |
@@ -24,7 +28,7 @@ use this matrix to determine whether their extension will run unmodified.
 | T1 | Simple single-file extensions | 38/38 (100%) | Run silently |
 | T2 | Multi-registration (tools + events + flags) | 83/87 (95.4%) | Run silently |
 | T3 | Multi-file with local imports | 79/90 (87.8%) | Run + warn if relative imports fail |
-| T4 | Extensions with npm dependencies | 1/3 (33.3%) | Blocked unless virtual stub exists |
+| T4 | Extensions with npm dependencies | 1/3 (33.3%) | Resolution stays within allowed roots; compatibility depends on required APIs |
 | T5 | Extensions using exec/network APIs | 4/5 (80.0%) | Capability-gated |
 
 ---
@@ -43,7 +47,7 @@ for the API subset that extensions actually use.
 | `node:fs/promises` | `readFile`, `writeFile`, `stat`, `mkdir`, `readdir`, `unlink`, `rm`, `access`, `copyFile`, `rename`, `chmod`, `chown`, `utimes` | Included above | Async versions of fs shim; permission changes are path-checking no-ops |
 | `node:crypto` | `createHash`, `createHmac`, `randomUUID`, `randomBytes`, `randomInt`, `timingSafeEqual`, `getHashes`, Ed25519 `sign`/`verify` | 56 tests | SHA-256/SHA-384/SHA-512, SHA-1, MD5, HMAC, KDFs; ciphers and RSA/ECDSA fail closed |
 | `node:buffer` | `Buffer.from`, `Buffer.alloc`, `Buffer.concat`, `Buffer.isBuffer`, `Buffer.byteLength`, `.toString()`, `.slice()`, `.subarray()`, `.compare()`, `.equals()`, `.indexOf()`, `.copy()` | 41 tests | Full Buffer protocol |
-| `node:child_process` | `spawnSync`, `execSync`, `execFileSync`, `spawn`, `exec`, `execFile` | 53 tests | Capability-gated (`exec`) |
+| `node:child_process` | `spawnSync`, `execSync`, `execFileSync`, `spawn`, `exec`, `execFile` | Shim and persistent-session regressions | Capability-gated (`exec`); bounded piped sessions support interactive protocols |
 | `node:http` | `request`, `get`, `createServer`, `STATUS_CODES`, `METHODS`, `Agent` | HTTP shim and virtual server regressions | Outbound requests use the HTTP capability; explicit loopback servers are private in-memory routes, never OS listeners |
 | `node:https` | `request`, `get` | Shared with http | Same as `node:http` |
 | `node:events` | `EventEmitter`, `on`, `emit`, `once`, `removeListener`, `removeAllListeners`, `listenerCount` | 26 tests | Full EventEmitter pattern |
@@ -93,10 +97,76 @@ Pi provides a targeted Bun compatibility surface via `globalThis.Bun` and
 | `Bun.argv` | Supported | Process arguments |
 | `Bun.file(path)` | Supported | Returns object with `exists()`, `text()`, `arrayBuffer()`, `json()` |
 | `Bun.write(path, data)` | Supported | Write files |
-| `Bun.which(command)` | Supported | Locate executables on PATH |
+| `Bun.which(command)` | Supported | Metadata-only lookup in the runtime's configured PATH; requires `exec` permission |
 | `Bun.spawn(...)` | Supported | Capability-gated (`exec`) |
+| `bun:sqlite` | Supported subset | Real FrankenSQLite databases; ESM and `createRequire()` return the same `Database` constructor |
 | `Bun.connect(...)` | Stubbed (no network) | In-memory socket emitter; use `pi.http()` or `node:http` for real network |
 | `Bun.listen(...)` | Stubbed (no network) | In-memory server emitter; use `pi.http()` or `node:http` for real network |
+
+### SQLite databases
+
+`import { Database } from "bun:sqlite"` and
+`createRequire(import.meta.url)("bun:sqlite").Database` use the repository's
+existing FrankenSQLite engine. Supported operations include schema creation
+and migration, parameterized statements, `run`, `get`, `all`, `values`,
+`iterate`, nested synchronous transactions, WAL pragmas, and close/reopen.
+`prepare()` parses schema and transaction statements using the engine's SQL
+parser; their semantic checks happen when executed because the engine does not
+compile those statements into prepared programs. Query and DML statements use
+the engine's prepared programs.
+
+File-backed databases require an extension-owned persistent storage grant and
+the corresponding read/write capabilities. `:memory:` databases acquire no
+filesystem permission. Database handles cannot be transferred to another
+extension. SQL batches are admitted in full before their first statement runs;
+SQL cannot acquire additional paths through `ATTACH`, `VACUUM INTO`, loadable
+extensions, filesystem functions, arbitrary virtual-table modules, or writable
+schema/directory pragmas. FTS5 is the only admitted virtual-table module.
+Triggers and allocating scalar functions such as `randomblob`, `zeroblob`,
+`printf`, and `format` are unsupported. Unsupported APIs and pragmas throw errors. In
+particular, the optional `mmap_size` optimization used by context-mode is not
+implemented.
+
+The bridge bounds database handles, SQL/request size, returned rows and bytes,
+page cache, and workers. Each engine operation has a cooperative cancellation
+deadline; a timed-out worker is retired and never reused. These limits do not
+provide an OS memory sandbox for every SQL intermediate allocation. The native
+database-family size limit is checked before and after operations, so it is
+not a hard per-write disk quota.
+
+Database files and the engine's companion files are checked for symlinks,
+reparse points, and hard links, with pinned parent identities rechecked around
+operations. Guest filesystem APIs cannot create native links in a storage
+grant. FrankenSQLite's native VFS still opens pathnames: on Unix, this does not
+isolate the database from a separate native process with the same OS user
+identity concurrently replacing directories. Applications requiring that
+stronger boundary need an OS sandbox or a descriptor-based engine VFS.
+
+### Persistent subprocess protocols
+
+`spawn()` supports real piped stdin/stdout/stderr for protocols such as MCP,
+including writes queued before admission, write callbacks, backpressure, EOF,
+and process exit. Creation goes through the existing `exec` policy, command
+mediation, and admission accounting. Native callbacks operate only on opaque,
+extension-owned handles; they cannot launch another process or signal an
+arbitrary PID. Input, output, session counts, environment size, and lifetime
+are bounded. Shutdown retires the owned process group and retains admission
+accounting until cleanup finishes.
+
+The runtime recognizes only the exact conventional executable probes
+`command -v NAME` on POSIX and `where NAME` on Windows. It answers them using
+file metadata and the configured PATH/PATHEXT, without running a shell.
+General synchronous process execution retains its existing opt-in requirement.
+Child environments are explicit and filtered for secrets and loader injection.
+Spreading `process.env` copies only the permitted environment snapshot, in
+stable key order; denied environment access exposes no snapshot keys. Pi
+advertises its configuration directory through `PI_CONFIG_DIR` metadata while
+preserving an explicitly configured value. This lets child integrations
+identify their host without receiving read access to a parent data directory.
+Context-mode's MCP server still needs a real Node or Bun executable on PATH.
+An allowed external process runs with the host user's OS authority, as with
+the existing `exec` capability; the extension's data-directory grants do not
+constitute a sandbox for external executables.
 
 ---
 
@@ -301,6 +371,38 @@ Extension access to sensitive APIs is governed by capability policies.
 Use `pi doctor <path> --policy <profile>` to check extension compatibility
 under a specific policy.
 
+### Persistent application state
+
+Ordinary extension writes retain their existing virtual-filesystem behavior.
+Persistent data directories are separate host-assigned capabilities and are
+never added to the JavaScript module resolver's search roots.
+
+For a verified installed npm extension, the loader can assign
+`~/.pi/<package-name>` (or `~/.pi/@scope/<package-name>`). Verification requires
+the installed `node_modules` path, manifest package name, and the declared
+`pi.extensions` entrypoint to agree. Thus `npm:context-mode` can create and
+reopen `~/.pi/context-mode/sessions` without receiving access to all of HOME or
+all of `.pi`. Pi's own configuration/authentication directories and unsafe
+namespace components are reserved. Ambiguous package origins or shared legacy
+extension IDs suppress automatic grants and emit diagnostics; unrelated
+extensions retain their own grants. Invalid or linked automatic roots remain
+deny-only boundaries.
+
+The host embedding API `PiJsRuntime::add_persistent_storage_root` can assign an
+explicit absolute directory to one extension. Guest code, package metadata,
+and environment changes cannot add arbitrary paths. A custom
+`CONTEXT_MODE_DATA_DIR` outside the assigned namespace therefore requires a
+corresponding host grant.
+
+Persistent reads and mutations check ownership and read/write policy. Mutations
+use no-follow directory handles on Unix and pinned, reparse-checked directory
+handles on Windows. Traversal, linked targets, Windows device paths/names,
+alternate data streams, and overlapping grants to different owners are
+rejected. These directories support durable mkdir, file reads/writes/appends,
+copy, rename, unlink, and empty-directory removal. Writable descriptors,
+symlink creation, recursive directory deletion, and cross-filesystem rename
+are explicitly unsupported within a persistent grant.
+
 ---
 
 ## 7. Preflight Analysis
@@ -333,21 +435,25 @@ The report includes:
 
 ### Module Resolution
 
-- **Bare package specifiers** (`import foo from "some-package"`) require a
-  virtual stub entry. Extensions using unlisted npm packages will fail to load.
+- **Bare package specifiers** (`import foo from "some-package"`) must resolve
+  to an installed package within the allowed extension roots or a registered
+  virtual module. Resolution does not supply native addons or complete Node/Bun
+  API compatibility.
 - **Relative imports** (`import ./utils`) work within bundled extensions but may
   fail for multi-file extensions that were not bundled.
 - **Network imports** (`import "https://..."`) are rejected.
 
 ### Runtime Constraints
 
-- **Single-threaded**: No `worker_threads`, no parallel execution.
+- **JavaScript execution**: No guest `worker_threads`; bounded native workers
+  handle SQLite and subprocess I/O.
 - **No native addons**: C/C++ Node addons cannot be loaded. Use hostcalls or
   WASM instead.
 - **Sandbox boundary**: `createServer`, `listen`, and other server-side APIs are
   blocked. Extensions are clients, not servers.
-- **Filesystem scope**: By default, filesystem access is scoped to the extension
-  directory. Reads outside require explicit capability grants.
+- **Filesystem scope**: Extension/workspace access retains its existing policy.
+  Persistent application namespaces are separate, owner-scoped data grants;
+  they do not authorize arbitrary HOME access or native addon loading.
 
 ### Remaining Failure Buckets (18/223)
 
