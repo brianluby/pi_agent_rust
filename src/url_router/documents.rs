@@ -1640,6 +1640,7 @@ mod tests {
             base_dir: root.path().to_path_buf(),
             source: "test".to_string(),
             disable_model_invocation: false,
+            user_invocable: true,
         };
 
         let error = resolve_skill_document("reread-limit", &skill)

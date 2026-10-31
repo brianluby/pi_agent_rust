@@ -5652,7 +5652,12 @@ fn generate_proxy_stub_module(spec: &str, named_exports: &BTreeSet<String>) -> S
         r"// Auto-generated npm proxy stub (Pattern 4) for {spec_literal}
 const __pkg = {spec_literal};
 const __handler = {{
-  get(_target, prop) {{
+  get(target, prop) {{
+    const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+    if (descriptor && !descriptor.configurable) {{
+      if ('value' in descriptor && !descriptor.writable) return descriptor.value;
+      if ('get' in descriptor && descriptor.get === undefined) return undefined;
+    }}
     if (typeof prop === 'symbol') {{
       if (prop === Symbol.toPrimitive) return () => '';
       return undefined;
@@ -5668,10 +5673,10 @@ const __handler = {{
   }},
   apply() {{ return __stub; }},
   construct() {{ return __stub; }},
-  has() {{ return false; }},
-  ownKeys() {{ return []; }},
-  getOwnPropertyDescriptor() {{
-    return {{ configurable: true, enumerable: false }};
+  has(target, prop) {{ return Reflect.has(target, prop); }},
+  ownKeys(target) {{ return Reflect.ownKeys(target); }},
+  getOwnPropertyDescriptor(target, prop) {{
+    return Reflect.getOwnPropertyDescriptor(target, prop);
   }},
 }};
 const __stub = new Proxy(function __pijs_noop() {{}}, __handler);
@@ -12090,7 +12095,12 @@ function __makeMissingRequireStub(spec) {
     return __missingRequireCache[spec];
   }
   const handler = {
-    get(_target, prop) {
+    get(target, prop) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+      if (descriptor && !descriptor.configurable) {
+        if ('value' in descriptor && !descriptor.writable) return descriptor.value;
+        if ('get' in descriptor && descriptor.get === undefined) return undefined;
+      }
       if (typeof prop === "symbol") {
         if (prop === Symbol.toPrimitive) return () => "";
         return undefined;
@@ -12105,10 +12115,10 @@ function __makeMissingRequireStub(spec) {
     },
     apply() { return stub; },
     construct() { return stub; },
-    has() { return false; },
-    ownKeys() { return []; },
-    getOwnPropertyDescriptor() {
-      return { configurable: true, enumerable: false };
+    has(target, prop) { return Reflect.has(target, prop); },
+    ownKeys(target) { return Reflect.ownKeys(target); },
+    getOwnPropertyDescriptor(target, prop) {
+      return Reflect.getOwnPropertyDescriptor(target, prop);
     },
   };
   const stub = new Proxy(function __pijs_missing_require_stub() {}, handler);
@@ -29920,7 +29930,20 @@ globalThis.__proxyProbe = {
   kind: typeof dep,
   chain: typeof dep.foo.bar(),
   primitive: String(dep),
+  values: Object.values(dep),
+  hasPrototype: 'prototype' in dep,
+  prototypeConfigurable: Object.getOwnPropertyDescriptor(dep, 'prototype').configurable,
 };
+Object.defineProperty(dep, 'fixed', { value: 7, enumerable: true });
+Object.defineProperty(dep, 'getterless', { get: undefined });
+const fixedSymbol = Symbol('fixed');
+Object.defineProperty(dep, fixedSymbol, { value: 9 });
+Object.freeze(dep);
+globalThis.__proxyProbe.fixed = dep.fixed;
+globalThis.__proxyProbe.symbol = dep[fixedSymbol];
+globalThis.__proxyProbe.getterless = dep.getterless === undefined;
+globalThis.__proxyProbe.frozen = Object.isFrozen(dep);
+globalThis.__proxyProbe.frozenValues = Object.values(dep);
 export default dep;
 "#,
             )
@@ -29964,6 +29987,14 @@ export default dep;
             assert_eq!(probe["kind"], serde_json::json!("function"));
             assert_eq!(probe["chain"], serde_json::json!("function"));
             assert_eq!(probe["primitive"], serde_json::json!(""));
+            assert_eq!(probe["values"], serde_json::json!([]));
+            assert_eq!(probe["hasPrototype"], serde_json::json!(true));
+            assert_eq!(probe["prototypeConfigurable"], serde_json::json!(false));
+            assert_eq!(probe["fixed"], serde_json::json!(7));
+            assert_eq!(probe["symbol"], serde_json::json!(9));
+            assert_eq!(probe["getterless"], serde_json::json!(true));
+            assert_eq!(probe["frozen"], serde_json::json!(true));
+            assert_eq!(probe["frozenValues"], serde_json::json!([7]));
 
             let events = runtime.drain_repair_events();
             assert!(events.iter().any(|event| {
@@ -34203,6 +34234,15 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                               typeof missing === 'function' &&
                               typeof missing.default === 'function' &&
                               typeof missing.anyNestedProperty === 'function';
+                            globalThis.requireResults.missingValues = Object.values(missing);
+                            globalThis.requireResults.hasPrototype = 'prototype' in missing;
+                            Object.defineProperty(missing, 'fixed', { value: 11, enumerable: true });
+                            Object.defineProperty(missing, 'getterless', { get: undefined });
+                            Object.freeze(missing);
+                            globalThis.requireResults.frozen = Object.isFrozen(missing);
+                            globalThis.requireResults.fixed = missing.fixed;
+                            globalThis.requireResults.getterless = missing.getterless === undefined;
+                            globalThis.requireResults.frozenValues = Object.values(missing);
                         } catch (err) {
                             globalThis.requireResults.missingModuleThrows = true;
                             globalThis.requireResults.missingModuleIsStub = false;
@@ -34223,6 +34263,12 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(r["http2PathHeader"], serde_json::json!(":path"));
             assert_eq!(r["missingModuleThrows"], serde_json::json!(false));
             assert_eq!(r["missingModuleIsStub"], serde_json::json!(true));
+            assert_eq!(r["missingValues"], serde_json::json!([]));
+            assert_eq!(r["hasPrototype"], serde_json::json!(true));
+            assert_eq!(r["frozen"], serde_json::json!(true));
+            assert_eq!(r["fixed"], serde_json::json!(11));
+            assert_eq!(r["getterless"], serde_json::json!(true));
+            assert_eq!(r["frozenValues"], serde_json::json!([11]));
         });
     }
 

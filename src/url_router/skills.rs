@@ -454,6 +454,7 @@ mod tests {
             base_dir: base,
             source: "test".to_string(),
             disable_model_invocation: false,
+            user_invocable: true,
         };
         (root, skill)
     }

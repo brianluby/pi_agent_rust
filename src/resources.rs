@@ -129,7 +129,7 @@ const MAX_SKILL_NAME_LEN: usize = 64;
 const MAX_SKILL_DESC_LEN: usize = 1024;
 const MAX_SKILL_DISCOVERY_ENTRIES: usize = 16_384;
 
-const ALLOWED_SKILL_FRONTMATTER: [&str; 8] = [
+const ALLOWED_SKILL_FRONTMATTER: [&str; 9] = [
     "name",
     "description",
     "license",
@@ -137,6 +137,7 @@ const ALLOWED_SKILL_FRONTMATTER: [&str; 8] = [
     "metadata",
     "allowed-tools",
     "disable-model-invocation",
+    "user-invocable",
     // Agent-authored managed skills (bd-cv653.4.2): the marker protects
     // user-authored skills from manage_skill mutations.
     "managed",
@@ -150,6 +151,9 @@ pub struct Skill {
     pub base_dir: PathBuf,
     pub source: String,
     pub disable_model_invocation: bool,
+    /// Whether users may discover and expand this skill as a slash command.
+    /// Independent of model visibility; absent frontmatter defaults to true.
+    pub user_invocable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1378,6 +1382,20 @@ fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFileResult {
     let disable_model_invocation = frontmatter
         .get("disable-model-invocation")
         .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let user_invocable = parsed
+        .booleans
+        .get("user-invocable")
+        .copied()
+        .unwrap_or(true);
+    if frontmatter.contains_key("user-invocable") && !parsed.booleans.contains_key("user-invocable")
+    {
+        diagnostics.push(ResourceDiagnostic {
+            kind: DiagnosticKind::Warning,
+            message: "frontmatter field \"user-invocable\" must be a boolean".to_string(),
+            path: path.to_path_buf(),
+            collision: None,
+        });
+    }
 
     LoadSkillFileResult {
         skill: Some(Skill {
@@ -1387,6 +1405,7 @@ fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFileResult {
             base_dir,
             source,
             disable_model_invocation,
+            user_invocable,
         }),
         diagnostics,
     }
@@ -2083,7 +2102,7 @@ fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
 
     let (name, args) = split_command_name_and_args(text, 7);
 
-    let Some(skill) = skills.iter().find(|s| s.name == name) else {
+    let Some(skill) = skills.iter().find(|s| s.name == name && s.user_invocable) else {
         return text.to_string();
     };
 
@@ -3093,6 +3112,7 @@ mod tests {
             base_dir: temp_dir.path().to_path_buf(),
             source: "test".to_string(),
             disable_model_invocation: false,
+            user_invocable: true,
         };
 
         let command = "/skill:reread-limit keep-these-args";
@@ -3288,6 +3308,7 @@ mod tests {
             base_dir: skill_dir,
             source: "user".to_string(),
             disable_model_invocation: false,
+            user_invocable: true,
         };
 
         let tab_out = expand_skill_command(
@@ -3312,6 +3333,7 @@ mod tests {
                 base_dir: PathBuf::from("/tmp/a"),
                 source: "user".to_string(),
                 disable_model_invocation: false,
+                user_invocable: true,
             },
             Skill {
                 name: "b".to_string(),
@@ -3320,6 +3342,7 @@ mod tests {
                 base_dir: PathBuf::from("/tmp/b"),
                 source: "user".to_string(),
                 disable_model_invocation: true,
+                user_invocable: true,
             },
         ];
         let prompt = format_skills_for_prompt(&skills);
@@ -3884,6 +3907,48 @@ mod tests {
         let errors = validate_frontmatter_fields(keys.iter());
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0], "unknown frontmatter field \"unknown-field\"");
+    }
+
+    #[test]
+    fn context_mode_skill_invocation_frontmatter_controls_commands_independently() {
+        let root = tempfile::tempdir().expect("tempdir");
+        for (field, expected, warning) in [
+            ("", true, false),
+            ("user-invocable: true\n", true, false),
+            ("user-invocable: false\n", false, false),
+            ("user-invocable: FALSE # model-only\n", false, false),
+            ("user-invocable: \"false\"\n", true, true),
+        ] {
+            let skill_dir = root.path().join("ctx-search");
+            fs::create_dir_all(&skill_dir).expect("create skill directory");
+            let skill_file = skill_dir.join("SKILL.md");
+            fs::write(
+                &skill_file,
+                format!(
+                    "---\nname: ctx-search\ndescription: |\n  Search persistent context.\n  Trigger: context search\n{field}---\nCall the context search tool.\n"
+                ),
+            )
+            .expect("write context-mode style skill");
+            let loaded = load_skill_from_file(&skill_file, "npm:context-mode".to_string());
+            assert_eq!(loaded.diagnostics.len(), usize::from(warning), "{field}");
+            if warning {
+                assert!(loaded.diagnostics[0].message.contains("must be a boolean"));
+            }
+            let skill = loaded.skill.expect("load skill");
+            assert_eq!(skill.user_invocable, expected, "{field}");
+            let mut resources = ResourceLoader::empty(true);
+            resources.skills.push(skill);
+            let catalog = crate::autocomplete::AutocompleteCatalog::from_resources(&resources);
+            assert_eq!(catalog.skills.len(), usize::from(expected), "{field}");
+            let command = "/skill:ctx-search retained arguments";
+            let expanded = expand_skill_command(command, resources.skills());
+            assert_eq!(expanded != command, expected, "{field}");
+            assert!(
+                format_skills_for_prompt(resources.skills()).contains("<name>ctx-search</name>")
+            );
+            resources.skills[0].disable_model_invocation = true;
+            assert!(format_skills_for_prompt(resources.skills()).is_empty());
+        }
     }
 
     #[test]
@@ -4519,6 +4584,7 @@ still frontmatter",
             base_dir: tmp.path().to_path_buf(),
             source: "test".to_string(),
             disable_model_invocation: false,
+            user_invocable: true,
         }];
         let result = expand_skill_command("/skill:test-skill extra args", &skills);
         assert!(result.contains("<skill name=\"test-skill\""));
