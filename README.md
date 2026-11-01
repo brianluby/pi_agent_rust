@@ -408,8 +408,8 @@ Watch the response appear incrementally, with thinking blocks shown inline.
 ### 36 Built-in Tools
 
 Tools are tiered so the model's live schema stays small while everything
-remains reachable. The tier table lives in `src/xdev.rs`; the default
-`--tools` list lives in `src/cli.rs`:
+remains reachable. The tier table and default enabled list live in
+`src/xdev.rs`; `src/cli.rs` resolves CLI selection and optional-tool settings:
 
 - **Essential** (always in the provider schema): `read`, `write`, `edit`,
   `bash`, `grep`, `find`, `ls`, `hashline_edit`, `ask`, `todo`,
@@ -423,15 +423,17 @@ remains reachable. The tier table lives in `src/xdev.rs`; the default
   service supervision), alongside the essential tier. The default `--tools`
   list names 19 tools; the registry always adds `manage_skill` and, when any
   discoverable tool is enabled, the `xdev` dispatcher
-- **`--tools` opt-in extras**: `eval`, `github`, `security_scan`
+- **Settings or `--tools` opt-in extras**: `eval` (`tools.enableEval`),
+  `github` (`tools.enableGithub`), `security_scan`
+  (`tools.enableSecurityScan`)
 - **Settings-gated extras** (off until enabled in `settings.json`):
   `browser` (`browser.enableBrowser`), `computer`
   (`computer.enableComputer`), the media trio `inspect_image`,
   `generate_image`, `tts` (`media.enableInspectImage` /
   `media.enableGenerateImage` / `media.enableTts`), and `read_media`
   (`media.enableReadMedia`; inline video/audio for Gemini-family models)
-- **Opt-in only**: `subagent` (it can start additional coding-agent
-  processes)
+- **Opt-in only**: `subagent` (`tools.enableSubagent` or `--tools`; it can
+  start additional coding-agent processes)
 
 | Tool | Description |
 |------|-------------|
@@ -532,9 +534,33 @@ evicted lines. The cap applies to each artifact, not the total across runs.
 still belong to the current Pi process: cross-process reattachment and
 survival after that host process exits are not implemented.
 
+To enable optional tools across launches, add their flags to the existing
+`tools` object in `~/.pi/agent/settings.json` or a trusted project's
+`.pi/settings.json`:
+
+```json
+{
+  "tools": {
+    "enableEval": true,
+    "enableGithub": true,
+    "enableSecurityScan": true,
+    "enableSubagent": true
+  }
+}
+```
+
+Each flag defaults to `false` and also accepts snake_case (`enable_eval`,
+`enable_github`, `enable_security_scan`, `enable_subagent`). With no `--tools`
+argument, enabled extras join the existing defaults. An explicit `--tools`
+list overrides these flags for that run, even if empty or equal to the default
+list; `--no-tools` disables all built-ins. Trusted project flags override global
+flags individually, including `false`; untrusted project settings are excluded.
+Existing approval policies and native child-agent allowlists still apply.
+See [Optional-tool settings](docs/settings.md#optional-tools).
+
 Per-tool exposure is configurable via `tools.loadMode.<name>` set to
-`essential`, `discoverable`, or `off`; an explicit `--tools` list always
-wins:
+`essential`, `discoverable`, or `off`. Load modes do not activate an optional
+tool by themselves. An explicit `--tools` selection remains available:
 
 ```bash
 pi --tools read,bash,edit,write,grep,find,ls,hashline_edit,subagent \
@@ -628,6 +654,11 @@ extension and never resolves a child executable by assuming a `pi` binary on
 `PATH`. By default it starts the current Rust Pi executable. Set
 `PI_SUBAGENT_PI_BINARY=/absolute/path/to/rpi` only when an explicit binary
 override is needed.
+
+Enable it persistently with `"tools": { "enableSubagent": true }` in
+`settings.json`, or include `subagent` in an explicit `--tools` list. It remains
+off by default; see [built-in native subagents](docs/subagent-builtins.md)
+for the bundled agent profiles.
 
 Agent definitions are Markdown files in `$PI_CODING_AGENT_DIR/agents/*.md`
 (normally `~/.pi/agent/agents/*.md`) or the nearest
@@ -1205,7 +1236,8 @@ Interactive file references:
 | `--provider <NAME>` | Force provider for this run (aliases supported) |
 | `--model <MODEL>` | Model to use (auto-select fallback: `anthropic/claude-sonnet-4-6`, then `anthropic/claude-opus-4-7`, then `openai/gpt-5.1-codex`) |
 | `--thinking <LEVEL>` | Thinking level: off/minimal/low/medium/high/xhigh/max |
-| `--tools <TOOLS>` | Comma-separated tool list |
+| `--tools <TOOLS>` | Comma-separated tool list; overrides optional-tool activation settings for this run |
+| `--no-tools` | Disable built-in tools, including tools enabled in settings |
 | `--api-key <KEY>` | API key (or use provider-specific env vars such as `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) |
 | `--extension-policy safe|balanced|permissive` | Extension capability profile |
 | `--repair-policy off|suggest|auto-safe|auto-strict` | Extension auto-repair policy |
@@ -1378,7 +1410,10 @@ Settings are resolved in priority order (first match wins):
 4. **Global settings** (`~/.pi/agent/settings.json`)
 5. **Built-in defaults**
 
-This means a CLI flag always overrides a `settings.json` value, and a project-level setting overrides the global one.
+This means a CLI flag always overrides a `settings.json` value, and a trusted
+project-level setting overrides the global one. Untrusted project settings are
+excluded. Optional-tool activation flags merge individually; a project can set
+one flag to `false` while inheriting the other global flags.
 
 ### Resource Resolution
 

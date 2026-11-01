@@ -1,6 +1,27 @@
 # Built-in native subagents
 
-The opt-in `subagent` tool now works without installing agent Markdown files.
+The opt-in `subagent` tool works without installing agent Markdown files.
+Enable it across launches in `~/.pi/agent/settings.json` or a trusted project's
+`.pi/settings.json`:
+
+```json
+{
+  "tools": {
+    "enableSubagent": true
+  }
+}
+```
+
+The snake_case spelling `tools.enable_subagent` is also accepted. The setting
+defaults to `false` and adds `subagent` to the default tool selection only when
+`--tools` is omitted. An explicit `--tools` list takes precedence: include
+`subagent` in that list to select it for the run. `--no-tools` disables it.
+Project settings require workspace trust, and activation preserves existing
+approval policies and native child tool allowlists. In particular, a global
+`enableSubagent: true` does not add recursive delegation to a child whose
+explicit tool allowlist omits `subagent`. See
+[Optional-tool settings](settings.md#optional-tools) for merging and precedence.
+
 Its five bundled profiles use the existing native child runner:
 
 | Agent | Purpose | Tools |

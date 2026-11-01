@@ -29,14 +29,14 @@ If `PI_CONFIG_PATH` is set, Pi loads *only* that file and skips the global/proje
 
 ## Merge behavior (global vs project)
 
-Project settings override global settings on a per-field basis.
+Trusted project settings override global settings on a per-field basis.
+An untrusted project's settings are excluded from the merge.
 
-Important detail: nested objects like `compaction`, `retry`, `images`, `terminal`, `branch_summary`,
-and `thinking_budgets` are treated as *single* fields. If `.pi/settings.json` contains a
-`compaction` object, it replaces the entire global `compaction` object.
-
-Within a single file, missing nested keys fall back to built-in defaults when accessed (see
-`src/config.rs`).
+Nested settings such as `compaction`, `retry`, `images`, `terminal`,
+`branch_summary`, and `thinking_budgets` also merge field by field. A project
+can override one nested value while inheriting the other global values.
+Missing values fall back to built-in defaults only when neither scope supplies
+them (see `src/config.rs`).
 
 Example:
 
@@ -51,10 +51,67 @@ Example:
 ```
 
 Resulting behavior:
-- `compaction.reserve_tokens` becomes `8192`
-- `compaction.enabled` does **not** inherit `false` from global; it falls back to its built-in default
+
+- `compaction.reserve_tokens` becomes `8192`.
+- `compaction.enabled` remains `false`, inherited from global settings.
+
+The `tools` object merges each activation flag independently, and `loadMode`
+merges entries by tool name. An omitted activation flag inherits the global
+value; an explicit `false` disables a globally enabled optional tool for that
+trusted project. See [Optional tools](#optional-tools).
 
 ## Supported settings (snake_case JSON keys)
+
+### Optional tools
+
+Persistently enable `eval`, `github`, `security_scan`, or `subagent` in the
+existing `tools` object. All four remain disabled by default.
+
+| Setting | Snake_case spelling | Tool | Default |
+| --- | --- | --- | --- |
+| `tools.enableEval` | `tools.enable_eval` | `eval` | `false` |
+| `tools.enableGithub` | `tools.enable_github` | `github` | `false` |
+| `tools.enableSecurityScan` | `tools.enable_security_scan` | `security_scan` | `false` |
+| `tools.enableSubagent` | `tools.enable_subagent` | `subagent` | `false` |
+
+Use JSON booleans, not strings such as `"true"`. The two spellings of each
+setting are equivalent; use one spelling per field in a file.
+
+For example, add this to `~/.pi/agent/settings.json`:
+
+```json
+{
+  "tools": {
+    "enableEval": true,
+    "enableGithub": true,
+    "enableSecurityScan": true,
+    "enableSubagent": true
+  }
+}
+```
+
+When `--tools` is omitted, Pi adds the enabled optional tools to its existing
+default tool list. An explicit `--tools` list selects the tools for that run
+and overrides these four flags, including when the list is empty or exactly
+matches the default list. For example, `pi --tools read,grep,find,ls` does not
+enable any of these four tools, even if all four settings are `true`.
+Conversely, `pi --tools read,eval` selects `eval` even when `enableEval` is
+`false`. `--no-tools` disables built-in tools regardless of either source.
+
+The same flags work in a trusted project's `.pi/settings.json`. For example,
+`{"tools":{"enableEval":false}}` disables a global `enableEval: true` while
+inheriting the other global tool flags and load modes. Project settings are
+applied only after the existing workspace-trust decision; an untrusted project
+cannot activate these tools or override global choices. Editing the project
+settings invalidates a stored trust decision. `PI_CONFIG_PATH` retains its
+existing explicit single-file behavior and skips the global/project merge.
+
+`tools.loadMode.<name>` (also `tools.load_mode.<name>`) controls exposure of
+already selected tools: `essential`, `discoverable`, or `off`. It does not
+activate an optional tool by itself. These activation flags use the existing
+tool registry and do not grant new approval permissions, extension capabilities,
+or child-agent tools. In particular, native children's explicit tool allowlists
+still override inherited optional-tool settings.
 
 ### Appearance
 
@@ -525,6 +582,9 @@ They remain outside project recall, reflection, and startup memory.
 
 ### Subagents
 
+- `tools.enableSubagent` (bool): Default `false`. Persistently enables the native
+  `subagent` tool when `--tools` is omitted. See [Optional tools](#optional-tools)
+  for aliases, CLI precedence, and workspace-trust behavior.
 - `subagent_structured_results` (bool): Default `false`. Alias: `subagentStructuredResults`.
   When `true`, the `subagent` tool appends a machine-readable
   `<subagent-structured-result>` block to its result text: a compact JSON array

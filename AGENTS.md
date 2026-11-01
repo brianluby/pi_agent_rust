@@ -299,13 +299,13 @@ Session persistence + index (JSONL, default-enabled SQLite backend support)
 - Extension-provided providers via stream-simple bridge
 - Tool definitions with JSON Schema
 
-**Built-in Tools** (36 total; the tier table is `ESSENTIAL_DEFAULTS` / `OPT_IN_ONLY` in `src/xdev.rs`, the default `--tools` list is in `src/cli.rs`, and README "36 Built-in Tools" is the user-facing inventory — keep all three in sync):
+**Built-in Tools** (36 total; the tier table and `default_enabled_tools` list are in `src/xdev.rs`, effective CLI/settings selection is in `src/cli.rs`, and README "36 Built-in Tools" is the user-facing inventory — keep all three in sync):
 - Essential, always in the schema: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `hashline_edit`, `ask`, `todo`, `web_search`, `submit_plan`, `current_time`, `xdev`
 - Discoverable behind `xdev`: `ast_grep`, `ast_edit`, `lsp`, `debug`, `manage_skill`, plus the memory bank (`retain`, `recall`, `reflect`, `memory_edit`, `learn`) when `memory.backend` is `local`
 - Default-enabled: `jobs`, `hub`
-- `--tools` opt-in: `eval`, `github`, `security_scan`
+- Opt-in via `--tools` or `tools.enableEval` / `tools.enableGithub` / `tools.enableSecurityScan`: `eval`, `github`, `security_scan`
 - Settings-gated: `browser`, `computer`, `inspect_image`, `generate_image`, `tts`, `read_media`
-- `subagent` - Native isolated Rust Pi child-agent delegation (opt-in only via `--tools ...subagent`)
+- `subagent` - Native isolated Rust Pi child-agent delegation (opt-in only via `--tools ...subagent` or `tools.enableSubagent`)
 
 **Session Management:**
 - JSONL format (version 3)
