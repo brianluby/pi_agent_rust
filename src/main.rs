@@ -2526,6 +2526,12 @@ async fn run(
         let available_models = rpc_available_models(&model_registry, cli.api_key.as_deref());
         let acp_options = pi::acp::AcpOptions {
             config: config.clone(),
+            settings_source: Some(pi::acp::AcpSettingsSource {
+                global_dir: global_dir.clone(),
+                config_override: config_path.clone(),
+                workspace_trust_env: std::env::var(pi::workspace_trust::TRUST_ENV_VAR).ok(),
+                launch_cwd: cwd.clone(),
+            }),
             launch: pi::acp::AcpLaunchOptions::from_cli(&cli),
             available_models,
             model_registry: model_registry.clone(),

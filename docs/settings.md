@@ -60,6 +60,26 @@ merges entries by tool name. An omitted activation flag inherits the global
 value; an explicit `false` disables a globally enabled optional tool for that
 trusted project. See [Optional tools](#optional-tools).
 
+## ACP workspace settings
+
+For `pi --acp`, creating a session, loading a saved session from disk, or
+forking a session resolves global settings together with the requested
+workspace's trusted project settings. Untrusted project settings are excluded.
+Explicit CLI choices, including `--tools` and `--no-tools`, retain precedence.
+A running session keeps the settings admitted when it was created, including
+its prompt, steering, and media policy; reattaching does not replace them.
+
+The launch-time `--trust` flag applies to the launch workspace and the contents
+approved there. It is not blanket consent for other workspaces requested later
+by an editor. Existing persisted trust decisions are checked for the requested
+workspace and current contents. Global `trustAllWorkspaces` and explicit
+`PI_WORKSPACE_TRUST` policies retain their existing scope.
+
+`PI_CONFIG_PATH` still selects one file instead of the global/project merge.
+A relative override is resolved against Pi's launch directory and keeps that
+location when a session requests a different workspace. The startup skills
+block is omitted for a different or untrusted workspace.
+
 ## Supported settings (snake_case JSON keys)
 
 ### Optional tools

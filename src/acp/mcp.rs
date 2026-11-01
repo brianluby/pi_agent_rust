@@ -818,6 +818,8 @@ mod tests {
                     )),
                     cwd: root.path().into(), mcp: Some(Arc::clone(&mcp)),
                     available_models: Vec::new(),
+                    config: Arc::new(crate::config::Config::default()),
+                    global_dir: root.path().into(),
                 }));
                 let (out, receiver) = std::sync::mpsc::sync_channel(128);
                 let out = AcpOutput::new(out);

@@ -450,6 +450,8 @@ fn live_state(
         cwd: cwd.into(),
         mcp: Some(Arc::clone(&mcp)),
         available_models: Vec::new(),
+        config: Arc::new(crate::config::Config::default()),
+        global_dir: root.into(),
     }));
     (id, state, mcp)
 }
@@ -682,6 +684,7 @@ fn options(root: &Path, handle: asupersync::runtime::RuntimeHandle) -> AcpOption
         .find("anthropic", "claude-sonnet-4-5")
         .unwrap();
     AcpOptions {
+        settings_source: None,
         launch: crate::acp::AcpLaunchOptions::default(),
         config: crate::config::Config::default(),
         available_models: vec![model],

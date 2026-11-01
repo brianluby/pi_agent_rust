@@ -799,6 +799,15 @@ Pi runs in four modes, each suited to different workflows:
 | **RPC** | `pi --mode rpc` | Headless JSON protocol over stdin/stdout for IDE integrations |
 | **ACP** | `pi --acp` | JSON-RPC 2.0 Agent Client Protocol over stdin/stdout (e.g. the Zed editor) |
 
+**ACP workspace settings.** Sessions created by `pi --acp` resolve global
+settings and trusted settings from the requested workspace when creating,
+loading from disk, or forking a session. Reattaching to a running session keeps
+its admitted settings, including prompt, steering, and media policy. Launching
+with `--trust` does not approve unrelated workspaces requested later by the
+editor. Explicit CLI choices keep precedence. See
+[ACP workspace settings](docs/settings.md#acp-workspace-settings) for trust and
+configuration-path details.
+
 **ACP model selection.** After `initialize`, `session/new`, `session/load`, and
 `session/resume` return model choices and the active selection. Modern clients
 use the `model` selector in `configOptions` and send
