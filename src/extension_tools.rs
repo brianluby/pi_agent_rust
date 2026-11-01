@@ -17,7 +17,7 @@ use crate::extensions::JsExtensionRuntimeHandle;
 use crate::extensions::WasmExtensionHandle;
 use crate::extensions::{ExtensionManager, ExtensionRuntimeHandle};
 use crate::extensions_js::ExtensionToolDef;
-use crate::tools::{Tool, ToolOutput, ToolUpdate};
+use crate::tools::{SharedToolRegistry, Tool, ToolOutput, ToolUpdate};
 #[cfg(feature = "wasm-host")]
 use asupersync::time::{timeout, wall_now};
 
@@ -101,20 +101,79 @@ pub async fn collect_extension_tool_wrappers(
     manager: &ExtensionManager,
     ctx_payload: Value,
 ) -> Result<Vec<Box<dyn Tool>>> {
-    let shared_ctx_payload = Arc::new(ctx_payload);
     let active = manager
         .active_tools()
         .map(|tools| tools.into_iter().collect::<HashSet<_>>());
+    let mut wrappers =
+        collect_all_extension_tool_wrappers(manager, manager.runtime(), ctx_payload).await?;
+    if let Some(active) = active {
+        wrappers.retain(|tool| active.contains(tool.name()));
+    }
+    Ok(wrappers)
+}
+
+/// Agent-owned publication state for deferred extension tool registration.
+/// Exact Arc identities distinguish our mounts from later same-name host
+/// overrides without adding a manager/runtime ownership cycle.
+pub(crate) struct ExtensionToolCatalog {
+    ctx_payload: Value,
+    published: Vec<Arc<dyn Tool>>,
+    initialized: bool,
+}
+
+impl ExtensionToolCatalog {
+    pub(crate) const fn new(ctx_payload: Value) -> Self {
+        Self {
+            ctx_payload,
+            published: Vec::new(),
+            initialized: false,
+        }
+    }
+
+    pub(crate) async fn refresh(
+        &mut self,
+        manager: &ExtensionManager,
+        tools: &SharedToolRegistry,
+    ) -> Result<()> {
+        // Collection asks the runtime for its authoritative, owner-validated
+        // snapshot. Errors leave the published registry untouched.
+        let replacements = collect_all_extension_tool_wrappers(
+            manager,
+            manager.runtime_for_tools(),
+            self.ctx_payload.clone(),
+        )
+        .await?;
+        let active = manager.active_tools();
+        self.published = tools.reconcile_extension_tools(
+            &self.published,
+            replacements,
+            active.as_deref(),
+            !self.initialized,
+        );
+        self.initialized = true;
+        Ok(())
+    }
+
+    pub(crate) fn clear(&mut self, tools: &SharedToolRegistry) {
+        self.published = tools.reconcile_extension_tools(&self.published, Vec::new(), None, false);
+        self.initialized = false;
+    }
+}
+
+async fn collect_all_extension_tool_wrappers(
+    manager: &ExtensionManager,
+    runtime: Option<ExtensionRuntimeHandle>,
+    ctx_payload: Value,
+) -> Result<Vec<Box<dyn Tool>>> {
+    #[cfg(not(feature = "wasm-host"))]
+    let _ = manager;
+    let shared_ctx_payload = Arc::new(ctx_payload);
 
     let mut wrappers: Vec<Box<dyn Tool>> = Vec::new();
     let mut seen = HashSet::new();
 
-    if let Some(runtime) = manager.runtime() {
+    if let Some(runtime) = runtime {
         let mut defs = runtime.get_registered_tools().await?;
-        if let Some(active) = active.as_ref() {
-            defs.retain(|def| active.contains(&def.name));
-        }
-
         defs.sort_by(|a, b| a.name.cmp(&b.name));
         for def in defs {
             if !seen.insert(def.name.clone()) {
@@ -140,11 +199,6 @@ pub async fn collect_extension_tool_wrappers(
 
         wasm_defs.sort_by(|a, b| a.0.name.cmp(&b.0.name));
         for (def, handle) in wasm_defs {
-            if let Some(active) = active.as_ref()
-                && !active.contains(&def.name)
-            {
-                continue;
-            }
             if !seen.insert(def.name.clone()) {
                 tracing::warn!(tool = %def.name, "Duplicate extension tool name; ignoring");
                 continue;
@@ -761,6 +815,79 @@ mod tests {
             .await
             .expect("load js extensions");
         (temp_dir, manager, js_runtime, shared)
+    }
+
+    #[test]
+    fn deferred_catalog_preserves_host_overrides_and_replacement_owners() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let (temp_dir, manager, _js_runtime, shared) = start_extension_on_shared_registry(
+                r#"
+                export default function(pi) {
+                    for (const name of ["late_echo", "survivor"]) {
+                        pi.registerTool({
+                            name, description: "extension " + name,
+                            parameters: { type: "object" },
+                            execute: async () => ({
+                                content: [{ type: "text", text: "extension:" + name }],
+                            }),
+                        });
+                    }
+                }
+                "#,
+            ).await;
+            shared.update(|registry| registry.push(Box::new(LateEchoTool)));
+            let ctx = json!({ "cwd": temp_dir.path().display().to_string() });
+            manager.set_active_tools(vec!["survivor".to_string()]);
+            let mut filtered = ExtensionToolCatalog::new(ctx.clone());
+            filtered.refresh(&manager, &shared).await.unwrap();
+            assert_eq!(shared.snapshot().get("late_echo").unwrap().origin(), crate::tools::ToolOrigin::BuiltIn);
+            assert!(shared.snapshot().get("survivor").is_some());
+            filtered.clear(&shared);
+            manager.set_active_tools(vec!["late_echo".to_string(), "survivor".to_string()]);
+            let mut catalog = ExtensionToolCatalog::new(ctx.clone());
+            catalog.refresh(&manager, &shared).await.unwrap();
+            let original = shared.snapshot();
+            assert_eq!(original.get("late_echo").unwrap().origin(), crate::tools::ToolOrigin::Extension);
+            let version = shared.version();
+            catalog.refresh(&manager, &shared).await.unwrap();
+            assert_eq!(shared.version(), version, "unchanged schemas retain the provider cache");
+
+            manager.set_active_tools(vec!["survivor".to_string()]);
+            catalog.refresh(&manager, &shared).await.unwrap();
+            assert!(shared.snapshot().get("late_echo").is_none());
+            assert!(shared.snapshot().inactive_tools().iter().any(|tool| tool.name() == "late_echo"));
+
+            // A later host mount can share a shelved registration's name.
+            // Refresh must neither erase that host tool nor revive the old
+            // inactive wrapper over it.
+            shared.update(|registry| registry.push(Box::new(LateEchoTool)));
+            catalog.refresh(&manager, &shared).await.unwrap();
+            manager.set_active_tools(vec!["late_echo".to_string(), "survivor".to_string()]);
+            catalog.refresh(&manager, &shared).await.unwrap();
+            let snapshot = shared.snapshot();
+            assert_eq!(snapshot.get("late_echo").unwrap().origin(), crate::tools::ToolOrigin::BuiltIn);
+            assert!(!snapshot.inactive_tools().iter().any(|tool| tool.name() == "late_echo"));
+            let output = snapshot.get("late_echo").unwrap()
+                .execute("native-override", json!({ "text": "retained" }), None).await.unwrap();
+            assert!(matches!(&output.content[0], ContentBlock::Text(text) if text.text == "echo:retained"));
+            let old_output = original.get("late_echo").unwrap()
+                .execute("retained-snapshot", json!({}), None).await.unwrap();
+            assert!(matches!(&old_output.content[0], ContentBlock::Text(text) if text.text == "extension:late_echo"));
+
+            // Reload publishes a fresh owner before the former one is
+            // cleared. Both sets have Extension origin and identical names.
+            let mut replacement = ExtensionToolCatalog::new(ctx);
+            replacement.refresh(&manager, &shared).await.unwrap();
+            catalog.clear(&shared);
+            assert_eq!(shared.snapshot().get("late_echo").unwrap().origin(), crate::tools::ToolOrigin::Extension);
+            assert!(shared.snapshot().get("survivor").is_some());
+            shared.update(|registry| registry.push(Box::new(LateEchoTool)));
+            replacement.clear(&shared);
+            assert_eq!(shared.snapshot().tools().len(), 1);
+            assert_eq!(shared.snapshot().get("late_echo").unwrap().origin(), crate::tools::ToolOrigin::BuiltIn);
+            assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+        });
     }
 
     /// Production-path check for the shared registry (bd-4t6oz): the JS

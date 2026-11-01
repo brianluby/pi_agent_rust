@@ -132,16 +132,27 @@ fn validate_components(path: &Path) -> io::Result<()> {
                     .split('.')
                     .next()
                     .unwrap_or_default()
+                    .trim_end_matches(' ')
                     .to_ascii_uppercase();
-                if name.contains(':')
+                let port = stem
+                    .strip_prefix("COM")
+                    .or_else(|| stem.strip_prefix("LPT"));
+                if name.contains(['<', '>', ':', '"', '|', '?', '*'])
+                    || name.chars().any(|ch| ch <= '\u{1f}')
                     || name.ends_with(['.', ' '])
-                    || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-                    || (stem.len() == 4
-                        && (stem.starts_with("COM") || stem.starts_with("LPT"))
-                        && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+                    || matches!(
+                        stem.as_str(),
+                        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+                    )
+                    || port.is_some_and(|number| {
+                        matches!(
+                            number,
+                            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                        )
+                    })
                 {
                     return Err(denied(
-                        "persistent storage does not accept Windows device names or streams",
+                        "persistent storage does not accept Windows device names, streams or reserved characters",
                     ));
                 }
             }
@@ -172,6 +183,11 @@ fn reject_link_components(path: &Path) -> io::Result<()> {
                 ));
             }
             Ok(metadata) => {
+                if !metadata.is_file() && !metadata.is_dir() {
+                    return Err(denied(
+                        "persistent storage accepts only regular files and directories",
+                    ));
+                }
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::MetadataExt as _;
@@ -287,6 +303,12 @@ impl PersistentStorage {
                 "persistent storage namespace is not granted to this extension",
             ));
         }
+        let registered_input = self.is_registered(path);
+        if registered_input {
+            // Windows canonicalization opens the target. Reject device names
+            // and namespace syntax before it can touch a special OS object.
+            validate_components(path)?;
+        }
         let checked = crate::extensions::safe_canonicalize(path);
         if self
             .foreign_roots
@@ -298,7 +320,7 @@ impl PersistentStorage {
                 "persistent storage namespace is not granted to this extension",
             ));
         }
-        let registered = self.is_registered(path) || self.is_registered(&checked);
+        let registered = registered_input || self.is_registered(&checked);
         if !registered {
             return Ok(None);
         }
@@ -430,28 +452,37 @@ pub(super) fn pin_parent(path: &Path, create: bool) -> io::Result<StorageParent>
     }
 }
 
+#[cfg(unix)]
+fn open_leaf(parent: &StorageParent, access: rustix::fs::OFlags) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+    let name = parent
+        .path
+        .file_name()
+        .ok_or_else(|| denied("storage file has no name"))?;
+    // A leaf can change after preflight. Never wait for a FIFO peer or acquire
+    // a controlling terminal before the caller validates the opened object.
+    let flags = access | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+    Ok(File::from(rustix::fs::openat(
+        &parent.directory,
+        name,
+        flags,
+        Mode::RUSR | Mode::WUSR,
+    )?))
+}
+
 fn open_file(parent: &StorageParent, append: bool, exclusive: bool) -> io::Result<File> {
     parent.verify()?;
     #[cfg(unix)]
     let file = {
-        use rustix::fs::{Mode, OFlags};
-        let mut flags = OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        use rustix::fs::OFlags;
+        let mut flags = OFlags::WRONLY | OFlags::CREATE;
         if append {
             flags |= OFlags::APPEND;
         }
         if exclusive {
             flags |= OFlags::EXCL;
         }
-        let name = parent
-            .path
-            .file_name()
-            .ok_or_else(|| denied("storage file has no name"))?;
-        File::from(rustix::fs::openat(
-            &parent.directory,
-            name,
-            flags,
-            Mode::RUSR | Mode::WUSR,
-        )?)
+        open_leaf(parent, flags)?
     };
     #[cfg(windows)]
     let file = {
@@ -514,16 +545,7 @@ pub(super) fn read_file(
     }
     let parent = pin_parent(&path, false)?;
     #[cfg(unix)]
-    let file = {
-        use rustix::fs::{Mode, OFlags};
-        File::from(rustix::fs::openat(
-            &parent.directory,
-            path.file_name()
-                .ok_or_else(|| denied("storage file has no name"))?,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?)
-    };
+    let file = open_leaf(&parent, rustix::fs::OFlags::RDONLY)?;
     #[cfg(windows)]
     let file = {
         use std::os::windows::fs::OpenOptionsExt as _;
@@ -953,6 +975,133 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn storage_rejects_special_targets_without_io_and_keeps_regular_files_usable() {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::extensions::safe_canonicalize(temp.path());
+        let fifo = root.join("events.pipe");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        let socket = root.join("events.socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let mut state = PiJsModuleState::new();
+        state
+            .persistent_storage
+            .register(root.clone(), "owner", false)
+            .unwrap();
+        let state = Rc::new(RefCell::new(state));
+        let contents = serde_json::json!({ "data": BASE64.encode("session event") });
+        for path in [&fifo, &socket] {
+            assert!(
+                state
+                    .borrow()
+                    .persistent_storage
+                    .resolve(path, Some("owner"))
+                    .is_err()
+            );
+            assert!(read_file(path, Some("owner"), &state).is_err());
+            for operation in ["write", "append"] {
+                assert!(mutate(operation, path, &contents, None).is_err());
+            }
+            assert!(pin_parent(path, false).is_err());
+        }
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        assert!(
+            std::fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+
+        let regular = root.join("events.jsonl");
+        mutate("write", &regular, &contents, None).unwrap();
+        mutate("append", &regular, &contents, None).unwrap();
+        assert_eq!(
+            read_file(&regular, Some("owner"), &state).unwrap().unwrap(),
+            b"session eventsession event"
+        );
+        let parent = pin_parent(&regular, false).unwrap();
+        let opened = open_file(&parent, false, false).unwrap();
+        assert_eq!(
+            opened.metadata().unwrap().len(),
+            26,
+            "open must not truncate"
+        );
+        assert!(
+            open_file(&parent, false, true).is_err(),
+            "exclusive create must fail"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_fifo_leaf_never_waits_for_a_pipe_peer() {
+        use rustix::fs::{Mode, OFlags};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::extensions::safe_canonicalize(temp.path());
+        for (name, access) in [
+            ("read", OFlags::RDONLY),
+            ("write", OFlags::WRONLY | OFlags::CREATE),
+            ("append", OFlags::WRONLY | OFlags::CREATE | OFlags::APPEND),
+        ] {
+            let path = root.join(name);
+            // Model replacement after the caller's final path preflight.
+            let parent = pin_parent(&path, false).unwrap();
+            rustix::fs::mkfifoat(rustix::fs::CWD, &path, Mode::RUSR | Mode::WUSR).unwrap();
+            let (sender, receiver) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                sender.send(open_leaf(&parent, access)).unwrap();
+            });
+            let result = receiver.recv_timeout(Duration::from_secs(2));
+            // Keep a broken implementation bounded: release a blocking open
+            // before joining, then fail with the original timeout evidence.
+            let rescue = result.is_err().then(|| {
+                let reader = rustix::fs::open(
+                    &path,
+                    OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .unwrap();
+                let writer = rustix::fs::open(
+                    &path,
+                    OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .unwrap();
+                (reader, writer)
+            });
+            worker.join().unwrap();
+            drop(rescue);
+            let result = result.expect("storage leaf open must not wait for a pipe peer");
+            if name == "read" {
+                let file = result.unwrap();
+                assert!(!file.metadata().unwrap().is_file());
+                assert!(
+                    rustix::fs::fcntl_getfl(&file)
+                        .unwrap()
+                        .contains(OFlags::NONBLOCK)
+                );
+            } else {
+                assert!(result.is_err(), "a FIFO without a reader is not writable");
+            }
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn denied_windows_boundaries_recognize_case_device_and_stream_aliases() {
@@ -999,6 +1148,9 @@ mod tests {
         for path in [
             r"C:\Users\alice\.pi\context-mode\sessions\state.db",
             r"\\server\share\state\data.db",
+            r"C:\state\com10.db",
+            r"C:\state\company.txt",
+            r"C:\state\reports\évent-¹.db",
         ] {
             validate_components(Path::new(path)).unwrap();
         }
@@ -1008,6 +1160,22 @@ mod tests {
             r"C:\state\file:secret",
             r"C:\state\NUL",
             r"C:\state\COM1.db",
+            r"C:\state\com¹.db",
+            r"C:\state\COM²",
+            r"C:\state\Com³.log",
+            r"C:\state\lpt¹.db",
+            r"C:\state\LPT²",
+            r"C:\state\LpT³.log",
+            r"C:\state\NUL .db",
+            r"C:\state\CONIN$",
+            r"C:\state\conout$",
+            "C:\\state\\control\u{1f}.db",
+            r"C:\state\wildcard*.db",
+            r"C:\state\question?.db",
+            r"C:\state\file|pipe.db",
+            r"C:\state\less<than.db",
+            r"C:\state\greater>than.db",
+            r#"C:\state\quote".db"#,
             r"C:\state\file.",
             r"\\.\pipe\secret",
             r"\\?\C:\state\data.db",

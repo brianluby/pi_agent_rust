@@ -290,7 +290,10 @@ pub trait ToolInvocationHost: Send + Sync {
     /// Capture non-secret model affinity before presenting a sampling review.
     /// Standalone or custom hosts must explicitly opt into this capability.
     fn sampling_model(&self) -> Result<ToolSamplingModel> {
-        Err(Error::tool("mcp", "sampling is unavailable for this caller"))
+        Err(Error::tool(
+            "mcp",
+            "sampling is unavailable for this caller",
+        ))
     }
 
     /// Recheck live session ownership after a user review can have suspended.
@@ -310,7 +313,10 @@ pub trait ToolInvocationHost: Send + Sync {
         _request: ToolSamplingRequest,
         _expected_session: &str,
     ) -> Result<ToolSamplingResult> {
-        Err(Error::tool("mcp", "sampling is unavailable for this caller"))
+        Err(Error::tool(
+            "mcp",
+            "sampling is unavailable for this caller",
+        ))
     }
 }
 
@@ -6427,6 +6433,91 @@ impl ToolRegistry {
         }
     }
 
+    /// Publish a complete extension catalog while retaining exact ownership.
+    /// A later host replacement must not be mistaken for one of our wrappers
+    /// merely because it has the same name or extension origin.
+    fn reconcile_extension_tools(
+        &mut self,
+        previous: &[Arc<dyn Tool>],
+        replacements: Vec<Box<dyn Tool>>,
+        active: Option<&[String]>,
+        initial: bool,
+    ) -> Vec<Arc<dyn Tool>> {
+        let owned = |tool: &Arc<dyn Tool>| previous.iter().any(|old| Arc::ptr_eq(old, tool));
+        let foreign_names: std::collections::HashSet<String> = self
+            .tools
+            .iter()
+            .chain(&self.inactive)
+            .filter(|tool| !owned(tool))
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let mut replacements: std::collections::BTreeMap<String, Arc<dyn Tool>> = replacements
+            .into_iter()
+            .map(|mut tool| {
+                tool.bind_job_session_scope(self.job_session_scope.clone());
+                tool.bind_model_scope(self.model_scope.clone());
+                tool.bind_cost_scope(self.cost_scope.clone());
+                tool.bind_text_file_client_scope(self.text_file_client_scope.clone());
+                tool.bind_terminal_client_scope(self.terminal_client_scope.clone());
+                (tool.name().to_string(), Arc::from(tool))
+            })
+            .collect();
+        let is_active =
+            |name: &str| active.is_none_or(|names| names.iter().any(|candidate| candidate == name));
+        let initial_names: std::collections::HashSet<String> = if initial {
+            replacements
+                .keys()
+                .filter(|name| is_active(name))
+                .cloned()
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        let mut published = Vec::with_capacity(replacements.len());
+        let old_active = std::mem::take(&mut self.tools);
+        let old_inactive = std::mem::take(&mut self.inactive);
+        for (was_active, old_tools) in [(true, old_active), (false, old_inactive)] {
+            for tool in old_tools {
+                if owned(&tool) || initial_names.contains(tool.name()) {
+                    // push/extend can replace an active name while an older
+                    // wrapper with that name is shelved. Retire the stale
+                    // wrapper too; a refresh cannot resurrect it over the host.
+                    if !initial && foreign_names.contains(tool.name()) {
+                        replacements.remove(tool.name());
+                        continue;
+                    }
+                    if let Some(next) = replacements.remove(tool.name()) {
+                        published.push(Arc::clone(&next));
+                        if is_active(next.name()) {
+                            self.tools.push(next);
+                        } else {
+                            self.inactive.push(next);
+                        }
+                    }
+                } else if was_active {
+                    self.tools.push(tool);
+                } else {
+                    self.inactive.push(tool);
+                }
+            }
+        }
+        for (name, next) in replacements {
+            if foreign_names.contains(&name) {
+                // Initial publication above preserves the existing ability
+                // to override a built-in. Automatic later refreshes cannot
+                // overwrite host/MCP registrations mounted in the meantime.
+                continue;
+            }
+            published.push(Arc::clone(&next));
+            if is_active(&name) {
+                self.tools.push(next);
+            } else {
+                self.inactive.push(next);
+            }
+        }
+        published
+    }
+
     /// Reconcile one manager's authoritative catalog without replacing any
     /// unrelated tool, including a currently shelved extension registration.
     /// Old snapshots retain their Arc handles for calls already in flight.
@@ -6645,6 +6736,40 @@ impl SharedToolRegistry {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         changed
+    }
+
+    /// Atomically refresh wrappers, including inactive registrations. Rebind
+    /// execution handles even when their schemas are unchanged, but invalidate
+    /// the provider schema cache only when its visible definitions change.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) fn reconcile_extension_tools(
+        &self,
+        previous: &[Arc<dyn Tool>],
+        replacements: Vec<Box<dyn Tool>>,
+        active: Option<&[String]>,
+        initial: bool,
+    ) -> Vec<Arc<dyn Tool>> {
+        let mut guard = self
+            .inner
+            .registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut next = guard.clone_shallow();
+        let published = next.reconcile_extension_tools(previous, replacements, active, initial);
+        let schema_changed = guard.tools.len() != next.tools.len()
+            || guard.tools.iter().zip(&next.tools).any(|(before, after)| {
+                before.name() != after.name()
+                    || before.label() != after.label()
+                    || before.description() != after.description()
+                    || before.parameters() != after.parameters()
+            });
+        *guard = Arc::new(next);
+        if schema_changed {
+            self.inner
+                .version
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        published
     }
 
     /// Publish a modified registry: shallow-copy the current snapshot, apply

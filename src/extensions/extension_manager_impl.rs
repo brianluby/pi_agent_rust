@@ -2954,6 +2954,19 @@ impl ExtensionManager {
         runtime
     }
 
+    /// Runtime view for wrappers mounted into the actor's own shared registry.
+    /// The application manager already owns a same-owner actor; attaching a
+    /// public lifetime here would form actor -> registry -> wrapper -> actor.
+    /// `set_runtime` retains foreign-owner handles deliberately, so preserve
+    /// their stored ownership rather than stripping every handle's lifetime.
+    pub(crate) fn runtime_for_tools(&self) -> Option<ExtensionRuntimeHandle> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .runtime
+            .clone()
+    }
+
     pub fn js_runtime(&self) -> Option<JsExtensionRuntimeHandle> {
         match self.runtime() {
             Some(ExtensionRuntimeHandle::Js(runtime)) => Some(runtime),

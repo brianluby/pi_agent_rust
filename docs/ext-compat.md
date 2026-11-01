@@ -169,8 +169,19 @@ particular, the optional `mmap_size` optimization used by context-mode is not
 implemented.
 
 The bridge bounds database handles, SQL/request size, returned rows and bytes,
-page cache, and workers. Each engine operation has a cooperative cancellation
-deadline; a timed-out worker is retired and never reused. These limits do not
+page cache, and workers. Each synchronous request reserves 30 seconds for
+processing and at most one additional 30-second native lock-wait allowance,
+anchored to the original request start. The allowance uses the engine's actual
+busy-timeout setting and its file-open/prepare bootstrap floor; batches and
+retries cannot renew the resulting 60-second bound. This is a wall-time
+reservation, not measured CPU time. Normal native busy errors remain retryable
+on the same connection instead of colliding with the host deadline.
+
+An expired request cancels and retires the worker, with a bounded 250 ms
+acknowledgment grace. Retirement does not run an asynchronous close that could
+flush retained writes. Cancellation remains cooperative, and a worker that
+has not yet exited retains its process-wide permit. The embedding actor cannot
+preempt this synchronous call with its own timer. These limits do not
 provide an OS memory sandbox for every SQL intermediate allocation. The native
 database-family size limit is checked before and after operations, so it is
 not a hard per-write disk quota.
@@ -421,6 +432,24 @@ export default function activate(pi) {
 }
 ```
 
+### Deferred tool registration
+
+The Agent publishes the runtime's validated tool catalog before each provider
+schema snapshot. Tools registered after awaited initialization in
+before_agent_start, as context-mode does after MCP tools/list, are therefore
+available in that request and through the shared execution registry. Later
+definition changes reach the next provider request; unchanged visible schemas
+retain their cache version.
+
+Reconciliation retains inactive registrations for setActiveTools restoration
+and removes only the exact wrappers it previously published. Initial active
+extension overrides keep their existing behavior; automatic later refreshes
+preserve host or MCP tools that have replaced an extension's name. An initially
+inactive same-name extension does not displace a built-in. Internal catalog
+wrappers do not retain their own actor's application lifetime through the
+shared registry; explicitly retained public runtime handles keep their normal
+ownership semantics.
+
 ### Context message transforms
 
 Context hooks receive the message array produced by earlier handlers, across
@@ -506,7 +535,12 @@ use no-follow directory handles on Unix and pinned, reparse-checked directory
 handles on Windows. Traversal, linked targets, Windows device paths/names,
 alternate data streams, and overlapping grants to different owners are
 rejected. Checks inspect original inputs and virtual symlink targets before
-normalization can discard forbidden components. These directories support
+normalization can discard forbidden components. FIFOs, sockets, and device
+targets are rejected before I/O. Unix final-file opens are nonblocking as well
+as no-follow, so replacement with a FIFO after preflight cannot park the
+runtime waiting for a pipe peer. Windows raw component validation runs before
+canonicalization and includes reserved console names and superscript COM/LPT
+device aliases. These directories support
 durable mkdir/mkdtemp, file reads/writes/appends, copy, rename, unlink, and
 empty-directory removal. Read-only descriptors belong to the extension that
 opened them and can still be closed by that owner after a path is revoked.

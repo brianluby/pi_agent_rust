@@ -7,6 +7,12 @@
 //! Cancellation reaches the engine's actual operation context. A timed-out
 //! worker is poisoned and cannot accept further work; the process-wide worker
 //! permit stays with the thread until it has really exited.
+//! Each synchronous request reserves 30 seconds for processing plus at most
+//! one 30-second native lock-wait allowance. Both share the original request
+//! start, so batches and retries cannot renew the 60-second wall-time bound.
+//! The allowance comes from native PRAGMA state and the pinned engine's
+//! open/prepare bootstrap floor; it is not a measurement of CPU time. The
+//! embedding actor cannot interrupt this synchronous call with its own timer.
 //!
 //! Native fsqlite uses a cooperative directory namespace. Guest code has no
 //! host symlink/hardlink primitive and cannot name a database outside its grant.
@@ -55,6 +61,10 @@ const MAX_DATABASES: usize = 16;
 const MAX_WORKERS: usize = 8;
 const MAX_DATABASE_BYTES: u64 = 128 * 1024 * 1024;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_BUSY_TIMEOUT_MS: u64 = 30_000;
+// fsqlite 0.4.10 uses this floor for connection admission and prepare refresh,
+// independently of a connection's current PRAGMA busy_timeout setting.
+const ENGINE_BOOTSTRAP_WAIT: Duration = Duration::from_millis(30_000);
 const CANCEL_GRACE: Duration = Duration::from_millis(250);
 static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
@@ -524,6 +534,26 @@ struct AdmittedSql {
 }
 
 impl AdmittedSql {
+    fn requested_busy_timeout(&self) -> Duration {
+        // Admission has already decoded every quoted identifier and limited
+        // assignments/calls to literal integer values. Reserve before a batch
+        // can increase its timeout and encounter contention in a later SQL
+        // statement; this is not a shadow copy of the connection setting.
+        self.statements
+            .iter()
+            .filter(|tokens| {
+                tokens.first().and_then(Token::word) == Some("pragma")
+                    && tokens
+                        .get(1)
+                        .and_then(Token::name)
+                        .is_some_and(|name| name.eq_ignore_ascii_case("busy_timeout"))
+            })
+            .filter_map(|tokens| tokens.get(3).and_then(Token::name))
+            .filter_map(|value| value.parse::<u64>().ok())
+            .max()
+            .map_or(Duration::ZERO, Duration::from_millis)
+    }
+
     fn is_dml(&self) -> bool {
         matches!(
             self.parsed.first(),
@@ -901,7 +931,7 @@ fn admit_pragma(tokens: &[Token]) -> Result<()> {
                 _ => None,
             }
             .and_then(|value| value.parse::<u64>().ok());
-            if scalar.is_some_and(|value| value <= 30_000) {
+            if scalar.is_some_and(|value| value <= MAX_BUSY_TIMEOUT_MS) {
                 Ok(())
             } else {
                 Err("SQLite busy_timeout must be between 0 and 30000 milliseconds".into())
@@ -967,7 +997,104 @@ enum Command {
 
 struct Work {
     command: Command,
-    reply: mpsc::SyncSender<NativeResult<Json>>,
+    budget: Arc<OperationBudget>,
+    reply: mpsc::SyncSender<WorkCompletion>,
+}
+
+struct WorkCompletion {
+    result: NativeResult<Json>,
+    finished_at: Instant,
+}
+
+/// Reserve one native lock-wait allowance without renewing the request clock.
+/// The mutex orders admission against host timeout: a worker cannot publish a
+/// new allowance after the caller has already decided to cancel the request.
+struct OperationBudget {
+    started: Instant,
+    processing: Duration,
+    hard_timeout: Option<Duration>,
+    state: Mutex<OperationBudgetState>,
+}
+
+#[derive(Default)]
+struct OperationBudgetState {
+    lock_wait: Duration,
+    expired: bool,
+}
+
+impl OperationBudget {
+    fn new(processing: Duration, hard_timeout: Option<Duration>) -> Self {
+        Self {
+            started: Instant::now(),
+            processing,
+            hard_timeout,
+            state: Mutex::new(OperationBudgetState::default()),
+        }
+    }
+
+    fn total(&self, state: &OperationBudgetState) -> Duration {
+        let reserved = self.processing.saturating_add(state.lock_wait);
+        self.hard_timeout
+            .map_or(reserved, |hard| reserved.min(hard))
+    }
+
+    fn reserve_lock_wait(&self, wait: Duration) -> NativeResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.expired || self.started.elapsed() >= self.total(&state) {
+            state.expired = true;
+            return Err(SqliteFailure::interrupted(
+                "SQLite request deadline elapsed before native execution",
+            ));
+        }
+        state.lock_wait = state
+            .lock_wait
+            .max(wait.min(Duration::from_millis(MAX_BUSY_TIMEOUT_MS)));
+        Ok(())
+    }
+
+    fn reserve_database(&self, database: &EngineDatabase, prepare: bool) -> NativeResult<()> {
+        let milliseconds = u64::try_from(database.conn.pragma_state().busy_timeout_ms).unwrap_or(0);
+        let mut wait = Duration::from_millis(milliseconds);
+        if prepare && database.parent.is_some() {
+            wait = wait.max(ENGINE_BOOTSTRAP_WAIT);
+        }
+        self.reserve_lock_wait(wait)
+    }
+
+    fn remaining(&self) -> Duration {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.total(&state).saturating_sub(self.started.elapsed())
+    }
+
+    fn expire_at(&self, now: Instant) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if now.saturating_duration_since(self.started) >= self.total(&state) {
+            state.expired = true;
+        }
+        state.expired
+    }
+
+    fn timeout_error(&self) -> SqliteFailure {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        SqliteFailure::interrupted(format!(
+            "SQLite request exceeded {} milliseconds ({} milliseconds processing, {} milliseconds reserved native lock wait); connection and runtime are poisoned",
+            self.total(&state).as_millis(),
+            self.processing.as_millis(),
+            state.lock_wait.as_millis(),
+        ))
+    }
 }
 
 struct WorkerPermit;
@@ -983,6 +1110,7 @@ struct Worker {
     thread: Option<JoinHandle<()>>,
     cancel: Arc<Mutex<Option<Cancel>>>,
     stopped: Arc<AtomicBool>,
+    timed_out: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -996,8 +1124,10 @@ impl Worker {
         let (sender, receiver) = mpsc::sync_channel::<Work>(1);
         let cancel = Arc::new(Mutex::new(None::<Cancel>));
         let stopped = Arc::new(AtomicBool::new(false));
+        let timed_out = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let worker_stopped = Arc::clone(&stopped);
+        let worker_timed_out = Arc::clone(&timed_out);
         let thread = std::thread::Builder::new()
             .name("pijs-sqlite".into())
             .stack_size(16 * 1024 * 1024)
@@ -1013,12 +1143,16 @@ impl Worker {
                         &mut databases,
                         &worker_cancel,
                         &worker_stopped,
+                        &work.budget,
                     );
                     worker_cancel
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .take();
-                    let _ = work.reply.send(result);
+                    let _ = work.reply.send(WorkCompletion {
+                        result,
+                        finished_at: Instant::now(),
+                    });
                     if worker_stopped.load(Ordering::Acquire) {
                         break;
                     }
@@ -1027,14 +1161,17 @@ impl Worker {
                 // out caller never drops connections on the QuickJS thread.
                 for (_, mut database) in databases {
                     database.conn.root_cx().cancel();
-                    if database.verify_paths().is_ok() {
+                    if !worker_timed_out.load(Ordering::Acquire) && database.verify_paths().is_ok()
+                    {
                         let _ = futures::executor::block_on(
                             database.conn.close_without_checkpoint_in_place(),
                         );
                     }
-                    // If the namespace changed, skip async close: it may
-                    // flush retained state. Connection::drop only cancels
-                    // and reclaims runtime state without disk I/O.
+                    // A deadline or namespace failure must not enter async
+                    // close with its independent teardown Cx: even the
+                    // no-checkpoint variant can commit retained writes.
+                    // Connection::drop cancels/reclaims state without SQL
+                    // commit, rollback or checkpoint I/O.
                 }
             })
             .map_err(|error| format!("Cannot start SQLite worker: {error}"))?;
@@ -1043,47 +1180,76 @@ impl Worker {
             thread: Some(thread),
             cancel,
             stopped,
+            timed_out,
         })
     }
 
     fn call(&mut self, command: Command) -> NativeResult<Json> {
-        self.call_with_timeout(command, OPERATION_TIMEOUT)
+        self.call_with_budget(command, OPERATION_TIMEOUT, None)
     }
 
+    #[cfg(test)]
     fn call_with_timeout(&mut self, command: Command, timeout: Duration) -> NativeResult<Json> {
+        self.call_with_budget(command, timeout, Some(timeout))
+    }
+
+    fn call_with_budget(
+        &mut self,
+        command: Command,
+        processing: Duration,
+        hard_timeout: Option<Duration>,
+    ) -> NativeResult<Json> {
         if self.stopped.load(Ordering::Acquire) {
             return Err(SqliteFailure::interrupted("SQLite worker is poisoned"));
         }
+        let budget = Arc::new(OperationBudget::new(processing, hard_timeout));
         let (reply, response) = mpsc::sync_channel(1);
         if self
             .sender
             .as_ref()
             .ok_or("SQLite worker is closed")?
-            .send(Work { command, reply })
+            .send(Work {
+                command,
+                budget: Arc::clone(&budget),
+                reply,
+            })
             .is_err()
         {
             self.stopped.store(true, Ordering::Release);
             return Err("SQLite worker terminated".into());
         }
-        match response.recv_timeout(timeout) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                self.stopped.store(true, Ordering::Release);
-                Err("SQLite worker terminated while executing a statement".into())
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.stop();
-                // Cooperative engine checkpoints acknowledge cancellation.
-                // Never join an unacknowledged thread on the UI path. Its
-                // permit remains live until the thread actually exits, so
-                // repeated timeouts cannot create unlimited detached work.
-                let _ = response.recv_timeout(CANCEL_GRACE);
-                Err(SqliteFailure::interrupted(format!(
-                    "SQLite operation exceeded {} milliseconds; connection and runtime are poisoned",
-                    timeout.as_millis()
-                )))
+        loop {
+            match response.recv_timeout(budget.remaining()) {
+                Ok(completion) => {
+                    // A descheduled caller must not reject a result the engine
+                    // completed within budget, or accept a late completion.
+                    if !budget.expire_at(completion.finished_at) {
+                        return completion.result;
+                    }
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.stopped.store(true, Ordering::Release);
+                    return Err("SQLite worker terminated while executing a statement".into());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Native admission may have reserved its one allowance
+                    // while this receiver was waiting on the processing
+                    // budget. Re-read the same anchored deadline, not a new
+                    // relative timeout and never a fresh retry budget.
+                    if budget.expire_at(Instant::now()) {
+                        break;
+                    }
+                }
             }
         }
+        self.timed_out.store(true, Ordering::Release);
+        self.stop();
+        // Cooperative engine checkpoints acknowledge cancellation. Never join
+        // an unacknowledged thread on the UI path. Its permit remains live
+        // until the thread really exits, bounding detached work process-wide.
+        let _ = response.recv_timeout(CANCEL_GRACE);
+        Err(budget.timeout_error())
     }
 
     fn stop(&mut self) {
@@ -1180,6 +1346,7 @@ fn execute_work(
     databases: &mut HashMap<u64, EngineDatabase>,
     cancel: &Mutex<Option<Cancel>>,
     stopped: &AtomicBool,
+    budget: &OperationBudget,
 ) -> NativeResult<Json> {
     match command {
         Command::Open {
@@ -1190,6 +1357,9 @@ fn execute_work(
             strict,
             safe_integers,
         } => {
+            if path.is_some() {
+                budget.reserve_lock_wait(ENGINE_BOOTSTRAP_WAIT)?;
+            }
             let parent = path
                 .as_deref()
                 .map(|path| {
@@ -1260,13 +1430,14 @@ fn execute_work(
                 poisoned: Cell::new(false),
             };
             database.verify_paths()?;
-            futures::executor::block_on(validate_schema(&database))?;
+            futures::executor::block_on(validate_schema(&database, budget))?;
             databases.insert(id, database);
             Ok(json!({ "id": id }))
         }
         Command::Request(Request::Close { id }) => {
             let database = databases.get_mut(&id).ok_or("SQLite database is closed")?;
             database.verify_paths()?;
+            budget.reserve_database(database, false)?;
             // Close cannot borrow a binding guard and &mut Connection at once;
             // cancelling this terminal operation cancels the connection root.
             let cx = database.conn.root_cx().clone();
@@ -1288,8 +1459,8 @@ fn execute_work(
             set_cancel(cancel, stopped, Arc::new(move || cancel_cx.cancel()));
             let binding = database.conn.bind_operation_cx(&operation_cx);
             let result = futures::executor::block_on(async {
-                validate_schema(database).await?;
-                execute_request(database, request).await
+                validate_schema(database, budget).await?;
+                execute_request(database, request, budget).await
             });
             drop(binding);
             if database.poisoned.get() {
@@ -1313,6 +1484,10 @@ fn execute_work(
             for (_, mut database) in databases.drain() {
                 if let Err(error) = database.verify_paths() {
                     first_error.get_or_insert_with(|| error.into());
+                    continue;
+                }
+                if let Err(error) = budget.reserve_database(&database, false) {
+                    first_error.get_or_insert(error);
                     continue;
                 }
                 let cx = database.conn.root_cx().clone();
@@ -1341,7 +1516,8 @@ fn set_cancel(slot: &Mutex<Option<Cancel>>, stopped: &AtomicBool, cancel: Cancel
     *slot = Some(cancel);
 }
 
-async fn validate_schema(database: &EngineDatabase) -> NativeResult<()> {
+async fn validate_schema(database: &EngineDatabase, budget: &OperationBudget) -> NativeResult<()> {
+    budget.reserve_database(database, false)?;
     let rows = database
         .conn
         .query("PRAGMA schema_version")
@@ -1361,6 +1537,7 @@ async fn validate_schema(database: &EngineDatabase) -> NativeResult<()> {
     if database.schema_version.get() == Some(version) {
         return Ok(());
     }
+    budget.reserve_database(database, true)?;
     let rows = database
         .conn
         .query("SELECT type, sql FROM sqlite_master WHERE sql IS NOT NULL LIMIT 1025")
@@ -1383,11 +1560,16 @@ async fn validate_schema(database: &EngineDatabase) -> NativeResult<()> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn execute_request(database: &EngineDatabase, request: Request) -> NativeResult<Json> {
+async fn execute_request(
+    database: &EngineDatabase,
+    request: Request,
+    budget: &OperationBudget,
+) -> NativeResult<Json> {
     match request {
         Request::Prepare { sql, .. } => {
             let admitted = admit_sql(&sql, true)?;
             let columns = if admitted.uses_native_prepare() {
+                budget.reserve_database(database, true)?;
                 database
                     .conn
                     .prepare(&sql)
@@ -1409,6 +1591,7 @@ async fn execute_request(database: &EngineDatabase, request: Request) -> NativeR
             ..
         } => {
             let admitted = admit_sql(&sql, true)?;
+            budget.reserve_lock_wait(admitted.requested_busy_timeout())?;
             let params = bind_parameters(&admitted.parameters, bindings, database.strict)?;
             if !admitted.uses_native_prepare() {
                 if params.is_empty() {
@@ -1428,11 +1611,12 @@ async fn execute_request(database: &EngineDatabase, request: Request) -> NativeR
                         .map_err(SqliteFailure::from)?;
                 }
                 return if matches!(mode, QueryMode::Run) {
-                    change_result(database).await
+                    change_result(database, budget).await
                 } else {
                     Ok(json!({ "columns": [], "rows": [] }))
                 };
             }
+            budget.reserve_database(database, true)?;
             let statement = database
                 .conn
                 .prepare(&sql)
@@ -1443,7 +1627,7 @@ async fn execute_request(database: &EngineDatabase, request: Request) -> NativeR
                     .execute_with_params(&params)
                     .await
                     .map_err(SqliteFailure::from)?;
-                return change_result(database).await;
+                return change_result(database, budget).await;
             }
             let columns = statement.column_names();
             let mut bytes = serde_json::to_vec(&columns)
@@ -1468,10 +1652,9 @@ async fn execute_request(database: &EngineDatabase, request: Request) -> NativeR
             let mut seen = 0_usize;
             let mut limit_error = None;
             let mut stopped_after_first = false;
-            let started = Instant::now();
             let mut accept = |row: &Row| -> std::result::Result<(), FrankenError> {
                 seen += 1;
-                if seen > MAX_RESULT_ROWS || started.elapsed() >= OPERATION_TIMEOUT {
+                if seen > MAX_RESULT_ROWS || budget.expire_at(Instant::now()) {
                     limit_error = Some("SQLite result exceeds the row or time limit".to_string());
                     return Err(FrankenError::Abort);
                 }
@@ -1539,6 +1722,19 @@ async fn execute_request(database: &EngineDatabase, request: Request) -> NativeR
             if !admitted.parameters.is_empty() {
                 return Err("Use a prepared statement for SQL parameters".into());
             }
+            budget.reserve_lock_wait(admitted.requested_busy_timeout())?;
+            let may_prepare = admitted.parsed.iter().any(|statement| {
+                !matches!(
+                    statement,
+                    SqlStatement::Begin(_)
+                        | SqlStatement::Commit
+                        | SqlStatement::Rollback(_)
+                        | SqlStatement::Savepoint(_)
+                        | SqlStatement::Release(_)
+                        | SqlStatement::Pragma(_)
+                )
+            });
+            budget.reserve_database(database, may_prepare)?;
             if !admitted.statements.is_empty() {
                 database
                     .conn
@@ -1546,7 +1742,7 @@ async fn execute_request(database: &EngineDatabase, request: Request) -> NativeR
                     .await
                     .map_err(SqliteFailure::from)?;
             }
-            change_result(database).await
+            change_result(database, budget).await
         }
         Request::InTransaction { .. } => Ok(json!(database.conn.in_transaction())),
         Request::Open { .. } | Request::Close { .. } => Err("Invalid SQLite operation".into()),
@@ -1602,7 +1798,8 @@ async fn finish_row_savepoint(
     Err(failure)
 }
 
-async fn change_result(database: &EngineDatabase) -> NativeResult<Json> {
+async fn change_result(database: &EngineDatabase, budget: &OperationBudget) -> NativeResult<Json> {
+    budget.reserve_database(database, true)?;
     let rows = database
         .conn
         .query("SELECT changes()")
@@ -1726,6 +1923,187 @@ fn encode_value(value: &SqliteValue, integers: bool, bytes: &mut usize) -> Resul
 mod tests {
     use super::*;
 
+    fn open_file(worker: &mut Worker, id: u64, path: &Path) {
+        worker
+            .call(Command::Open {
+                id,
+                path: Some(path.to_path_buf()),
+                readonly: false,
+                create: true,
+                strict: false,
+                safe_integers: false,
+            })
+            .expect("open real native database");
+    }
+
+    fn exec(worker: &mut Worker, id: u64, sql: &str) {
+        worker
+            .call(Command::Request(Request::Exec {
+                id,
+                sql: sql.to_owned(),
+            }))
+            .expect(sql);
+    }
+
+    fn wait_for_worker_exit(worker: &Worker) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while worker
+            .thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            worker.thread.as_ref().is_some_and(JoinHandle::is_finished),
+            "native engine did not acknowledge cancellation"
+        );
+    }
+
+    #[test]
+    fn real_lock_wait_has_its_own_allowance_and_busy_connections_remain_reusable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = crate::extensions::safe_canonicalize(temp.path()).join("busy-budget.db");
+        let mut worker = Worker::start().expect("worker");
+        open_file(&mut worker, 1, &path);
+        exec(
+            &mut worker,
+            1,
+            "PRAGMA journal_mode = WAL; CREATE TABLE events(id INTEGER PRIMARY KEY)",
+        );
+        open_file(&mut worker, 2, &path);
+        exec(
+            &mut worker,
+            1,
+            "BEGIN IMMEDIATE; INSERT INTO events VALUES(99)",
+        );
+
+        for (setting, sql) in [
+            // The first case reads the actual native setting. The other two
+            // raise it within the same admitted batch, before the lock wait.
+            ("PRAGMA busy_timeout=300", "BEGIN IMMEDIATE"),
+            (
+                "PRAGMA busy_timeout=0",
+                "PRAGMA \"busy_timeout\"='300'; BEGIN IMMEDIATE",
+            ),
+            (
+                "PRAGMA busy_timeout=0",
+                "PRAGMA busy_timeout(300); BEGIN IMMEDIATE",
+            ),
+        ] {
+            exec(&mut worker, 2, setting);
+            let started = Instant::now();
+            let error = worker
+                .call_with_budget(
+                    Command::Request(Request::Exec {
+                        id: 2,
+                        sql: sql.to_owned(),
+                    }),
+                    Duration::from_millis(100),
+                    None,
+                )
+                .expect_err("competing writer must exhaust its native busy timeout");
+            assert_eq!(error.primary_code, Some(5), "{error}");
+            assert!(error.code.starts_with("SQLITE_BUSY"), "{error}");
+            assert!(
+                started.elapsed() >= Duration::from_millis(250),
+                "native lock waiting must exceed the separate 100ms processing budget"
+            );
+            assert!(
+                !worker.stopped.load(Ordering::Acquire),
+                "normal BUSY must not poison the worker"
+            );
+            assert_eq!(
+                worker
+                    .call(Command::Request(Request::InTransaction { id: 2 }))
+                    .unwrap(),
+                false
+            );
+        }
+        exec(&mut worker, 1, "ROLLBACK");
+        exec(
+            &mut worker,
+            2,
+            "BEGIN IMMEDIATE; INSERT INTO events VALUES(1); COMMIT",
+        );
+        worker.call(Command::Reset).expect("close native handles");
+        open_file(&mut worker, 3, &path);
+        let rows = worker
+            .call(Command::Request(Request::Query {
+                id: 3,
+                sql: "SELECT id FROM events ORDER BY id".into(),
+                bindings: Bindings::default(),
+                mode: QueryMode::Values,
+            }))
+            .expect("reopened persistent state");
+        assert_eq!(rows["rows"], json!([[1]]));
+        worker
+            .call(Command::Reset)
+            .expect("close reopened database");
+    }
+
+    #[test]
+    fn cancelling_a_real_lock_wait_cannot_commit_after_the_lock_is_released() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = crate::extensions::safe_canonicalize(temp.path()).join("cancelled-writer.db");
+        let mut locker = Worker::start().expect("locker worker");
+        let mut contender = Worker::start().expect("contender worker");
+        open_file(&mut locker, 1, &path);
+        exec(
+            &mut locker,
+            1,
+            "PRAGMA journal_mode=WAL; CREATE TABLE events(id INTEGER PRIMARY KEY); INSERT INTO events VALUES(1)",
+        );
+        open_file(&mut contender, 1, &path);
+        exec(&mut contender, 1, "PRAGMA busy_timeout=1000");
+        exec(
+            &mut locker,
+            1,
+            "BEGIN IMMEDIATE; INSERT INTO events VALUES(2)",
+        );
+        let started = Instant::now();
+        let error = contender
+            .call_with_timeout(
+                Command::Request(Request::Exec {
+                    id: 1,
+                    sql: "INSERT INTO events VALUES(99)".into(),
+                }),
+                Duration::from_millis(100),
+            )
+            .expect_err("hard cancellation must dominate native wait allowance");
+        assert_eq!(error.code, "SQLITE_INTERRUPT", "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "host cancellation must stay bounded"
+        );
+        assert!(contender.timed_out.load(Ordering::Acquire));
+        assert!(
+            contender
+                .call(Command::Request(Request::InTransaction { id: 1 }))
+                .is_err()
+        );
+        // Release the real writer only after cancellation. A detached native
+        // operation or teardown must not then insert the timed-out row.
+        exec(&mut locker, 1, "ROLLBACK");
+        wait_for_worker_exit(&contender);
+        exec(&mut locker, 1, "INSERT INTO events VALUES(3)");
+        locker
+            .call(Command::Reset)
+            .expect("close surviving database");
+        open_file(&mut locker, 2, &path);
+        let rows = locker
+            .call(Command::Request(Request::Query {
+                id: 2,
+                sql: "SELECT id FROM events ORDER BY id".into(),
+                bindings: Bindings::default(),
+                mode: QueryMode::Values,
+            }))
+            .expect("durable rows after timed-out writer has exited");
+        assert_eq!(rows["rows"], json!([[1], [3]]));
+        locker.call(Command::Reset).expect("close verifier");
+    }
+
     #[test]
     fn sql_admission_decodes_identifiers_and_validates_every_statement() {
         for sql in [
@@ -1799,13 +2177,14 @@ mod tests {
                 safe_integers: false,
             })
             .expect("real memory database");
+        exec(&mut worker, 1, "PRAGMA busy_timeout=0");
         let started = Instant::now();
-        let error = worker.call_with_timeout(Command::Request(Request::Query {
+        let error = worker.call_with_budget(Command::Request(Request::Query {
             id: 1,
             sql: "WITH RECURSIVE counter(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM counter) SELECT sum(n) FROM counter".into(),
             bindings: Bindings::default(),
             mode: QueryMode::Get,
-        }), Duration::from_millis(100)).expect_err("unbounded recursive query must time out");
+        }), Duration::from_millis(100), None).expect_err("unbounded recursive query must time out");
         assert!(error.message.contains("SQLITE_INTERRUPT"), "{error}");
         assert_eq!(error.code, "SQLITE_INTERRUPT");
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -1816,18 +2195,6 @@ mod tests {
         );
         // This is a real engine acknowledgment check, not merely a host
         // recv_timeout assertion. The worker must also release its connection.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while worker
-            .thread
-            .as_ref()
-            .is_some_and(|thread| !thread.is_finished())
-            && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(
-            worker.thread.as_ref().is_some_and(JoinHandle::is_finished),
-            "engine did not acknowledge cancellation"
-        );
+        wait_for_worker_exit(&worker);
     }
 }

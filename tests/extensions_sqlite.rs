@@ -287,7 +287,8 @@ fn sqlite_busy_error_reaches_context_mode_retry_and_preserves_persistent_state()
             locker.exec('PRAGMA journal_mode = WAL');
             locker.exec('CREATE TABLE events (id INTEGER PRIMARY KEY, data TEXT)');
             const db = new sqlite.Database({path}, {{ create: false }});
-            db.exec('PRAGMA busy_timeout = 0');
+            db.exec('PRAGMA busy_timeout = 150');
+            const configuredWait = db.query('PRAGMA busy_timeout').get().timeout;
             const insert = db.prepare('INSERT INTO events VALUES (?, ?)');
             const save = db.transaction(() => insert.run(1, 'persisted after retry'));
             locker.exec('BEGIN IMMEDIATE');
@@ -312,11 +313,15 @@ fn sqlite_busy_error_reaches_context_mode_retry_and_preserves_persistent_state()
             db.close();
             locker.close();
             const reopened = new sqlite.Database({path}, {{ readonly: true }});
-            globalThis.sqliteResult = {{ attempts, failures, inTransaction,
+            globalThis.sqliteResult = {{ attempts, failures, inTransaction, configuredWait,
               rows: reopened.query('SELECT id, data FROM events ORDER BY id').values() }};
             reopened.close();
         "#)).await;
         assert_eq!(result["attempts"], 2, "{result}");
+        assert_eq!(
+            result["configuredWait"], 150,
+            "native timeout setting must remain visible: {result}"
+        );
         assert_eq!(result["inTransaction"], false, "{result}");
         assert_eq!(
             result["rows"],

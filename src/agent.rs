@@ -24,7 +24,7 @@ use crate::extension_events::{
     apply_before_agent_start_response, apply_input_event_response,
     apply_session_before_compact_response,
 };
-use crate::extension_tools::collect_extension_tool_wrappers;
+use crate::extension_tools::ExtensionToolCatalog;
 use crate::extensions::{
     EXTENSION_EVENT_TIMEOUT_MS, ExtensionAiCompletionRequest, ExtensionCompactionOptions,
     ExtensionDeliverAs, ExtensionEventName, ExtensionHostActions, ExtensionLoadSpec,
@@ -2046,6 +2046,9 @@ pub struct Agent {
     /// Optional extension manager for tool/event hooks.
     extensions: Option<ExtensionManager>,
 
+    /// Runtime-owned extension tools published into the shared native registry.
+    extension_tool_catalog: ExtensionToolCatalog,
+
     /// Message history.
     messages: Vec<Message>,
 
@@ -2292,6 +2295,7 @@ impl Agent {
             tools,
             config,
             extensions: None,
+            extension_tool_catalog: ExtensionToolCatalog::new(json!({})),
             messages: Vec::new(),
             authored_queue_delivery_indices: Vec::new(),
             turn_checkpoint: None,
@@ -5133,6 +5137,14 @@ impl Agent {
         empty_response_limit_reached: bool,
     ) -> Result<AssistantStreamAttempt> {
         self.emit_cost_warning(&on_event);
+        // Extensions such as context-mode register tools only after awaiting
+        // initialization in before_agent_start. Reconcile after those hooks
+        // and on later tool-loop requests, before capturing any provider schema.
+        if let Some(manager) = &self.extensions {
+            self.extension_tool_catalog
+                .refresh(manager, &self.tools)
+                .await?;
+        }
         // Refresh admitted MCP catalogs before capturing the provider's tool
         // schema, under the same owner and cancellation as this request.
         crate::mcp::refresh_agent_tools(&self.tools, abort.as_ref(), checkpoint_cx).await;
@@ -10345,6 +10357,333 @@ mod extensions_integration_tests {
             assert_eq!(
                 details.get("from").and_then(serde_json::Value::as_str),
                 Some("extension")
+            );
+        });
+    }
+
+    /// context-mode awaits its MCP bridge in before_agent_start and only then
+    /// registers the tools returned by tools/list. A factory-only registry
+    /// snapshot misses every one of those tools even though bootstrap succeeds.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn context_mode_deferred_tools_reach_provider_and_execute_with_live_definitions() {
+        struct DeferredToolProvider {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Provider for DeferredToolProvider {
+            fn name(&self) -> &'static str {
+                "deferred-tool-provider"
+            }
+
+            fn api(&self) -> &'static str {
+                "test-api"
+            }
+
+            fn model_id(&self) -> &'static str {
+                "test-model"
+            }
+
+            async fn stream(
+                &self,
+                context: &Context<'_>,
+                _options: &StreamOptions,
+            ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+                let index = self.calls.fetch_add(1, Ordering::SeqCst);
+                let generation = index / 2 + 1;
+                let search = context
+                    .tools
+                    .iter()
+                    .find(|tool| tool.name == "ctx_search")
+                    .expect("awaited before_agent_start registration must reach the provider");
+                assert_eq!(
+                    search.description,
+                    format!("Search generation {generation}")
+                );
+                assert_eq!(
+                    search.parameters["properties"]["generation"]["const"],
+                    generation
+                );
+                assert!(
+                    context.tools.iter().all(|tool| tool.name != "ctx_inactive"),
+                    "refresh must preserve the explicit active-tool allowlist"
+                );
+
+                let (reason, content) = if index % 2 == 0 {
+                    (
+                        StopReason::ToolUse,
+                        vec![ContentBlock::ToolCall(ToolCall {
+                            id: format!("context-mode-{generation}"),
+                            name: "ctx_search".to_string(),
+                            arguments: json!({ "query": "needle", "generation": generation }),
+                            thought_signature: None,
+                        })],
+                    )
+                } else {
+                    let result = context
+                        .messages
+                        .iter()
+                        .rev()
+                        .find_map(|message| match message {
+                            Message::ToolResult(result) => Some(result),
+                            _ => None,
+                        })
+                        .expect("the native agent must execute the newly registered tool");
+                    assert!(!result.is_error);
+                    assert_eq!(result.tool_name, "ctx_search");
+                    let [ContentBlock::Text(text)] = result.content.as_slice() else {
+                        panic!("expected the real extension callback's text result");
+                    };
+                    assert_eq!(text.text, format!("ctx_search:{generation}:needle"));
+                    (
+                        StopReason::Stop,
+                        vec![ContentBlock::Text(TextContent::new("done"))],
+                    )
+                };
+                let message = AssistantMessage {
+                    content,
+                    api: self.api().to_string(),
+                    provider: self.name().to_string(),
+                    model: self.model_id().to_string(),
+                    usage: Usage::default(),
+                    stop_reason: reason,
+                    stop_details: None,
+                    error_message: None,
+                    timestamp: 0,
+                };
+                Ok(Box::pin(futures::stream::iter(vec![Ok(
+                    StreamEvent::Done { reason, message },
+                )])))
+            }
+        }
+
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let entry = temp.path().join("context-mode-lazy-tools.mjs");
+            std::fs::write(&entry, r#"
+                export default function(pi) {
+                    let generation = 0;
+                    pi.on('before_agent_start', async () => {
+                        // Match context-mode's awaited tools/list registration,
+                        // including a real actor timer before tools are known.
+                        await new Promise(resolve => setTimeout(resolve, 1));
+                        const current = ++generation;
+                        pi.registerTool({
+                            name: 'ctx_search',
+                            description: `Search generation ${current}`,
+                            parameters: {
+                                type: 'object',
+                                properties: {
+                                    query: { type: 'string' },
+                                    generation: { type: 'integer', const: current }
+                                },
+                                required: ['query', 'generation']
+                            },
+                            async execute(_callId, params, _onUpdate, _abort, ctx) {
+                                return {
+                                    content: [{ type: 'text', text: `ctx_search:${current}:${params.query}` }],
+                                    details: { cwd: ctx.cwd }
+                                };
+                            }
+                        });
+                        pi.registerTool({
+                            name: 'ctx_inactive',
+                            description: 'Explicitly inactive tool',
+                            parameters: { type: 'object', properties: {} },
+                            async execute() { throw new Error('inactive tool executed'); }
+                        });
+                        pi.setActiveTools(['ctx_search']);
+                    });
+                }
+            "#).expect("extension fixture");
+            let provider = Arc::new(DeferredToolProvider { calls: AtomicUsize::new(0) });
+            let agent = Agent::new(
+                provider.clone(),
+                ToolRegistry::new(&[], temp.path(), None),
+                AgentConfig::default(),
+            );
+            let mut session = AgentSession::new(
+                agent,
+                Arc::new(Mutex::new(Session::in_memory())),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            session.enable_extensions_with_policy(
+                &[], temp.path(), None, &[entry], None, Some(RepairPolicyMode::Off), None,
+                ExtensionHostConfiguration::default(),
+            ).await.expect("real extension load");
+            assert!(!session.agent.has_tool("ctx_search"), "the factory must stay lazy");
+            assert!(session.agent.build_context().tools.iter().all(|tool| tool.name != "ctx_search"));
+
+            for prompt in ["Search the indexed content", "Search again after re-registration"] {
+                session.run_text(prompt.to_string(), |_| {}).await.expect("native agent tool turn");
+            }
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+            let registry = session.agent.tools.snapshot();
+            let search = registry.get("ctx_search").expect("live shared tool registry");
+            assert_eq!(search.description(), "Search generation 2");
+            assert!(registry.get("ctx_inactive").is_none());
+            assert!(registry.inactive_tools().iter().any(|tool| tool.name() == "ctx_inactive"));
+            let output = search.execute("direct", json!({ "query": "shared", "generation": 2 }), None)
+                .await.expect("execute through the shared registry");
+            assert_eq!(output.details.unwrap()["cwd"], temp.path().display().to_string());
+            let manager = session.extensions.as_ref().expect("extensions").manager();
+            assert!(manager.shutdown(Duration::from_secs(5)).await);
+        });
+    }
+
+    /// The actor reads the same registry that holds these wrappers. Its own
+    /// mounted tools cannot count as application owners and keep pending native
+    /// work alive after the AgentSession and final public handle are dropped.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn catalog_mounted_tools_do_not_own_their_actor_through_the_shared_registry() {
+        struct PendingLifetimeTool {
+            entered: std::sync::mpsc::Sender<()>,
+            drops: Arc<AtomicUsize>,
+        }
+
+        struct PendingCall(Arc<AtomicUsize>);
+
+        impl Drop for PendingCall {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[async_trait]
+        impl Tool for PendingLifetimeTool {
+            fn name(&self) -> &'static str {
+                "lifetime_pending"
+            }
+
+            fn label(&self) -> &'static str {
+                "Pending lifetime fixture"
+            }
+
+            fn description(&self) -> &'static str {
+                "Holds native work until its application owner is dropped"
+            }
+
+            fn parameters(&self) -> Value {
+                json!({ "type": "object", "properties": {} })
+            }
+
+            async fn execute(
+                &self,
+                _tool_call_id: &str,
+                _input: Value,
+                _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+            ) -> Result<ToolOutput> {
+                let _guard = PendingCall(Arc::clone(&self.drops));
+                self.entered.send(()).expect("observe pending native work");
+                std::future::pending().await
+            }
+        }
+
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let entry = temp.path().join("catalog-owner.mjs");
+            std::fs::write(
+                &entry,
+                r#"
+                export default function(pi) {
+                    pi.registerTool({
+                        name: 'ctx_search',
+                        description: 'Mounted extension callback',
+                        parameters: { type: 'object', properties: {} },
+                        async execute() {
+                            return { content: [{ type: 'text', text: 'mounted' }], details: {} };
+                        }
+                    });
+                    pi.registerCommand('begin-idle-work', {
+                        handler() {
+                            setTimeout(() => pi.tool('lifetime_pending', {}).catch(() => {}), 1);
+                        }
+                    });
+                }
+            "#,
+            )
+            .expect("extension fixture");
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let drops = Arc::new(AtomicUsize::new(0));
+            let tools = ToolRegistry::from_tools(vec![Box::new(PendingLifetimeTool {
+                entered: entered_tx,
+                drops: Arc::clone(&drops),
+            })]);
+            let agent = Agent::new(Arc::new(NoopProvider), tools, AgentConfig::default());
+            // Keep the registry reachable even after the AgentSession is gone:
+            // a host-owned catalog snapshot is not a public runtime handle.
+            let shared_tools = agent.tools.clone();
+            let mut session = AgentSession::new(
+                agent,
+                Arc::new(Mutex::new(Session::in_memory())),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            let mut policy = ExtensionPolicy::default();
+            policy.default_caps.push("tool".to_string());
+            session
+                .enable_extensions_with_policy(
+                    &[],
+                    temp.path(),
+                    None,
+                    &[entry],
+                    Some(policy),
+                    Some(RepairPolicyMode::Off),
+                    None,
+                    ExtensionHostConfiguration::default(),
+                )
+                .await
+                .expect("load and mount actual extension tool");
+            assert!(shared_tools.snapshot().get("ctx_search").is_some());
+            let manager = session
+                .extensions
+                .as_ref()
+                .expect("extensions")
+                .manager()
+                .clone();
+            manager
+                .execute_command("begin-idle-work", "", 5_000)
+                .await
+                .expect("start idle timer");
+            entered_rx
+                .recv_timeout(Duration::from_secs(15))
+                .expect("pending native work entered");
+            let public_handle = manager.js_runtime().expect("public runtime handle");
+            drop(manager);
+            drop(session);
+            assert_eq!(
+                public_handle
+                    .get_registered_tools()
+                    .await
+                    .expect("retained public handle")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                0,
+                "public handles retain their actor"
+            );
+
+            // No explicit shutdown, pump or further runtime command is sent.
+            drop(public_handle);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while drops.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                1,
+                "catalog wrappers must not retain their own actor"
+            );
+            assert!(
+                shared_tools.snapshot().get("ctx_search").is_some(),
+                "registry stays reachable throughout cleanup"
             );
         });
     }
@@ -20198,6 +20537,7 @@ impl AgentSession {
 
         #[cfg(feature = "wasm-host")]
         if js_specs.is_empty() && native_specs.is_empty() && wasm_specs.is_empty() {
+            self.agent.extension_tool_catalog.clear(&self.agent.tools);
             self.extensions = None;
             self.agent.extensions = None;
             self.extension_queue_modes = None;
@@ -20207,6 +20547,7 @@ impl AgentSession {
 
         #[cfg(not(feature = "wasm-host"))]
         if js_specs.is_empty() && native_specs.is_empty() {
+            self.agent.extension_tool_catalog.clear(&self.agent.tools);
             self.extensions = None;
             self.agent.extensions = None;
             self.extension_queue_modes = None;
@@ -20527,8 +20868,13 @@ impl AgentSession {
         }
 
         let ctx_payload = serde_json::json!({ "cwd": cwd.display().to_string() });
-        let wrappers = collect_extension_tool_wrappers(&manager, ctx_payload).await?;
-        self.agent.extend_tools(wrappers);
+        let mut catalog = ExtensionToolCatalog::new(ctx_payload);
+        catalog.refresh(&manager, &self.agent.tools).await?;
+        // Keep the old registry intact if the new runtime cannot supply a
+        // validated catalog. After success, clear only old handles that the new
+        // publication did not replace; caller-installed overrides stay intact.
+        self.agent.extension_tool_catalog.clear(&self.agent.tools);
+        self.agent.extension_tool_catalog = catalog;
         self.agent.extensions = Some(manager.clone());
         self.extensions = Some(ExtensionRegion::new(manager));
         self.refresh_extension_compaction_models();
