@@ -13658,6 +13658,13 @@ fn collect_extension_entries_from_dir(dir: &Path) -> Vec<PathBuf> {
 // direction was independently proposed in PR #169 by @CCherry07).
 
 fn read_pi_extensions_from_package(package_json_path: &Path) -> Result<Option<Vec<String>>> {
+    let Some(json) = read_js_package_manifest(package_json_path)? else {
+        return Ok(None);
+    };
+    pi_extensions_from_manifest(&json, package_json_path)
+}
+
+fn read_js_package_manifest(package_json_path: &Path) -> Result<Option<Value>> {
     if !package_json_path.is_file() {
         return Ok(None);
     }
@@ -13674,6 +13681,13 @@ fn read_pi_extensions_from_package(package_json_path: &Path) -> Result<Option<Ve
             package_json_path.display()
         ))
     })?;
+    Ok(Some(json))
+}
+
+fn pi_extensions_from_manifest(
+    json: &Value,
+    package_json_path: &Path,
+) -> Result<Option<Vec<String>>> {
     let Some(pi) = json.get("pi") else {
         return Ok(None);
     };
@@ -13824,20 +13838,65 @@ fn is_independent_extensions_root(dir: &Path) -> bool {
 /// workspace clustering, no example scanning (bd-4bumf; see the module note
 /// above).
 fn discover_related_extension_entries(primary: &Path) -> Result<Vec<PathBuf>> {
+    discover_related_extension_entries_with_cache(primary, &mut HashMap::new())
+}
+
+#[derive(Clone)]
+struct JsPackageEntrySnapshot {
+    entries: Option<Vec<PathBuf>>,
+    establishes_boundary: bool,
+}
+
+type JsPackageEntryCache = HashMap<PathBuf, JsPackageEntrySnapshot>;
+
+fn cached_package_extension_entries(
+    manifest: &Path,
+    cache: &mut JsPackageEntryCache,
+) -> Result<JsPackageEntrySnapshot> {
+    let manifest = safe_canonicalize(manifest);
+    if let Some(entries) = cache.get(&manifest) {
+        return Ok(entries.clone());
+    }
+    let json = read_js_package_manifest(&manifest)?.ok_or_else(|| {
+        Error::extension(format!(
+            "Package manifest disappeared: {}",
+            manifest.display()
+        ))
+    })?;
+    let entries = pi_extensions_from_manifest(&json, &manifest)?.map(|entries| {
+        resolve_package_declared_entries(manifest.parent().unwrap_or(&manifest), &entries)
+    });
+    // A module-format scope does not create an independent package. Keep
+    // this exception exact: arbitrary unnamed package manifests still bind.
+    let type_only_scope = json.as_object().is_some_and(|object| {
+        object.len() == 1
+            && matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("module" | "commonjs")
+            )
+    });
+    let snapshot = JsPackageEntrySnapshot {
+        entries,
+        establishes_boundary: !type_only_scope,
+    };
+    cache.insert(manifest, snapshot.clone());
+    Ok(snapshot)
+}
+
+fn discover_related_extension_entries_with_cache(
+    primary: &Path,
+    cache: &mut JsPackageEntryCache,
+) -> Result<Vec<PathBuf>> {
     let canonical_primary = safe_canonicalize(primary);
     let mut out = vec![canonical_primary.clone()];
     let mut seen = BTreeSet::new();
     let _ = seen.insert(canonical_primary.clone());
 
     let mut selected_resolved: Vec<PathBuf> = Vec::new();
-    for package_json in find_package_json_ancestors(primary.parent()) {
-        let Some(package_dir) = package_json.parent() else {
+    for package_json in find_package_json_ancestors(canonical_primary.parent()) {
+        let Some(resolved) = cached_package_extension_entries(&package_json, cache)?.entries else {
             continue;
         };
-        let Some(package_entries) = read_pi_extensions_from_package(&package_json)? else {
-            continue;
-        };
-        let resolved = resolve_package_declared_entries(package_dir, &package_entries);
         if !resolved.contains(&canonical_primary) {
             continue;
         }
@@ -13855,7 +13914,100 @@ fn discover_related_extension_entries(primary: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-type GroupedJsExtensionSpecs<'a> = Vec<(String, Vec<(&'a JsExtensionLoadSpec, Vec<PathBuf>)>)>;
+#[derive(Debug, PartialEq, Eq)]
+enum JsExtensionProvenance {
+    DeclaredPackage(PathBuf),
+    Directory(PathBuf),
+    IndependentEntry(PathBuf),
+}
+
+impl JsExtensionProvenance {
+    fn path(&self) -> &Path {
+        match self {
+            Self::DeclaredPackage(path) | Self::Directory(path) | Self::IndependentEntry(path) => {
+                path
+            }
+        }
+    }
+
+    fn filesystem_root(&self) -> PathBuf {
+        match self {
+            Self::IndependentEntry(path) => path.parent().unwrap_or(path).to_path_buf(),
+            Self::DeclaredPackage(path) | Self::Directory(path) => path.clone(),
+        }
+    }
+}
+
+fn js_extension_provenance(
+    entry: &Path,
+    cache: &mut JsPackageEntryCache,
+) -> Result<JsExtensionProvenance> {
+    let is_node_modules = |name: &std::ffi::OsStr| {
+        name == "node_modules"
+            || (cfg!(windows)
+                && name
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("node_modules")))
+    };
+    let entry = safe_canonicalize(entry);
+    let parent = entry
+        .parent()
+        .ok_or_else(|| Error::extension("JS extension entry has no parent directory"))?;
+    for directory in parent.ancestors() {
+        let manifest = directory.join("package.json");
+        if manifest.is_file() {
+            let manifest = safe_canonicalize(&manifest);
+            // A nearer package is a boundary even when it does not declare
+            // this entry. An outer workspace cannot claim nested packages.
+            if manifest.parent() != Some(directory) {
+                break;
+            }
+            let snapshot = cached_package_extension_entries(&manifest, cache)?;
+            if snapshot
+                .entries
+                .is_some_and(|entries| entries.contains(&entry))
+            {
+                return Ok(JsExtensionProvenance::DeclaredPackage(
+                    directory.to_path_buf(),
+                ));
+            }
+            if snapshot.establishes_boundary {
+                break;
+            }
+        }
+        // Missing manifests do not turn installed dependency directories
+        // into portions of the containing workspace package.
+        let installed_package = directory.parent().is_some_and(|parent| {
+            parent.file_name().is_some_and(is_node_modules)
+                || (parent
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with('@'))
+                    && parent
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(is_node_modules))
+        });
+        if installed_package {
+            break;
+        }
+    }
+    Ok(if is_independent_extensions_root(parent) {
+        JsExtensionProvenance::IndependentEntry(entry)
+    } else {
+        JsExtensionProvenance::Directory(parent.to_path_buf())
+    })
+}
+
+#[derive(Debug)]
+struct JsExtensionSpecPlan<'a> {
+    spec: &'a JsExtensionLoadSpec,
+    entry_paths: Vec<PathBuf>,
+    filesystem_roots: Vec<PathBuf>,
+    declared_package_root: Option<PathBuf>,
+}
+
+type GroupedJsExtensionSpecs<'a> = Vec<(String, Vec<JsExtensionSpecPlan<'a>>)>;
 
 fn group_js_extension_specs<'a>(
     specs: &'a [JsExtensionLoadSpec],
@@ -13863,6 +14015,8 @@ fn group_js_extension_specs<'a>(
 ) -> Result<GroupedJsExtensionSpecs<'a>> {
     let mut group_by_id = HashMap::<String, usize>::new();
     let mut grouped_specs = GroupedJsExtensionSpecs::new();
+    let mut provenance_by_id = HashMap::<String, JsExtensionProvenance>::new();
+    let mut package_entries = JsPackageEntryCache::new();
     for spec in specs {
         if spec.extension_id.trim().is_empty() {
             return Err(Error::extension("JS extension id cannot be empty"));
@@ -13871,7 +14025,53 @@ fn group_js_extension_specs<'a>(
         // set drives both peer-boundary metadata and the subsequent load, so a
         // concurrent manifest/filesystem change cannot create an unclassified
         // extension root between two discovery passes.
-        let entry_paths = resolve_extension_load_entry_paths(spec, explicit_entry_paths)?;
+        let entry_paths =
+            resolve_extension_load_entry_paths(spec, explicit_entry_paths, &mut package_entries)?;
+        let provenance = js_extension_provenance(&spec.entry_path, &mut package_entries)?;
+        for entry_path in &entry_paths {
+            let entry_provenance = js_extension_provenance(entry_path, &mut package_entries)?;
+            if entry_provenance != provenance {
+                return Err(Error::extension(format!(
+                    "Ambiguous JS extension provenance for {}: declared entry {} belongs to {}, outside primary origin {}",
+                    spec.extension_id,
+                    entry_path.display(),
+                    entry_provenance.path().display(),
+                    provenance.path().display(),
+                )));
+            }
+        }
+        let controlling_root = provenance.filesystem_root();
+        let mut filesystem_roots = Vec::new();
+        let mut seen_roots = HashSet::new();
+        for entry in &entry_paths {
+            // Keep the leaf boundaries as well as the containing package:
+            // distinct explicit owners in one package must not inherit each
+            // other's deeper directories through their shared package root.
+            if let Some(parent) = entry.parent()
+                && seen_roots.insert(parent.to_path_buf())
+            {
+                filesystem_roots.push(parent.to_path_buf());
+            }
+            if seen_roots.insert(controlling_root.clone()) {
+                filesystem_roots.push(controlling_root.clone());
+            }
+        }
+        let declared_package_root = match &provenance {
+            JsExtensionProvenance::DeclaredPackage(root) => Some(root.clone()),
+            _ => None,
+        };
+        if let Some(previous) = provenance_by_id.get(&spec.extension_id) {
+            if previous != &provenance {
+                return Err(Error::extension(format!(
+                    "Ambiguous JS extension provenance: id {} resolves to unrelated origins {} and {}; assign distinct explicit extension identities",
+                    spec.extension_id,
+                    previous.path().display(),
+                    provenance.path().display(),
+                )));
+            }
+        } else {
+            provenance_by_id.insert(spec.extension_id.clone(), provenance);
+        }
         let group_index = match group_by_id.entry(spec.extension_id.clone()) {
             std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -13881,7 +14081,12 @@ fn group_js_extension_specs<'a>(
                 index
             }
         };
-        grouped_specs[group_index].1.push((spec, entry_paths));
+        grouped_specs[group_index].1.push(JsExtensionSpecPlan {
+            spec,
+            entry_paths,
+            filesystem_roots,
+            declared_package_root,
+        });
     }
     Ok(grouped_specs)
 }
@@ -13891,8 +14096,8 @@ fn collect_js_extension_roots(
 ) -> Result<Vec<(String, Vec<PathBuf>)>> {
     let mut leaf_root_owner = HashMap::<PathBuf, String>::new();
     for (extension_id, extension_specs) in grouped_specs {
-        for (_, entry_paths) in extension_specs {
-            for entry_path in entry_paths {
+        for plan in extension_specs {
+            for entry_path in &plan.entry_paths {
                 let Some(parent) = entry_path.parent() else {
                     continue;
                 };
@@ -13924,10 +14129,10 @@ fn collect_js_extension_roots(
     for (extension_id, extension_specs) in grouped_specs {
         let mut roots = Vec::new();
         let mut seen = BTreeSet::new();
-        for (_, entry_paths) in extension_specs {
-            for root in collect_extension_roots_from_paths(entry_paths) {
+        for plan in extension_specs {
+            for root in &plan.filesystem_roots {
                 if seen.insert(root.clone()) {
-                    roots.push(root);
+                    roots.push(root.clone());
                 }
             }
         }
@@ -14027,10 +14232,17 @@ fn collect_js_application_storage_namespaces(
     let mut out = Vec::new();
     for (extension_id, specs) in grouped_specs {
         let mut namespaces = BTreeSet::new();
-        for (_, entry_paths) in specs {
-            for entry in entry_paths {
+        for plan in specs {
+            for entry in &plan.entry_paths {
                 let mut classified = false;
-                for manifest in find_package_json_ancestors(entry.parent()) {
+                // Persistent authority follows the same admitted package
+                // boundary as module/filesystem roots, never a fresh search
+                // through outer packages that happen to name this entry.
+                for manifest in plan
+                    .declared_package_root
+                    .iter()
+                    .map(|root| root.join("package.json"))
+                {
                     let Some(package_dir) = manifest.parent() else {
                         continue;
                     };
@@ -14122,6 +14334,58 @@ fn collect_js_application_storage_namespaces(
 #[cfg(test)]
 mod application_storage_tests {
     use super::*;
+
+    /// Exercise the namespace collector's independent deny defense with
+    /// plans that production grouping now rejects before runtime creation.
+    fn storage_plans_without_group_admission(
+        specs: &[JsExtensionLoadSpec],
+    ) -> GroupedJsExtensionSpecs<'_> {
+        let mut groups = GroupedJsExtensionSpecs::new();
+        for spec in specs {
+            let explicit = HashSet::from([spec.entry_path.clone()]);
+            for (id, plans) in
+                group_js_extension_specs(std::slice::from_ref(spec), &explicit).unwrap()
+            {
+                if let Some((_, grouped)) = groups.iter_mut().find(|(owner, _)| owner == &id) {
+                    grouped.extend(plans);
+                } else {
+                    groups.push((id, plans));
+                }
+            }
+        }
+        groups
+    }
+
+    #[test]
+    fn nested_package_entry_cannot_borrow_an_ancestor_root_or_storage_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let outer = temp.path().join("node_modules/outer");
+        let inner = outer.join("node_modules/inner");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(
+            outer.join("package.json"),
+            json!({"name":"outer", "pi":{"extensions":["./node_modules/inner/extension.mjs"]}})
+                .to_string(),
+        )
+        .unwrap();
+        fs::write(inner.join("package.json"), r#"{"name":"inner"}"#).unwrap();
+        let entry = inner.join("extension.mjs");
+        fs::write(&entry, "export default function() {}").unwrap();
+        let specs = vec![JsExtensionLoadSpec::from_entry_path(entry).unwrap()];
+        let explicit = HashSet::from([specs[0].entry_path.clone()]);
+        let grouped = group_js_extension_specs(&specs, &explicit).unwrap();
+        assert_eq!(
+            collect_js_extension_roots(&grouped).unwrap(),
+            vec![("extension".to_string(), vec![safe_canonicalize(&inner)])]
+        );
+        assert_eq!(
+            collect_js_application_storage_namespaces(&grouped),
+            JsApplicationStorageNamespaces {
+                owned: vec![("extension".to_string(), Vec::new())],
+                denied: Vec::new(),
+            }
+        );
+    }
 
     #[test]
     fn npm_storage_namespaces_require_matching_install_identity_and_reserve_pi_data() {
@@ -14235,7 +14499,8 @@ mod application_storage_tests {
             JsExtensionLoadSpec::from_entry_path(other_root.join("independent.js")).unwrap();
         let specs = vec![valid.clone(), collision.clone(), independent.clone()];
         let explicit = specs.iter().map(|spec| spec.entry_path.clone()).collect();
-        let grouped = group_js_extension_specs(&specs, &explicit).unwrap();
+        assert!(group_js_extension_specs(&specs, &explicit).is_err());
+        let grouped = storage_plans_without_group_admission(&specs);
         let discovered = collect_js_application_storage_namespaces(&grouped);
         assert_eq!(
             discovered.owned,
@@ -14257,7 +14522,8 @@ mod application_storage_tests {
         shared_identity.extension_id.clone_from(&valid.extension_id);
         let specs = vec![valid.clone(), collision, shared_identity];
         let explicit = specs.iter().map(|spec| spec.entry_path.clone()).collect();
-        let grouped = group_js_extension_specs(&specs, &explicit).unwrap();
+        assert!(group_js_extension_specs(&specs, &explicit).is_err());
+        let grouped = storage_plans_without_group_admission(&specs);
         let discovered = collect_js_application_storage_namespaces(&grouped);
         assert!(discovered.owned.iter().all(|(_, roots)| roots.is_empty()));
         assert_eq!(
@@ -14275,7 +14541,8 @@ mod application_storage_tests {
         fs::write(&loose, "export default function(pi) {}").unwrap();
         let specs = vec![valid, JsExtensionLoadSpec::from_entry_path(loose).unwrap()];
         let explicit = specs.iter().map(|spec| spec.entry_path.clone()).collect();
-        let grouped = group_js_extension_specs(&specs, &explicit).unwrap();
+        assert!(group_js_extension_specs(&specs, &explicit).is_err());
+        let grouped = storage_plans_without_group_admission(&specs);
         let discovered = collect_js_application_storage_namespaces(&grouped);
         assert!(discovered.owned.iter().all(|(_, roots)| roots.is_empty()));
         assert_eq!(discovered.denied, vec![PathBuf::from("context-mode")]);
@@ -14432,8 +14699,8 @@ async fn build_js_runtime_shards(
 
     let mut candidate = JsRuntimeShardSet::default();
     for (extension_id, extension_specs, runtime) in prepared {
-        for (spec, entry_paths) in extension_specs {
-            load_one_extension(&runtime, host, spec, &entry_paths, origin, root_deadline).await?;
+        for plan in extension_specs {
+            load_one_extension(&runtime, host, &plan, origin, root_deadline).await?;
         }
 
         let snapshot =
@@ -14570,11 +14837,12 @@ async fn scrub_and_drop_runtime_shards(
 async fn load_one_extension(
     runtime: &PiJsRuntime,
     host: &JsRuntimeHost,
-    spec: &JsExtensionLoadSpec,
-    entry_paths: &[PathBuf],
+    plan: &JsExtensionSpecPlan<'_>,
     origin: Option<&SessionActionOrigin>,
     root_deadline: Instant,
 ) -> Result<()> {
+    let spec = plan.spec;
+    let entry_paths = &plan.entry_paths;
     if entry_paths.len() > 1 {
         tracing::info!(
             event = "ext.load.multi_entry",
@@ -14589,8 +14857,8 @@ async fn load_one_extension(
     // bundled assets (HTML templates, markdown docs, etc.) within the
     // extension's own directory tree, and so the resolver can detect
     // monorepo escape patterns (Pattern 3).
-    for root in collect_extension_roots_from_paths(entry_paths) {
-        runtime.add_extension_root_with_id(root, Some(spec.extension_id.as_str()));
+    for root in &plan.filesystem_roots {
+        runtime.add_extension_root_with_id(root.clone(), Some(spec.extension_id.as_str()));
     }
 
     let meta = json!({
@@ -14653,9 +14921,11 @@ async fn load_one_extension(
 fn resolve_extension_load_entry_paths(
     spec: &JsExtensionLoadSpec,
     explicit_entry_paths: &HashSet<PathBuf>,
+    package_entries: &mut JsPackageEntryCache,
 ) -> Result<Vec<PathBuf>> {
     let explicit_primary = safe_canonicalize(&spec.entry_path);
-    let mut entry_paths = discover_related_extension_entries(&spec.entry_path)?;
+    let mut entry_paths =
+        discover_related_extension_entries_with_cache(&spec.entry_path, package_entries)?;
     if explicit_entry_paths.len() > 1 {
         entry_paths.retain(|entry_path| {
             let canonical = safe_canonicalize(entry_path);

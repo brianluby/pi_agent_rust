@@ -516,6 +516,24 @@ Extension access to sensitive APIs is governed by capability policies.
 Use `pi doctor <path> --policy <profile>` to check extension compatibility
 under a specific policy.
 
+### Extension owner isolation
+
+Before creating JavaScript realms, the loader validates the canonical source
+of every entry, including entries expanded from package declarations. A shared
+owner may combine entries explicitly declared by the same containing package.
+An outer workspace declaration cannot merge entries across nested package
+boundaries. A nested manifest containing only the module `type` setting does
+not create a separate package. Undeclared loose entries retain their directory
+boundary; those directly under an independent `extensions/` directory retain
+individual source identities. Flat sibling files retain directory-based
+filesystem access. Validated package roots keep the more specific entry
+directories that protect one owner's private files from another owner.
+
+If unrelated sources resolve to the same legacy extension ID, loading fails
+before their factories run. The loader preserves existing IDs because
+capability overrides, trust state, and resource limits use those exact keys.
+A rejected replacement leaves the previously loaded extensions available.
+
 ### Persistent application state
 
 Ordinary extension writes retain their existing virtual-filesystem behavior.
@@ -528,10 +546,11 @@ the installed `node_modules` path, manifest package name, and the declared
 `pi.extensions` entrypoint to agree. Thus `npm:context-mode` can create and
 reopen `~/.pi/context-mode/sessions` without receiving access to all of HOME or
 all of `.pi`. Pi's own configuration/authentication directories and unsafe
-namespace components are reserved. Ambiguous package origins or shared legacy
-extension IDs suppress automatic grants and emit diagnostics; unrelated
-extensions retain their own grants. Invalid or linked automatic roots remain
-deny-only boundaries.
+namespace components are reserved. Shared legacy extension IDs across unrelated
+sources are rejected before runtime construction. Ambiguous application
+namespaces suppress automatic grants and emit diagnostics; unrelated extensions
+retain their own grants. Invalid or linked automatic roots remain deny-only
+boundaries.
 
 Each owner's storage paths are resolved once using that owner's runtime
 configuration. Every realm receives the same protected path boundaries before

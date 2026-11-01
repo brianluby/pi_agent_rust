@@ -1391,3 +1391,351 @@ fn quarantined_provider_cleanup_cannot_publish_new_tool_reservations() {
         assert!(manager.shutdown(Duration::from_secs(5)).await);
     });
 }
+
+/// Filename-derived policy IDs are not package identities. An ambiguous
+/// candidate must be rejected before a factory can run, and a failed reload
+/// must leave the previously loaded realm intact.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn unrelated_same_id_packages_and_cross_package_coentries_fail_before_factories() {
+    let harness = common::TestHarness::new("provenance_reload_guard");
+    let (manager, runtime) = load_catalog_packages(
+        &harness,
+        &[(
+            "surviving-package",
+            r#"
+            export default function(pi) {
+                pi.registerCommand('surviving-command', { handler: () => 'still alive' });
+            }
+        "#,
+        )],
+    );
+    let source = "export default function() { throw new Error('unrelated factory executed'); }";
+    let make_spec = |path: &str| {
+        JsExtensionLoadSpec::from_entry_path(harness.create_file(path, source.as_bytes()))
+            .expect("candidate spec")
+    };
+    let mut candidates = Vec::new();
+
+    // This is context-mode's actual package/adapter filename shape. Another
+    // independently installed package can naturally choose extension.js too.
+    let mut same_id = Vec::new();
+    for name in ["context-mode", "unrelated-package"] {
+        let package = format!("node_modules/{name}");
+        harness.create_file(
+            format!("{package}/package.json"),
+            serde_json::to_vec(&json!({
+                "name": name, "type": "module",
+                "pi": { "extensions": ["./build/adapters/pi/extension.js"] },
+            }))
+            .unwrap(),
+        );
+        same_id.push(make_spec(&format!(
+            "{package}/build/adapters/pi/extension.js"
+        )));
+    }
+    assert!(same_id.iter().all(|spec| spec.extension_id == "extension"));
+    candidates.push(same_id);
+
+    // A declaring workspace cannot absorb a nearer named package merely
+    // because that package has no pi.extensions of its own.
+    harness.create_file(
+        "workspace/package.json",
+        br#"{
+        "name":"outer", "pi":{"extensions":["./a/extension.mjs","./b/extension.mjs"]}
+    }"#,
+    );
+    harness.create_file("workspace/a/package.json", br#"{"name":"a"}"#);
+    harness.create_file("workspace/b/package.json", br#"{"name":"b"}"#);
+    let nested = make_spec("workspace/a/extension.mjs");
+    make_spec("workspace/b/extension.mjs");
+    candidates.push(vec![nested]);
+
+    harness.create_file(
+        "escaping/package.json",
+        br#"{
+        "name":"escaping", "pi":{"extensions":["./extension.mjs","../outside/extension.mjs"]}
+    }"#,
+    );
+    let escaping = make_spec("escaping/extension.mjs");
+    make_spec("outside/extension.mjs");
+    candidates.push(vec![escaping]);
+
+    // A type-only manifest cannot make node_modules itself transparent.
+    harness.create_file(
+        "dependency-parent/package.json",
+        br#"{
+        "name":"dependency-parent", "pi":{"extensions":[
+            "./extension.mjs", "./node_modules/child/extension.mjs"
+        ]}
+    }"#,
+    );
+    harness.create_file(
+        "dependency-parent/node_modules/child/package.json",
+        br#"{"type":"module"}"#,
+    );
+    let dependency_parent = make_spec("dependency-parent/extension.mjs");
+    make_spec("dependency-parent/node_modules/child/extension.mjs");
+    candidates.push(vec![dependency_parent]);
+
+    #[cfg(windows)]
+    {
+        harness.create_file(
+            "windows-parent/package.json",
+            br#"{
+            "name":"windows-parent", "pi":{"extensions":[
+                "./extension.mjs", "./Node_Modules/child/extension.mjs"
+            ]}
+        }"#,
+        );
+        harness.create_file(
+            "windows-parent/Node_Modules/child/package.json",
+            br#"{"type":"module"}"#,
+        );
+        let windows_parent = make_spec("windows-parent/extension.mjs");
+        make_spec("windows-parent/Node_Modules/child/extension.mjs");
+        candidates.push(vec![windows_parent]);
+    }
+
+    #[cfg(unix)]
+    {
+        harness.create_file(
+            "linked/package.json",
+            br#"{
+            "name":"linked", "pi":{"extensions":["./extension.mjs","./linked-entry.mjs"]}
+        }"#,
+        );
+        let linked = make_spec("linked/extension.mjs");
+        std::os::unix::fs::symlink(
+            harness.temp_dir().join("outside/extension.mjs"),
+            harness.temp_dir().join("linked/linked-entry.mjs"),
+        )
+        .expect("symlinked co-entry");
+        candidates.push(vec![linked]);
+    }
+
+    common::run_async(async move {
+        for specs in candidates {
+            let error = manager
+                .load_js_extensions(specs)
+                .await
+                .expect_err("unrelated origins must fail before factory execution")
+                .to_string();
+            assert!(
+                error.contains("Ambiguous JS extension provenance"),
+                "{error}"
+            );
+            assert!(!error.contains("unrelated factory executed"), "{error}");
+            assert_eq!(
+                manager
+                    .execute_command("surviving-command", "", 5000)
+                    .await
+                    .expect("old runtime survives failed candidate"),
+                json!("still alive")
+            );
+        }
+        assert!(
+            runtime
+                .get_registered_tools()
+                .await
+                .expect("old catalog remains usable")
+                .is_empty()
+        );
+        assert!(manager.shutdown(Duration::from_secs(5)).await);
+    });
+}
+
+fn start_provenance_fixture(
+    harness: &common::TestHarness,
+    policy: pi::extensions::ExtensionPolicy,
+) -> (ExtensionManager, JsExtensionRuntimeHandle) {
+    let workspace = harness.temp_dir().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("separate workspace");
+    // Package fixtures are siblings of cwd, so successful bundled reads
+    // require their admitted package roots rather than workspace authority.
+    let cwd = pi::extensions::safe_canonicalize(&workspace);
+    let manager = ExtensionManager::new();
+    let runtime = common::run_async(JsExtensionRuntimeHandle::start_with_policy(
+        PiJsRuntimeConfig {
+            cwd: cwd.display().to_string(),
+            env: std::collections::HashMap::from([
+                ("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string()),
+                (
+                    "PROVENANCE_TEST_VALUE".to_string(),
+                    "configured value".to_string(),
+                ),
+            ]),
+            disk_cache_dir: None,
+            repair_mode: pi::extensions_js::RepairMode::Off,
+            ..Default::default()
+        },
+        Arc::new(ToolRegistry::new(&[], &cwd, None)),
+        manager.clone(),
+        policy,
+    ))
+    .expect("start real provenance runtime");
+    manager.set_js_runtime(runtime.clone());
+    (manager, runtime)
+}
+
+/// Declared entries of one package retain their shared realm and unchanged
+/// policy key, including an entry below a pure Node module-format scope.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn declared_same_package_entries_preserve_order_assets_and_legacy_policy_denials() {
+    let harness = common::TestHarness::new("provenance_declared_package");
+    harness.create_file(
+        "bundle/package.json",
+        br#"{
+        "name":"different-display-name", "type":"module",
+        "pi":{"extensions":["./a/extension.mjs","./build/extension.mjs"]}
+    }"#,
+    );
+    harness.create_file("bundle/build/package.json", br#"{"type":"module"}"#);
+    harness.create_file("bundle/asset.txt", b"package asset");
+    let first = harness.create_file(
+        "bundle/a/extension.mjs",
+        br#"
+        export default function(pi) {
+            globalThis.provenanceOrder = ['first'];
+            pi.registerCommand('bundle-order', { handler: () => globalThis.provenanceOrder });
+        }
+    "#,
+    );
+    let second = harness.create_file("bundle/build/extension.mjs", br#"
+        import { readFileSync } from 'node:fs';
+        import { dirname, join } from 'node:path';
+        import { fileURLToPath } from 'node:url';
+        export default function(pi) {
+            globalThis.provenanceOrder.push('second');
+            const asset = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'asset.txt'), 'utf8');
+            pi.registerCommand('bundle-policy', { handler: async () => {
+                let execError = '';
+                try { await pi.exec('pi-provenance-command-that-must-not-run', []); }
+                catch (error) { execError = String(error.message || error); }
+                return { asset, env: process.env.PROVENANCE_TEST_VALUE ?? null, execError };
+            }});
+        }
+    "#);
+    let specs = vec![
+        JsExtensionLoadSpec::from_entry_path(first).expect("first spec"),
+        JsExtensionLoadSpec::from_entry_path(second).expect("second spec"),
+    ];
+    assert!(specs.iter().all(|spec| spec.extension_id == "extension"));
+    let mut policy = pi::extensions::ExtensionPolicy::default();
+    policy.deny_caps.retain(|cap| cap != "exec" && cap != "env");
+    policy
+        .default_caps
+        .extend(["exec".to_string(), "env".to_string()]);
+    policy.per_extension.insert(
+        "extension".to_string(),
+        pi::extensions::ExtensionOverride {
+            deny: vec!["exec".to_string(), "env".to_string()],
+            ..Default::default()
+        },
+    );
+    let (manager, _) = start_provenance_fixture(&harness, policy);
+    common::run_async(async move {
+        manager
+            .load_js_extensions(specs)
+            .await
+            .expect("same package loads one realm");
+        assert_eq!(
+            manager
+                .execute_command("bundle-order", "", 5000)
+                .await
+                .unwrap(),
+            json!(["first", "second"])
+        );
+        let observed = manager
+            .execute_command("bundle-policy", "", 5000)
+            .await
+            .unwrap();
+        assert_eq!(observed["asset"], "package asset");
+        assert!(
+            observed["env"].is_null(),
+            "legacy per-owner env deny must remain active: {observed}"
+        );
+        assert!(
+            observed["execError"]
+                .as_str()
+                .is_some_and(|error| error.to_ascii_lowercase().contains("denied")),
+            "native hostcall must retain legacy per-owner exec denial: {observed}"
+        );
+        assert!(manager.shutdown(Duration::from_secs(5)).await);
+    });
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn distinct_owners_in_one_declared_package_keep_private_leaf_boundaries() {
+    let harness = common::TestHarness::new("provenance_private_leaves");
+    harness.create_file(
+        "bundle/package.json",
+        br#"{
+        "name":"shared-package", "type":"module",
+        "pi":{"extensions":["./left/left.mjs","./right/right.mjs"]}
+    }"#,
+    );
+    harness.create_file("bundle/left/private.txt", b"left private");
+    harness.create_file("bundle/right/private.txt", b"right private");
+    harness.create_file(
+        "bundle/right/helper.mjs",
+        b"export default 'right private module';",
+    );
+    let left = harness.create_file("bundle/left/left.mjs", br#"
+        import { readFileSync, writeFileSync } from 'node:fs';
+        import { dirname, join } from 'node:path';
+        import { fileURLToPath } from 'node:url';
+        export default function(pi) {
+            const root = dirname(fileURLToPath(import.meta.url));
+            pi.registerCommand('probe-private-leaves', { handler: async () => {
+                let read = false, write = false, imported = false;
+                try { readFileSync(join(root, '..', 'right', 'private.txt'), 'utf8'); read = true; } catch (_) {}
+                try { writeFileSync(join(root, '..', 'right', 'created.txt'), 'foreign'); write = true; } catch (_) {}
+                try { await import('../right/helper.mjs'); imported = true; } catch (_) {}
+                return { own: readFileSync(join(root, 'private.txt'), 'utf8'), read, write, imported };
+            }});
+        }
+    "#);
+    let right = harness.create_file("bundle/right/right.mjs", br#"
+        import { readFileSync } from 'node:fs';
+        import { dirname, join } from 'node:path';
+        import { fileURLToPath } from 'node:url';
+        export default function(pi) {
+            pi.registerCommand('right-private', { handler: () =>
+                readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'private.txt'), 'utf8') });
+        }
+    "#);
+    let specs = vec![
+        JsExtensionLoadSpec::from_entry_path(left).unwrap(),
+        JsExtensionLoadSpec::from_entry_path(right).unwrap(),
+    ];
+    assert_ne!(specs[0].extension_id, specs[1].extension_id);
+    let (manager, _) =
+        start_provenance_fixture(&harness, pi::extensions::ExtensionPolicy::default());
+    let untouched = harness.temp_dir().join("bundle/right/private.txt");
+    common::run_async(async move {
+        manager
+            .load_js_extensions(specs)
+            .await
+            .expect("separate owners in shared declared package");
+        let observed = manager
+            .execute_command("probe-private-leaves", "", 5000)
+            .await
+            .unwrap();
+        assert_eq!(
+            observed,
+            json!({ "own":"left private", "read":false, "write":false, "imported":false })
+        );
+        assert_eq!(
+            manager
+                .execute_command("right-private", "", 5000)
+                .await
+                .unwrap(),
+            json!("right private")
+        );
+        assert_eq!(std::fs::read_to_string(untouched).unwrap(), "right private");
+        assert!(manager.shutdown(Duration::from_secs(5)).await);
+    });
+}
