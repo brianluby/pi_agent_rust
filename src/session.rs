@@ -2471,7 +2471,7 @@ impl ExtensionSession for SessionHandle {
                 "pendingMessageCount": 0,
             });
         };
-        let session_file = session.path.as_ref().map(|p| p.display().to_string());
+        let session_file = session.session_file().map(|p| p.display().to_string());
         let session_id = session.header.id.clone();
         let session_name = session.get_name();
         let model =
@@ -3001,6 +3001,24 @@ impl AutosaveQueue {
 // Session
 // ============================================================================
 
+#[derive(Debug, Clone)]
+struct SessionPathReservation {
+    path: PathBuf,
+    session_id: String,
+    cwd: String,
+    session_dir: Option<PathBuf>,
+    store_kind: SessionStoreKind,
+}
+
+impl SessionPathReservation {
+    fn matches(&self, session: &Session) -> bool {
+        self.session_id == session.header.id
+            && self.cwd == session.header.cwd
+            && self.session_dir == session.session_dir
+            && self.store_kind == session.store_kind
+    }
+}
+
 /// A session manages conversation state and persistence.
 #[derive(Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -3011,6 +3029,9 @@ pub struct Session {
     pub entries: Vec<SessionEntry>,
     /// Path to the session file (None for in-memory)
     pub path: Option<PathBuf>,
+    /// Stable future path exposed to extensions before the first save.
+    /// Reserving a name never creates a directory or a transcript file.
+    reserved_path: Option<SessionPathReservation>,
     /// Current leaf entry ID. Direct modification outside of `session.rs`
     /// is forbidden because it can desynchronize the `is_linear` optimization cache.
     pub(crate) leaf_id: Option<String>,
@@ -3069,6 +3090,7 @@ impl Clone for Session {
             header: self.header.clone(),
             entries: self.entries.clone(),
             path: self.path.clone(),
+            reserved_path: self.reserved_path.clone(),
             leaf_id: self.leaf_id.clone(),
             session_dir: self.session_dir.clone(),
             store_kind: self.store_kind,
@@ -3999,6 +4021,7 @@ impl Session {
             header: SessionHeader::new(),
             entries: Vec::new(),
             path: None,
+            reserved_path: None,
             leaf_id: None,
             session_dir: None,
             store_kind: SessionStoreKind::Jsonl,
@@ -4040,6 +4063,7 @@ impl Session {
             header,
             entries: Vec::new(),
             path: None,
+            reserved_path: None,
             leaf_id: None,
             session_dir,
             store_kind,
@@ -4060,6 +4084,115 @@ impl Session {
             v2_sidecar_stale: false,
             v2_message_count_offset: 0,
         }
+    }
+
+    /// Return the existing or reserved persistence filename.
+    ///
+    /// A reserved filename is metadata, not evidence that a file exists. Hosts
+    /// must reserve only when persistence is enabled; ephemeral sessions keep
+    /// returning `None` unless a caller explicitly asks to persist them.
+    #[must_use]
+    pub fn session_file(&self) -> Option<&Path> {
+        self.path.as_deref().or_else(|| {
+            self.reserved_path
+                .as_ref()
+                .filter(|reservation| reservation.matches(self))
+                .map(|reservation| reservation.path.as_path())
+        })
+    }
+
+    /// Reserve the exact filename the first save will use, without disk writes.
+    ///
+    /// Call after configuring the session's working directory and storage
+    /// directory, before exposing session identity to extension lifecycle
+    /// hooks. A later change to those path-driving fields must not silently
+    /// change an identity already observed by an extension.
+    pub fn reserve_persistence_path(&mut self) -> Result<()> {
+        if let Some(path) = &self.path {
+            let absolute = std::path::absolute(path)?;
+            let resolved = resolve_session_persistence_path(&absolute)?;
+            self.persistence_store_kind(Some(&resolved))?;
+            self.path = Some(resolved);
+            self.reserved_path = None;
+            return Ok(());
+        }
+        self.header
+            .validate()
+            .map_err(|reason| Error::session(format!("Invalid session header: {reason}")))?;
+        let store_kind = self.persistence_store_kind(None)?;
+        if let Some(reservation) = &self.reserved_path {
+            if !reservation.matches(self) {
+                return Err(Error::session(
+                    "Session persistence identity changed after its filename was reserved",
+                ));
+            }
+            return Ok(());
+        }
+        let path = self.new_persistence_path(store_kind)?;
+        self.reserved_path = Some(SessionPathReservation {
+            path,
+            session_id: self.header.id.clone(),
+            cwd: self.header.cwd.clone(),
+            session_dir: self.session_dir.clone(),
+            store_kind: self.store_kind,
+        });
+        Ok(())
+    }
+
+    fn persistence_store_kind(&self, path: Option<&Path>) -> Result<SessionStoreKind> {
+        match path.and_then(|path| path.extension().and_then(|ext| ext.to_str())) {
+            Some("jsonl") => Ok(SessionStoreKind::Jsonl),
+            Some("sqlite") => {
+                #[cfg(feature = "sqlite-sessions")]
+                {
+                    Ok(SessionStoreKind::Sqlite)
+                }
+                #[cfg(not(feature = "sqlite-sessions"))]
+                {
+                    Err(Error::session(
+                        "SQLite session files require building with `--features sqlite-sessions`",
+                    ))
+                }
+            }
+            _ => Ok(self.store_kind),
+        }
+    }
+
+    fn new_persistence_path(&self, store_kind: SessionStoreKind) -> Result<PathBuf> {
+        let base_dir = self
+            .session_dir
+            .clone()
+            .unwrap_or_else(Config::sessions_dir);
+        let base_dir = std::path::absolute(base_dir)?;
+        let configured_cwd = PathBuf::from(self.header.cwd.trim());
+        let cwd = std::path::absolute(configured_cwd)?;
+        let project_session_dir = base_dir.join(encode_cwd(&cwd));
+        let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S%.3fZ");
+        // Preserve the existing filename-safe handling of imported/legacy IDs.
+        let prefix: String = self
+            .header
+            .id
+            .chars()
+            .take(8)
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let short_id = if prefix.trim_matches('_').is_empty() {
+            "session"
+        } else {
+            &prefix
+        };
+        Ok(project_session_dir.join(format!(
+            "{}_{}.{}",
+            timestamp,
+            short_id,
+            store_kind.extension()
+        )))
     }
 
     /// Open an existing session.
@@ -4566,6 +4699,7 @@ impl Session {
                 header,
                 entries,
                 path: None,
+                reserved_path: None,
                 leaf_id: leaf_id.clone(),
                 session_dir: None,
                 store_kind: SessionStoreKind::Jsonl,
@@ -4640,6 +4774,7 @@ impl Session {
             header,
             entries,
             path: Some(path.to_path_buf()),
+            reserved_path: None,
             leaf_id: leaf_id.clone(),
             session_dir: None,
             store_kind: SessionStoreKind::Sqlite,
@@ -5100,27 +5235,7 @@ impl Session {
             }
         }
 
-        let store_kind = match self
-            .path
-            .as_ref()
-            .and_then(|path| path.extension().and_then(|ext| ext.to_str()))
-        {
-            Some("jsonl") => SessionStoreKind::Jsonl,
-            Some("sqlite") => {
-                #[cfg(feature = "sqlite-sessions")]
-                {
-                    SessionStoreKind::Sqlite
-                }
-
-                #[cfg(not(feature = "sqlite-sessions"))]
-                {
-                    return Err(Error::session(
-                        "SQLite session files require building with `--features sqlite-sessions`",
-                    ));
-                }
-            }
-            _ => self.store_kind,
-        };
+        let store_kind = self.persistence_store_kind(self.path.as_deref())?;
 
         // Repair and validate all in-memory header state before creating a
         // session directory or assigning a persistence path. A rejected first
@@ -5139,56 +5254,38 @@ impl Session {
             .map_err(|reason| Error::session(format!("Invalid session header: {reason}")))?;
 
         if self.path.is_none() {
-            // Create a new path
-            let base_dir = self
-                .session_dir
-                .clone()
-                .unwrap_or_else(Config::sessions_dir);
-            let cwd = if self.header.cwd.trim().is_empty() {
-                std::env::current_dir()?
-            } else {
-                let configured_cwd = PathBuf::from(self.header.cwd.trim());
-                if configured_cwd.is_absolute() {
-                    configured_cwd
-                } else {
-                    std::env::current_dir()?.join(configured_cwd)
-                }
-            };
-            let encoded_cwd = encode_cwd(&cwd);
-            let project_session_dir = base_dir.join(&encoded_cwd);
-
-            let directory_to_check = project_session_dir.clone();
+            self.reserve_persistence_path()?;
+            let reserved = self
+                .reserved_path
+                .as_ref()
+                .ok_or_else(|| Error::session("Session filename reservation is missing"))?
+                .path
+                .clone();
+            // The name may have been visible to extensions for an entire
+            // turn. Recheck it before materialization; a new terminal symlink
+            // must not redirect the write or change the published identity.
+            if resolve_session_persistence_path(&reserved)? != reserved {
+                return Err(Error::session(
+                    "Reserved session filename was redirected before its first save",
+                ));
+            }
+            let project_session_dir = reserved
+                .parent()
+                .ok_or_else(|| Error::session("Reserved session filename has no parent"))?;
+            let directory_to_check = project_session_dir.to_path_buf();
             asupersync::runtime::spawn_blocking(move || {
                 ensure_session_directory_creation_access(&directory_to_check)
                     .map_err(|err| Error::Io(Box::new(err)))
             })
             .await?;
-            asupersync::fs::create_dir_all(&project_session_dir).await?;
-
-            let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S%.3fZ");
-            // Robust against malformed/legacy session ids: keep a short, filename-safe suffix.
-            let short_id = {
-                let prefix: String = self
-                    .header
-                    .id
-                    .chars()
-                    .take(8)
-                    .map(|ch| {
-                        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                            ch
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                if prefix.trim_matches('_').is_empty() {
-                    "session".to_string()
-                } else {
-                    prefix
-                }
-            };
-            let filename = format!("{}_{}.{}", timestamp, short_id, store_kind.extension());
-            self.path = Some(project_session_dir.join(filename));
+            asupersync::fs::create_dir_all(project_session_dir).await?;
+            if resolve_session_persistence_path(&reserved)? != reserved {
+                return Err(Error::session(
+                    "Reserved session filename changed during directory creation",
+                ));
+            }
+            self.path = Some(reserved);
+            self.reserved_path = None;
         }
 
         let session_dir_clone = self.session_dir.clone();
@@ -6334,6 +6431,9 @@ impl Session {
     /// separate metadata entry. It never becomes the selected conversation
     /// leaf, and its parent cannot point into an omitted source branch.
     pub fn init_from_fork_plan(&mut self, plan: ForkPlan) {
+        // Fork planning can replace the effective cwd before any transcript
+        // exists. It starts a new identity rather than reusing an earlier hint.
+        self.reserved_path = None;
         self.entries = plan.entries;
         self.leaf_id = plan.leaf_id;
         self.header.cwd = plan.original_cwd;
@@ -8445,6 +8545,7 @@ fn open_jsonl_blocking_with_entry_limit(
             header,
             entries,
             path: Some(path_buf),
+            reserved_path: None,
             leaf_id: leaf_id.clone(),
             session_dir: None,
             store_kind: SessionStoreKind::Jsonl,
@@ -12457,6 +12558,273 @@ mod tests {
         assert!(!serialized.contains(&path.display().to_string()));
         assert!(!serialized.contains(&temp.path().display().to_string()));
         assert_eq!(second_trace.session_path_hash.len(), 16);
+    }
+
+    fn assert_reserved_session_round_trip(store_kind: SessionStoreKind) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions_root = temp.path().join("custom sessions");
+        let project = temp.path().join("configured project");
+        std::fs::create_dir(&project).expect("create configured project");
+        let mut session =
+            Session::create_with_dir_and_store(Some(sessions_root.clone()), store_kind);
+        session.header.cwd = project.display().to_string();
+        session
+            .reserve_persistence_path()
+            .expect("reserve filename");
+        let reserved = session
+            .session_file()
+            .expect("reserved filename")
+            .to_path_buf();
+        assert!(reserved.is_absolute());
+        assert_eq!(
+            reserved.parent(),
+            Some(sessions_root.join(encode_cwd(&project)).as_path())
+        );
+        assert_eq!(
+            reserved.extension().and_then(|s| s.to_str()),
+            Some(store_kind.extension())
+        );
+        assert!(
+            session.path.is_none(),
+            "reservation is not a materialized transcript"
+        );
+        assert!(
+            !sessions_root.exists(),
+            "reservation must not create directories"
+        );
+
+        session.reserve_persistence_path().expect("reuse filename");
+        let cloned = session.clone();
+        assert_eq!(cloned.session_file(), Some(reserved.as_path()));
+        let handle = SessionHandle(Arc::new(AsyncMutex::new(cloned)));
+        let state = run_async(async { handle.get_state().await });
+        assert_eq!(state["sessionFile"], reserved.display().to_string());
+
+        session.append_message(make_test_message(
+            "persist the extension's original identity",
+        ));
+        run_async(async { session.save().await }).expect("first save");
+        assert_eq!(session.path.as_deref(), Some(reserved.as_path()));
+        assert!(session.reserved_path.is_none());
+        let reopened = run_async(async {
+            Session::open(reserved.to_str().expect("UTF-8 fixture filename")).await
+        })
+        .expect("cold reopen");
+        assert_eq!(reopened.session_file(), Some(reserved.as_path()));
+        assert_eq!(reopened.header.id, session.header.id);
+        assert_eq!(reopened.header.cwd, session.header.cwd);
+        assert_eq!(reopened.entries.len(), 1);
+    }
+
+    #[test]
+    fn reserved_jsonl_session_path_survives_first_save_and_cold_open() {
+        assert_reserved_session_round_trip(SessionStoreKind::Jsonl);
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    #[test]
+    fn reserved_sqlite_session_path_survives_first_save_and_cold_open() {
+        assert_reserved_session_round_trip(SessionStoreKind::Sqlite);
+    }
+
+    #[test]
+    fn ephemeral_session_has_no_reserved_persistence_identity() {
+        let session = Session::in_memory();
+        assert!(session.session_file().is_none());
+        let handle = SessionHandle(Arc::new(AsyncMutex::new(session)));
+        let state = run_async(async { handle.get_state().await });
+        assert!(state["sessionFile"].is_null());
+    }
+
+    #[test]
+    fn explicit_relative_session_path_is_anchored_before_extension_exposure() {
+        let _lock = current_dir_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _cwd = CurrentDirGuard::new(temp.path());
+        let mut session = Session::create_with_dir(Some(temp.path().join("index storage")));
+        session.path = Some(PathBuf::from("explicit.jsonl"));
+        session
+            .reserve_persistence_path()
+            .expect("anchor explicit path");
+        let expected = std::env::current_dir().expect("cwd").join("explicit.jsonl");
+        assert_eq!(session.session_file(), Some(expected.as_path()));
+        assert!(
+            session.reserved_path.is_none(),
+            "the explicit path remains authoritative"
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("read untouched root")
+                .count(),
+            0
+        );
+        session.append_message(make_test_message("explicit filename"));
+        run_async(async { session.save().await }).expect("save explicit path");
+        let reopened = run_async(async {
+            Session::open(expected.to_str().expect("UTF-8 explicit path")).await
+        })
+        .expect("reopen absolute path");
+        assert_eq!(reopened.session_file(), Some(expected.as_path()));
+        assert_eq!(session.path.as_deref(), Some(expected.as_path()));
+    }
+
+    #[test]
+    fn reserved_path_rejects_identity_drift_without_creating_storage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions_root = temp.path().join("sessions");
+        let mut session = Session::create_with_dir(Some(sessions_root.clone()));
+        session
+            .reserve_persistence_path()
+            .expect("reserve filename");
+        let original = session
+            .session_file()
+            .expect("reserved filename")
+            .to_path_buf();
+        for changed in ["id", "cwd", "session_dir"] {
+            let mut changed_session = session.clone();
+            match changed {
+                "id" => changed_session.header.id = "different-identity".to_string(),
+                "cwd" => {
+                    changed_session.header.cwd = temp.path().join("other cwd").display().to_string()
+                }
+                "session_dir" => {
+                    changed_session.session_dir = Some(temp.path().join("other sessions"))
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                changed_session.session_file().is_none(),
+                "{changed} must invalidate the hint"
+            );
+            let error = run_async(async { changed_session.save().await })
+                .expect_err("must not silently choose a second filename");
+            assert!(
+                error.to_string().contains("identity changed"),
+                "{changed}: {error}"
+            );
+            assert!(changed_session.path.is_none());
+            assert_eq!(
+                std::fs::read_dir(temp.path())
+                    .expect("read untouched root")
+                    .count(),
+                0
+            );
+        }
+        assert_eq!(session.session_file(), Some(original.as_path()));
+    }
+
+    #[test]
+    fn fork_discards_a_filename_reserved_for_the_previous_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions_root = temp.path().join("sessions");
+        let mut source = Session::create_with_dir(Some(sessions_root.clone()));
+        source.header.cwd = temp.path().join("source workspace").display().to_string();
+        source.append_message(make_test_message("forked conversation"));
+        let plan = source.plan_fork_current_context().expect("fork plan");
+        let mut fork = Session::create_with_dir(Some(sessions_root.clone()));
+        fork.header.cwd = temp.path().join("previous workspace").display().to_string();
+        fork.reserve_persistence_path()
+            .expect("reserve before fork");
+        let previous = fork.session_file().expect("old filename").to_path_buf();
+        fork.init_from_fork_plan(plan);
+        assert!(fork.session_file().is_none());
+        fork.reserve_persistence_path()
+            .expect("reserve fork filename");
+        let fork_path = fork.session_file().expect("fork filename");
+        assert_ne!(fork_path, previous.as_path());
+        assert_eq!(
+            fork_path.parent(),
+            Some(
+                sessions_root
+                    .join(encode_cwd(Path::new(&source.header.cwd)))
+                    .as_path()
+            )
+        );
+        assert_ne!(fork.header.id, source.header.id);
+        assert!(!sessions_root.exists());
+    }
+
+    #[test]
+    fn invalid_session_header_never_materializes_a_reserved_filename() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sessions_root = temp.path().join("sessions");
+        let mut invalid = Session::create_with_dir(Some(sessions_root.clone()));
+        invalid.header.r#type = "note".to_string();
+        invalid
+            .reserve_persistence_path()
+            .expect_err("invalid reservation");
+        assert!(invalid.path.is_none());
+        assert!(invalid.reserved_path.is_none());
+
+        let mut reserved = Session::create_with_dir(Some(sessions_root.clone()));
+        reserved
+            .reserve_persistence_path()
+            .expect("valid reservation");
+        reserved.header.r#type = "note".to_string();
+        run_async(async { reserved.save().await }).expect_err("invalid first save");
+        assert!(reserved.path.is_none());
+        assert!(!sessions_root.exists());
+    }
+
+    #[cfg(not(feature = "sqlite-sessions"))]
+    #[test]
+    fn unsupported_explicit_sqlite_path_cannot_be_reserved() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let explicit = temp.path().join("nested").join("session.sqlite");
+        let mut session = Session::create();
+        session.path = Some(explicit.clone());
+        let error = session
+            .reserve_persistence_path()
+            .expect_err("SQLite feature is required");
+        assert!(error.to_string().contains("sqlite-sessions"));
+        assert_eq!(session.path.as_deref(), Some(explicit.as_path()));
+        assert!(session.reserved_path.is_none());
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("read untouched root")
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reserved_session_path_rejects_a_later_terminal_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut session = Session::create_with_dir(Some(temp.path().join("sessions")));
+        session
+            .reserve_persistence_path()
+            .expect("reserve filename");
+        let reserved = session
+            .session_file()
+            .expect("reserved filename")
+            .to_path_buf();
+        std::fs::create_dir_all(reserved.parent().expect("reserved parent"))
+            .expect("create fixture directory");
+        let unrelated = temp.path().join("unrelated.jsonl");
+        std::fs::write(&unrelated, b"unrelated authoritative bytes\n").expect("write target");
+        symlink(&unrelated, &reserved).expect("replace reserved filename with link");
+        session.append_message(make_test_message("must not redirect"));
+        let error = run_async(async { session.save().await }).expect_err("reject redirection");
+        assert!(
+            error
+                .to_string()
+                .contains("redirected before its first save"),
+            "{error}"
+        );
+        assert!(session.path.is_none());
+        assert_eq!(
+            std::fs::read(&unrelated).expect("read target"),
+            b"unrelated authoritative bytes\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(&reserved)
+                .expect("link metadata")
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -17957,7 +18325,9 @@ mod tests {
         )
         .expect("write header and malformed history");
         assert_eq!(
-            read_persisted_session_header(&path).expect("header only").id,
+            read_persisted_session_header(&path)
+                .expect("header only")
+                .id,
             header.id
         );
 

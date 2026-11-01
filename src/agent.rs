@@ -10363,6 +10363,84 @@ mod extensions_integration_tests {
         });
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn extension_startup_has_a_stable_session_file_without_creating_a_transcript() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            for save_enabled in [true, false] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let base = crate::extensions::safe_canonicalize(temp.path());
+                let cwd = base.join("workspace");
+                let transcripts = base.join("transcripts");
+                std::fs::create_dir_all(&cwd).expect("workspace");
+                let entry = base.join("session_identity.mjs");
+                std::fs::write(&entry, r#"
+                    export default async function init(pi) {
+                        const observed = { factory: (await pi.session('getState', {})).sessionFile };
+                        pi.on('startup', (event, ctx) => {
+                            observed.startup = event.sessionFile;
+                            observed.startupContext = ctx.sessionManager.getSessionFile();
+                        });
+                        pi.on('session_start', (_event, ctx) => {
+                            observed.started = ctx.sessionManager.getSessionFile();
+                        });
+                        pi.registerCommand('session-identity', {
+                            handler: async (_args, ctx) => ({
+                                ...observed, live: ctx.sessionManager.getSessionFile(),
+                            }),
+                        });
+                    }
+                "#).expect("extension");
+                let mut storage = if save_enabled {
+                    Session::create_with_dir(Some(transcripts.clone()))
+                } else {
+                    Session::in_memory()
+                };
+                // The SDK selects this after Session::new. Reserving a name in
+                // the Session constructor would use the wrong project here.
+                storage.header.cwd = cwd.display().to_string();
+                let shared = Arc::new(Mutex::new(storage));
+                let agent = Agent::new(
+                    Arc::new(NoopProvider),
+                    ToolRegistry::new(&[], &cwd, None),
+                    AgentConfig::default(),
+                );
+                let mut session = AgentSession::new(
+                    agent, Arc::clone(&shared), save_enabled,
+                    ResolvedCompactionSettings::default(),
+                );
+                session.enable_extensions(&[], &cwd, None, &[entry]).await
+                    .expect("extension startup");
+                let manager = session.extensions.as_ref().expect("extensions").manager();
+                let observed = manager.execute_command("session-identity", "", 5000).await
+                    .expect("session identity");
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut storage = shared.lock(cx.cx()).await.expect("session lock");
+                let planned = storage.session_file().map(Path::to_path_buf);
+                assert_eq!(planned.is_some(), save_enabled);
+                assert!(storage.path.is_none(), "startup must not mark a transcript persisted");
+                assert!(!transcripts.exists(), "startup must not create session directories");
+                let expected = planned.as_ref().map(|path| path.display().to_string());
+                assert_eq!(observed, json!({
+                    "factory": expected, "startup": expected,
+                    "startupContext": expected, "started": expected, "live": expected,
+                }));
+                if let Some(planned) = planned {
+                    assert!(planned.starts_with(transcripts.join(crate::session::encode_cwd(&cwd))));
+                    storage.set_name("Persistent context-mode identity");
+                    storage.save().await.expect("first save");
+                    assert_eq!(storage.path.as_ref(), Some(&planned));
+                    assert!(planned.is_file());
+                }
+                drop(storage);
+                assert!(manager.shutdown(Duration::from_secs(5)).await);
+            }
+        });
+    }
+
     /// context-mode awaits its MCP bridge in before_agent_start and only then
     /// registers the tools returned by tools/list. A factory-only registry
     /// snapshot misses every one of those tools even though bootstrap succeeds.
@@ -20557,6 +20635,19 @@ impl AgentSession {
             return Ok(());
         }
 
+        // Extensions may key durable state by getSessionFile() during their
+        // factory or session_start hook. Reserve the eventual transcript name
+        // after the host has selected its cwd, without creating an empty file.
+        // Ephemeral sessions must continue to expose no persistence path.
+        if self.save_enabled {
+            let cx = crate::agent_cx::AgentCx::for_request();
+            self.session
+                .lock(cx.cx())
+                .await
+                .map_err(|error| Error::session(error.to_string()))?
+                .reserve_persistence_path()?;
+        }
+
         let resolved_policy = Self::resolve_extension_policy_for_enable(config, policy);
         let resolved_repair_policy = repair_policy
             .or_else(|| config.map(|cfg| cfg.resolve_repair_policy(None)))
@@ -20846,7 +20937,7 @@ impl AgentSession {
                 .lock(cx.cx())
                 .await
                 .map_err(|e| Error::extension(e.to_string()))?;
-            session.path.as_ref().map(|p| p.display().to_string())
+            session.session_file().map(|p| p.display().to_string())
         };
 
         if let Err(err) = manager

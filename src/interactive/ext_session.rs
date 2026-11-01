@@ -366,7 +366,7 @@ impl ExtensionSession for InteractiveExtensionSession {
                 .to_string();
                 (
                     model,
-                    guard.path.as_ref().map(|p| p.display().to_string()),
+                    guard.session_file().map(|p| p.display().to_string()),
                     guard.header.id.clone(),
                     session_name,
                     message_count,
@@ -2140,6 +2140,74 @@ mod tests {
 
             assert_eq!(model_changes, 1);
             assert_eq!(thinking_changes, 1);
+        });
+    }
+
+    #[test]
+    fn get_state_preserves_reserved_session_file_when_classic_bridge_takes_over() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            for save_enabled in [true, false] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let base = crate::extensions::safe_canonicalize(temp.path());
+                let transcripts = base.join("transcripts");
+                let mut stored = if save_enabled {
+                    Session::create_with_dir(Some(transcripts.clone()))
+                } else {
+                    Session::in_memory()
+                };
+                stored.header.cwd = base.display().to_string();
+                if save_enabled {
+                    stored
+                        .reserve_persistence_path()
+                        .expect("reserve startup identity");
+                }
+                let expected = stored.session_file().map(Path::to_path_buf);
+                assert_eq!(expected.is_some(), save_enabled);
+                let session = Arc::new(Mutex::new(stored));
+                let startup = crate::session::SessionHandle(Arc::clone(&session))
+                    .get_state()
+                    .await;
+                let ext_session = InteractiveExtensionSession {
+                    session: Arc::clone(&session),
+                    model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                    model_catalog: test_model_catalog(),
+                    is_streaming: Arc::new(AtomicBool::new(false)),
+                    is_compacting: Arc::new(AtomicBool::new(false)),
+                    config: Config::default(),
+                    save_enabled,
+                    provider_admission: crate::agent::ProviderAdmissionGate::default(),
+                    session_action_admission: SessionActionAdmissionGate::default(),
+                };
+
+                let classic = ext_session.get_state().await;
+                let expected_json = json!(expected.as_ref().map(|path| path.display().to_string()));
+                assert_eq!(startup["sessionFile"], expected_json);
+                assert_eq!(classic["sessionFile"], startup["sessionFile"]);
+                assert_eq!(classic["sessionId"], startup["sessionId"]);
+                assert!(session.try_lock().expect("session lock").path.is_none());
+                assert!(
+                    !transcripts.exists(),
+                    "reading extension state must not materialize a transcript"
+                );
+
+                if let Some(expected) = expected {
+                    let cx = Cx::current().unwrap_or_else(Cx::for_request);
+                    {
+                        let mut stored = session.lock(&cx).await.expect("session lock");
+                        stored.set_name("Classic session identity");
+                        stored.save().await.expect("first transcript save");
+                        assert_eq!(stored.path.as_deref(), Some(expected.as_path()));
+                    }
+                    assert!(expected.is_file());
+                    let persisted = ext_session.get_state().await;
+                    assert_eq!(persisted["sessionFile"], classic["sessionFile"]);
+                    assert_eq!(persisted["sessionId"], classic["sessionId"]);
+                }
+            }
         });
     }
 

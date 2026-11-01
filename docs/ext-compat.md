@@ -172,6 +172,14 @@ Triggers and allocating scalar functions such as `randomblob`, `zeroblob`,
 particular, the optional `mmap_size` optimization used by context-mode is not
 implemented.
 
+Database replacement must also respect the engine's namespace identity records.
+Recovery code that renames only the main database, WAL, and SHM files can leave
+a nonempty FrankenSQLite identity record beside a missing main file. The engine
+then refuses to recreate that database. The bridge does not automatically remove
+these records: a safe replacement requires a guarded generation transition
+before the old file is moved. This limits context-mode's corrupt-database
+rename-and-retry recovery path.
+
 The bridge bounds database handles, SQL/request size, returned rows and bytes,
 page cache, and workers. Each synchronous request reserves 30 seconds for
 processing and at most one additional 30-second native lock-wait allowance,
@@ -491,6 +499,15 @@ adding those injected messages to durable conversation history.
 | `pi.session.setLabel(key, value)` | Set status line labels |
 | `pi.session.getThinkingLevel()` / `setThinkingLevel()` | Thinking mode |
 | `pi.events(op, payload)` | Dispatch lifecycle events |
+
+Persistent agent sessions reserve their eventual transcript filename before
+extension factories, `startup`, and `session_start` run. The session state and
+`ctx.sessionManager.getSessionFile()` expose that same filename before and after
+the first save, so extensions that hash it for database keys retain their
+history on cold resume. The reservation uses the host's effective working
+directory and configured session backend and directory. It creates no session
+directory or transcript; the normal validated save performs those writes.
+Ephemeral (`--no-session`) sessions continue to expose `null`.
 
 ### Host Tools
 

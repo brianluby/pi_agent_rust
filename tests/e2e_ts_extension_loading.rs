@@ -14,6 +14,7 @@ mod common;
 use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
 use pi::extensions_js::PiJsRuntimeConfig;
 use pi::package_manager::{PackageManager, ResolveExtensionSourcesOptions};
+use pi::session::{Session, SessionHandle};
 use pi::tools::ToolRegistry;
 use serde_json::Value;
 use std::sync::Arc;
@@ -918,15 +919,16 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
                 CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id);
             `);
             const insert = db.prepare('INSERT OR IGNORE INTO session_events (session_id, type, data, data_hash) VALUES (?, ?, ?, ?)');
-            const write = db.transaction((type, data) => {
-                insert.run('fixture-session', type, data, data);
-                insert.run('fixture-session', type, data, data);
+            const write = db.transaction((sessionId, type, data) => {
+                insert.run(sessionId, type, data, data);
+                insert.run(sessionId, type, data, data);
             });
             return { db, write };
         }
     "#).unwrap();
     std::fs::write(&entry, r#"
         import { mkdirSync } from 'node:fs';
+        import { createHash } from 'node:crypto';
         import { homedir } from 'node:os';
         import { join } from 'node:path';
         import { openSessionDB } from '../../db.js';
@@ -934,21 +936,34 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
             const directory = join(homedir(), '.pi', 'context-mode', 'sessions');
             mkdirSync(directory, { recursive: true });
             const { db, write } = openSessionDB(join(directory, 'project-fixture.db'));
-            pi.on('session_start', () => write('session_start', 'started'));
-            pi.on('tool_result', (event) => write('tool_result', event.toolName));
+            let sessionId = '';
+            let sessionFile = null;
+            pi.on('session_start', (_event, ctx) => {
+                // context-mode 1.0.169 derives its database key from this path.
+                // A constant fixture ID masks loss of history on cold resume.
+                sessionFile = ctx.sessionManager?.getSessionFile?.();
+                sessionId = sessionFile && typeof sessionFile === 'string'
+                    ? createHash('sha256').update(sessionFile).digest('hex').slice(0, 16)
+                    : `pi-${Date.now()}`;
+                write(sessionId, 'session_start', 'started');
+            });
+            pi.on('tool_result', (event) => write(sessionId, 'tool_result', event.toolName));
             pi.registerCommand('ctx-storage-stats', {
                 description: 'Only registers after persistent SQLite initialization',
                 handler: async () => ({ display: JSON.stringify({
-                    count: db.prepare('SELECT count(*) AS count FROM session_events').get().count,
-                    rows: db.prepare('SELECT type, data FROM session_events ORDER BY id').all(),
+                    sessionFile, sessionId,
+                    count: db.prepare('SELECT count(*) AS count FROM session_events WHERE session_id = ?').get(sessionId).count,
+                    rows: db.prepare('SELECT type, data FROM session_events WHERE session_id = ? ORDER BY id').all(sessionId),
+                    sessionCount: db.prepare('SELECT count(DISTINCT session_id) AS count FROM session_events').get().count,
                 }) }),
             });
             pi.registerCommand('ctx-storage-close', { handler: async () => { db.close(); return { display: 'closed' }; } });
         }
     "#).unwrap();
 
-    let load = || {
+    let load = |session: Arc<asupersync::sync::Mutex<Session>>| {
         let manager = ExtensionManager::new();
+        manager.set_session(Arc::new(SessionHandle(session)));
         let tools = Arc::new(ToolRegistry::new(&[], &workspace, None));
         let mut policy = pi::extensions::ExtensionPolicy::default();
         policy.deny_caps.retain(|cap| cap != "env");
@@ -999,29 +1014,65 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
         common::run_async(async move { manager.dispatch_event(event, data).await }).unwrap();
     };
 
-    let manager = load();
+    let transcripts = base.join("transcripts");
+    let mut fresh_session = Session::create_with_dir(Some(transcripts.clone()));
+    fresh_session.header.cwd = workspace.display().to_string();
+    fresh_session
+        .reserve_persistence_path()
+        .expect("reserve session identity before loading");
+    let session_file = fresh_session
+        .session_file()
+        .expect("future transcript")
+        .to_path_buf();
+    assert!(fresh_session.path.is_none());
+    assert!(
+        !transcripts.exists(),
+        "reserving an identity must not create a transcript"
+    );
+    let shared = Arc::new(asupersync::sync::Mutex::new(fresh_session));
+    let manager = load(Arc::clone(&shared));
     assert_eq!(stats(&manager)["count"], 0);
     dispatch(
         &manager,
         pi::extensions::ExtensionEventName::SessionStart,
         None,
     );
-    assert_eq!(stats(&manager)["count"], 1);
+    let initial = stats(&manager);
+    assert_eq!(initial["count"], 1);
+    assert_eq!(initial["sessionFile"], session_file.display().to_string());
+    assert!(!initial["sessionId"].as_str().unwrap().starts_with("pi-"));
+    common::run_async(async move {
+        let cx = pi::agent_cx::AgentCx::for_request();
+        let mut session = shared.lock(cx.cx()).await.expect("session lock");
+        session.set_name("Durable context-mode session");
+        session.save().await.expect("first native session save");
+    });
+    assert!(session_file.is_file());
     close(manager);
     assert!(
         home.join(".pi/context-mode/sessions/project-fixture.db")
             .is_file()
     );
 
-    let manager = load();
-    assert_eq!(
-        stats(&manager)["rows"],
-        serde_json::json!([{"type":"session_start","data":"started"}])
-    );
+    let reopen_path = session_file.to_str().unwrap().to_string();
+    let reopened = common::run_async(async move { Session::open(&reopen_path).await })
+        .expect("cold native transcript reopen");
+    let manager = load(Arc::new(asupersync::sync::Mutex::new(reopened)));
     dispatch(
         &manager,
         pi::extensions::ExtensionEventName::SessionStart,
         None,
+    );
+    let resumed = stats(&manager);
+    assert_eq!(resumed["sessionId"], initial["sessionId"]);
+    assert_eq!(resumed["sessionFile"], initial["sessionFile"]);
+    assert_eq!(
+        resumed["sessionCount"], 1,
+        "resume must not orphan a second database identity"
+    );
+    assert_eq!(
+        resumed["rows"],
+        serde_json::json!([{"type":"session_start","data":"started"}])
     );
     assert_eq!(
         stats(&manager)["count"],
