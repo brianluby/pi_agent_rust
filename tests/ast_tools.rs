@@ -854,7 +854,7 @@ fn ast_tools_are_gated_behind_tools_flag() {
     let defaults = pi::cli::parse_with_extension_flags(vec!["pi".to_string()])
         .expect("default CLI parse")
         .cli;
-    let names = defaults.enabled_tools();
+    let names = defaults.enabled_tools(&pi::config::Config::default());
     assert!(names.contains(&"ast_grep"));
     assert!(names.contains(&"ast_edit"));
 
@@ -870,7 +870,10 @@ fn ast_tools_are_gated_behind_tools_flag() {
     ])
     .expect("CLI parse with --tools")
     .cli;
-    assert_eq!(cli.enabled_tools(), vec!["read", "ast_grep", "ast_edit"]);
+    assert_eq!(
+        cli.enabled_tools(&pi::config::Config::default()),
+        vec!["read", "ast_grep", "ast_edit"]
+    );
 
     harness.log().info("verify", "--tools gating enforced");
     finish_case(&harness, "ast_tools_are_gated_behind_tools_flag");

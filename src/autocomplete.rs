@@ -76,6 +76,7 @@ impl AutocompleteCatalog {
         let mut skills = resources
             .skills()
             .iter()
+            .filter(|skill| skill.user_invocable)
             .map(|skill| NamedEntry {
                 name: skill.name.clone(),
                 description: Some(skill.description.clone()).filter(|d| !d.trim().is_empty()),

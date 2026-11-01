@@ -1323,3 +1323,442 @@ fn load_failure_then_good_load_succeeds() {
 
     shutdown(&manager);
 }
+
+// Idle progress must be observed outside the actor. Calling execute, dispatch,
+// or PumpOnce while waiting would accidentally drive the very work under test.
+fn observe_idle_json(path: &std::path::Path) -> Result<serde_json::Value, String> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let observation = std::fs::read(path)
+            .map_err(|error| format!("{}: {error}", path.display()))
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()));
+        match observation {
+            Ok(value) => return Ok(value),
+            Err(error) if Instant::now() >= deadline => return Err(error),
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+fn idle_npm_package(
+    harness: &common::TestHarness,
+    name: &str,
+    source: &str,
+) -> JsExtensionLoadSpec {
+    let package = format!("node_modules/{name}");
+    harness.create_file(
+        format!("{package}/package.json"),
+        serde_json::to_vec(&json!({
+            "name": name,
+            "version": "1.0.0",
+            "type": "module",
+            "pi": { "extensions": ["./index.mjs"] },
+        }))
+        .expect("package manifest"),
+    );
+    let entry = harness.create_file(format!("{package}/index.mjs"), source.as_bytes());
+    JsExtensionLoadSpec::from_entry_path(entry).expect("idle extension spec")
+}
+
+fn load_idle_packages(
+    harness: &common::TestHarness,
+    tools: Arc<ToolRegistry>,
+    specs: Vec<JsExtensionLoadSpec>,
+) -> ExtensionManager {
+    let cwd = pi::extensions::safe_canonicalize(harness.temp_dir());
+    let home = cwd.join("home");
+    std::fs::create_dir_all(&home).expect("fixture home");
+    let mut environment = std::collections::HashMap::<String, String>::new();
+    for name in ["PATH", "SystemRoot", "SYSTEMROOT", "WINDIR", "TEMP", "TMP"] {
+        if let Ok(value) = std::env::var(name) {
+            if cfg!(windows) && environment.keys().any(|key| key.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            environment.insert(name.to_string(), value);
+        }
+    }
+    for name in ["HOME", "USERPROFILE"] {
+        environment.insert(name.to_string(), home.display().to_string());
+    }
+    environment.insert("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string());
+    let config = PiJsRuntimeConfig {
+        cwd: cwd.display().to_string(),
+        env: environment,
+        disk_cache_dir: None,
+        repair_mode: pi::extensions_js::RepairMode::Off,
+        ..Default::default()
+    };
+    let mut policy = pi::extensions::ExtensionPolicy::default();
+    policy.deny_caps.retain(|cap| cap != "exec" && cap != "env");
+    policy
+        .default_caps
+        .extend(["exec", "env", "tool"].map(str::to_string));
+    let manager = ExtensionManager::new();
+    let runtime = common::run_async(JsExtensionRuntimeHandle::start_with_policy(
+        config,
+        tools,
+        manager.clone(),
+        policy,
+    ))
+    .expect("start idle runtime");
+    manager.set_js_runtime(runtime);
+    common::run_async({
+        let manager = manager.clone();
+        async move { manager.load_js_extensions(specs).await }
+    })
+    .expect("load idle npm packages");
+    manager
+}
+
+/// A portable real subprocess, selected alone by the idle extension. Ordinary
+/// test discovery returns immediately; child mode echoes stdin until EOF.
+#[test]
+fn idle_stdio_peer() {
+    use std::io::{BufRead as _, Write as _};
+    if std::env::var("PIJS_IDLE_STDIO_PEER").as_deref() != Ok("enabled") {
+        return;
+    }
+    for line in std::io::stdin().lock().lines() {
+        println!("PIJS-IDLE-REPLY:{}", line.expect("idle peer stdin"));
+        std::io::stdout().flush().expect("idle peer stdout");
+    }
+    eprintln!("PIJS-IDLE-EOF");
+}
+
+/// The trigger does not exist until loading has returned. The entire timer,
+/// admitted process exchange, close callback and persistent write must therefore
+/// run while the actor is idle, with no external command helping it progress.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn idle_timer_and_child_callbacks_progress_without_an_external_pump() {
+    let harness = common::TestHarness::new("reliability_idle_stdio");
+    let executable = serde_json::to_string(&std::env::current_exe().expect("test executable"))
+        .expect("serialize executable");
+    let source = format!(
+        r#"
+        import {{ existsSync, mkdirSync, writeFileSync, renameSync }} from 'node:fs';
+        import {{ homedir }} from 'node:os';
+        import {{ dirname, join }} from 'node:path';
+        import {{ fileURLToPath }} from 'node:url';
+        import {{ spawn }} from 'node:child_process';
+        export default function() {{
+            const trigger = join(dirname(fileURLToPath(import.meta.url)), 'start');
+            const directory = join(homedir(), '.pi', 'idle-stdio-fixture');
+            mkdirSync(directory, {{ recursive: true }});
+            const result = join(directory, 'result.json');
+            function persist(value) {{
+                writeFileSync(result + '.tmp', JSON.stringify(value));
+                renameSync(result + '.tmp', result);
+            }}
+            const timer = setInterval(() => {{
+                if (!existsSync(trigger)) return;
+                clearInterval(timer);
+                try {{
+                    const child = spawn({executable},
+                        ['--exact', 'idle_stdio_peer', '--nocapture', '--quiet'],
+                        {{ env: {{ ...process.env, PIJS_IDLE_STDIO_PEER: 'enabled' }}, timeout: 12000 }});
+                    const events = [];
+                    let stdout = '', stderr = '', exits = 0, closes = 0, ended = false;
+                    child.stdout.on('data', chunk => {{ stdout += chunk.toString('utf8'); events.push('stdout'); }});
+                    child.stderr.on('data', chunk => {{ stderr += chunk.toString('utf8'); }});
+                    child.on('error', error => persist({{ error: String(error) }}));
+                    child.on('exit', () => {{ exits++; events.push('exit'); }});
+                    child.on('close', (code, signal) => {{
+                        closes++;
+                        events.push('close');
+                        persist({{ stdout, stderr, exits, closes, ended, events, code, signal }});
+                    }});
+                    child.stdin.end('post-load λ\n', error => {{
+                        if (error) persist({{ error: String(error) }});
+                        else ended = true;
+                    }});
+                }} catch (error) {{ persist({{ error: String(error) }}); }}
+            }}, 10);
+        }}
+        "#
+    );
+    let spec = idle_npm_package(&harness, "idle-stdio-fixture", &source);
+    let manager = load_idle_packages(
+        &harness,
+        Arc::new(ToolRegistry::new(&[], harness.temp_dir(), None)),
+        vec![spec],
+    );
+    let output = harness
+        .temp_dir()
+        .join("home/.pi/idle-stdio-fixture/result.json");
+    assert!(
+        !output.exists(),
+        "no callback may finish before the trigger"
+    );
+    harness.create_file("node_modules/idle-stdio-fixture/start", b"after-load");
+
+    // Capture the result before shutdown, which is itself an actor command.
+    let observed = observe_idle_json(&output);
+    let stopped = common::run_async(async move { manager.shutdown(Duration::from_secs(5)).await });
+    let result =
+        observed.expect("idle timer/process must write a host-visible result before shutdown");
+    assert!(stopped, "idle runtime must shut down cleanly");
+    assert!(result["error"].is_null(), "idle callback failed: {result}");
+    assert!(
+        result["stdout"]
+            .as_str()
+            .expect("child stdout")
+            .contains("PIJS-IDLE-REPLY:post-load λ"),
+        "the real child must echo the pre-admission stdin frame: {result}"
+    );
+    assert!(
+        result["stderr"]
+            .as_str()
+            .expect("child stderr")
+            .contains("PIJS-IDLE-EOF")
+    );
+    assert_eq!(result["code"], 0);
+    assert!(result["signal"].is_null());
+    assert_eq!(result["exits"], 1);
+    assert_eq!(result["closes"], 1);
+    assert_eq!(result["ended"], true);
+    let events = result["events"].as_array().expect("callback order");
+    assert_eq!(events.last(), Some(&json!("close")));
+    assert!(
+        events.iter().position(|event| event == "stdout")
+            < events.iter().position(|event| event == "close")
+    );
+    assert!(
+        events.iter().position(|event| event == "exit")
+            < events.iter().position(|event| event == "close")
+    );
+}
+
+struct IdlePendingTool {
+    started: std::sync::mpsc::Sender<()>,
+    entries: Arc<std::sync::atomic::AtomicUsize>,
+    drops: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct IdlePendingCall(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for IdlePendingCall {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl pi::tools::Tool for IdlePendingTool {
+    fn name(&self) -> &str {
+        "idle_pending"
+    }
+
+    fn label(&self) -> &str {
+        "Idle pending fixture"
+    }
+
+    fn description(&self) -> &str {
+        "Holds a native hostcall future until its owning runtime is canceled"
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        _input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(pi::tools::ToolUpdate) + Send + Sync>>,
+    ) -> pi::error::Result<pi::tools::ToolOutput> {
+        let _call = IdlePendingCall(Arc::clone(&self.drops));
+        self.entries
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.started
+            .send(())
+            .expect("host observes native admission");
+        std::future::pending().await
+    }
+}
+
+/// A pending native dispatch must neither block another realm nor be restarted
+/// on each idle turn. Shutdown must cancel its owned future before acknowledging.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn idle_pending_hostcall_preserves_peer_progress_and_shutdown_cancels_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let harness = common::TestHarness::new("reliability_idle_pending");
+    let blocker = idle_npm_package(
+        &harness,
+        "idle-blocker-fixture",
+        r#"
+        import { existsSync } from 'node:fs';
+        import { dirname, join } from 'node:path';
+        import { fileURLToPath } from 'node:url';
+        export default function(pi) {
+            const trigger = join(dirname(fileURLToPath(import.meta.url)), 'start');
+            const timer = setInterval(() => {
+                if (!existsSync(trigger)) return;
+                clearInterval(timer);
+                pi.tool('idle_pending', {}).catch(() => {});
+            }, 10);
+        }
+        "#,
+    );
+    let peer = idle_npm_package(
+        &harness,
+        "idle-peer-fixture",
+        r#"
+        import { existsSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
+        import { homedir } from 'node:os';
+        import { dirname, join } from 'node:path';
+        import { fileURLToPath } from 'node:url';
+        export default function(pi) {
+            const trigger = join(dirname(fileURLToPath(import.meta.url)), 'start');
+            const directory = join(homedir(), '.pi', 'idle-peer-fixture');
+            mkdirSync(directory, { recursive: true });
+            let ticks = 0;
+            const timer = setInterval(() => {
+                if (!existsSync(trigger)) return;
+                clearInterval(timer);
+                ticks++;
+                const result = join(directory, 'result.json');
+                writeFileSync(result + '.tmp', JSON.stringify({ ticks }));
+                renameSync(result + '.tmp', result);
+            }, 10);
+            pi.registerCommand('idle-peer-state', {
+                handler: async () => ({ display: String(ticks) }),
+            });
+        }
+        "#,
+    );
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let entries = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let tools = Arc::new(ToolRegistry::from_tools(vec![Box::new(IdlePendingTool {
+        started: started_tx,
+        entries: Arc::clone(&entries),
+        drops: Arc::clone(&drops),
+    })]));
+    let manager = load_idle_packages(&harness, tools, vec![blocker, peer]);
+    harness.create_file("node_modules/idle-blocker-fixture/start", b"after-load");
+    let entered = started_rx.recv_timeout(Duration::from_secs(15));
+    let observed = if entered.is_ok() {
+        harness.create_file(
+            "node_modules/idle-peer-fixture/start",
+            b"while-native-call-pending",
+        );
+        observe_idle_json(
+            &harness
+                .temp_dir()
+                .join("home/.pi/idle-peer-fixture/result.json"),
+        )
+    } else {
+        Err("native hostcall did not start while the actor was idle".to_string())
+    };
+    // Only after observing independent idle progress may we send a command.
+    let command = if observed.is_ok() {
+        Some(common::run_async({
+            let manager = manager.clone();
+            async move { manager.execute_command("idle-peer-state", "", 5000).await }
+        }))
+    } else {
+        None
+    };
+    let dropped_before_shutdown = drops.load(Ordering::SeqCst);
+    let stopped = common::run_async(async move { manager.shutdown(Duration::from_secs(5)).await });
+    entered.expect("the idle hostcall must reach the real native Tool");
+    assert_eq!(
+        observed.expect("a pending peer must not block idle timers"),
+        json!({ "ticks": 1 })
+    );
+    assert_eq!(
+        command
+            .expect("peer command attempted")
+            .expect("peer command succeeds")["display"],
+        "1"
+    );
+    assert_eq!(
+        entries.load(Ordering::SeqCst),
+        1,
+        "Pending must retain one invocation, not restart it"
+    );
+    assert_eq!(
+        dropped_before_shutdown, 0,
+        "idle turns must retain the in-flight future"
+    );
+    assert!(stopped, "pending dispatch must not prevent shutdown");
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "shutdown must cancel before acknowledgement"
+    );
+}
+
+/// A retained public handle owns the actor independently of its manager. An
+/// actor-internal manager view held by a pending hostcall must not own it back.
+#[test]
+fn idle_pending_call_lives_until_the_last_public_runtime_handle_is_dropped() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let harness = common::TestHarness::new("reliability_idle_owner_lifetime");
+    let spec = idle_npm_package(
+        &harness,
+        "idle-lifetime-fixture",
+        r#"
+        import { existsSync } from 'node:fs';
+        import { dirname, join } from 'node:path';
+        import { fileURLToPath } from 'node:url';
+        export default function(pi) {
+            const trigger = join(dirname(fileURLToPath(import.meta.url)), 'start');
+            const timer = setInterval(() => {
+                if (!existsSync(trigger)) return;
+                clearInterval(timer);
+                pi.tool('idle_pending', {}).catch(() => {});
+            }, 10);
+        }
+        "#,
+    );
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let entries = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    // The tool retains only its counters and admission signal. Neither it nor
+    // the registry retains a manager or another caller-owned runtime handle.
+    let tools = Arc::new(ToolRegistry::from_tools(vec![Box::new(IdlePendingTool {
+        started: started_tx,
+        entries: Arc::clone(&entries),
+        drops: Arc::clone(&drops),
+    })]));
+    let manager = load_idle_packages(&harness, tools, vec![spec]);
+    harness.create_file("node_modules/idle-lifetime-fixture/start", b"after-load");
+    let entered = started_rx.recv_timeout(Duration::from_secs(15));
+    let handle = manager.js_runtime().expect("public runtime handle");
+    drop(manager);
+
+    let (handle, query) = common::run_async(async move {
+        let query = handle.get_registered_tools().await;
+        (handle, query)
+    });
+    let retained_while_public_handle_exists = drops.load(Ordering::SeqCst);
+    // There is deliberately no shutdown call. The only remaining manager view
+    // is the actor's pending dispatch context, which cannot extend its lifetime.
+    drop(handle);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while drops.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    entered.expect("native hostcall starts before dropping its application owner");
+    assert_eq!(
+        query
+            .expect("public handle remains usable after dropping the manager")
+            .len(),
+        0
+    );
+    assert_eq!(entries.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        retained_while_public_handle_exists, 0,
+        "dropping the manager must not cancel a caller-owned handle"
+    );
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "dropping the last public owner must cancel the pending native future"
+    );
+}

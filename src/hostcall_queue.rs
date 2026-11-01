@@ -861,7 +861,7 @@ impl<T: Clone + QueueTenant> HostcallRequestQueue<T> {
         }
     }
 
-    fn pop_front(&mut self) -> Option<T> {
+    pub(crate) fn pop_front(&mut self) -> Option<T> {
         let value = if let Some(value) = self.fast.pop() {
             value
         } else {

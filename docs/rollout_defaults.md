@@ -27,24 +27,36 @@ Tools are partitioned into two architectural tiers per `xdev` load mode principl
 | `web_search` | `src/web_search.rs` | **Default-On** | Built-in / `--tools` | Multi-provider Search |
 | `lsp` | `src/tools.rs` | **Default-On** | Built-in / LSP server | Code Intelligence |
 | `ast_grep`, `ast_edit` | `src/ast_tools.rs` | **Default-On** | Built-in | Structural Code Refactoring |
-| `subagent` | `src/subagents.rs` | **Opt-in** | `--tools subagent` | Child Agent Delegation |
-| `memory` | `src/tools.rs` | **Opt-in** | `[memory] enable=true` | SQLite Memory Bank |
-| `github` | `src/github.rs` | **Opt-in** | `--tools github` | GitHub CLI Operations |
-| `browser` | `src/browser.rs` | **Opt-in** | `[browser] enable_browser=true` | Headless Chromium Automation |
-| `computer` | `src/computer.rs` | **Opt-in** | `[computer] enable_computer=true` | Desktop OS & Screen Automation |
-| `inspect_image` | `src/media_tools.rs` | **Opt-in** | `[media] enable_media=true` | Vision Image Inspection |
-| `generate_image` | `src/media_tools.rs` | **Opt-in** | `[media] enable_media=true` | Image Generation |
-| `tts` | `src/media_tools.rs` | **Opt-in** | `[media] enable_media=true` | Speech Synthesis |
-| `eval` | `src/eval.rs` | **Opt-in** | `[eval] enable=true` | Python/JS Kernel Execution |
-| `security_scan` | `src/security_scan.rs` | **Opt-in** | `--tools security_scan` | SARIF Security Review |
+| `subagent` | `src/subagents.rs` | **Opt-in** | `tools.enableSubagent: true` or `--tools subagent` | Child Agent Delegation |
+| `memory` | `src/tools.rs` | **Opt-in** | `memory.backend: "local"` or `"cass"` | SQLite Memory Bank |
+| `github` | `src/github.rs` | **Opt-in** | `tools.enableGithub: true` or `--tools github` | GitHub CLI Operations |
+| `browser` | `src/browser.rs` | **Opt-in** | `browser.enableBrowser: true` | Headless Chromium Automation |
+| `computer` | `src/computer.rs` | **Opt-in** | `computer.enableComputer: true` | Desktop OS & Screen Automation |
+| `inspect_image` | `src/media_tools.rs` | **Opt-in** | `media.enableInspectImage: true` | Vision Image Inspection |
+| `generate_image` | `src/media_tools.rs` | **Opt-in** | `media.enableGenerateImage: true` | Image Generation |
+| `tts` | `src/media_tools.rs` | **Opt-in** | `media.enableTts: true` | Speech Synthesis |
+| `eval` | `src/eval.rs` | **Opt-in** | `tools.enableEval: true` or `--tools eval` | Python/JS Kernel Execution |
+| `security_scan` | `src/security_scan.rs` | **Opt-in** | `tools.enableSecurityScan: true` or `--tools security_scan` | SARIF Security Review |
 
 ---
 
 ## 2. Configuration Schema Updates (`docs/settings.md`)
 
-Each opt-in tool family is governed by structured configuration blocks in `~/.config/pi/config.toml` or `.pi/config.toml`:
+Tool settings are JSON objects in `~/.pi/agent/settings.json` or a trusted
+project's `.pi/settings.json`:
 
-- `[media]`: Configures TTS voice, provider, image generation models, and media artifact directories.
-- `[computer]`: Controls desktop automation permissions, screenshot directories, and interactive approval gates.
-- `[browser]`: Configures headless Chromium executable paths, debugging ports, and domain allowlists.
-- `[memory]`: Configures local SQLite vector and fact store paths.
+- `tools`: Enables `eval`, `github`, `security_scan`, and `subagent` through the
+  four default-false activation flags above, and configures per-tool load modes.
+- `media`: Configures TTS voice, provider, image generation models, and media artifact directories.
+- `computer`: Controls desktop automation permissions, screenshot directories, and interactive approval gates.
+- `browser`: Configures headless Chromium executable paths, debugging ports, and domain allowlists.
+- `memory`: Configures local SQLite vector and fact store paths.
+
+The four `tools.enable*` flags also accept snake_case spellings. They add tools
+to the existing default selection only when `--tools` is absent. An explicit
+`--tools` list overrides them, and `--no-tools` wins over both. Trusted project
+flags merge individually over global flags; an untrusted project contributes
+none of these settings. Load modes alone never activate optional tools, and
+activation preserves existing permission checks and child-agent allowlists.
+`PI_CONFIG_PATH` retains the explicit single-file override. See the
+[settings reference](settings.md#optional-tools) for examples and precedence.

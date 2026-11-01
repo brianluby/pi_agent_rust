@@ -236,7 +236,7 @@ pub(super) async fn load(
             .map_err(|error| HistoryError::invalid(format!("Cannot arm prewalk: {error}")))?;
         let mcp_state = super::mcp::prepare(
             &cwd,
-            &crate::config::Config::global_dir(),
+            &state.global_dir,
             supplied.unwrap_or_default(),
         );
         if let (Some(agent), Some(mcp_state)) = (state.agent_session.as_mut(), mcp_state.as_ref()) {
@@ -350,6 +350,9 @@ pub(super) async fn fork(
     } else {
         None
     };
+    let options = options.for_workspace(&cwd).map_err(|error| {
+        HistoryError::invalid(format!("Cannot load fork workspace settings: {error}"))
+    })?;
     // Use the same action-before-store order as native session mutations.
     // The source remains admitted after this snapshot guard is released.
     let actions = handle.map(|handle| handle.session().session_action_admission_gate());
@@ -450,16 +453,16 @@ pub(super) async fn fork(
         candidate,
         save_enabled,
         cwd.clone(),
-        options,
+        &options,
         Some(permission_client),
         budget.clone(),
     )
     .map_err(|error| HistoryError::internal(format!("Cannot build forked session: {error}")))?;
-    state.mcp = super::mcp::prepare(&cwd, &crate::config::Config::global_dir(), servers);
+    state.mcp = super::mcp::prepare(&cwd, &state.global_dir, servers);
     if let (Some(agent), Some(mcp)) = (state.agent_session.as_mut(), state.mcp.as_ref()) {
         super::mcp::mount(agent.session_mut(), mcp);
     }
-    super::arm_acp_prewalk(&mut state, options)
+    super::arm_acp_prewalk(&mut state, &options)
         .await
         .map_err(|error| HistoryError::invalid(format!("Cannot arm fork prewalk: {error}")))?;
     let fork_handle = state
@@ -1043,6 +1046,7 @@ mod tests {
         let registry = crate::models::ModelRegistry::load(&auth, None);
         let entry = registry.find("anthropic", "claude-sonnet-4-5").unwrap();
         AcpOptions {
+            settings_source: None,
             launch: crate::acp::AcpLaunchOptions::default(),
             config: crate::config::Config::default(),
             available_models: vec![entry],
@@ -1069,6 +1073,143 @@ mod tests {
         timeout(wall_now(), Duration::from_secs(30), Box::pin(work))
             .await
             .expect("ACP fork lifecycle watchdog expired")
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn restored_and_forked_acp_sessions_resolve_workspace_trust_again() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(bounded_fork(async {
+            let root = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let cwd = project.path().canonicalize().unwrap();
+            let global_dir = root.path().join("global");
+            let launch_cwd = root.path().join("launch");
+            std::fs::create_dir_all(&global_dir).unwrap();
+            std::fs::create_dir_all(&launch_cwd).unwrap();
+            std::fs::create_dir_all(cwd.join(".pi")).unwrap();
+            let settings = cwd.join(".pi/settings.json");
+            std::fs::write(&settings, r#"{"tools":{"enableGithub":true}}"#).unwrap();
+            let surface = crate::workspace_trust::WorkspaceTrustSurface::scan(&cwd)
+                .unwrap()
+                .unwrap();
+            let mut trust = crate::workspace_trust::WorkspaceTrustStore::load(
+                &global_dir.join(crate::workspace_trust::TRUST_STORE_FILE),
+            );
+            trust
+                .record(
+                    &crate::workspace_trust::workspace_key(&cwd),
+                    &surface.digest,
+                    crate::workspace_trust::TrustDecision::Trusted,
+                )
+                .unwrap();
+            let mut options = test_options(root.path(), runtime.handle());
+            options.config = serde_json::from_value(json!({
+                "tools": {
+                    "enableEval": true,
+                    "enableGithub": true,
+                    "enableSecurityScan": true,
+                    "enableSubagent": true
+                }
+            }))
+            .unwrap();
+            options.settings_source = Some(super::super::AcpSettingsSource {
+                global_dir: global_dir.clone(),
+                config_override: None,
+                workspace_trust_env: None,
+                launch_cwd,
+            });
+            options.launch.no_context_files = true;
+            options.launch.system_prompt = Some("ACP saved workspace fixture".into());
+            let mut saved = fixture(root.path(), &cwd);
+            saved.save().await.unwrap();
+            let id = saved.header.id.clone();
+            let params = json!({ "sessionId": id, "cwd": cwd, "mcpServers": [] });
+            let sessions = Arc::new(Mutex::new(HashMap::new()));
+            let cx = AgentCx::for_testing();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let out = AcpOutput::new(tx);
+            let client = fork_client(&out, &cx);
+            load(&params, &options, &client, &sessions, &cx, &out, false)
+                .await
+                .unwrap();
+            let original = sessions.lock(&cx).await.unwrap().get(&id).unwrap().clone();
+            {
+                let state = original.lock(&cx).await.unwrap();
+                let agent = state.agent_session.as_ref().unwrap();
+                assert!(agent.has_tool("github"));
+                for name in ["eval", "security_scan", "subagent"] {
+                    assert!(!agent.has_tool(name), "launch workspace leaked {name}");
+                }
+                assert_eq!(state.global_dir, global_dir);
+            }
+
+            std::fs::write(&settings, r#"{"tools":{"enableGithub":false}}"#).unwrap();
+            // Reattachment preserves a live session's original admission.
+            load(&params, &options, &client, &sessions, &cx, &out, false)
+                .await
+                .unwrap();
+            let reattached = sessions.lock(&cx).await.unwrap().get(&id).unwrap().clone();
+            assert!(Arc::ptr_eq(&original, &reattached));
+            assert!(
+                reattached
+                    .lock(&cx)
+                    .await
+                    .unwrap()
+                    .agent_session
+                    .as_ref()
+                    .unwrap()
+                    .has_tool("github")
+            );
+
+            let forked = fork(&params, &options, &client, &sessions, &cx, &out)
+                .await
+                .unwrap();
+            let fork_id = forked["sessionId"].as_str().unwrap();
+            let fork_state = sessions
+                .lock(&cx)
+                .await
+                .unwrap()
+                .get(fork_id)
+                .unwrap()
+                .clone();
+            {
+                let state = fork_state.lock(&cx).await.unwrap();
+                let agent = state.agent_session.as_ref().unwrap();
+                for name in ["eval", "github", "security_scan", "subagent"] {
+                    assert!(!agent.has_tool(name), "untrusted fork gained {name}");
+                }
+                assert_eq!(state.global_dir, global_dir);
+            }
+            // A cold reopen re-evaluates the changed digest too.
+            let cold_sessions = Arc::new(Mutex::new(HashMap::new()));
+            load(&params, &options, &client, &cold_sessions, &cx, &out, false)
+                .await
+                .unwrap();
+            let cold = cold_sessions
+                .lock(&cx)
+                .await
+                .unwrap()
+                .get(&id)
+                .unwrap()
+                .clone();
+            {
+                let cold = cold.lock(&cx).await.unwrap();
+                for name in ["eval", "github", "security_scan", "subagent"] {
+                    assert!(!cold.agent_session.as_ref().unwrap().has_tool(name));
+                }
+            }
+            assert!(
+                original
+                    .lock(&cx)
+                    .await
+                    .unwrap()
+                    .agent_session
+                    .as_ref()
+                    .unwrap()
+                    .has_tool("github")
+            );
+        }));
     }
 
     #[test]
@@ -1534,6 +1675,8 @@ mod tests {
                 Arc::new(Mutex::new(super::super::AcpSessionState {
                     agent_session: None,
                     cwd: cwd.clone(),
+                    config: Arc::new(crate::config::Config::default()),
+                    global_dir: root.path().to_path_buf(),
                     mcp: None,
                     available_models: Vec::new(),
                 })),
@@ -2072,6 +2215,7 @@ mod tests {
             let registry = crate::models::ModelRegistry::load(&auth, None);
             let entry = registry.find("anthropic", "claude-sonnet-4-5").unwrap();
             let options = AcpOptions {
+                settings_source: None,
                 launch: crate::acp::AcpLaunchOptions::default(),
                 config: crate::config::Config::default(),
                 available_models: vec![entry],

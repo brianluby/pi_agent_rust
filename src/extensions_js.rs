@@ -60,6 +60,12 @@ use swc_ecma_parser::{Parser as SwcParser, StringInput, Syntax, TsSyntax};
 use swc_ecma_transforms_base::resolver;
 use swc_ecma_transforms_typescript::strip;
 
+mod executable;
+mod process_session;
+mod sqlite;
+#[path = "extensions_js_storage.rs"]
+mod storage;
+
 macro_rules! compressed_js_literal {
     ($source:expr) => {{
         const RAW_LEN: usize = ($source).len();
@@ -77,47 +83,16 @@ macro_rules! compressed_js_literal {
 // ============================================================================
 
 use crate::extensions::{
-    ExecMediationResult, ExtensionPolicy, ExtensionPolicyMode, SecretBrokerPolicy,
-    SessionActionOrigin, evaluate_exec_mediation,
+    ExecMediationResult, ExtensionPolicy, SecretBrokerPolicy, SessionActionOrigin,
+    evaluate_exec_mediation,
 };
 
 /// Helper to check `exec` capability for sync execution where we cannot prompt.
 fn check_exec_capability(policy: &ExtensionPolicy, extension_id: Option<&str>) -> bool {
-    let cap = "exec";
-
-    // 1. Per-extension overrides
-    if let Some(id) = extension_id
-        && let Some(override_config) = policy.per_extension.get(id)
-    {
-        if override_config.deny.iter().any(|c| c == cap) {
-            return false;
-        }
-        if override_config.allow.iter().any(|c| c == cap) {
-            return true;
-        }
-        if let Some(mode) = override_config.mode {
-            return match mode {
-                ExtensionPolicyMode::Permissive => true,
-                ExtensionPolicyMode::Strict | ExtensionPolicyMode::Prompt => false, // Prompt = deny for sync
-            };
-        }
-    }
-
-    // 2. Global deny
-    if policy.deny_caps.iter().any(|c| c == cap) {
-        return false;
-    }
-
-    // 3. Global allow (default_caps)
-    if policy.default_caps.iter().any(|c| c == cap) {
-        return true;
-    }
-
-    // 4. Mode fallback
-    match policy.mode {
-        ExtensionPolicyMode::Permissive => true,
-        ExtensionPolicyMode::Strict | ExtensionPolicyMode::Prompt => false, // Prompt = deny for sync
-    }
+    // Use the same precedence and case normalization as asynchronous exec.
+    // In particular, a per-extension allow cannot override a global deny.
+    // Synchronous calls have no prompt channel, so Prompt also fails closed.
+    policy.evaluate_for("exec", extension_id).decision == crate::extensions::PolicyDecision::Allow
 }
 
 /// Determine whether an environment variable is safe to expose to extensions.
@@ -129,6 +104,48 @@ pub fn is_env_var_allowed(key: &str) -> bool {
     // is_secret returns true if it IS a secret (should be blocked).
     // So we allow it if it is NOT a secret.
     !policy.is_secret(key)
+}
+
+fn configured_environment_value<'a>(
+    environment: &'a HashMap<String, String>,
+    key: &str,
+    windows: bool,
+) -> Option<&'a str> {
+    if windows {
+        // Synthetic host snapshots can contain aliases that the Windows OS
+        // environment would treat as one binding. Use the same winner for
+        // every spelling, independent of HashMap iteration or the query case.
+        environment
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(key))
+            .min_by(|(left, _), (right, _)| left.cmp(right))
+            .map(|(_, value)| value.as_str())
+    } else {
+        environment.get(key).map(String::as_str)
+    }
+}
+
+fn uses_windows_environment(environment: &HashMap<String, String>) -> bool {
+    configured_environment_value(environment, "PI_PLATFORM", cfg!(windows)).map_or(
+        cfg!(windows),
+        |platform| {
+            matches!(
+                platform.to_ascii_lowercase().as_str(),
+                "win32" | "windows" | "windows_nt" | "msys" | "cygwin"
+            )
+        },
+    )
+}
+
+fn normalize_windows_environment_snapshot(environment: &mut HashMap<String, String>) {
+    let mut entries: Vec<_> = std::mem::take(environment).into_iter().collect();
+    entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    let mut names = HashSet::new();
+    for (name, value) in entries {
+        if names.insert(name.to_ascii_uppercase()) {
+            environment.insert(name, value);
+        }
+    }
 }
 
 fn parse_truthy_flag(value: &str) -> bool {
@@ -144,8 +161,8 @@ fn is_global_compat_scan_mode() -> bool {
 }
 
 fn is_compat_scan_mode(env: &HashMap<String, String>) -> bool {
-    env.get("PI_EXT_COMPAT_SCAN")
-        .map_or_else(is_global_compat_scan_mode, |value| parse_truthy_flag(value))
+    configured_environment_value(env, "PI_EXT_COMPAT_SCAN", uses_windows_environment(env))
+        .map_or_else(is_global_compat_scan_mode, parse_truthy_flag)
 }
 
 /// Compatibility-mode fallback values for environment-gated extension registration.
@@ -4966,6 +4983,9 @@ struct PiJsModuleState {
     /// workspace-boundary checks, but never grant filesystem or resolver
     /// access to this runtime.
     foreign_extension_root_boundaries_by_id: HashMap<String, Vec<PathBuf>>,
+    /// Host-granted persistent data directories, deliberately excluded from
+    /// executable module resolution and missing-asset repair.
+    persistent_storage: storage::PersistentStorage,
     /// Shared handle for recording repair events from the resolver.
     repair_events: Arc<std::sync::Mutex<Vec<ExtensionRepairEvent>>>,
     /// Directory for persistent transpiled-source disk cache.
@@ -5016,6 +5036,7 @@ impl PiJsModuleState {
             extension_roots_by_id: HashMap::new(),
             extension_roots_without_id: Vec::new(),
             foreign_extension_root_boundaries_by_id: HashMap::new(),
+            persistent_storage: storage::PersistentStorage::default(),
             repair_events: Arc::new(std::sync::Mutex::new(Vec::new())),
             disk_cache_dir: None,
             compiled_sources_bytes: 0,
@@ -5279,6 +5300,22 @@ fn path_is_in_workspace_or_registered_extension_root(
     let checked_path = crate::extensions::safe_canonicalize(path);
     checked_path.starts_with(workspace_root)
         || path_is_in_registered_extension_root(&checked_path, module_state)
+        || module_state.borrow().persistent_storage.is_registered(path)
+        || module_state
+            .borrow()
+            .persistent_storage
+            .is_registered(&checked_path)
+}
+
+fn persistent_storage_path(
+    path: &Path,
+    extension_id: Option<&str>,
+    module_state: &Rc<RefCell<PiJsModuleState>>,
+) -> std::io::Result<Option<PathBuf>> {
+    module_state
+        .borrow()
+        .persistent_storage
+        .resolve(path, extension_id)
 }
 
 fn path_is_in_leaf_allowed_extension_root(
@@ -5309,6 +5346,19 @@ fn path_is_allowed_extension_fs_path(
     module_state: &Rc<RefCell<PiJsModuleState>>,
     fallback_roots: &Arc<std::sync::Mutex<Vec<PathBuf>>>,
 ) -> bool {
+    let checked_path = crate::extensions::safe_canonicalize(path);
+    if module_state.borrow().persistent_storage.is_registered(path)
+        || module_state
+            .borrow()
+            .persistent_storage
+            .is_registered(&checked_path)
+    {
+        return module_state
+            .borrow()
+            .persistent_storage
+            .allows(path, extension_id, "read");
+    }
+    let path = checked_path.as_path();
     let in_owned_root =
         path_is_in_allowed_extension_root(path, extension_id, module_state, fallback_roots);
     if path_is_in_registered_extension_root(path, module_state) {
@@ -5652,7 +5702,12 @@ fn generate_proxy_stub_module(spec: &str, named_exports: &BTreeSet<String>) -> S
         r"// Auto-generated npm proxy stub (Pattern 4) for {spec_literal}
 const __pkg = {spec_literal};
 const __handler = {{
-  get(_target, prop) {{
+  get(target, prop) {{
+    const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+    if (descriptor && !descriptor.configurable) {{
+      if ('value' in descriptor && !descriptor.writable) return descriptor.value;
+      if ('get' in descriptor && descriptor.get === undefined) return undefined;
+    }}
     if (typeof prop === 'symbol') {{
       if (prop === Symbol.toPrimitive) return () => '';
       return undefined;
@@ -5668,10 +5723,10 @@ const __handler = {{
   }},
   apply() {{ return __stub; }},
   construct() {{ return __stub; }},
-  has() {{ return false; }},
-  ownKeys() {{ return []; }},
-  getOwnPropertyDescriptor() {{
-    return {{ configurable: true, enumerable: false }};
+  has(target, prop) {{ return Reflect.has(target, prop); }},
+  ownKeys(target) {{ return Reflect.ownKeys(target); }},
+  getOwnPropertyDescriptor(target, prop) {{
+    return Reflect.getOwnPropertyDescriptor(target, prop);
   }},
 }};
 const __stub = new Proxy(function __pijs_noop() {{}}, __handler);
@@ -5899,7 +5954,12 @@ impl JsModuleResolver for PiJsResolver {
                 ));
             }
 
-            return Ok(canonical.to_string_lossy().replace('\\', "/"));
+            let name = canonical.to_string_lossy();
+            return Ok(if cfg!(windows) {
+                name.replace('\\', "/")
+            } else {
+                name.into_owned()
+            });
         }
 
         // Pattern 3 (bd-k5q5.8.4): monorepo sibling module stubs.
@@ -6150,7 +6210,7 @@ fn compile_module_source(
 /// The source file metadata can remain unchanged across a Pi upgrade while the
 /// transformed output changes. Versioning the key prevents a newer binary from
 /// reusing stale compiled JavaScript emitted by an older compiler pipeline.
-const COMPILED_MODULE_CACHE_VERSION: u8 = 4;
+const COMPILED_MODULE_CACHE_VERSION: u8 = 5;
 
 fn module_cache_key(
     static_virtual_modules: &HashMap<String, String>,
@@ -6238,6 +6298,18 @@ fn load_compiled_module_source(
     state: &mut PiJsModuleState,
     name: &str,
 ) -> rquickjs::Result<Vec<u8>> {
+    if !state.static_virtual_modules.contains_key(name)
+        && !state.dynamic_virtual_modules.contains_key(name)
+        && (state.persistent_storage.is_registered(Path::new(name))
+            || state
+                .persistent_storage
+                .is_registered(&crate::extensions::safe_canonicalize(Path::new(name))))
+    {
+        return Err(rquickjs::Error::new_loading_message(
+            name,
+            "Persistent application storage is data-only and cannot be imported as executable code",
+        ));
+    }
     let cache_key = module_cache_key(
         &state.static_virtual_modules,
         &state.dynamic_virtual_modules,
@@ -6372,21 +6444,59 @@ impl Default for WarmIsolatePool {
 }
 
 fn prefix_import_meta_url(module_name: &str, body: &str) -> Vec<u8> {
-    let url = if module_name.starts_with('/') {
-        format!("file://{module_name}")
-    } else if module_name.starts_with("file://") {
+    let url = if module_name.starts_with("file:") {
         module_name.to_string()
+    } else if let Ok(url) = url::Url::from_file_path(module_name) {
+        url.to_string()
+    } else if module_name.starts_with('/') {
+        let mut url = url::Url::parse("file:///").expect("static file URL");
+        url.set_path(module_name);
+        url.to_string()
     } else if module_name.len() > 2
         && module_name.as_bytes()[1] == b':'
+        && module_name.as_bytes()[0].is_ascii_alphabetic()
         && (module_name.as_bytes()[2] == b'/' || module_name.as_bytes()[2] == b'\\')
     {
-        // Windows absolute path: `C:/Users/...` or `C:\Users\...`
-        format!("file:///{module_name}")
+        // Also encode Windows paths correctly in host-independent diagnostics.
+        let mut url = url::Url::parse("file:///").expect("static file URL");
+        url.set_path(&format!("/{}", module_name.replace('\\', "/")));
+        url.to_string()
     } else {
         format!("pi://{module_name}")
     };
     let url_literal = serde_json::to_string(&url).unwrap_or_else(|_| "\"\"".to_string());
     format!("import.meta.url = {url_literal};\n{body}").into_bytes()
+}
+
+fn module_path_from_file_url(specifier: &str) -> Option<PathBuf> {
+    let url = url::Url::parse(specifier).ok()?;
+    if url.scheme() != "file" || url.query().is_some() || url.fragment().is_some() {
+        // Module identity is a canonical path in PiJS. Do not silently merge
+        // distinct query/fragment module instances into that cache identity.
+        return None;
+    }
+    let encoded = url.path().as_bytes();
+    let mut index = 0;
+    while index < encoded.len() {
+        if encoded[index] == b'%' {
+            let hex = encoded.get(index + 1..index + 3)?;
+            let high = char::from(hex[0]).to_digit(16)?;
+            let low = char::from(hex[1]).to_digit(16)?;
+            let decoded = high * 16 + low;
+            if decoded == 0
+                || decoded == u32::from(b'/')
+                || (cfg!(windows) && decoded == u32::from(b'\\'))
+            {
+                return None;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    let path = url.to_file_path().ok()?;
+    path.to_str()?;
+    Some(path)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6401,11 +6511,14 @@ fn resolve_module_path(
         return None;
     }
 
-    if let Some(path) = specifier.strip_prefix("file://") {
+    if specifier
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+    {
         if canonical_roots.is_empty() {
             return None;
         }
-        let path_buf = PathBuf::from(path);
+        let path_buf = module_path_from_file_url(specifier)?;
         let canonical = crate::extensions::safe_canonicalize(&path_buf);
         let allowed = canonical_roots
             .iter()
@@ -7033,13 +7146,84 @@ fn source_declares_binding(source: &str, name: &str) -> bool {
     false
 }
 
-/// Extract static `require("specifier")` calls from JavaScript source.
+/// Extract free static `require("specifier")` calls from JavaScript source.
 ///
-/// This scanner is intentionally lexical: it ignores matches inside comments
-/// and string/template literals so code-generation strings like
-/// `` `require("pkg/path").default` `` do not become false-positive imports.
-#[allow(clippy::too_many_lines)]
+/// A locally bound require, including createRequire inside a function, owns
+/// its own resolution and conditional execution. Hoisting those calls would
+/// load inactive platform dependencies before their guards can run.
 fn extract_static_require_specifiers(source: &str) -> Vec<String> {
+    scoped_static_require_specifiers(source)
+        .unwrap_or_else(|| lexical_static_require_specifiers(source))
+}
+
+fn scoped_static_require_specifiers(source: &str) -> Option<Vec<String>> {
+    use swc_ecma_ast::{CallExpr, Callee, Expr, Lit};
+    use swc_ecma_visit::{Visit, VisitWith as _};
+
+    struct RequireCollector {
+        unresolved: Mark,
+        seen: HashSet<String>,
+        specifiers: Vec<String>,
+    }
+
+    impl Visit for RequireCollector {
+        fn visit_call_expr(&mut self, call: &CallExpr) {
+            call.visit_children_with(self);
+            let Callee::Expr(callee) = &call.callee else {
+                return;
+            };
+            let Expr::Ident(identifier) = callee.as_ref() else {
+                return;
+            };
+            if identifier.sym.as_ref() != "require"
+                || !identifier.ctxt.has_mark(self.unresolved)
+                || call.args.len() != 1
+                || call.args[0].spread.is_some()
+            {
+                return;
+            }
+            let Expr::Lit(Lit::Str(literal)) = call.args[0].expr.as_ref() else {
+                return;
+            };
+            let specifier = literal.value.to_string_lossy().into_owned();
+            if self.seen.insert(specifier.clone()) {
+                self.specifiers.push(specifier);
+            }
+        }
+    }
+
+    GLOBALS.set(&Globals::new(), || {
+        let cm: Lrc<SourceMap> = Lrc::default();
+        let file = cm.new_source_file(
+            FileName::Custom("pijs-require-analysis.js".to_string()).into(),
+            source.to_string(),
+        );
+        let mut parser = SwcParser::new(
+            Syntax::Es(Default::default()),
+            StringInput::from(&*file),
+            None,
+        );
+        let module = parser.parse_module().ok()?;
+        if !parser.take_errors().is_empty() {
+            return None;
+        }
+        let unresolved = Mark::new();
+        let mut program = SwcProgram::Module(module);
+        resolver(unresolved, Mark::new(), false).process(&mut program);
+        let mut collector = RequireCollector {
+            unresolved,
+            seen: HashSet::new(),
+            specifiers: Vec::new(),
+        };
+        program.visit_with(&mut collector);
+        Some(collector.specifiers)
+    })
+}
+
+/// Preserve the existing lexical fallback for source accepted only after the
+/// legacy syntax repair pass. Valid JavaScript always uses scope analysis.
+#[allow(clippy::too_many_lines)]
+fn lexical_static_require_specifiers(source: &str) -> Vec<String> {
     const REQUIRE: &[u8] = b"require";
 
     let bytes = source.as_bytes();
@@ -7243,7 +7427,7 @@ fn is_native_addon_require(specifier: &str) -> bool {
 ///    for require targets and a `require()` function, preserving existing ESM
 #[allow(clippy::too_many_lines)]
 fn maybe_cjs_to_esm(source: &str) -> String {
-    let has_require = source.contains("require(");
+    let has_require = source.contains("require");
     let has_module_exports = source.contains("module.exports")
         || source.contains("module[\"exports\"]")
         || source.contains("module['exports']");
@@ -7313,8 +7497,7 @@ fn maybe_cjs_to_esm(source: &str) -> String {
             "function require(s) {\n\
              \x20 const m = __cjs_req_map[s];\n\
              \x20 if (!m) throw new Error('Cannot find module: ' + s);\n\
-             \x20 return m.default !== undefined && typeof m.default === 'object' \
-                  ? m.default : m;\n\
+             \x20 return Object.prototype.hasOwnProperty.call(m, 'default') ? m.default : m;\n\
              }\n",
         );
     }
@@ -7325,25 +7508,31 @@ fn maybe_cjs_to_esm(source: &str) -> String {
     let has_exports_binding = source_declares_binding(source, "exports");
     let needs_filename = has_filename_refs && !has_filename_binding;
     let needs_dirname = has_dirname_refs && !has_dirname_binding;
-    let needs_module = (has_module_exports || has_exports_usage) && !has_module_binding;
+    let exports_cjs_default =
+        !has_export_default && (!has_esm || has_module_exports || has_exports_usage);
+    let needs_module =
+        (has_module_exports || has_exports_usage || exports_cjs_default) && !has_module_binding;
     let needs_exports = (has_module_exports || has_exports_usage) && !has_exports_binding;
 
+    if needs_filename || needs_dirname {
+        output.push_str("import { fileURLToPath as __cjs_file_url_to_path } from 'node:url';\n");
+    }
+    if needs_dirname {
+        output.push_str("import { dirname as __cjs_path_dirname } from 'node:path';\n");
+    }
     if needs_filename || needs_dirname || needs_module || needs_exports {
         // Provide CJS compatibility globals only for bindings not declared by source.
         if needs_filename {
             output.push_str(
                 "const __filename = (() => {\n\
-                 \x20 try { return new URL(import.meta.url).pathname || ''; } catch { return ''; }\n\
+                 \x20 return __cjs_file_url_to_path(import.meta.url);\n\
                  })();\n",
             );
         }
         if needs_dirname {
             output.push_str(
                 "const __dirname = (() => {\n\
-                 \x20 try {\n\
-                 \x20\x20 const __pi_pathname = new URL(import.meta.url).pathname || '';\n\
-                 \x20\x20 return __pi_pathname ? __pi_pathname.replace(/[/\\\\][^/\\\\]*$/, '') : '.';\n\
-                 \x20 } catch { return '.'; }\n\
+                 \x20 return __cjs_path_dirname(__cjs_file_url_to_path(import.meta.url));\n\
                  })();\n",
             );
         }
@@ -7372,7 +7561,7 @@ fn maybe_cjs_to_esm(source: &str) -> String {
         }
     }
 
-    if !has_export_default && (!has_esm || has_module_exports || has_exports_usage) {
+    if exports_cjs_default {
         // Export CommonJS entrypoint for loaders that require a default init fn.
         output.push_str("export default module.exports;\n");
     }
@@ -7877,7 +8066,7 @@ for (let i = 0; i < _numCpus; i++) _cpus.push({{ model: "cpu", speed: 2400, time
 export function homedir() {{
   const env_home =
     globalThis.pi && globalThis.pi.env && typeof globalThis.pi.env.get === "function"
-      ? globalThis.pi.env.get("HOME")
+      ? globalThis.pi.env.get("HOME") || globalThis.pi.env.get("USERPROFILE")
       : undefined;
   return env_home || _homedir;
 }}
@@ -7949,6 +8138,7 @@ fn read_proc_uid_gid() -> Option<(u32, u32)> {
 #[allow(clippy::too_many_lines)]
 fn default_virtual_modules() -> HashMap<String, String> {
     let mut modules = HashMap::new();
+    modules.insert("bun:sqlite".to_string(), sqlite::MODULE_SOURCE.to_string());
 
     // Some extensions import Agent unconditionally but feature-detect native
     // Undici before using it. Keep that import resolvable without advertising
@@ -9819,7 +10009,7 @@ export function copyToClipboard(_text) {
 export function getAgentDir() {
   const home =
     globalThis.pi && globalThis.pi.env && typeof globalThis.pi.env.get === "function"
-      ? globalThis.pi.env.get("HOME")
+      ? globalThis.pi.env.get("HOME") || globalThis.pi.env.get("USERPROFILE")
       : undefined;
   return home ? `${home}/.pi/agent` : "/home/unknown/.pi/agent";
 }
@@ -11224,7 +11414,9 @@ export default nativePath;
         "node:child_process".to_string(),
         compressed_js_literal!(r#"
 const __pi_child_process_state = {
-  nextPid: 1000,
+  // Native process IDs are u32. Provisional handles must never collide with
+  // an admitted child's PID while another spawn is still awaiting admission.
+  nextPid: 0x100000000,
   children: new Map(),
 };
 
@@ -11282,7 +11474,7 @@ function __emitCloseOnce(child, code, signal = null) {
 
 function __parseSpawnOptions(raw) {
   const options = raw && typeof raw === "object" ? raw : {};
-  const allowed = new Set(["cwd", "detached", "shell", "stdio", "timeout"]);
+  const allowed = new Set(["cwd", "detached", "shell", "stdio", "timeout", "env"]);
   for (const key of Object.keys(options)) {
     if (!allowed.has(key)) {
       throw new Error(`node:child_process.spawn: unsupported option '${key}'`);
@@ -11335,6 +11527,7 @@ function __parseSpawnOptions(raw) {
     detached: Boolean(options.detached),
     stdio,
     timeoutMs,
+    env: options.env,
   };
 }
 
@@ -11400,6 +11593,278 @@ function __installProcessKillBridge() {
 
 __installProcessKillBridge();
 
+function __spawnPersistent(cmd, argv, opts) {
+  if (opts.detached) {
+    throw new Error("node:child_process.spawn: persistent piped processes cannot be detached");
+  }
+  if (opts.env !== undefined && (!opts.env || typeof opts.env !== "object" || Array.isArray(opts.env))) {
+    throw new TypeError("node:child_process.spawn: env must be an object");
+  }
+  const child = __makeEmitter();
+  child.pid = __pi_child_process_state.nextPid++;
+  child.killed = false;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.__pi_done = false;
+  child.stdout = opts.stdio[1] === "pipe" ? __makeEmitter() : null;
+  child.stderr = opts.stdio[2] === "pipe" ? __makeEmitter() : null;
+  child.stdin = opts.stdio[0] === "pipe" ? __makeEmitter() : null;
+  const streams = [child.stdout, child.stderr];
+  for (const stream of streams) {
+    if (!stream) continue;
+    stream.setEncoding = (encoding) => { stream.encoding = String(encoding); return stream; };
+  }
+  let handle = null;
+  let timer = null;
+  let referenced = true;
+  let spawned = false;
+  let nextWrite = 1;
+  let bufferedBytes = 0;
+  let needsDrain = false;
+  let pendingKill = null;
+  const pending = [];
+  const writes = new Map();
+  let endWrite = null;
+  const MAX_BUFFERED = 4 * 1024 * 1024;
+  const MAX_CHUNK = 256 * 1024;
+  const HIGH_WATER = 64 * 1024;
+
+  function pipeError(message) {
+    const error = message instanceof Error ? message : new Error(String(message?.message || message));
+    if (!error.code && message && typeof message === "object" && message.code) error.code = String(message.code);
+    if (!error.code) error.code = "EPIPE";
+    return error;
+  }
+  function settleWrite(id, error) {
+    const write = writes.get(id);
+    if (!write) return;
+    writes.delete(id);
+    bufferedBytes -= write.size;
+    const callbacks = write.callbacks || [write.callback];
+    for (const callback of callbacks) {
+      if (typeof callback === "function") Promise.resolve().then(() => callback(error || undefined));
+    }
+    if (write === endWrite) endWrite = null;
+    if (write.end && child.stdin && !error) {
+      child.stdin.writableFinished = true;
+      child.stdin.closed = true;
+      child.stdin.emit("finish");
+    }
+  }
+  function close(code, signal, error) {
+    if (child.__pi_done) return;
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+    if (handle) {
+      try { __pi_process_session_close_native(handle); } catch (_) {}
+    }
+    for (const id of [...writes.keys()]) settleWrite(id, pipeError(error || "Process stdin closed"));
+    pending.length = 0;
+    if (child.stdin) {
+      child.stdin.destroyed = true;
+      child.stdin.closed = true;
+    }
+    for (const stream of streams) if (stream) stream.emit("end");
+    if (error) child.emit("error", pipeError(error));
+    if (spawned) {
+      __emitCloseOnce(child, code, signal);
+    } else {
+      child.__pi_done = true;
+      child.exitCode = code;
+      child.signalCode = signal;
+      __pi_child_process_state.children.delete(child.pid);
+      child.emit("close", code, signal);
+    }
+  }
+  function flushInput() {
+    if (!handle || child.__pi_done) return;
+    while (pending.length) {
+      const next = pending[0];
+      const accepted = next.end
+        ? __pi_process_session_end_native(handle, next.id)
+        : __pi_process_session_write_native(handle, next.id, next.data);
+      if (!accepted) return;
+      pending.shift();
+    }
+  }
+  function poll() {
+    timer = null;
+    if (!handle || child.__pi_done) return;
+    try {
+      const result = JSON.parse(__pi_process_session_poll_native(handle));
+      for (const frame of result.frames || []) {
+        if (frame.stream) {
+          const stream = frame.stream === "stdout" ? child.stdout : child.stderr;
+          if (stream) {
+            const bytes = Buffer.from(frame.data, "base64");
+            stream.emit("data", stream.encoding ? bytes.toString(stream.encoding) : bytes);
+          }
+        } else if (frame.writeId !== undefined) {
+          const error = frame.error ? pipeError(frame.error) : null;
+          settleWrite(frame.writeId, error);
+          if (error && child.stdin) {
+            // The native writer closes its endpoint after an I/O failure.
+            // Settle every queued fragment and EOF callback once, including
+            // fragments already accepted by that writer's bounded channel.
+            child.stdin.destroyed = true;
+            child.stdin.closed = true;
+            for (const id of [...writes.keys()]) settleWrite(id, error);
+            pending.length = 0;
+            child.stdin.emit("error", error);
+          }
+        }
+      }
+      if (result.terminal) {
+        const terminal = result.terminal;
+        close(terminal.code ?? null, terminal.signal ?? null, terminal.error);
+        return;
+      }
+      flushInput();
+      if (needsDrain && bufferedBytes < HIGH_WATER && child.stdin) {
+        needsDrain = false;
+        child.stdin.emit("drain");
+      }
+    } catch (error) {
+      try { __pi_process_session_kill_native(handle, "SIGKILL"); } catch (_) {}
+      close(null, null, error);
+      return;
+    }
+    timer = setTimeout(poll, 10);
+    if (!referenced && timer && typeof timer.unref === "function") timer.unref();
+  }
+  if (child.stdin) {
+    child.stdin.destroyed = false;
+    child.stdin.writableEnded = false;
+    child.stdin.writableFinished = false;
+    child.stdin.closed = false;
+    child.stdin.write = (chunk, encoding, callback) => {
+      if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+      if (child.stdin.writableEnded || child.stdin.destroyed || child.__pi_done) {
+        const error = pipeError("write after process stdin closed");
+        if (typeof callback === "function") Promise.resolve().then(() => callback(error));
+        else Promise.resolve().then(() => child.stdin.emit("error", error));
+        return false;
+      }
+      const bytes = typeof chunk === "string" ? Buffer.from(chunk, encoding || "utf8") : Buffer.from(chunk);
+      const fragments = Math.max(1, Math.ceil(bytes.length / MAX_CHUNK));
+      if (bufferedBytes + bytes.length > MAX_BUFFERED || writes.size + fragments > 1024) {
+        throw new RangeError("node:child_process stdin buffer limit exceeded");
+      }
+      // A logical JSON-RPC frame can exceed one native pipe message. Validate
+      // the entire write and prepare every bounded fragment before publishing
+      // any of it, preserving byte order and one completion callback.
+      let remaining = fragments;
+      let completed = false;
+      const fragmentCallback = typeof callback === "function" ? (error) => {
+        remaining--;
+        if (!completed && (error || remaining === 0)) {
+          completed = true;
+          callback(error);
+        }
+      } : undefined;
+      const staged = [];
+      for (let index = 0; index < fragments; index++) {
+        const start = index * MAX_CHUNK;
+        const part = Buffer.from(bytes.subarray(start, Math.min(start + MAX_CHUNK, bytes.length)));
+        staged.push({ id: nextWrite++, data: part.toString("base64"), size: part.length,
+          callback: fragmentCallback, end: false });
+      }
+      for (const write of staged) {
+        writes.set(write.id, write);
+        pending.push(write);
+      }
+      bufferedBytes += bytes.length;
+      try { flushInput(); }
+      catch (error) { close(null, null, error); return false; }
+      if (bufferedBytes >= HIGH_WATER) needsDrain = true;
+      return bufferedBytes < HIGH_WATER;
+    };
+    child.stdin.end = (chunk, encoding, callback) => {
+      if (typeof chunk === "function") { callback = chunk; chunk = undefined; }
+      else if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+      const hasChunk = chunk !== undefined && chunk !== null;
+      function rejectEnd(code, message) {
+        const error = pipeError(message);
+        error.code = code;
+        if (typeof callback === "function") Promise.resolve().then(() => callback(error));
+        else if (hasChunk) Promise.resolve().then(() => child.stdin.emit("error", error));
+        return child.stdin;
+      }
+      if (child.stdin.writableEnded) {
+        if (hasChunk) return rejectEnd("ERR_STREAM_WRITE_AFTER_END", "write after process stdin ended");
+        if (endWrite && !child.stdin.destroyed && !child.__pi_done) {
+          if (typeof callback === "function") {
+            if (endWrite.callbacks.length >= 1024) throw new RangeError("node:child_process stdin callback limit exceeded");
+            endWrite.callbacks.push(callback);
+          }
+          return child.stdin;
+        }
+        return child.stdin.writableFinished
+          ? rejectEnd("ERR_STREAM_ALREADY_FINISHED", "process stdin already finished")
+          : rejectEnd("ERR_STREAM_DESTROYED", "process stdin is closed");
+      }
+      if (child.stdin.destroyed || child.__pi_done) {
+        return rejectEnd("ERR_STREAM_DESTROYED", "process stdin is closed");
+      }
+      if (hasChunk) child.stdin.write(chunk, encoding);
+      // A synchronous native-write failure may have closed the child while
+      // accepting the final chunk. Never enqueue EOF after its close drain.
+      if (child.stdin.destroyed || child.__pi_done) {
+        return rejectEnd("ERR_STREAM_DESTROYED", "process stdin is closed");
+      }
+      child.stdin.writableEnded = true;
+      const id = nextWrite++;
+      const write = { id, size: 0, callbacks: typeof callback === "function" ? [callback] : [], end: true };
+      endWrite = write;
+      writes.set(id, write);
+      pending.push(write);
+      try { flushInput(); } catch (error) { close(null, null, error); }
+      return child.stdin;
+    };
+  }
+  child.kill = (signal = "SIGTERM") => {
+    if (child.__pi_done) return false;
+    const requested = String(signal || "SIGTERM");
+    if (requested !== "SIGTERM" && requested !== "SIGKILL") throw new Error("Unsupported process signal");
+    if (!handle) {
+      pendingKill = requested;
+      child.killed = true;
+      return true;
+    }
+    const accepted = __pi_process_session_kill_native(handle, requested);
+    if (accepted) child.killed = true;
+    return accepted;
+  };
+  child.ref = () => { referenced = true; if (timer && typeof timer.ref === "function") timer.ref(); return child; };
+  child.unref = () => { referenced = false; if (timer && typeof timer.unref === "function") timer.unref(); return child; };
+  child.stdio = [child.stdin, child.stdout, child.stderr];
+  __pi_child_process_state.children.set(child.pid, child);
+  const execOptions = { persistent: true, stdio: opts.stdio, shell: false };
+  if (opts.cwd !== undefined) execOptions.cwd = opts.cwd;
+  if (opts.timeoutMs !== undefined) execOptions.timeout = opts.timeoutMs;
+  if (opts.env !== undefined) {
+    execOptions.env = Object.create(null);
+    for (const [name, value] of Object.entries(opts.env)) {
+      if (value !== undefined) execOptions.env[name] = value === null ? null : String(value);
+    }
+  }
+  globalThis.pi.exec(cmd, argv, execOptions).then((result) => {
+    if (!result || typeof result.session !== "string") throw new Error("Persistent process session was not created");
+    handle = result.session;
+    if (child.__pi_done) { __pi_process_session_close_native(handle); return; }
+    __pi_child_process_state.children.delete(child.pid);
+    child.pid = result.pid;
+    __pi_child_process_state.children.set(child.pid, child);
+    spawned = true;
+    child.emit("spawn");
+    if (pendingKill) __pi_process_session_kill_native(handle, pendingKill);
+    if (!child.stdin) pending.push({ id: 0, end: true });
+    flushInput();
+    poll();
+  }).catch((error) => close(null, null, error));
+  return child;
+}
+
 export function spawn(command, args = [], options = {}) {
   const cmd = String(command ?? "").trim();
   if (!cmd) {
@@ -11411,6 +11876,13 @@ export function spawn(command, args = [], options = {}) {
 
   const argv = args.map((arg) => String(arg));
   const opts = __parseSpawnOptions(options);
+
+  if (opts.stdio[0] === "pipe" || opts.env !== undefined) {
+    if (typeof __pi_process_session_poll_native !== "function") {
+      throw new Error("node:child_process.spawn: persistent process host is unavailable");
+    }
+    return __spawnPersistent(cmd, argv, opts);
+  }
 
   const child = __makeEmitter();
   child.pid = __pi_child_process_state.nextPid++;
@@ -11597,8 +12069,22 @@ export function execSync(command, options) {
   const timeout = typeof opts.timeout === "number" ? opts.timeout : 0;
   const maxBuffer = typeof opts.maxBuffer === "number" ? opts.maxBuffer : 1024 * 1024;
 
-  // execSync runs through a shell, so pass via sh -c
-  const raw = __pi_exec_sync_native("sh", JSON.stringify(["-c", cmdStr]), cwd, timeout, maxBuffer);
+  // Resolve the conventional PATH probe without running a shell. All other
+  // sync execution retains its existing opt-in and capability checks.
+  const probePattern = globalThis.process && globalThis.process.platform === "win32"
+    ? /^where[ \t]+([A-Za-z0-9][A-Za-z0-9._+-]*)$/
+    : /^command[ \t]+-v[ \t]+([A-Za-z0-9][A-Za-z0-9._+-]*)$/;
+  const probe = probePattern.exec(cmdStr);
+  const discoveryOptions = Object.keys(opts).every((key) =>
+    ["cwd", "encoding", "stdio", "timeout", "maxBuffer"].includes(key));
+  let raw;
+  if (probe && discoveryOptions && typeof __pi_find_executables_native === "function") {
+    const matches = JSON.parse(__pi_find_executables_native(probe[1], cwd));
+    const hits = globalThis.process.platform === "win32" ? matches : matches.slice(0, 1);
+    raw = JSON.stringify({ stdout: hits.length ? hits.join("\n") + "\n" : "", stderr: "", status: hits.length ? 0 : 1, pid: 0 });
+  } else {
+    raw = __pi_exec_sync_native("sh", JSON.stringify(["-c", cmdStr]), cwd, timeout, maxBuffer);
+  }
   const result = __parseExecSyncResult(raw, cmdStr);
 
   if (result.error) {
@@ -11919,6 +12405,7 @@ import * as vm from "node:vm";
 import * as v8 from "node:v8";
 import * as workerThreads from "node:worker_threads";
 import * as testMod from "node:test";
+import * as bunSqlite from "bun:sqlite";
 
 function __normalizeBuiltin(id) {
   const spec = String(id ?? "");
@@ -12034,6 +12521,7 @@ function __normalizeBuiltin(id) {
 }
 
 const __builtinModules = {
+  "bun:sqlite": bunSqlite,
   "node:fs": fs,
   "node:fs/promises": fsPromises,
   "node:path": path,
@@ -12090,7 +12578,12 @@ function __makeMissingRequireStub(spec) {
     return __missingRequireCache[spec];
   }
   const handler = {
-    get(_target, prop) {
+    get(target, prop) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+      if (descriptor && !descriptor.configurable) {
+        if ('value' in descriptor && !descriptor.writable) return descriptor.value;
+        if ('get' in descriptor && descriptor.get === undefined) return undefined;
+      }
       if (typeof prop === "symbol") {
         if (prop === Symbol.toPrimitive) return () => "";
         return undefined;
@@ -12105,10 +12598,10 @@ function __makeMissingRequireStub(spec) {
     },
     apply() { return stub; },
     construct() { return stub; },
-    has() { return false; },
-    ownKeys() { return []; },
-    getOwnPropertyDescriptor() {
-      return { configurable: true, enumerable: false };
+    has(target, prop) { return Reflect.has(target, prop); },
+    ownKeys(target) { return Reflect.ownKeys(target); },
+    getOwnPropertyDescriptor(target, prop) {
+      return Reflect.getOwnPropertyDescriptor(target, prop);
     },
   };
   const stub = new Proxy(function __pijs_missing_require_stub() {}, handler);
@@ -12121,6 +12614,7 @@ export function createRequire(_path) {
     const normalized = __normalizeBuiltin(id);
     const builtIn = __builtinModules[normalized];
     if (builtIn) {
+      if (normalized === "bun:sqlite") return builtIn;
       if (builtIn && Object.prototype.hasOwnProperty.call(builtIn, "default") && builtIn.default !== undefined) {
         return builtIn.default;
       }
@@ -12207,6 +12701,18 @@ const __pi_vfs = (() => {
     if (typeof globalThis.__pi_host_check_read_access === "function") {
       globalThis.__pi_host_check_read_access(toHostPath(normalized));
     }
+  }
+
+  function isPersistentPath(path) {
+    return typeof globalThis.__pi_host_is_persistent_storage_path === "function"
+      && globalThis.__pi_host_is_persistent_storage_path(toHostPath(path));
+  }
+
+  function persistentMutation(op, path, options = {}) {
+    if (typeof globalThis.__pi_host_persistent_storage_mutate !== "function") {
+      throw new Error("PiJS persistent storage bridge is unavailable");
+    }
+    globalThis.__pi_host_persistent_storage_mutate(op, toHostPath(path), JSON.stringify(options));
   }
 
   function checkWorkspaceWriteAccess(resolved) {
@@ -12350,14 +12856,18 @@ const __pi_vfs = (() => {
     return { root: path.startsWith("/") ? "/" : "", tail: path.startsWith("/") ? path.slice(1) : path };
   }
 
-  function normalizePath(input) {
-    const raw = String(input ?? "").replace(/\\/g, "/");
+  function absoluteInputPath(raw) {
     // Detect Windows drive-letter absolute paths (e.g. "C:/Users/...")
     const hasDriveLetter = raw.length >= 3 && /^[A-Za-z]:\//.test(raw);
     const isAbsolute = raw.startsWith("/") || hasDriveLetter;
-    const base = isAbsolute
+    return isAbsolute
       ? raw
       : `${(globalThis.process && typeof globalThis.process.cwd === "function" ? globalThis.process.cwd() : "/").replace(/\\/g, "/")}/${raw}`;
+  }
+
+  function normalizePath(input) {
+    const raw = String(input ?? "").replace(/\\/g, "/");
+    const base = absoluteInputPath(raw);
     const { root, tail } = splitRoot(base);
     const parts = [];
     for (const part of tail.split("/")) {
@@ -12552,13 +13062,16 @@ const __pi_vfs = (() => {
     }
   }
 
-  function resolveSymlinkPath(linkPath, target) {
-    const raw = String(target ?? "");
+  function resolveSymlinkPath(linkPath, target, rawPaths) {
+    const raw = String(target ?? "").replace(/\\/g, "/");
     if (isAbsolutePathInput(raw)) {
+      rawPaths.push(raw);
       const normalized = normalizePath(raw);
       return mapExtensionTempPath(raw, normalized);
     }
-    return normalizePath(`${dirname(linkPath)}/${raw}`);
+    const absolute = `${dirname(linkPath)}/${raw}`;
+    rawPaths.push(absolute);
+    return normalizePath(absolute);
   }
 
   function firstSymlinkComponent(path) {
@@ -12575,10 +13088,13 @@ const __pi_vfs = (() => {
   }
 
   function resolvePathDetails(path, followSymlinks = true) {
-    let normalized = mapExtensionTempPath(path, normalizePath(path));
+    const raw = String(path ?? "").replace(/\\/g, "/");
+    const absolute = absoluteInputPath(raw);
+    const rawPaths = [absolute];
+    let normalized = mapExtensionTempPath(raw, normalizePath(absolute));
     const authorizationPaths = [normalized];
     if (!followSymlinks) {
-      return { resolved: normalized, authorizationPaths };
+      return { resolved: normalized, authorizationPaths, rawPaths };
     }
 
     const seen = new Set();
@@ -12592,32 +13108,38 @@ const __pi_vfs = (() => {
       authorizationPaths.push(component.linkPath);
       const target = resolveSymlinkPath(
         component.linkPath,
-        state.symlinks.get(component.linkPath)
+        state.symlinks.get(component.linkPath),
+        rawPaths,
       );
       normalized = component.remaining.length > 0
         ? normalizePath(`${target}/${component.remaining.join("/")}`)
         : target;
       authorizationPaths.push(normalized);
     }
-    return { resolved: normalized, authorizationPaths };
+    return { resolved: normalized, authorizationPaths, rawPaths };
   }
 
   function resolvePath(path, followSymlinks = true) {
     return resolvePathDetails(path, followSymlinks).resolved;
   }
 
-  function authorizeResolution(details, checkAccess) {
+  function authorizeResolution(details, checkAccess, capability) {
+    if (typeof globalThis.__pi_host_check_persistent_storage_input === "function") {
+      for (const raw of details.rawPaths || []) {
+        globalThis.__pi_host_check_persistent_storage_input(toHostPath(raw), capability);
+      }
+    }
     for (const candidate of details.authorizationPaths) {
       checkAccess(candidate);
     }
   }
 
   function authorizeReadResolution(details) {
-    authorizeResolution(details, checkReadAccess);
+    authorizeResolution(details, checkReadAccess, "read");
   }
 
   function authorizeWriteResolution(details) {
-    authorizeResolution(details, checkWriteAccess);
+    authorizeResolution(details, checkWriteAccess, "write");
   }
 
   function resolvePathForRead(path, followSymlinks = true) {
@@ -12688,11 +13210,19 @@ const __pi_vfs = (() => {
   }
 
   function authorizeFdRead(entry) {
-    authorizeReadResolution({ authorizationPaths: entry.authorizationPaths });
+    assertFdOwner(entry, "read");
+    authorizeReadResolution({ authorizationPaths: entry.authorizationPaths, rawPaths: entry.rawPaths });
   }
 
   function authorizeFdWrite(entry) {
-    authorizeWriteResolution({ authorizationPaths: entry.authorizationPaths });
+    assertFdOwner(entry, "write");
+    authorizeWriteResolution({ authorizationPaths: entry.authorizationPaths, rawPaths: entry.rawPaths });
+  }
+
+  function assertFdOwner(entry, capability) {
+    if (entry.extensionId !== currentExtensionId()) {
+      throw new Error(`host ${capability} denied: file descriptor belongs to another extension`);
+    }
   }
 
   function toWritableView(buffer) {
@@ -12792,8 +13322,9 @@ const __pi_vfs = (() => {
       return makeStat(resolvePath(normalized, true), true);
     }
 
-    const isDir = state.dirs.has(normalized);
-    let bytes = state.files.get(normalized);
+    const persistent = isPersistentPath(normalized);
+    const isDir = !persistent && state.dirs.has(normalized);
+    let bytes = persistent ? undefined : state.files.get(normalized);
     let hostStat = null;
     if (!isDir && bytes === undefined && !isCurrentExtensionTempPath(normalized) && typeof globalThis.__pi_host_stat_sync === "function") {
       try {
@@ -12924,9 +13455,13 @@ const __pi_vfs = (() => {
   state.isCurrentExtensionTempPath = isCurrentExtensionTempPath;
   state.checkReadAccess = checkReadAccess;
   state.checkWriteAccess = checkWriteAccess;
+  state.isPersistentPath = isPersistentPath;
+  state.persistentMutation = persistentMutation;
   state.checkWorkspaceWriteAccess = checkWorkspaceWriteAccess;
   state.parseOpenFlags = parseOpenFlags;
   state.getFdEntry = getFdEntry;
+  state.currentExtensionId = currentExtensionId;
+  state.assertFdOwner = assertFdOwner;
   state.authorizeFdRead = authorizeFdRead;
   state.authorizeFdWrite = authorizeFdWrite;
   state.toWritableView = toWritableView;
@@ -12983,7 +13518,7 @@ export function existsSync(path) {
 
 export function readFileSync(path, encoding) {
   const resolved = __pi_vfs.resolvePathForRead(path, true);
-  let bytes = __pi_vfs.files.get(resolved);
+  let bytes = __pi_vfs.isPersistentPath(resolved) ? undefined : __pi_vfs.files.get(resolved);
   let hostError = "";
   if (bytes === undefined) {
     const host = __pi_vfs.readHostBytes(resolved);
@@ -12998,6 +13533,15 @@ export function readFileSync(path, encoding) {
 }
 
 export function appendFileSync(path, data, opts) {
+  const persistentPath = __pi_vfs.resolvePathForWrite(path, true);
+  if (__pi_vfs.isPersistentPath(persistentPath)) {
+    const bytes = __pi_vfs.toBytes(data, opts);
+    __pi_vfs.persistentMutation("append", persistentPath, {
+      data: Buffer.from(bytes).toString("base64"),
+      flag: opts && typeof opts === "object" ? opts.flag : undefined,
+    });
+    return;
+  }
   const flags =
     opts && typeof opts === "object" && typeof opts.flag === "string"
       ? opts.flag
@@ -13013,6 +13557,14 @@ export function appendFileSync(path, data, opts) {
 
 export function writeFileSync(path, data, opts) {
   const resolved = __pi_vfs.resolvePathForWrite(path, true);
+  if (__pi_vfs.isPersistentPath(resolved)) {
+    const bytes = __pi_vfs.toBytes(data, opts);
+    __pi_vfs.persistentMutation("write", resolved, {
+      data: Buffer.from(bytes).toString("base64"),
+      flag: opts && typeof opts === "object" ? opts.flag : undefined,
+    });
+    return;
+  }
   if (
     __pi_vfs.dirs.has(resolved) ||
     __pi_vfs.readHostStat(resolved, true)?.kind === "dir"
@@ -13090,20 +13642,59 @@ const __fakeStat = {
 };
 export function statSync(path) { return __pi_vfs.makeStat(path, true); }
 export function lstatSync(path) { return __pi_vfs.makeStat(path, false); }
-export function mkdtempSync(prefix, _opts) {
+function pathResult(path, opts) {
+  const encoding = typeof opts === "string" ? opts : opts && opts.encoding;
+  if (encoding === "buffer") return Buffer.from(path, "utf8");
+  return encoding && encoding !== "utf8" && encoding !== "utf-8"
+    ? Buffer.from(path, "utf8").toString(encoding) : path;
+}
+export function mkdtempSync(prefix, opts) {
   const p = String(prefix ?? "/tmp/tmp-");
+  const raw = p.replace(/\\/g, "/");
+  const separator = raw.lastIndexOf("/");
+  // Only the parent is a path to resolve: the final component is a literal
+  // prefix, including a trailing '.', and must not follow an existing link.
+  const parent = __pi_vfs.resolvePathForWrite(separator < 0 ? "." : raw.slice(0, separator + 1), true);
+  const resolvedPrefix = __pi_vfs.childPrefix(parent) + raw.slice(separator + 1);
+  if (__pi_vfs.isPersistentPath(resolvedPrefix)) {
+    if (typeof globalThis.__pi_host_persistent_storage_mkdtemp !== "function") {
+      throw new Error("PiJS persistent temporary directory bridge is unavailable");
+    }
+    return pathResult(globalThis.__pi_host_persistent_storage_mkdtemp(__pi_vfs.toHostPath(resolvedPrefix)), opts);
+  }
   const out = `${p}${Date.now().toString(36)}`;
-  const resolved = __pi_vfs.resolvePath(out, true);
+  const resolved = __pi_vfs.resolvePathForWrite(out, true);
   __pi_vfs.checkWorkspaceWriteAccess(resolved);
   __pi_vfs.ensureDir(resolved);
-  return out;
+  return pathResult(out, opts);
 }
-export function realpathSync(path, _opts) {
+export function realpathSync(path, opts) {
   const resolved = __pi_vfs.resolvePathForRead(path, true);
-  return __pi_vfs.unmapExtensionTempPath(resolved);
+  const virtual = __pi_vfs.files.has(resolved) || __pi_vfs.dirs.has(resolved);
+  let canonical = __pi_vfs.unmapExtensionTempPath(resolved);
+  if (!__pi_vfs.isCurrentExtensionTempPath(resolved)
+      && typeof globalThis.__pi_host_realpath_sync === "function") {
+    try {
+      canonical = globalThis.__pi_host_realpath_sync(__pi_vfs.toHostPath(resolved));
+    } catch (error) {
+      // Overlay-only entries have no host path. Never hide a denied host
+      // resolution behind a previously cached virtual directory or file.
+      const identified = typeof globalThis.__pi_get_current_extension_id === "function"
+        && !!globalThis.__pi_get_current_extension_id();
+      if (!virtual || (identified && String(error && error.message || error).includes("denied"))) throw error;
+    }
+  } else if (!virtual) {
+    throw new Error(`ENOENT: no such file or directory, realpath '${String(path ?? "")}'`);
+  }
+  return pathResult(canonical, opts);
 }
+realpathSync.native = realpathSync;
 export function unlinkSync(path) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
+  if (__pi_vfs.isPersistentPath(normalized)) {
+    __pi_vfs.persistentMutation("unlink", normalized);
+    return;
+  }
   if (__pi_vfs.symlinks.delete(normalized)) {
     return;
   }
@@ -13113,6 +13704,11 @@ export function unlinkSync(path) {
 }
 export function rmdirSync(path, _opts) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
+  if (__pi_vfs.isPersistentPath(normalized)) {
+    if (_opts && _opts.recursive) throw new Error("PiJS persistent recursive directory removal is unsupported");
+    __pi_vfs.persistentMutation("rmdir", normalized);
+    return;
+  }
   const prefix = __pi_vfs.childPrefix(normalized);
   if (normalized === "/") {
     throw new Error("EBUSY: resource busy or locked, rmdir '/'");
@@ -13142,6 +13738,13 @@ export function rmdirSync(path, _opts) {
 }
 export function rmSync(path, opts) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
+  if (__pi_vfs.isPersistentPath(normalized)) {
+    if (opts && opts.recursive) throw new Error("PiJS persistent recursive directory removal is unsupported");
+    if (opts && opts.force && !existsSync(normalized)) return;
+    const op = statSync(normalized).isDirectory() ? "rmdir" : "unlink";
+    __pi_vfs.persistentMutation(op, normalized);
+    return;
+  }
   const prefix = __pi_vfs.childPrefix(normalized);
   if (__pi_vfs.files.has(normalized)) {
     __pi_vfs.files.delete(normalized);
@@ -13186,6 +13789,13 @@ export function copyFileSync(src, dest, _mode) {
 export function renameSync(oldPath, newPath) {
   const src = __pi_vfs.resolvePathForWrite(oldPath, false);
   const dst = __pi_vfs.resolvePathForWrite(newPath, false);
+  if (__pi_vfs.isPersistentPath(src) || __pi_vfs.isPersistentPath(dst)) {
+    if (!__pi_vfs.isPersistentPath(src) || !__pi_vfs.isPersistentPath(dst)) {
+      throw new Error("PiJS cannot rename across persistent and virtual filesystems");
+    }
+    __pi_vfs.persistentMutation("rename", src, { target: __pi_vfs.toHostPath(dst) });
+    return;
+  }
   const linkTarget = __pi_vfs.symlinks.get(src);
   if (linkTarget !== undefined) {
     __pi_vfs.ensureDir(__pi_vfs.dirname(dst));
@@ -13204,6 +13814,10 @@ export function renameSync(oldPath, newPath) {
 }
 export function mkdirSync(path, _opts) {
   const resolved = __pi_vfs.resolvePathForWrite(path, true);
+  if (__pi_vfs.isPersistentPath(resolved)) {
+    __pi_vfs.persistentMutation("mkdir", resolved, { recursive: !!(_opts && _opts.recursive) });
+    return undefined;
+  }
   if (__pi_vfs.files.has(resolved) || __pi_vfs.symlinks.has(resolved)) {
     throw new Error(`EEXIST: file already exists, mkdir '${String(path ?? "")}'`);
   }
@@ -13252,6 +13866,9 @@ export function readlinkSync(path, opts) {
 }
 export function symlinkSync(target, path, _type) {
   const normalized = __pi_vfs.resolvePathForWrite(path, false);
+  if (__pi_vfs.isPersistentPath(normalized)) {
+    throw new Error("PiJS persistent storage does not permit symlinks");
+  }
   const parent = __pi_vfs.dirname(normalized);
   if (!__pi_vfs.dirs.has(parent)) {
     throw new Error(`ENOENT: no such file or directory, symlink '${String(path ?? "")}'`);
@@ -13273,6 +13890,10 @@ export function openSync(path, flags = "r", _mode) {
     __pi_vfs.authorizeWriteResolution(resolution);
   }
   const resolved = resolution.resolved;
+
+  if (needsWriteAccess && __pi_vfs.isPersistentPath(resolved)) {
+    throw new Error("PiJS persistent file descriptors are unsupported; use writeFileSync or appendFileSync");
+  }
 
   const hostStat = __pi_vfs.readHostStat(resolved, true);
   if (__pi_vfs.dirs.has(resolved) || hostStat?.kind === "dir") {
@@ -13320,7 +13941,9 @@ export function openSync(path, flags = "r", _mode) {
   const current = __pi_vfs.files.get(resolved) || host.bytes || new Uint8Array();
   __pi_vfs.fds.set(fd, {
     path: resolved,
+    extensionId: __pi_vfs.currentExtensionId(),
     authorizationPaths: resolution.authorizationPaths.slice(),
+    rawPaths: resolution.rawPaths.slice(),
     readable: opts.readable,
     writable: opts.writable,
     append: opts.append,
@@ -13331,12 +13954,9 @@ export function openSync(path, flags = "r", _mode) {
 }
 export function closeSync(fd) {
   const entry = __pi_vfs.getFdEntry(fd);
-  if (entry.readable) {
-    __pi_vfs.authorizeFdRead(entry);
-  }
-  if (entry.writable) {
-    __pi_vfs.authorizeFdWrite(entry);
-  }
+  // Releasing this virtual handle performs no filesystem I/O. Its owner must
+  // be able to discard cached bytes after a path or capability is revoked.
+  __pi_vfs.assertFdOwner(entry, entry.readable ? "read" : "write");
   __pi_vfs.fds.delete(fd);
 }
 export function readSync(fd, buffer, offset = 0, length, position = null) {
@@ -13548,8 +14168,8 @@ export function createWriteStream(path, opts) {
     try {
       closeSync(fd);
     } finally {
-      // closeSync authorizes before deleting. Cleanup must still release this
-      // virtual descriptor when authorization changes between open and close.
+      // A stream owns its exact descriptor even if cleanup runs under a
+      // different callback principal. Never release a reused numeric handle.
       if (__pi_vfs.fds.get(fd) === fdEntry) {
         __pi_vfs.fds.delete(fd);
       }
@@ -13735,6 +14355,7 @@ export function realpath(path, optOrCb, cb) {
     catch (err) { callback(err); }
   }
 }
+realpath.native = realpath;
 export function access(_path, modeOrCb, cb) {
   const callback = typeof modeOrCb === 'function' ? modeOrCb : cb;
   const mode = typeof modeOrCb === 'function' ? constants.F_OK : modeOrCb;
@@ -14167,18 +14788,96 @@ export default { createInterface };
     modules.insert(
         "node:url".to_string(),
         compressed_js_literal!(r"
-export function fileURLToPath(url) {
-  const u = String(url ?? '');
-  if (u.startsWith('file://')) {
-    let p = decodeURIComponent(u.slice(7));
-    // file:///C:/... → C:/... (strip leading / before Windows drive letter)
-    if (p.length >= 3 && p[0] === '/' && p[2] === ':') { p = p.slice(1); }
-    return p;
-  }
-  return u;
+import { win32 as __fileWindowsPath } from 'node:path';
+
+function __fileUrlError(code, message) {
+  const error = new TypeError(message);
+  error.code = code;
+  return error;
 }
-export function pathToFileURL(path) {
-  return new URL('file://' + encodeURI(String(path ?? '')));
+function __fileUrlWindows(options) {
+  return options?.windows === undefined
+    ? globalThis.process?.platform === 'win32'
+    : Boolean(options.windows);
+}
+
+export function fileURLToPath(value, options) {
+  let url;
+  if (typeof value === 'string') {
+    try { url = new _URL(value); }
+    catch (_) { throw __fileUrlError('ERR_INVALID_URL', 'Invalid URL'); }
+  } else if (value instanceof _URL) {
+    url = value;
+  } else {
+    throw __fileUrlError('ERR_INVALID_ARG_TYPE', 'The url argument must be a string or URL');
+  }
+  if (url.protocol !== 'file:') {
+    throw __fileUrlError('ERR_INVALID_URL_SCHEME', 'The URL must be of scheme file');
+  }
+  const windows = __fileUrlWindows(options);
+  // Reject encoded separators before decoding. Filesystem and module-loader
+  // authorization still applies to the resulting path, including dot segments.
+  if (/%2f/i.test(url.pathname) || (windows && /%5c/i.test(url.pathname))) {
+    throw __fileUrlError('ERR_INVALID_FILE_URL_PATH', 'File URL path contains an encoded separator');
+  }
+  const path = decodeURIComponent(url.pathname);
+  if (windows) {
+    const normalized = path.replace(/\//g, '\\');
+    if (url.hostname) return '\\\\' + url.hostname + normalized;
+    if (!/^\/[A-Za-z]:/.test(path)) {
+      throw __fileUrlError('ERR_INVALID_FILE_URL_PATH', 'File URL path must be absolute');
+    }
+    return normalized.slice(1);
+  }
+  if (url.hostname && url.hostname !== 'localhost') {
+    throw __fileUrlError('ERR_INVALID_FILE_URL_HOST', 'File URL host must be localhost or empty');
+  }
+  return path;
+}
+
+function __encodeFilePath(path) {
+  // encodeURI preserves URL delimiters that are literal filename characters.
+  // Encode them separately so query/hash parsing cannot change the target.
+  return encodeURI(path).replace(/[?#~]/g, (ch) => '%' + ch.charCodeAt(0).toString(16).toUpperCase());
+}
+export function pathToFileURL(path, options) {
+  if (typeof path !== 'string') {
+    throw __fileUrlError('ERR_INVALID_ARG_TYPE', 'The path argument must be a string');
+  }
+  const windows = __fileUrlWindows(options);
+  let resolved;
+  if (windows) {
+    let input = path.replace(/\\/g, '/');
+    if (/^\/\/\?\/UNC\//i.test(input)) input = '//' + input.slice(8);
+    else if (/^\/\/\?\/[A-Za-z]:\//.test(input)) input = input.slice(4);
+    if (input.startsWith('//') && input.indexOf('/', 2) < 0) {
+      throw __fileUrlError('ERR_INVALID_ARG_VALUE', 'Missing UNC resource path');
+    }
+    if (/^\/\/[^/]+\/$/.test(input)) return new _URL('file:' + input);
+    resolved = __fileWindowsPath.resolve(input).replace(/\\/g, '/');
+    if (/^\/\/[^/]+\/[^/]+$/.test(input) && resolved.endsWith('/')) {
+      resolved = resolved.slice(0, -1);
+    }
+    if (/[\\/]$/.test(path) && !resolved.endsWith('/')) resolved += '/';
+    if (resolved.startsWith('//')) {
+      const slash = resolved.indexOf('/', 2);
+      return new _URL('file://' + resolved.slice(2, slash) + __encodeFilePath(resolved.slice(slash)));
+    }
+    return new _URL('file://' + (resolved.startsWith('/') ? '' : '/') + __encodeFilePath(resolved));
+  }
+  // POSIX backslashes are filename characters. Avoid the legacy cross-platform
+  // node:path normalization that treats them as Windows separators.
+  const cwd = globalThis.process?.cwd?.() ?? '/';
+  const input = path.startsWith('/') ? path : cwd + '/' + path;
+  const parts = [];
+  for (const part of input.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') parts.pop();
+    else parts.push(part);
+  }
+  resolved = '/' + parts.join('/');
+  if (path.endsWith('/') && !resolved.endsWith('/')) resolved += '/';
+  return new _URL('file://' + __encodeFilePath(resolved));
 }
 
 // Use built-in URL if available (QuickJS may have it), else provide polyfill
@@ -17608,6 +18307,8 @@ pub struct PiJsRuntime<C: SchedulerClock = WallClock> {
     /// Immutable principal for production extension isolates. Harness runtimes
     /// leave this unset so low-level bridge tests can model multiple identities.
     owner_extension_id: Option<Arc<str>>,
+    sqlite_state: Rc<RefCell<sqlite::SqliteRuntime>>,
+    process_sessions: process_session::ProcessSessions,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -17625,6 +18326,7 @@ struct JsRuntimeRegistrySnapshot {
     pending_tasks: u64,
     pending_hostcalls: u64,
     pending_timers: u64,
+    timer_handles: u64,
     pending_event_listener_lists: u64,
     event_batch_contexts: u64,
     provider_streams: u64,
@@ -17731,35 +18433,71 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         policy: Option<ExtensionPolicy>,
         owner_extension_id: Option<Arc<str>>,
     ) -> Result<Self> {
-        // Inject target architecture so JS process.arch can read it
-        #[cfg(target_arch = "x86_64")]
-        config
-            .env
-            .entry("PI_TARGET_ARCH".to_string())
-            .or_insert_with(|| "x64".to_string());
-        #[cfg(target_arch = "aarch64")]
-        config
-            .env
-            .entry("PI_TARGET_ARCH".to_string())
-            .or_insert_with(|| "arm64".to_string());
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        config
-            .env
-            .entry("PI_TARGET_ARCH".to_string())
-            .or_insert_with(|| "x64".to_string());
+        // The production snapshot can serve several differently authorized
+        // realms. Bind disclosure to this immutable owner before creating the
+        // JS environment snapshot or a subprocess environment. A caller's
+        // explicit deny_env remains a stronger restriction.
+        if policy.as_ref().is_some_and(|policy| {
+            policy
+                .evaluate_for("env", owner_extension_id.as_deref())
+                .decision
+                != crate::extensions::PolicyDecision::Allow
+        }) {
+            config.deny_env = true;
+        }
 
-        // Inject target platform so JS process.platform matches os.platform().
-        // OSTYPE env var is a shell variable and not always exported.
+        let windows_environment = uses_windows_environment(&config.env);
+        if windows_environment {
+            // Normalize before exposing values, enumerating the snapshot, or
+            // copying it into child processes. Retain the selected spelling
+            // so ordinary Windows `Path` snapshots still enumerate as `Path`.
+            normalize_windows_environment_snapshot(&mut config.env);
+        }
+
+        // Inject host metadata without creating a second Windows spelling of
+        // an explicitly configured binding.
+        let architecture = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "x64"
+        };
+        let platform = match std::env::consts::OS {
+            "macos" => "darwin",
+            "windows" => "win32",
+            other => other,
+        };
+        for (key, value) in [("PI_TARGET_ARCH", architecture), ("PI_PLATFORM", platform)] {
+            if configured_environment_value(&config.env, key, windows_environment).is_none() {
+                config.env.insert(key.to_string(), value.to_string());
+            }
+        }
+
+        // This is host metadata, not a filesystem grant. Child integrations
+        // identify Pi from it without probing a parent of their data root.
+        // Preserve explicit snapshots and avoid ambient HOME when supplied.
+        if configured_environment_value(&config.env, "PI_CONFIG_DIR", windows_environment).is_none()
         {
-            let platform = match std::env::consts::OS {
-                "macos" => "darwin",
-                "windows" => "win32",
-                other => other,
-            };
-            config
-                .env
-                .entry("PI_PLATFORM".to_string())
-                .or_insert_with(|| platform.to_string());
+            let config_dir = configured_environment_value(
+                &config.env,
+                "PI_CODING_AGENT_DIR",
+                windows_environment,
+            )
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                ["HOME", "USERPROFILE"]
+                    .into_iter()
+                    .find_map(|key| {
+                        configured_environment_value(&config.env, key, windows_environment)
+                            .filter(|value| !value.is_empty())
+                    })
+                    .map(|home| PathBuf::from(home).join(".pi").join("agent"))
+            })
+            .unwrap_or_else(crate::config::Config::global_dir);
+            config.env.insert(
+                "PI_CONFIG_DIR".to_string(),
+                config_dir.to_string_lossy().into_owned(),
+            );
         }
 
         let runtime = AsyncRuntime::new().map_err(|err| map_js_error(&err))?;
@@ -17790,6 +18528,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 .with_disk_cache_dir(config.disk_cache_dir.clone())
                 .with_compiled_cache_limit_bytes(compiled_cache_limit_bytes),
         ));
+        module_state
+            .borrow_mut()
+            .persistent_storage
+            .set_policy(policy.clone());
         runtime
             .set_loader(
                 PiJsResolver {
@@ -17830,6 +18572,24 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let trace_seq = Arc::new(AtomicU64::new(1));
         let bridge_secret = uuid::Uuid::new_v4().simple().to_string();
         let runtime_id = uuid::Uuid::new_v4().simple().to_string();
+        let process_sessions = process_session::ProcessSessions::new(
+            config.cwd.clone(),
+            // Inheritance must not disclose custom broker secrets through a
+            // child's stdout after process.env has correctly hidden them.
+            // ProcessSessions applies its transfer restrictions afterwards.
+            config
+                .env
+                .iter()
+                .filter(|(name, _)| {
+                    policy
+                        .as_ref()
+                        .is_none_or(|policy| !policy.secret_broker.is_secret(name))
+                })
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            config.deny_env,
+            owner_extension_id.clone(),
+        );
 
         let instance = Self {
             runtime,
@@ -17855,6 +18615,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             bridge_secret,
             runtime_id,
             owner_extension_id,
+            sqlite_state: Rc::new(RefCell::new(sqlite::SqliteRuntime::default())),
+            process_sessions,
         };
 
         instance.install_pi_bridge().await?;
@@ -17920,6 +18682,20 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         )
     }
 
+    /// Cancel native work retained by a permanently quarantined realm.
+    ///
+    /// Unlike a cold-drop scrub, this never runs guest cleanup or asks SQLite
+    /// to close/checkpoint a connection. The actor retains the failed realm's
+    /// diagnostic state, but process and SQLite worker permits remain with
+    /// their workers only until cancellation actually finishes.
+    pub(crate) fn cancel_native_resources_for_quarantine(&self) {
+        self.process_sessions.close_all();
+        self.sqlite_state.borrow_mut().retire();
+        let streams = std::mem::take(&mut *self.deferred_hostcalls.borrow_mut());
+        drop(streams);
+        self.hostcall_queue.borrow_mut().clear();
+    }
+
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
     /// Scrub observable realm state before the runtime is dropped.
     ///
@@ -17928,6 +18704,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// registry inventory, so callers must cold-create the next realm even
     /// after a clean scrub.
     pub async fn scrub_for_cold_drop(&self) -> Result<PiJsRealmScrubReport> {
+        self.process_sessions.close_all();
+        self.sqlite_state
+            .borrow_mut()
+            .reset()
+            .map_err(Error::extension)?;
         let rust_pending_hostcalls =
             u64::try_from(self.hostcall_tracker.borrow().pending_count()).unwrap_or(u64::MAX);
         let rust_pending_hostcall_queue =
@@ -17968,7 +18749,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
         report.pending_tasks_before = reset_payload.before.pending_tasks;
         report.pending_hostcalls_before = reset_payload.before.pending_hostcalls;
-        report.pending_timers_before = reset_payload.before.pending_timers;
+        report.pending_timers_before = reset_payload
+            .before
+            .pending_timers
+            .max(reset_payload.before.timer_handles);
 
         let residual_after = reset_payload.after.extensions
             + reset_payload.after.tools
@@ -17982,6 +18766,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             + reset_payload.after.pending_tasks
             + reset_payload.after.pending_hostcalls
             + reset_payload.after.pending_timers
+            + reset_payload.after.timer_handles
             + reset_payload.after.pending_event_listener_lists
             + reset_payload.after.event_batch_contexts
             + reset_payload.after.provider_streams
@@ -18019,6 +18804,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             state.extension_roots_by_id.clear();
             state.extension_roots_without_id.clear();
             state.foreign_extension_root_boundaries_by_id.clear();
+            state.persistent_storage.clear();
 
             for spec in dynamic_specs {
                 if remove_compiled_source(&mut state, &spec).is_some() {
@@ -18154,6 +18940,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// JavaScript realm and must never authorize realm reuse.
     #[cfg(test)]
     fn reset_host_bookkeeping_before_drop(&self) {
+        self.process_sessions.close_all();
+        self.sqlite_state
+            .borrow_mut()
+            .reset()
+            .expect("reset SQLite before dropping test runtime");
         let mut state = self.module_state.borrow_mut();
         state.extension_roots.clear();
         state.canonical_extension_roots.clear();
@@ -18162,6 +18953,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         state.extension_roots_by_id.clear();
         state.extension_roots_without_id.clear();
         state.foreign_extension_root_boundaries_by_id.clear();
+        state.persistent_storage.clear();
         state.dynamic_virtual_modules.clear();
         state.dynamic_virtual_named_exports.clear();
         state.module_cache_counters = ModuleCacheCounters::default();
@@ -18250,6 +19042,26 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// After processing, call `complete_hostcall()` for each.
     pub fn drain_hostcall_requests(&self) -> VecDeque<HostcallRequest> {
         self.hostcall_queue.borrow_mut().drain_all()
+    }
+
+    /// Take one request without disturbing the queue's FIFO or reclamation state.
+    pub(crate) fn pop_hostcall_request(&self) -> Option<HostcallRequest> {
+        self.hostcall_queue.borrow_mut().pop_front()
+    }
+
+    /// Delay until actor-owned work should next be polled. In-flight hostcalls
+    /// require periodic polls even when JavaScript has no user timer scheduled.
+    pub(crate) fn idle_poll_delay_ms(&self) -> Option<u64> {
+        let scheduler = self.scheduler.borrow();
+        if scheduler.macrotask_count() > 0 || !self.hostcall_queue.borrow().is_empty() {
+            return Some(0);
+        }
+        let timer_delay = scheduler.time_until_next_timer();
+        if self.pending_hostcall_count() > 0 {
+            Some(timer_delay.unwrap_or(10).min(10))
+        } else {
+            timer_delay
+        }
     }
 
     /// Drain pending QuickJS jobs (Promise microtasks) until fixpoint.
@@ -18971,6 +19783,74 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         }
     }
 
+    /// Grant one extension a persistent data directory. This is a host-only
+    /// capability: guest metadata cannot add roots, and data roots never grant
+    /// module-import authority. The path must be absolute and contain no links.
+    pub fn add_persistent_storage_root(&self, root: PathBuf, extension_id: &str) -> Result<()> {
+        if self
+            .owner_extension_id
+            .as_deref()
+            .is_some_and(|owner| owner != extension_id)
+        {
+            return Err(Error::extension(
+                "Persistent storage owner does not match runtime owner",
+            ));
+        }
+        self.module_state
+            .borrow_mut()
+            .persistent_storage
+            .register(root, extension_id, false)
+            .map_err(|error| Error::extension(format!("Invalid persistent storage grant: {error}")))
+    }
+
+    pub(crate) fn register_foreign_persistent_storage_root(
+        &self,
+        root: PathBuf,
+        extension_id: &str,
+    ) -> Result<()> {
+        self.module_state
+            .borrow_mut()
+            .persistent_storage
+            .register(root, extension_id, true)
+            .map_err(|error| {
+                Error::extension(format!("Invalid persistent storage boundary: {error}"))
+            })
+    }
+
+    /// Resolve host-supplied state configuration before any guest code runs.
+    /// Mutable JavaScript process.env values cannot expand these grants.
+    pub(crate) fn application_storage_root(&self, namespace: &Path) -> Option<PathBuf> {
+        let configured_home = if self.config.deny_env {
+            None
+        } else {
+            ["HOME", "USERPROFILE"].into_iter().find_map(|key| {
+                configured_environment_value(
+                    &self.config.env,
+                    key,
+                    uses_windows_environment(&self.config.env),
+                )
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+            })
+        };
+        let home = configured_home
+            // node:os.homedir exposes this host metadata even when generic
+            // environment access is denied. Match its HOME/USERPROFILE order.
+            .or_else(|| std::env::var("HOME").ok().filter(|value| !value.is_empty()))
+            .or_else(|| {
+                std::env::var("USERPROFILE")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            })
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir)?;
+        Some(
+            crate::extensions::safe_canonicalize(&home)
+                .join(".pi")
+                .join(namespace),
+        )
+    }
+
     /// Register a peer extension root as an ownership boundary without
     /// granting this runtime filesystem or module-resolver access to it.
     ///
@@ -19018,6 +19898,20 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         }
     }
 
+    /// Called only after the shared exec dispatcher has admitted and mediated
+    /// this request. Native JS session callbacks cannot create new processes.
+    pub(crate) fn spawn_process_session(
+        &self,
+        extension_id: Option<&str>,
+        command: &str,
+        args: &[String],
+        options: &serde_json::Value,
+        on_exit: Box<dyn FnOnce() + Send>,
+    ) -> std::result::Result<serde_json::Value, String> {
+        self.process_sessions
+            .spawn(extension_id, command, args, options, on_exit)
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn install_pi_bridge(&self) -> Result<()> {
         let runtime_id = self.runtime_id.clone();
@@ -19034,12 +19928,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let process_args = self.config.args.clone();
         // Platform is runtime metadata, independent of permission to read env.
         // PI_PLATFORM was supplied by the host at runtime construction above.
-        let process_platform = self
-            .config
-            .env
-            .get("PI_PLATFORM")
-            .cloned()
-            .unwrap_or_else(|| std::env::consts::OS.to_string());
+        let windows_environment = uses_windows_environment(&self.config.env);
+        let process_platform =
+            configured_environment_value(&self.config.env, "PI_PLATFORM", windows_environment)
+                .map(str::to_string)
+                .unwrap_or_else(|| std::env::consts::OS.to_string());
         let env = self.config.env.clone();
         let deny_env = self.config.deny_env;
         let repair_mode = self.config.repair_mode;
@@ -19051,11 +19944,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let owner_extension_id = self.owner_extension_id.clone();
         let mut extension_temp_roots = vec![std::env::temp_dir().to_string_lossy().into_owned()];
         for key in ["TMPDIR", "TEMP", "TMP"] {
-            if let Some(value) = env.get(key)
+            if let Some(value) = configured_environment_value(&env, key, windows_environment)
                 && !value.trim().is_empty()
-                && !extension_temp_roots.contains(value)
+                && !extension_temp_roots.iter().any(|root| root == value)
             {
-                extension_temp_roots.push(value.clone());
+                extension_temp_roots.push(value.to_string());
             }
         }
         if !extension_temp_roots.iter().any(|root| root == "/tmp") {
@@ -19067,6 +19960,17 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         self.context
             .with(|ctx| {
                 let global = ctx.globals();
+
+                storage::install(&ctx, &module_state, &process_cwd)?;
+                sqlite::install(
+                    &ctx,
+                    Rc::clone(&self.sqlite_state),
+                    Rc::clone(&module_state),
+                    process_cwd.clone(),
+                    policy.clone(),
+                )?;
+                self.process_sessions.install(&ctx)?;
+                executable::install(&ctx, env.clone(), process_cwd.clone(), policy.clone())?;
 
                 global.set(
                     "__pi_bridge_secret_matches_native",
@@ -19453,6 +20357,31 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     }),
                 )?;
 
+                // A timer handle owns this opaque scheduler closure. Keeping
+                // provenance in the Rust closure preserves the original root
+                // across refresh/repeat, including after its first firing,
+                // without retaining expired timers in a global origin map.
+                global.set(
+                    "__pi_create_timer_scheduler_native",
+                    Func::from({
+                        let scheduler = Rc::clone(&scheduler);
+                        let active_origin = Rc::clone(&active_session_action_origin);
+                        let timer_origins = Rc::clone(&user_timer_origins);
+                        move || {
+                            let origin = active_origin.borrow().clone();
+                            let scheduler = Rc::clone(&scheduler);
+                            let timer_origins = Rc::clone(&timer_origins);
+                            Func::from(move |delay_ms: u64| -> u64 {
+                                let timer_id = scheduler.borrow_mut().set_timeout(delay_ms);
+                                if let Some(origin) = origin.clone() {
+                                    timer_origins.borrow_mut().insert(timer_id, origin);
+                                }
+                                timer_id
+                            })
+                        }
+                    }),
+                )?;
+
                 // __pi_clear_timeout_native(timer_id) -> bool
                 global.set(
                     "__pi_clear_timeout_native",
@@ -19611,6 +20540,33 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     }),
                 )?;
 
+                // Enumerate only permitted snapshot bindings safe to copy into
+                // child environments. Loader hooks and Windows per-drive keys
+                // remain individually readable under the same env policy, but
+                // cannot poison `{ ...process.env }` at process admission.
+                // Sorting avoids HashMap iteration nondeterminism.
+                global.set(
+                    "__pi_env_keys_native",
+                    Func::from({
+                        let env = env.clone();
+                        let policy_for_env = policy.clone();
+                        move || -> Vec<String> {
+                            if deny_env {
+                                return Vec::new();
+                            }
+                            let mut keys: Vec<String> = env.keys().filter(|key| {
+                                process_session::safe_environment_name(key)
+                                    && policy_for_env.as_ref().map_or_else(
+                                        || is_env_var_allowed(key),
+                                        |policy| !policy.secret_broker.is_secret(key),
+                                    )
+                            }).cloned().collect();
+                            keys.sort();
+                            keys
+                        }
+                    }),
+                )?;
+
                 // __pi_env_get_native(key) -> string | null
                 global.set(
                     "__pi_env_get_native",
@@ -19650,7 +20606,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             if !allowed {
                                 return Ok(None);
                             }
-                            Ok(env.get(&key).cloned())
+                            Ok(configured_environment_value(&env, &key, windows_environment)
+                                .map(str::to_string))
                         }
                     }),
                 )?;
@@ -19905,7 +20862,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 crate::extensions::safe_canonicalize(&requested_abs);
 
                             let allowed = path_is_allowed_extension_fs_path(
-                                &checked_path,
+                                &requested_abs,
                                 &workspace_root,
                                 extension_id.as_deref(),
                                 &module_state,
@@ -19965,13 +20922,20 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let checked_path =
                                 crate::extensions::safe_canonicalize(&requested_abs);
 
-                            let allowed = path_is_allowed_extension_fs_path(
-                                &checked_path,
-                                &workspace_root,
-                                extension_id.as_deref(),
-                                &module_state,
-                                &allowed_read_roots,
-                            );
+                            let storage = &module_state.borrow().persistent_storage;
+                            let allowed = if storage.is_registered(&requested_abs)
+                                || storage.is_registered(&checked_path)
+                            {
+                                storage.allows(&requested_abs, extension_id.as_deref(), "write")
+                            } else {
+                                path_is_allowed_extension_fs_path(
+                                    &requested_abs,
+                                    &workspace_root,
+                                    extension_id.as_deref(),
+                                    &module_state,
+                                    &allowed_read_roots,
+                                )
+                            };
                             log_host_fs_decision(
                                 "write",
                                 allowed,
@@ -20025,7 +20989,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 crate::extensions::safe_canonicalize(&requested_abs);
 
                             let allowed = path_is_allowed_extension_fs_path(
-                                &checked_path,
+                                &requested_abs,
                                 &workspace_root,
                                 extension_id.as_deref(),
                                 &module_state,
@@ -20082,6 +21046,37 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     }),
                 )?;
 
+                // __pi_host_realpath_sync(path) -> canonical existing host path.
+                // Project identity must follow real host aliases; data grants
+                // retain their stricter prohibition on linked path components.
+                global.set(
+                    "__pi_host_realpath_sync",
+                    Func::from({
+                        let process_cwd = process_cwd.clone();
+                        let allowed_read_roots = Arc::clone(&allowed_read_roots);
+                        let module_state = Rc::clone(&module_state);
+                        move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<String> {
+                            let extension_id = current_extension_id(&ctx);
+                            let workspace_root = crate::extensions::safe_canonicalize(Path::new(&process_cwd));
+                            let requested = PathBuf::from(&path);
+                            let requested = if requested.is_absolute() { requested } else { workspace_root.join(requested) };
+                            let allowed = |path: &Path| path_is_allowed_extension_fs_path(
+                                path, &workspace_root, extension_id.as_deref(), &module_state, &allowed_read_roots,
+                            );
+                            if !allowed(&requested) {
+                                return Err(rquickjs::Error::new_loading_message(&path, "host realpath denied: path outside extension root"));
+                            }
+                            let canonical = std::fs::canonicalize(&requested)
+                                .map(crate::extensions::strip_unc_prefix)
+                                .map_err(|error| rquickjs::Error::new_loading_message(&path, format!("host realpath: {error}")))?;
+                            if !allowed(&requested) || !allowed(&canonical) {
+                                return Err(rquickjs::Error::new_loading_message(&path, "host realpath denied: path changed during resolution"));
+                            }
+                            Ok(canonical.to_string_lossy().into_owned())
+                        }
+                    }),
+                )?;
+
                 // __pi_host_read_dir_sync(path) -> JSON string (throws on error)
                 // Synchronous real-filesystem directory listing fallback for
                 // node:fs readdirSync. Confined to the workspace root and
@@ -20107,7 +21102,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 crate::extensions::safe_canonicalize(&requested_abs);
 
                             let allowed = path_is_allowed_extension_fs_path(
-                                &checked_path,
+                                &requested_abs,
                                 &workspace_root,
                                 extension_id.as_deref(),
                                 &module_state,
@@ -20209,6 +21204,16 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 workspace_root.join(requested)
                             };
 
+                            if let Some(bytes) = storage::read_file(
+                                &requested_abs,
+                                extension_id.as_deref(),
+                                &module_state,
+                            ).map_err(|error| rquickjs::Error::new_loading_message(
+                                &path, format!("persistent storage read: {error}"),
+                            ))? {
+                                return Ok(BASE64_STANDARD.encode(bytes));
+                            }
+
                             let apply_missing_asset_fallback = |checked_path: &Path, error_msg: &str| -> rquickjs::Result<String> {
                                 let in_ext_root = path_is_in_leaf_allowed_extension_root(
                                     checked_path,
@@ -20270,7 +21275,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 let prechecked_path =
                                     crate::extensions::safe_canonicalize(&requested_abs);
                                 if !path_is_allowed_extension_fs_path(
-                                    &prechecked_path,
+                                    &requested_abs,
                                     &workspace_root,
                                     extension_id.as_deref(),
                                     &module_state,
@@ -20305,7 +21310,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         let checked_path = crate::extensions::safe_canonicalize(&requested_abs);
 
                                         let allowed = path_is_allowed_extension_fs_path(
-                                            &checked_path,
+                                            &requested_abs,
                                             &workspace_root,
                                             extension_id.as_deref(),
                                             &module_state,
@@ -20404,7 +21409,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     &allowed_read_roots,
                                 );
                                 let allowed = path_is_allowed_extension_fs_path(
-                                    &checked_path,
+                                    &requested_abs,
                                     &workspace_root,
                                     extension_id.as_deref(),
                                     &module_state,
@@ -21269,6 +22274,7 @@ function __pi_runtime_registry_snapshot() {
         pendingTasks: __pi_map_size_primordial(__pi_tasks),
         pendingHostcalls: __pi_map_size_primordial(__pi_pending_hostcalls),
         pendingTimers: __pi_map_size_primordial(__pi_timer_callbacks),
+        timerHandles: __pi_timer_runtime.count(),
         pendingEventListenerLists: __pi_map_size_primordial(__pi_event_listeners),
         eventBatchContexts: __pi_map_size_primordial(__pi_event_batch_contexts),
         providerStreams:
@@ -21350,6 +22356,7 @@ function __pi_reset_extension_runtime_state(bridge_secret) {
     __pi_map_clear_primordial(__pi_tasks);
     __pi_map_clear_primordial(__pi_pending_hostcalls);
     __pi_map_clear_primordial(__pi_timer_callbacks);
+    __pi_timer_runtime.reset(bridge_secret);
     __pi_map_clear_primordial(__pi_event_listeners);
     __pi_map_clear_primordial(__pi_event_batch_contexts);
     __pi_session_identity.id = null;
@@ -21371,6 +22378,7 @@ function __pi_reset_extension_runtime_state(bridge_secret) {
         after.pendingTasks === 0 &&
         after.pendingHostcalls === 0 &&
         after.pendingTimers === 0 &&
+        after.timerHandles === 0 &&
         after.pendingEventListenerLists === 0 &&
         after.eventBatchContexts === 0 &&
         after.providerStreams === 0 &&
@@ -23146,6 +24154,35 @@ function __pi_project_model_entry(raw) {
         }
         return undefined;
     }
+
+	    if (eventName === 'context') {
+	        const base = event_payload && typeof event_payload === 'object' ? event_payload : {};
+	        let currentMessages = Array.isArray(base.messages) ? base.messages : [];
+	        for (const entry of handlers) {
+	            const handler = entry && entry.handler;
+	            if (typeof handler !== 'function') continue;
+	            const event = Object.assign({ type: 'context' }, base, { messages: currentMessages });
+	            let result = undefined;
+	            try {
+	                result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
+	            } catch (e) {
+	                try { globalThis.console && globalThis.console.error && globalThis.console.error('Event handler error:', eventName, entry.extensionId, e); } catch (_e) {}
+	                continue;
+	            }
+	            // A void handler keeps prior rewrites, including in-place array
+	            // changes. Each subsequent handler sees the current messages.
+	            if (Array.isArray(event.messages)) currentMessages = event.messages;
+	            if (result === undefined || result === null) continue;
+	            const next = Array.isArray(result)
+	                ? result
+	                : (typeof result === 'object' ? result.messages : undefined);
+	            if (Array.isArray(next)) currentMessages = next;
+	            else if (next === null) currentMessages = [];
+	        }
+	        // Return the messages even for in-place/void handlers so changes
+	        // survive the realm boundary and cannot be lost to a later owner.
+	        return { messages: currentMessages };
+	    }
 
 	    if (eventName === 'resources_discover') {
 	        const skillPaths = [];
@@ -25127,34 +26164,56 @@ if (typeof globalThis.process === 'undefined') {
     const detHome = __pi_env_get_native('PI_DETERMINISTIC_HOME');
     const detCwd = __pi_env_get_native('PI_DETERMINISTIC_CWD');
 
+    // Materialize only the capability-filtered, immutable host snapshot.
+    // Libraries can spread process.env into child options without exposing
+    // credentials or receiving permission to enumerate the ambient host env.
+    const envTarget = Object.create(null);
+    for (const key of __pi_env_keys_native()) {
+        const value = __pi_env_get_native(key);
+        if (value !== null && value !== undefined) envTarget[key] = value;
+    }
+    if (detHome) envTarget.HOME = detHome;
     const envProxy = new Proxy(
-        {},
+        envTarget,
         {
-            get(_target, prop) {
+            get(target, prop, receiver) {
+                if (Reflect.getOwnPropertyDescriptor(target, prop)) {
+                    return Reflect.get(target, prop, receiver);
+                }
                 if (typeof prop !== 'string') return undefined;
-                if (prop === 'HOME' && detHome) return detHome;
                 const value = __pi_env_get_native(prop);
                 return value === null || value === undefined ? undefined : value;
             },
-            set(_target, prop, _value) {
+            set(target, prop, value) {
+                const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+                if (descriptor && descriptor.configurable === false) {
+                    if ('value' in descriptor && descriptor.writable === false) {
+                        return Object.is(value, descriptor.value);
+                    }
+                    if ('set' in descriptor && descriptor.set === undefined) return false;
+                }
                 // Read-only in PiJS — silently ignore writes
                 return typeof prop === 'string';
             },
-            deleteProperty(_target, prop) {
+            deleteProperty(target, prop) {
+                const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+                if (descriptor && (!descriptor.configurable || !Reflect.isExtensible(target))) return false;
                 // Read-only — silently ignore deletes
                 return typeof prop === 'string';
             },
-            has(_target, prop) {
+            has(target, prop) {
+                if (Reflect.has(target, prop)) return true;
                 if (typeof prop !== 'string') return false;
-                if (prop === 'HOME' && detHome) return true;
                 const value = __pi_env_get_native(prop);
                 return value !== null && value !== undefined;
             },
-            ownKeys() {
-                // Cannot enumerate real env — return empty
-                return [];
+            ownKeys(target) {
+                return Reflect.ownKeys(target);
             },
-            getOwnPropertyDescriptor(_target, prop) {
+            getOwnPropertyDescriptor(target, prop) {
+                const descriptor = Reflect.getOwnPropertyDescriptor(target, prop);
+                if (descriptor) return descriptor;
+                if (!Reflect.isExtensible(target)) return undefined;
                 if (typeof prop !== 'string') return undefined;
                 const value = __pi_env_get_native(prop);
                 if (value === null || value === undefined) return undefined;
@@ -25584,12 +26643,9 @@ if (typeof globalThis.Bun === 'undefined') {
             globalThis.process && typeof globalThis.process.cwd === 'function'
                 ? globalThis.process.cwd()
                 : '/';
-        const raw = __pi_exec_sync_native('which', JSON.stringify([name]), cwd, 2000, 1024 * 1024);
         try {
-            const parsed = JSON.parse(raw || '{}');
-            if (Number(parsed && parsed.code) !== 0) return null;
-            const out = String((parsed && parsed.stdout) || '').trim();
-            return out ? out.split('\n')[0] : null;
+            const matches = JSON.parse(__pi_find_executables_native(name, cwd));
+            return matches.length ? matches[0] : null;
         } catch (_) {
             return null;
         }
@@ -25790,70 +26846,147 @@ if (typeof globalThis.Bun === 'undefined') {
     globalThis.Bun = Bun;
 }
 
-if (typeof globalThis.setTimeout !== 'function') {
-    globalThis.setTimeout = (callback, delay, ...args) => {
-        const ms = Number(delay || 0);
-        const timer_id = __pi_set_timeout_native(ms <= 0 ? 0 : Math.floor(ms));
-        const captured_id = __pi_get_current_extension_id();
-        __pi_register_timer(timer_id, () => {
-            const invoke = () => callback(...args);
-            const result = captured_id
-                ? __pi_with_extension_async(captured_id, invoke)
+// Timer ownership belongs to the embedding actor. ref/unref record the Node
+// handle preference; neither can retain a realm after host shutdown or cancel
+// a callback while its host is alive. State and trusted rescheduling closures
+// stay private, so inspecting a handle cannot reveal or replace provenance.
+const __pi_timer_runtime = (() => {
+    const states = new WeakMap();
+    const active = new Map();
+    const getState = Function.call.bind(WeakMap.prototype.get);
+    const setState = Function.call.bind(WeakMap.prototype.set);
+    const hasState = Function.call.bind(WeakMap.prototype.has);
+    const getActive = Function.call.bind(Map.prototype.get);
+    const setActive = Function.call.bind(Map.prototype.set);
+    const deleteActive = Function.call.bind(Map.prototype.delete);
+    const forEachActive = Function.call.bind(Map.prototype.forEach);
+    const clearActive = __pi_map_clear_primordial;
+    const activeCount = __pi_map_size_primordial;
+    const createScheduler = __pi_create_timer_scheduler_native;
+    Object.defineProperty(globalThis, '__pi_create_timer_scheduler_native', {
+        value: undefined, writable: false, configurable: false, enumerable: false,
+    });
+    let epoch = 0;
+
+    function stateOf(handle) {
+        const state = getState(states, handle);
+        if (!state) throw new TypeError('Invalid Timeout receiver');
+        return state;
+    }
+    function disarm(state) {
+        if (state.nativeId !== null) {
+            __pi_unregister_timer(state.nativeId);
+            __pi_clear_timeout_native(state.nativeId);
+            state.nativeId = null;
+        }
+    }
+    function cancel(handle) {
+        const state = stateOf(handle);
+        if (state.epoch !== epoch || state.cancelled) return;
+        disarm(state);
+        deleteActive(active, state.id);
+        state.active = false;
+        state.cancelled = true;
+        state.callback = null;
+        state.args = null;
+        state.schedule = null;
+    }
+    function arm(handle, state) {
+        disarm(state);
+        const version = ++state.version;
+        const nativeId = state.schedule(state.delay);
+        state.nativeId = nativeId;
+        // The initial native id is unique across both kinds of timer. Later
+        // re-arms get fresh native ids without changing the handle's identity.
+        if (state.id === null) state.id = nativeId;
+        state.active = true;
+        setActive(active, state.id, handle);
+        __pi_register_timer(nativeId, () => {
+            if (state.epoch !== epoch || !state.active || state.version !== version) return;
+            state.nativeId = null;
+            if (!state.repeat) {
+                state.active = false;
+                deleteActive(active, state.id);
+            }
+            const callback = state.callback;
+            const args = state.args;
+            const invoke = () => callback.apply(handle, args);
+            const result = state.owner
+                ? __pi_with_extension_async(state.owner, invoke)
                 : Promise.resolve().then(invoke);
-            result.catch((e) => {
-                console.error('setTimeout callback error:', e);
+            result.catch((error) => console.error('Timer callback error:', error)).then(() => {
+                // Keep the existing serialized interval callback behavior.
+                // A refresh or clear during that callback wins over re-arming.
+                if (state.repeat && state.active && !state.cancelled &&
+                    state.epoch === epoch && state.version === version) {
+                    arm(handle, state);
+                }
             });
         });
-        return timer_id;
-    };
-}
-
-if (typeof globalThis.clearTimeout !== 'function') {
-    globalThis.clearTimeout = (timer_id) => {
-        __pi_unregister_timer(timer_id);
-        try {
-            __pi_clear_timeout_native(timer_id);
-        } catch (_) {}
-    };
-}
-
-// setInterval polyfill using setTimeout
-const __pi_intervals = new Map();
-let __pi_interval_id = 0;
-
-if (typeof globalThis.setInterval !== 'function') {
-    globalThis.setInterval = (callback, delay, ...args) => {
-        const ms = Math.max(0, Number(delay || 0));
-        const id = ++__pi_interval_id;
-        const captured_id = __pi_get_current_extension_id();
-        const run = async () => {
-            if (!__pi_intervals.has(id)) return;
-            try {
-                if (captured_id) {
-                    await __pi_with_extension_async(captured_id, () => callback(...args));
-                } else {
-                    await callback(...args);
-                }
-            } catch (e) {
-                console.error('setInterval callback error:', e);
-            }
-            if (__pi_intervals.has(id)) {
-                __pi_intervals.set(id, globalThis.setTimeout(run, ms));
-            }
-        };
-        __pi_intervals.set(id, globalThis.setTimeout(run, ms));
-        return id;
-    };
-}
-
-if (typeof globalThis.clearInterval !== 'function') {
-    globalThis.clearInterval = (id) => {
-        const timerId = __pi_intervals.get(id);
-        if (timerId !== undefined) {
-            globalThis.clearTimeout(timerId);
-            __pi_intervals.delete(id);
+    }
+    class Timeout {
+        ref() { stateOf(this).referenced = true; return this; }
+        unref() { stateOf(this).referenced = false; return this; }
+        hasRef() { return stateOf(this).referenced; }
+        refresh() {
+            const state = stateOf(this);
+            if (state.epoch === epoch && !state.cancelled) arm(this, state);
+            return this;
         }
-    };
+        close() { cancel(this); return this; }
+        [Symbol.toPrimitive]() { return stateOf(this).id; }
+    }
+    if (typeof Symbol.dispose === 'symbol') {
+        Object.defineProperty(Timeout.prototype, Symbol.dispose, {
+            value() { cancel(this); }, configurable: true, writable: true,
+        });
+    }
+    function create(callback, delay, repeat, args) {
+        if (typeof callback !== 'function') throw new TypeError('Timer callback must be a function');
+        let ms = Number(delay || 0);
+        if (!Number.isFinite(ms) || ms < 0 || ms > 2147483647) ms = 1;
+        const handle = new Timeout();
+        const state = {
+            id: null, nativeId: null, delay: Math.floor(ms), repeat, callback, args,
+            owner: __pi_get_current_extension_id(),
+            schedule: createScheduler(),
+            referenced: true, active: false, cancelled: false, epoch, version: 0,
+        };
+        setState(states, handle, state);
+        arm(handle, state);
+        return handle;
+    }
+    function clear(handle) {
+        if (typeof handle === 'number' || typeof handle === 'string') {
+            handle = getActive(active, Number(handle));
+        }
+        if (handle && hasState(states, handle)) cancel(handle);
+    }
+    return Object.freeze({
+        setTimeout: (callback, delay, ...args) => create(callback, delay, false, args),
+        setInterval: (callback, delay, ...args) => create(callback, delay, true, args),
+        clear,
+        count: () => activeCount(active),
+        reset(secret) {
+            if (!__pi_bridge_secret_matches_native(secret)) throw new Error('Timer reset denied');
+            forEachActive(active, (handle) => cancel(handle));
+            epoch++;
+            clearActive(active);
+        },
+    });
+})();
+
+if (typeof globalThis.setTimeout !== 'function') {
+    globalThis.setTimeout = __pi_timer_runtime.setTimeout;
+}
+if (typeof globalThis.clearTimeout !== 'function') {
+    globalThis.clearTimeout = __pi_timer_runtime.clear;
+}
+if (typeof globalThis.setInterval !== 'function') {
+    globalThis.setInterval = __pi_timer_runtime.setInterval;
+}
+if (typeof globalThis.clearInterval !== 'function') {
+    globalThis.clearInterval = __pi_timer_runtime.clear;
 }
 
 if (typeof globalThis.fetch !== 'function') {
@@ -28182,6 +29315,55 @@ const path = require('path');
     }
 
     #[test]
+    fn extract_static_require_specifiers_respects_nested_lexical_bindings() {
+        let source = r#"
+import { createRequire } from 'node:module';
+export function loadDatabase() {
+    const require = createRequire(import.meta.url);
+    if (globalThis.Bun) return require(['bun', 'sqlite'].join(':')).Database;
+    return require('better-sqlite3');
+}
+function parameter(require) { return require('parameter-local'); }
+function destructured({ require }) { return require('destructured-local'); }
+const arrow = (require) => require('arrow-local');
+{
+    const require = () => {};
+    require('block-local');
+}
+const fs = require /* whitespace must not hide a free call */ ('node:fs');
+function freeCall() { return require('node:path'); }
+const escaped = require('node:\u006f\u0073');
+"#;
+        assert_eq!(
+            extract_static_require_specifiers(source),
+            vec!["node:fs", "node:path", "node:os"]
+        );
+    }
+
+    #[test]
+    fn maybe_cjs_to_esm_preserves_lazy_create_require_driver_selection() {
+        let source = r#"
+import { createRequire } from 'node:module';
+export function loadDatabase() {
+    const require = createRequire(import.meta.url);
+    if (globalThis.Bun) return require(['bun', 'sqlite'].join(':')).Database;
+    return require('better-sqlite3');
+}
+"#;
+        assert_eq!(maybe_cjs_to_esm(source), source);
+    }
+
+    #[test]
+    fn maybe_cjs_to_esm_provides_empty_exports_for_side_effect_modules() {
+        let rewritten = maybe_cjs_to_esm(
+            "const path = require ('node:path'); globalThis.loadedName = path.basename('/fixture/value');",
+        );
+        assert!(rewritten.contains("const module = { exports: {} };"));
+        assert!(rewritten.contains("export default module.exports;"));
+        assert!(rewritten.contains("from \"node:path\";"));
+    }
+
+    #[test]
     fn maybe_cjs_to_esm_ignores_codegen_string_requires() {
         let source = r#"
 const fs = require("fs");
@@ -28506,6 +29688,201 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                     .is_none(),
                 "final completion must erase hostcall provenance"
             );
+        });
+    }
+
+    #[test]
+    fn timer_handles_share_cancellation_and_keep_private_state() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.timerResults = [];
+                    globalThis.keptTimer = setTimeout(function(value) {
+                        timerResults.push([value, this === keptTimer]);
+                    }, 10, 'kept');
+                    const interval = setInterval(() => timerResults.push('wrong interval'), 10);
+                    const cancelled = setTimeout(() => timerResults.push('wrong timeout'), 10);
+                    clearTimeout(Number(interval));
+                    clearInterval(String(Number(cancelled)));
+                    if (typeof Symbol.dispose === 'symbol') {
+                        const disposed = setTimeout(() => timerResults.push('wrong disposal'), 10);
+                        disposed[Symbol.dispose]();
+                        disposed.refresh();
+                    }
+                    globalThis.timerFeatures = {
+                        object: typeof keptTimer === 'object',
+                        private: Reflect.ownKeys(keptTimer).length === 0,
+                        unique: Number(keptTimer) !== Number(interval),
+                        referenced: keptTimer.hasRef(),
+                        same: keptTimer.unref() === keptTimer,
+                        unreferenced: !keptTimer.hasRef(),
+                        nativeFactoryHidden: typeof __pi_create_timer_scheduler_native === 'undefined',
+                    };
+                    const saved = [WeakMap.prototype.get, WeakMap.prototype.set, WeakMap.prototype.has];
+                    globalThis.timerStateIntercepts = 0;
+                    try {
+                        WeakMap.prototype.get = function(...args) { timerStateIntercepts++; return saved[0].apply(this, args); };
+                        WeakMap.prototype.set = function(...args) { timerStateIntercepts++; return saved[1].apply(this, args); };
+                        WeakMap.prototype.has = function(...args) { timerStateIntercepts++; return saved[2].apply(this, args); };
+                        const protectedTimer = setTimeout(() => {}, 100);
+                        protectedTimer.unref().ref();
+                        protectedTimer.hasRef();
+                        clearTimeout(protectedTimer);
+                    } finally {
+                        [WeakMap.prototype.get, WeakMap.prototype.set, WeakMap.prototype.has] = saved;
+                    }
+                    "#,
+                )
+                .await
+                .expect("create and clear timer handles");
+            let features = runtime.read_global_json("timerFeatures").await.unwrap();
+            assert!(
+                features
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(|value| value.as_bool() == Some(true))
+            );
+            assert_eq!(
+                runtime
+                    .read_global_json("timerStateIntercepts")
+                    .await
+                    .unwrap(),
+                0
+            );
+            clock.set(10);
+            runtime
+                .tick()
+                .await
+                .expect("fire retained unreferenced timer");
+            assert_eq!(
+                runtime.read_global_json("timerResults").await.unwrap(),
+                serde_json::json!([["kept", true]])
+            );
+            assert!(!runtime.has_pending());
+            runtime.eval("keptTimer.refresh();").await.unwrap();
+            clock.set(20);
+            runtime.tick().await.expect("refresh fired timer");
+            assert_eq!(
+                runtime.read_global_json("timerResults").await.unwrap(),
+                serde_json::json!([["kept", true], ["kept", true]])
+            );
+            runtime.eval("keptTimer.close().refresh();").await.unwrap();
+            assert!(!runtime.has_pending(), "closed handles must not re-arm");
+            let snapshot = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
+            assert_eq!(snapshot["timerHandles"], 0);
+        });
+    }
+
+    #[test]
+    fn refreshed_and_repeated_timers_preserve_original_hostcall_provenance() {
+        futures::executor::block_on(async {
+            for timer_function in ["setTimeout", "setInterval"] {
+                let clock = Arc::new(DeterministicClock::new(0));
+                let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                    .await
+                    .expect("create runtime");
+                let source = SessionActionOriginSource::default();
+                {
+                    let _origin_guard = runtime.enter_session_action_origin(Some(source.capture()));
+                    runtime
+                        .eval(&format!(
+                            "globalThis.refreshedTimer = {timer_function}(() => pi.log({{ from: 'refresh' }}), 10);"
+                        ))
+                        .await
+                        .unwrap();
+                }
+                source.advance();
+                clock.set(5);
+                {
+                    let _later_origin = runtime.enter_session_action_origin(Some(source.capture()));
+                    runtime.eval("refreshedTimer.refresh();").await.unwrap();
+                }
+                clock.set(10);
+                assert!(!runtime.tick().await.unwrap().ran_macrotask);
+                for deadline in [15, 25] {
+                    clock.set(deadline);
+                    runtime.tick().await.unwrap();
+                    let requests = runtime.drain_hostcall_requests();
+                    assert_eq!(requests.len(), 1, "{timer_function} at {deadline}");
+                    let call_id = &requests[0].call_id;
+                    let origin = runtime.session_action_origin_for_hostcall(call_id).unwrap();
+                    assert!(
+                        !source.accepts(&origin),
+                        "refresh must not replace a stale timer origin with its caller's fresh origin"
+                    );
+                    runtime.complete_hostcall(
+                        call_id,
+                        HostcallOutcome::Success(serde_json::Value::Null),
+                    );
+                    runtime.tick().await.unwrap();
+                    if deadline == 15 && timer_function == "setTimeout" {
+                        let _later_origin =
+                            runtime.enter_session_action_origin(Some(source.capture()));
+                        runtime.eval("refreshedTimer.refresh();").await.unwrap();
+                    }
+                }
+                runtime.eval("clearTimeout(refreshedTimer);").await.unwrap();
+                assert!(!runtime.has_pending());
+                assert!(runtime.user_timer_origins.borrow().is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn timer_reset_invalidates_held_handles_and_pending_interval_callbacks() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval("globalThis.expiredTimer = setTimeout(() => {}, 0);")
+                .await
+                .unwrap();
+            runtime.tick().await.unwrap();
+            assert!(
+                runtime
+                    .scrub_for_cold_drop()
+                    .await
+                    .unwrap()
+                    .inventoried_state_cleared
+            );
+            runtime.eval("expiredTimer.refresh();").await.unwrap();
+            assert!(
+                !runtime.has_pending(),
+                "a held pre-scrub timer cannot reactivate"
+            );
+
+            runtime.eval(
+                "globalThis.pendingInterval = setInterval(() => new Promise(resolve => { globalThis.releaseInterval = resolve; }), 0);"
+            ).await.unwrap();
+            runtime.tick().await.unwrap();
+            let snapshot = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
+            assert_eq!(snapshot["pendingTimers"], 0);
+            assert_eq!(snapshot["timerHandles"], 1);
+            let report = runtime.scrub_for_cold_drop().await.unwrap();
+            assert!(
+                !report.inventoried_state_cleared,
+                "pending callback remains hygiene evidence"
+            );
+            assert_eq!(report.reason_code.as_deref(), Some("pending_js_work"));
+            assert_eq!(report.pending_timers_before, 1);
+            assert_eq!(report.residual_entries_after, 0);
+            runtime
+                .eval("releaseInterval(); pendingInterval.refresh();")
+                .await
+                .unwrap();
+            assert!(
+                !runtime.has_pending(),
+                "settling a pre-scrub callback must not re-arm"
+            );
+            let snapshot = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
+            assert_eq!(snapshot["timerHandles"], 0);
         });
     }
 
@@ -29759,6 +31136,77 @@ import { isIPv4 as netIsIpv4 } from "node:net";
     }
 
     #[test]
+    fn resolve_module_path_decodes_file_urls_and_preserves_scope() {
+        let temp = tempfile::tempdir().expect("file URL fixture");
+        let root = temp.path().join("extension # % λ");
+        std::fs::create_dir_all(&root).expect("create encoded-name root");
+        let base = root.join("index.mjs");
+        let module = root.join("helper #%.mjs");
+        let outside = temp.path().join("outside.mjs");
+        std::fs::write(&base, "export {};\n").unwrap();
+        std::fs::write(&module, "export const answer = 42;\n").unwrap();
+        std::fs::write(&outside, "throw new Error('outside executed');\n").unwrap();
+        let roots = [crate::extensions::safe_canonicalize(&root)];
+        let module_url = url::Url::from_file_path(&module).unwrap();
+        assert!(module_url.as_str().contains("%23"));
+        assert!(module_url.as_str().contains("%25"));
+        assert_eq!(
+            resolve_module_path(
+                base.to_str().unwrap(),
+                module_url.as_str(),
+                RepairMode::Off,
+                &roots
+            ),
+            Some(module.clone())
+        );
+        let outside_url = url::Url::from_file_path(&outside).unwrap();
+        assert!(
+            resolve_module_path(
+                base.to_str().unwrap(),
+                outside_url.as_str(),
+                RepairMode::Off,
+                &roots
+            )
+            .is_none()
+        );
+        for suffix in ["#fragment", "?variant=2", "%2fsecret.mjs", "%00", "%zz"] {
+            let invalid = format!("{}{suffix}", module_url.as_str());
+            assert!(module_path_from_file_url(&invalid).is_none(), "{invalid}");
+        }
+        let traversal = format!(
+            "{}/%2e%2e/outside.mjs",
+            url::Url::from_directory_path(&root)
+                .unwrap()
+                .as_str()
+                .trim_end_matches('/')
+        );
+        assert!(
+            resolve_module_path(base.to_str().unwrap(), &traversal, RepairMode::Off, &roots)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn import_meta_url_encodes_paths_for_native_and_windows_modules() {
+        for (path, expected) in [
+            (
+                "/tmp/extension # % λ/entry.mjs",
+                "file:///tmp/extension%20%23%20%25%20%CE%BB/entry.mjs",
+            ),
+            (
+                r"C:\Users\reporter # % λ\entry.mjs",
+                "file:///C:/Users/reporter%20%23%20%25%20%CE%BB/entry.mjs",
+            ),
+        ] {
+            let compiled = String::from_utf8(prefix_import_meta_url(path, "export {};")).unwrap();
+            assert!(
+                compiled.starts_with(&format!("import.meta.url = {expected:?};\n")),
+                "{compiled}"
+            );
+        }
+    }
+
+    #[test]
     fn detect_monorepo_escape_uses_nearest_base_root() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let workspace_root = temp_dir.path();
@@ -29920,7 +31368,20 @@ globalThis.__proxyProbe = {
   kind: typeof dep,
   chain: typeof dep.foo.bar(),
   primitive: String(dep),
+  values: Object.values(dep),
+  hasPrototype: 'prototype' in dep,
+  prototypeConfigurable: Object.getOwnPropertyDescriptor(dep, 'prototype').configurable,
 };
+Object.defineProperty(dep, 'fixed', { value: 7, enumerable: true });
+Object.defineProperty(dep, 'getterless', { get: undefined });
+const fixedSymbol = Symbol('fixed');
+Object.defineProperty(dep, fixedSymbol, { value: 9 });
+Object.freeze(dep);
+globalThis.__proxyProbe.fixed = dep.fixed;
+globalThis.__proxyProbe.symbol = dep[fixedSymbol];
+globalThis.__proxyProbe.getterless = dep.getterless === undefined;
+globalThis.__proxyProbe.frozen = Object.isFrozen(dep);
+globalThis.__proxyProbe.frozenValues = Object.values(dep);
 export default dep;
 "#,
             )
@@ -29964,6 +31425,14 @@ export default dep;
             assert_eq!(probe["kind"], serde_json::json!("function"));
             assert_eq!(probe["chain"], serde_json::json!("function"));
             assert_eq!(probe["primitive"], serde_json::json!(""));
+            assert_eq!(probe["values"], serde_json::json!([]));
+            assert_eq!(probe["hasPrototype"], serde_json::json!(true));
+            assert_eq!(probe["prototypeConfigurable"], serde_json::json!(false));
+            assert_eq!(probe["fixed"], serde_json::json!(7));
+            assert_eq!(probe["symbol"], serde_json::json!(9));
+            assert_eq!(probe["getterless"], serde_json::json!(true));
+            assert_eq!(probe["frozen"], serde_json::json!(true));
+            assert_eq!(probe["frozenValues"], serde_json::json!([7]));
 
             let events = runtime.drain_repair_events();
             assert!(events.iter().any(|event| {
@@ -33344,6 +34813,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             std::fs::create_dir_all(&ext_a).expect("mkdir ext-a");
             std::fs::create_dir_all(&ext_b).expect("mkdir ext-b");
             let fd_path = ext_a.join("fd-secret.txt");
+            let shared_path = workspace.join("shared-fd.txt");
 
             let config = PiJsRuntimeConfig {
                 cwd: workspace.display().to_string(),
@@ -33366,10 +34836,13 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     const require = createRequire('/tmp/example.js');
                     const fs = require('node:fs');
                     let fd;
+                    let sharedFd;
                     return __pi_with_extension_async(__pi_test_secret, "ext.a", async () => {{
                         fs.mkdirSync({ext_a:?}, {{ recursive: true }});
                         fs.writeFileSync({fd_path:?}, 'fd-secret');
                         fd = fs.openSync({fd_path:?}, 'r+');
+                        fs.writeFileSync({shared_path:?}, 'workspace-content');
+                        sharedFd = fs.openSync({shared_path:?}, 'r');
                     }}).then(() => __pi_with_extension_async(__pi_test_secret, "ext.b", async () => {{
                         for (const [name, operation] of [
                             ['read', () => fs.readSync(fd, Buffer.alloc(9), 0, 9, 0)],
@@ -33388,11 +34861,21 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                                     String((err && err.message) || err || '');
                             }}
                         }}
+                        // Workspace paths are readable by both principals;
+                        // the open descriptor itself still belongs to ext.a.
+                        for (const [name, operation] of [
+                            ['sharedRead', () => fs.readSync(sharedFd, Buffer.alloc(32), 0, 32, 0)],
+                            ['sharedClose', () => fs.closeSync(sharedFd)],
+                        ]) {{
+                            try {{ operation(); globalThis.fdScope[name] = true; }}
+                            catch (_) {{ globalThis.fdScope[name] = false; }}
+                        }}
                     }})).then(() => __pi_with_extension_async(__pi_test_secret, "ext.a", async () => {{
                         globalThis.fdScope.ownerValue =
                             fs.readFileSync({fd_path:?}, 'utf8');
                         globalThis.fdScope.ownerSize = fs.fstatSync(fd).size;
                         fs.closeSync(fd);
+                        fs.closeSync(sharedFd);
                     }}));
                 }}).finally(() => {{
                     globalThis.fdScope.done = true;
@@ -33424,6 +34907,8 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             }
             assert_eq!(result["ownerValue"], serde_json::json!("fd-secret"));
             assert_eq!(result["ownerSize"], serde_json::json!(9));
+            assert_eq!(result["sharedRead"], serde_json::json!(false));
+            assert_eq!(result["sharedClose"], serde_json::json!(false));
         });
     }
 
@@ -34203,6 +35688,15 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                               typeof missing === 'function' &&
                               typeof missing.default === 'function' &&
                               typeof missing.anyNestedProperty === 'function';
+                            globalThis.requireResults.missingValues = Object.values(missing);
+                            globalThis.requireResults.hasPrototype = 'prototype' in missing;
+                            Object.defineProperty(missing, 'fixed', { value: 11, enumerable: true });
+                            Object.defineProperty(missing, 'getterless', { get: undefined });
+                            Object.freeze(missing);
+                            globalThis.requireResults.frozen = Object.isFrozen(missing);
+                            globalThis.requireResults.fixed = missing.fixed;
+                            globalThis.requireResults.getterless = missing.getterless === undefined;
+                            globalThis.requireResults.frozenValues = Object.values(missing);
                         } catch (err) {
                             globalThis.requireResults.missingModuleThrows = true;
                             globalThis.requireResults.missingModuleIsStub = false;
@@ -34223,6 +35717,12 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(r["http2PathHeader"], serde_json::json!(":path"));
             assert_eq!(r["missingModuleThrows"], serde_json::json!(false));
             assert_eq!(r["missingModuleIsStub"], serde_json::json!(true));
+            assert_eq!(r["missingValues"], serde_json::json!([]));
+            assert_eq!(r["hasPrototype"], serde_json::json!(true));
+            assert_eq!(r["frozen"], serde_json::json!(true));
+            assert_eq!(r["fixed"], serde_json::json!(11));
+            assert_eq!(r["getterless"], serde_json::json!(true));
+            assert_eq!(r["frozenValues"], serde_json::json!([11]));
         });
     }
 
@@ -35470,8 +36970,8 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     r"
                     globalThis.urlResults = {};
                     import('node:url').then((url) => {
-                        globalThis.urlResults.fileToPath = url.fileURLToPath('file:///home/user/test.txt');
-                        globalThis.urlResults.pathToFile = url.pathToFileURL('/home/user/test.txt').href;
+                        globalThis.urlResults.fileToPath = url.fileURLToPath('file:///home/user/test.txt', { windows: false });
+                        globalThis.urlResults.pathToFile = url.pathToFileURL('/home/user/test.txt', { windows: false }).href;
 
                         const u = new url.URL('https://example.com/path?key=val#frag');
                         globalThis.urlResults.href = u.href;

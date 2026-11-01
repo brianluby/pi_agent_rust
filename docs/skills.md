@@ -88,6 +88,7 @@ You are an expert SQL developer. When writing queries:
 | `name` | Skill ID (must match directory name if in a subdir; mismatches emit a warning). |
 | `description` | **Required.** Short description used for selection; empty descriptions are skipped. |
 | `disable-model-invocation` | If `true`, the skill is not shown to the model in the system prompt. |
+| `user-invocable` | Boolean, default `true`. If `false`, the skill is omitted from slash-command completion and `/skill:name` does not expand it. Model visibility is controlled independently by `disable-model-invocation`. |
 
 If `name` is omitted, the parent directory name is used.
 

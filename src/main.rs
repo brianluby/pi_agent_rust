@@ -2317,7 +2317,7 @@ async fn run(
     // through the same handle, so `pi.tool` hostcalls apply the session's
     // undo/workspace policy and see tools mounted after boot (extension
     // wrappers, MCP tools, plan tools).
-    let shared_enabled_tools = cli.enabled_tools();
+    let shared_enabled_tools = cli.enabled_tools(&config);
     // A name the registry does not know is dropped without a word, so
     // `--tools read,bsah,edit` hands the model two tools and reports three.
     let unknown_tools = pi::tools::unknown_tool_names(&shared_enabled_tools);
@@ -2342,9 +2342,9 @@ async fn run(
     // what this printed before — tells them something false about a tool they
     // can actually have.
     for (name, how) in pi::tools::unselectable_tool_names(&shared_enabled_tools) {
-        eprintln!("Warning: --tools: \"{name}\" is not selected with --tools; {how}");
+        eprintln!("Warning: --tools: \"{name}\": {how}");
     }
-    let shared_tools = pi::tools::SharedToolRegistry::new(if cli.no_tools {
+    let shared_tools = pi::tools::SharedToolRegistry::new(if cli.builtin_tools_disabled() {
         ToolRegistry::without_builtins(Some(&config))
     } else {
         ToolRegistry::with_mutation_recorder(
@@ -2526,6 +2526,12 @@ async fn run(
         let available_models = rpc_available_models(&model_registry, cli.api_key.as_deref());
         let acp_options = pi::acp::AcpOptions {
             config: config.clone(),
+            settings_source: Some(pi::acp::AcpSettingsSource {
+                global_dir: global_dir.clone(),
+                config_override: config_path.clone(),
+                workspace_trust_env: std::env::var(pi::workspace_trust::TRUST_ENV_VAR).ok(),
+                launch_cwd: cwd.clone(),
+            }),
             launch: pi::acp::AcpLaunchOptions::from_cli(&cli),
             available_models,
             model_registry: model_registry.clone(),
@@ -2694,7 +2700,7 @@ async fn run(
         None
     };
 
-    let enabled_tools = cli.enabled_tools();
+    let enabled_tools = cli.enabled_tools(&config);
     // CLI flag wins; fall back to PI_MAX_TOOL_ITERATIONS env, then default.
     // `clamp_max_tool_iterations` keeps invalid values out of the loop and
     // emits a warning instead of failing the run.
@@ -3056,11 +3062,12 @@ async fn run(
         ]);
     }
     // submit_plan shares the agent's plan-mode state (bd-cv653.3.5); it is
-    // registered when built-ins are enabled, and self-errors outside plan mode.
+    // registered only when selected, and self-errors outside plan mode.
     {
         let plan_state = agent_session.agent.plan_state();
         let auto_approve = cli.plan_yolo || config.plan_auto_approve();
-        if !cli.no_tools {
+        let submit_plan_enabled = enabled_tools.contains(&"submit_plan");
+        if submit_plan_enabled {
             agent_session
                 .agent
                 .extend_tools(vec![Box::new(pi::plan::SubmitPlanTool::new(
@@ -3068,7 +3075,7 @@ async fn run(
                     auto_approve,
                 )) as Box<dyn pi::tools::Tool>]);
         }
-        if cli.plan_mode && !cli.no_tools {
+        if cli.plan_mode && submit_plan_enabled {
             plan_state.enter_planning();
             let cx = pi::agent_cx::AgentCx::for_request();
             if let Ok(mut inner) = agent_session.session.lock(cx.cx()).await {
@@ -3078,7 +3085,7 @@ async fn run(
                 );
             }
         } else if cli.plan_mode {
-            eprintln!("Warning: --plan-mode is unavailable while --no-tools is enabled");
+            eprintln!("Warning: --plan-mode requires the submit_plan tool to be enabled");
         }
     }
     agent_session.advisor = advisor_options(&cli, &config, &model_registry, &auth)
@@ -9534,7 +9541,7 @@ fn prompt_workspace_trust(
             "package entries"
         };
         eprintln!(
-            "  - .pi/settings.json ({} {noun}; npm/git installs run lifecycle scripts)",
+            "  - .pi/settings.json (optional tool activation and {} {noun}; npm/git installs run lifecycle scripts)",
             surface.package_count
         );
     }

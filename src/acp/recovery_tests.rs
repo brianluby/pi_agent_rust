@@ -230,6 +230,7 @@ fn options(root: &Path, url: &str, runtime: RuntimeHandle, retries: u32) -> AcpO
         entry(FALLBACK_PROVIDER, FALLBACK_MODEL, false, 512),
     ];
     AcpOptions {
+        settings_source: None,
         launch: AcpLaunchOptions::default(),
         config: Config {
             default_provider: Some(PRIMARY_PROVIDER.to_string()),

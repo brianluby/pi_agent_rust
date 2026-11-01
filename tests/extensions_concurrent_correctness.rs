@@ -780,3 +780,962 @@ export default function activate(pi) {
 
     shutdown(&manager);
 }
+
+/// Context rewrites compose across handlers, isolated realms and the event-bus
+/// phase. context-mode's one-shot timestamp-less injection must survive a later
+/// extension, including observers that return nothing and in-place mutations.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn context_messages_compose_across_realms_and_event_phases() {
+    let harness = common::TestHarness::new("context_composition");
+    let cwd = harness.temp_dir().to_path_buf();
+    let manager = ExtensionManager::new();
+    let runtime = common::run_async(JsExtensionRuntimeHandle::start(
+        PiJsRuntimeConfig {
+            cwd: cwd.display().to_string(),
+            env: std::collections::HashMap::from([(
+                "PI_EXT_COMPAT_SCAN".to_string(),
+                "0".to_string(),
+            )]),
+            repair_mode: pi::extensions_js::RepairMode::Off,
+            disk_cache_dir: None,
+            ..Default::default()
+        },
+        Arc::new(ToolRegistry::new(&[], &cwd, None)),
+        manager.clone(),
+    ))
+    .expect("start context runtime");
+    manager.set_js_runtime(runtime);
+    let entries = [
+        ("extensions/context_first.mjs", r#"
+            export default function(pi) {
+                pi.on('context', event => ({ messages: [
+                    ...event.messages, { role: 'user', content: 'first', timestamp: 1 },
+                ] }));
+                pi.on('context', event => ({ messages: [
+                    ...event.messages,
+                    { role: 'user', content: 'second after ' + event.messages.length, timestamp: 2 },
+                ] }));
+                pi.events('on', { event: 'context', handler: event => [
+                    ...event.messages, { role: 'user', content: 'event bus', timestamp: 3 },
+                ] });
+            }
+        "#.to_string()),
+        ("extensions/context_mode.mjs", r#"
+            export default function(pi) {
+                let pendingContext = 'context-mode active.\n<resume>Resume the task</resume>';
+                pi.on('context', event => {
+                    if (!pendingContext) return;
+                    const content = pendingContext;
+                    pendingContext = '';
+                    event.messages.push({ role: 'user', content });
+                    return { messages: event.messages };
+                });
+            }
+        "#.to_string()),
+        ("extensions/context_observer.mjs", r#"
+            export default function(pi) {
+                let direct = [], bus = [];
+                pi.on('context', event => {
+                    direct = event.messages.map(message => message.content);
+                    if (event.clear) return { messages: null };
+                });
+                pi.events('on', { event: 'context', handler: event => {
+                    bus = event.messages.map(message => message.content);
+                    event.messages.push({ role: 'user', content: 'void mutation', timestamp: 4 });
+                } });
+                pi.registerCommand('context-observations', {
+                    handler: async () => ({ display: JSON.stringify({ direct, bus }) }),
+                });
+            }
+        "#.to_string()),
+    ];
+    assert!(load_inline_extensions(&harness, &manager, entries));
+    let (first, observations, second, cleared, stopped) = common::run_async(async move {
+        let original = json!([{ "role": "user", "content": "original", "timestamp": 0 }]);
+        let first = manager
+            .dispatch_event_with_response(
+                ExtensionEventName::Context,
+                Some(json!({ "messages": original.clone() })),
+                5000,
+            )
+            .await
+            .expect("first context dispatch")
+            .expect("first rewrite");
+        let observations = manager
+            .execute_command("context-observations", "", 5000)
+            .await
+            .expect("observer state");
+        let second = manager
+            .dispatch_event_with_response(
+                ExtensionEventName::Context,
+                Some(json!({ "messages": original.clone() })),
+                5000,
+            )
+            .await
+            .expect("second context dispatch")
+            .expect("second rewrite");
+        let cleared = manager
+            .dispatch_event_with_response(
+                ExtensionEventName::Context,
+                Some(json!({ "messages": original, "clear": true })),
+                5000,
+            )
+            .await
+            .expect("cleared context dispatch")
+            .expect("cleared rewrite");
+        let stopped = manager.shutdown(Duration::from_secs(5)).await;
+        (first, observations, second, cleared, stopped)
+    });
+    assert!(stopped);
+    let texts = |value: &serde_json::Value| {
+        value["messages"]
+            .as_array()
+            .expect("message array")
+            .iter()
+            .map(|message| {
+                message["content"]
+                    .as_str()
+                    .expect("message text")
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        texts(&first),
+        [
+            "original",
+            "first",
+            "second after 2",
+            "context-mode active.\n<resume>Resume the task</resume>",
+            "event bus",
+            "void mutation",
+        ]
+    );
+    assert!(
+        first["messages"][3].get("timestamp").is_none(),
+        "the Agent boundary supplies this field, not the realm dispatcher"
+    );
+    let observations: serde_json::Value =
+        serde_json::from_str(observations["display"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        observations["direct"],
+        json!([
+            "original",
+            "first",
+            "second after 2",
+            "context-mode active.\n<resume>Resume the task</resume>",
+        ])
+    );
+    assert_eq!(
+        observations["bus"],
+        json!([
+            "original",
+            "first",
+            "second after 2",
+            "context-mode active.\n<resume>Resume the task</resume>",
+            "event bus",
+        ])
+    );
+    assert_eq!(
+        texts(&second),
+        [
+            "original",
+            "first",
+            "second after 2",
+            "event bus",
+            "void mutation"
+        ]
+    );
+    assert_eq!(texts(&cleared), ["event bus", "void mutation"]);
+}
+
+fn load_catalog_packages(
+    harness: &common::TestHarness,
+    entries: &[(&str, &str)],
+) -> (ExtensionManager, JsExtensionRuntimeHandle) {
+    let cwd = harness.temp_dir().to_path_buf();
+    let home = cwd.join("home");
+    std::fs::create_dir_all(&home).expect("fixture home");
+    let specs = entries
+        .iter()
+        .map(|(name, source)| {
+            let package = format!("node_modules/{name}");
+            harness.create_file(
+                format!("{package}/package.json"),
+                serde_json::to_vec(&json!({
+                    "name": name, "version": "1.0.0", "type": "module",
+                    "pi": { "extensions": ["./index.mjs"] },
+                }))
+                .expect("package manifest"),
+            );
+            let entry = harness.create_file(format!("{package}/index.mjs"), source.as_bytes());
+            JsExtensionLoadSpec::from_entry_path(entry).expect("npm extension spec")
+        })
+        .collect();
+    let mut policy = pi::extensions::ExtensionPolicy::default();
+    policy.deny_caps.retain(|capability| capability != "env");
+    policy.default_caps.push("env".to_string());
+    let manager = ExtensionManager::new();
+    let runtime = common::run_async(JsExtensionRuntimeHandle::start_with_policy(
+        PiJsRuntimeConfig {
+            cwd: cwd.display().to_string(),
+            env: std::collections::HashMap::from([
+                ("HOME".to_string(), home.display().to_string()),
+                ("USERPROFILE".to_string(), home.display().to_string()),
+                ("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string()),
+            ]),
+            repair_mode: pi::extensions_js::RepairMode::Off,
+            disk_cache_dir: None,
+            ..Default::default()
+        },
+        Arc::new(ToolRegistry::new(&[], &cwd, None)),
+        manager.clone(),
+        policy,
+    ))
+    .expect("start catalog runtime");
+    manager.set_js_runtime(runtime.clone());
+    common::run_async({
+        let manager = manager.clone();
+        async move {
+            manager
+                .load_js_extensions(specs)
+                .await
+                .expect("load actual npm fixtures");
+        }
+    });
+    (manager, runtime)
+}
+
+fn wait_for_catalog_marker(harness: &common::TestHarness, package: &str, phase: usize) {
+    let marker = harness
+        .temp_dir()
+        .join(format!("home/.pi/{package}/ready-{phase}"));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "idle callback did not produce {}",
+            marker.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A callback running after load must publish execution routes before the next
+/// command, even when no get_registered_tools query has helped it synchronize.
+/// A later colliding registration must isolate its owner, leaving the original
+/// peer's callback and catalog intact.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn idle_tool_registration_publishes_routes_and_rejects_cross_realm_collisions() {
+    let harness = common::TestHarness::new("idle_catalog_routes");
+    let (manager, runtime) = load_catalog_packages(
+        &harness,
+        &[
+            (
+                "catalog-idle",
+                r#"
+            import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+            import { dirname, join } from 'node:path';
+            import { fileURLToPath } from 'node:url';
+            import { homedir } from 'node:os';
+            export default function(pi) {
+                const root = dirname(fileURLToPath(import.meta.url));
+                const state = join(homedir(), '.pi', 'catalog-idle');
+                let phase = 0;
+                const timer = setInterval(() => {
+                    if (!existsSync(join(root, `start-${phase + 1}`))) return;
+                    phase++;
+                    pi.registerTool({
+                        name: phase === 1 ? 'ctx_idle_search' : 'reserved_peer_tool',
+                        description: 'Registered by idle callback',
+                        parameters: { type: 'object', properties: { query: { type: 'string' } } },
+                        async execute(_id, input) {
+                            return { content: [{ type: 'text', text: `idle:${input.query}` }], details: {} };
+                        }
+                    });
+                    mkdirSync(state, { recursive: true });
+                    writeFileSync(join(state, `ready-${phase}`), 'registered');
+                    if (phase === 2) clearInterval(timer);
+                }, 5);
+            }
+        "#,
+            ),
+            (
+                "catalog-original",
+                r#"
+            export default function(pi) {
+                pi.registerTool({
+                    name: 'reserved_peer_tool', description: 'Original peer',
+                    parameters: { type: 'object', properties: {} },
+                    async execute() {
+                        return { content: [{ type: 'text', text: 'original peer' }], details: {} };
+                    }
+                });
+            }
+        "#,
+            ),
+        ],
+    );
+    harness.create_file("node_modules/catalog-idle/start-1", b"after load");
+    wait_for_catalog_marker(&harness, "catalog-idle", 1);
+    // This is deliberately the first runtime operation after the host observes
+    // idle registration: querying the catalog first would hide stale routes.
+    let (runtime, executed, definitions) = common::run_async(async move {
+        let executed = runtime
+            .execute_tool(
+                "ctx_idle_search".into(),
+                "idle-call".into(),
+                json!({ "query": "needle" }),
+                Arc::new(json!({})),
+                5000,
+            )
+            .await;
+        let definitions = runtime.get_registered_tools().await;
+        (runtime, executed, definitions)
+    });
+    assert_eq!(
+        executed.expect("idle registration must already be routable")["content"][0]["text"],
+        "idle:needle"
+    );
+    let definitions = definitions.expect("validated idle catalog");
+    let search = definitions
+        .iter()
+        .find(|tool| tool.name == "ctx_idle_search")
+        .expect("idle tool schema");
+    assert_eq!(search.description, "Registered by idle callback");
+    assert_eq!(search.parameters["properties"]["query"]["type"], "string");
+
+    harness.create_file(
+        "node_modules/catalog-idle/start-2",
+        b"collide after publication",
+    );
+    wait_for_catalog_marker(&harness, "catalog-idle", 2);
+    let (definitions, original, quarantined, stopped) = common::run_async(async move {
+        let definitions = runtime.get_registered_tools().await;
+        let original = runtime
+            .execute_tool(
+                "reserved_peer_tool".into(),
+                "peer-call".into(),
+                json!({}),
+                Arc::new(json!({})),
+                5000,
+            )
+            .await;
+        let quarantined = runtime
+            .execute_tool(
+                "ctx_idle_search".into(),
+                "bad-call".into(),
+                json!({}),
+                Arc::new(json!({})),
+                5000,
+            )
+            .await;
+        let stopped = manager.shutdown(Duration::from_secs(5)).await;
+        (definitions, original, quarantined, stopped)
+    });
+    assert!(stopped);
+    let names = definitions
+        .expect("one failed realm must not suppress its healthy peer")
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["reserved_peer_tool"]);
+    assert_eq!(
+        original.expect("original owner remains callable")["content"][0]["text"],
+        "original peer"
+    );
+    let error = quarantined
+        .expect_err("all callbacks of the invalid owner are quarantined")
+        .to_string();
+    assert!(
+        error.contains("quarantined") && error.contains("tool name collision"),
+        "{error}"
+    );
+}
+
+/// A failed realm keeps its accepted names reserved, while healthy lifecycle
+/// hooks and deferred tool registration remain usable by the native collector.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn quarantined_owner_preserves_name_reservations_without_blocking_healthy_tools() {
+    let harness = common::TestHarness::new("catalog_quarantine_isolation");
+    let (manager, runtime) = load_catalog_packages(
+        &harness,
+        &[
+            (
+                "catalog-timeout",
+                r#"
+            export default function(pi) {
+                pi.registerTool({ name: 'reserved_tool', description: 'Timed-out owner',
+                    parameters: { type: 'object', properties: {} },
+                    async execute() { return { content: [], details: {} }; } });
+                pi.registerCommand('quarantine-owner', { handler: async () => new Promise(() => {}) });
+                pi.on('before_agent_start', () => { throw new Error('quarantined hook ran'); });
+            }
+        "#,
+            ),
+            (
+                "catalog-healthy",
+                r#"
+            export default function(pi) {
+                pi.registerTool({ name: 'healthy_tool', description: 'Healthy peer',
+                    parameters: { type: 'object', properties: {} },
+                    async execute() { return { content: [{ type: 'text', text: 'healthy' }], details: {} }; } });
+                pi.on('before_agent_start', () => {
+                    pi.registerTool({ name: 'ctx_healthy_lazy', description: 'Healthy deferred tool',
+                        parameters: { type: 'object', properties: {} },
+                        async execute() { return { content: [{ type: 'text', text: 'healthy lazy' }], details: {} }; } });
+                    return { systemPrompt: 'healthy hook completed' };
+                });
+            }
+        "#,
+            ),
+            (
+                "catalog-contender",
+                r#"
+            export default function(pi) {
+                pi.registerTool({ name: 'contender_tool', description: 'Initial contender',
+                    parameters: { type: 'object', properties: {} },
+                    async execute() { return { content: [], details: {} }; } });
+                pi.registerCommand('claim-reserved', { handler() {
+                    pi.registerTool({ name: 'reserved_tool', description: 'Stolen name',
+                        parameters: { type: 'object', properties: {} },
+                        async execute() { return { content: [{ type: 'text', text: 'stolen' }], details: {} }; } });
+                } });
+            }
+        "#,
+            ),
+        ],
+    );
+    common::run_async(async move {
+        manager
+            .execute_command("quarantine-owner", "", 50)
+            .await
+            .expect_err("unresolved task must time out");
+        let original_fault = runtime
+            .execute_tool(
+                "reserved_tool".into(),
+                "failed-owner".into(),
+                json!({}),
+                Arc::new(json!({})),
+                5000,
+            )
+            .await
+            .expect_err("timed-out owner is quarantined")
+            .to_string();
+        assert!(original_fault.contains("quarantined"), "{original_fault}");
+        let response = manager
+            .dispatch_event_with_response(
+                ExtensionEventName::BeforeAgentStart,
+                Some(json!({ "prompt": "continue", "systemPrompt": "base" })),
+                5000,
+            )
+            .await
+            .expect("healthy hook dispatch")
+            .expect("healthy hook response");
+        assert_eq!(response["systemPrompt"], "healthy hook completed");
+        let wrappers = pi::extension_tools::collect_extension_tool_wrappers(&manager, json!({}))
+            .await
+            .expect("native collector must retain healthy realms");
+        let names = wrappers.iter().map(|tool| tool.name()).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["contender_tool", "ctx_healthy_lazy", "healthy_tool"]
+        );
+        let lazy = wrappers
+            .iter()
+            .find(|tool| tool.name() == "ctx_healthy_lazy")
+            .expect("deferred wrapper");
+        let result = lazy
+            .execute("healthy-native-call", json!({}), None)
+            .await
+            .expect("native wrapper execution");
+        let [pi::model::ContentBlock::Text(text)] = result.content.as_slice() else {
+            panic!("expected actual healthy extension output");
+        };
+        assert_eq!(text.text, "healthy lazy");
+
+        let collision = manager
+            .execute_command("claim-reserved", "", 5000)
+            .await
+            .expect_err("a quarantined owner's name remains reserved")
+            .to_string();
+        assert!(
+            collision.contains("tool name collision") && collision.contains("reserved_tool"),
+            "{collision}"
+        );
+        let after_fault = runtime
+            .execute_tool(
+                "reserved_tool".into(),
+                "still-reserved".into(),
+                json!({}),
+                Arc::new(json!({})),
+                5000,
+            )
+            .await
+            .expect_err("reserved route cannot be captured")
+            .to_string();
+        assert_eq!(after_fault, original_fault);
+        let names = runtime
+            .get_registered_tools()
+            .await
+            .expect("healthy final catalog")
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["ctx_healthy_lazy", "healthy_tool"]);
+        assert!(manager.shutdown(Duration::from_secs(5)).await);
+    });
+}
+
+/// Iterator cleanup may run after quarantine, but its registration side
+/// effects must not expand the failed realm's accepted name reservations.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn quarantined_provider_cleanup_cannot_publish_new_tool_reservations() {
+    let harness = common::TestHarness::new("quarantined_provider_catalog");
+    let (manager, runtime) = load_catalog_packages(
+        &harness,
+        &[
+            (
+                "catalog-cleanup",
+                r#"
+            import { mkdirSync, writeFileSync } from 'node:fs';
+            import { join } from 'node:path';
+            import { homedir } from 'node:os';
+            export default function(pi) {
+                pi.registerCommand('quarantine-provider', { handler: async () => new Promise(() => {}) });
+                pi.registerProvider('catalog-provider', {
+                    api: 'openai-completions', baseUrl: 'https://example.invalid', apiKey: 'unused',
+                    models: [{ id: 'catalog-model', name: 'Catalog model', input: ['text'], contextWindow: 100, maxTokens: 10 }],
+                    streamSimple() {
+                        return {
+                            async next() { return { done: false, value: 'pending' }; },
+                            async return() {
+                                pi.registerTool({ name: 'cleanup_name', description: 'Unaccepted cleanup registration',
+                                    parameters: { type: 'object', properties: {} },
+                                    async execute() { return { content: [], details: {} }; } });
+                                const state = join(homedir(), '.pi', 'catalog-cleanup');
+                                mkdirSync(state, { recursive: true });
+                                writeFileSync(join(state, 'ready-1'), 'cleanup ran');
+                                return { done: true };
+                            }
+                        };
+                    }
+                });
+            }
+        "#,
+            ),
+            (
+                "catalog-cleanup-peer",
+                r#"
+            export default function(pi) {
+                pi.registerCommand('claim-cleanup-name', { handler() {
+                    pi.registerTool({ name: 'cleanup_name', description: 'Healthy registration',
+                        parameters: { type: 'object', properties: {} },
+                        async execute() { return { content: [{ type: 'text', text: 'healthy owner' }], details: {} }; } });
+                } });
+            }
+        "#,
+            ),
+        ],
+    );
+    let cleanup_marker = harness.temp_dir().join("home/.pi/catalog-cleanup/ready-1");
+    common::run_async(async move {
+        let stream = runtime
+            .provider_stream_simple_start(
+                "catalog-provider".into(),
+                json!({ "id": "catalog-model" }),
+                json!({ "messages": [] }),
+                json!({}),
+                5000,
+            )
+            .await
+            .expect("open actual extension iterator");
+        manager
+            .execute_command("quarantine-provider", "", 50)
+            .await
+            .expect_err("quarantine the iterator's owner");
+        runtime
+            .provider_stream_simple_cancel(stream, 5000)
+            .await
+            .expect("bounded cleanup remains permitted after quarantine");
+        assert_eq!(
+            std::fs::read_to_string(cleanup_marker).expect("actual return() executed"),
+            "cleanup ran"
+        );
+        manager
+            .execute_command("claim-cleanup-name", "", 5000)
+            .await
+            .expect("quarantined cleanup did not reserve a new name");
+        let tools = runtime
+            .get_registered_tools()
+            .await
+            .expect("healthy validated catalog");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "cleanup_name");
+        assert_eq!(tools[0].description, "Healthy registration");
+        let result = runtime
+            .execute_tool(
+                "cleanup_name".into(),
+                "cleanup-owner-call".into(),
+                json!({}),
+                Arc::new(json!({})),
+                5000,
+            )
+            .await
+            .expect("route belongs to healthy peer");
+        assert_eq!(result["content"][0]["text"], "healthy owner");
+        assert!(manager.shutdown(Duration::from_secs(5)).await);
+    });
+}
+
+/// Filename-derived policy IDs are not package identities. An ambiguous
+/// candidate must be rejected before a factory can run, and a failed reload
+/// must leave the previously loaded realm intact.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn unrelated_same_id_packages_and_cross_package_coentries_fail_before_factories() {
+    let harness = common::TestHarness::new("provenance_reload_guard");
+    let (manager, runtime) = load_catalog_packages(
+        &harness,
+        &[(
+            "surviving-package",
+            r#"
+            export default function(pi) {
+                pi.registerCommand('surviving-command', { handler: () => 'still alive' });
+            }
+        "#,
+        )],
+    );
+    let source = "export default function() { throw new Error('unrelated factory executed'); }";
+    let make_spec = |path: &str| {
+        JsExtensionLoadSpec::from_entry_path(harness.create_file(path, source.as_bytes()))
+            .expect("candidate spec")
+    };
+    let mut candidates = Vec::new();
+
+    // This is context-mode's actual package/adapter filename shape. Another
+    // independently installed package can naturally choose extension.js too.
+    let mut same_id = Vec::new();
+    for name in ["context-mode", "unrelated-package"] {
+        let package = format!("node_modules/{name}");
+        harness.create_file(
+            format!("{package}/package.json"),
+            serde_json::to_vec(&json!({
+                "name": name, "type": "module",
+                "pi": { "extensions": ["./build/adapters/pi/extension.js"] },
+            }))
+            .unwrap(),
+        );
+        same_id.push(make_spec(&format!(
+            "{package}/build/adapters/pi/extension.js"
+        )));
+    }
+    assert!(same_id.iter().all(|spec| spec.extension_id == "extension"));
+    candidates.push(same_id);
+
+    // A declaring workspace cannot absorb a nearer named package merely
+    // because that package has no pi.extensions of its own.
+    harness.create_file(
+        "workspace/package.json",
+        br#"{
+        "name":"outer", "pi":{"extensions":["./a/extension.mjs","./b/extension.mjs"]}
+    }"#,
+    );
+    harness.create_file("workspace/a/package.json", br#"{"name":"a"}"#);
+    harness.create_file("workspace/b/package.json", br#"{"name":"b"}"#);
+    let nested = make_spec("workspace/a/extension.mjs");
+    make_spec("workspace/b/extension.mjs");
+    candidates.push(vec![nested]);
+
+    harness.create_file(
+        "escaping/package.json",
+        br#"{
+        "name":"escaping", "pi":{"extensions":["./extension.mjs","../outside/extension.mjs"]}
+    }"#,
+    );
+    let escaping = make_spec("escaping/extension.mjs");
+    make_spec("outside/extension.mjs");
+    candidates.push(vec![escaping]);
+
+    // A type-only manifest cannot make node_modules itself transparent.
+    harness.create_file(
+        "dependency-parent/package.json",
+        br#"{
+        "name":"dependency-parent", "pi":{"extensions":[
+            "./extension.mjs", "./node_modules/child/extension.mjs"
+        ]}
+    }"#,
+    );
+    harness.create_file(
+        "dependency-parent/node_modules/child/package.json",
+        br#"{"type":"module"}"#,
+    );
+    let dependency_parent = make_spec("dependency-parent/extension.mjs");
+    make_spec("dependency-parent/node_modules/child/extension.mjs");
+    candidates.push(vec![dependency_parent]);
+
+    #[cfg(windows)]
+    {
+        harness.create_file(
+            "windows-parent/package.json",
+            br#"{
+            "name":"windows-parent", "pi":{"extensions":[
+                "./extension.mjs", "./Node_Modules/child/extension.mjs"
+            ]}
+        }"#,
+        );
+        harness.create_file(
+            "windows-parent/Node_Modules/child/package.json",
+            br#"{"type":"module"}"#,
+        );
+        let windows_parent = make_spec("windows-parent/extension.mjs");
+        make_spec("windows-parent/Node_Modules/child/extension.mjs");
+        candidates.push(vec![windows_parent]);
+    }
+
+    #[cfg(unix)]
+    {
+        harness.create_file(
+            "linked/package.json",
+            br#"{
+            "name":"linked", "pi":{"extensions":["./extension.mjs","./linked-entry.mjs"]}
+        }"#,
+        );
+        let linked = make_spec("linked/extension.mjs");
+        std::os::unix::fs::symlink(
+            harness.temp_dir().join("outside/extension.mjs"),
+            harness.temp_dir().join("linked/linked-entry.mjs"),
+        )
+        .expect("symlinked co-entry");
+        candidates.push(vec![linked]);
+    }
+
+    common::run_async(async move {
+        for specs in candidates {
+            let error = manager
+                .load_js_extensions(specs)
+                .await
+                .expect_err("unrelated origins must fail before factory execution")
+                .to_string();
+            assert!(
+                error.contains("Ambiguous JS extension provenance"),
+                "{error}"
+            );
+            assert!(!error.contains("unrelated factory executed"), "{error}");
+            assert_eq!(
+                manager
+                    .execute_command("surviving-command", "", 5000)
+                    .await
+                    .expect("old runtime survives failed candidate"),
+                json!("still alive")
+            );
+        }
+        assert!(
+            runtime
+                .get_registered_tools()
+                .await
+                .expect("old catalog remains usable")
+                .is_empty()
+        );
+        assert!(manager.shutdown(Duration::from_secs(5)).await);
+    });
+}
+
+fn start_provenance_fixture(
+    harness: &common::TestHarness,
+    policy: pi::extensions::ExtensionPolicy,
+) -> (ExtensionManager, JsExtensionRuntimeHandle) {
+    let workspace = harness.temp_dir().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("separate workspace");
+    // Package fixtures are siblings of cwd, so successful bundled reads
+    // require their admitted package roots rather than workspace authority.
+    let cwd = pi::extensions::safe_canonicalize(&workspace);
+    let manager = ExtensionManager::new();
+    let runtime = common::run_async(JsExtensionRuntimeHandle::start_with_policy(
+        PiJsRuntimeConfig {
+            cwd: cwd.display().to_string(),
+            env: std::collections::HashMap::from([
+                ("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string()),
+                (
+                    "PROVENANCE_TEST_VALUE".to_string(),
+                    "configured value".to_string(),
+                ),
+            ]),
+            disk_cache_dir: None,
+            repair_mode: pi::extensions_js::RepairMode::Off,
+            ..Default::default()
+        },
+        Arc::new(ToolRegistry::new(&[], &cwd, None)),
+        manager.clone(),
+        policy,
+    ))
+    .expect("start real provenance runtime");
+    manager.set_js_runtime(runtime.clone());
+    (manager, runtime)
+}
+
+/// Declared entries of one package retain their shared realm and unchanged
+/// policy key, including an entry below a pure Node module-format scope.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn declared_same_package_entries_preserve_order_assets_and_legacy_policy_denials() {
+    let harness = common::TestHarness::new("provenance_declared_package");
+    harness.create_file(
+        "bundle/package.json",
+        br#"{
+        "name":"different-display-name", "type":"module",
+        "pi":{"extensions":["./a/extension.mjs","./build/extension.mjs"]}
+    }"#,
+    );
+    harness.create_file("bundle/build/package.json", br#"{"type":"module"}"#);
+    harness.create_file("bundle/asset.txt", b"package asset");
+    let first = harness.create_file(
+        "bundle/a/extension.mjs",
+        br#"
+        export default function(pi) {
+            globalThis.provenanceOrder = ['first'];
+            pi.registerCommand('bundle-order', { handler: () => globalThis.provenanceOrder });
+        }
+    "#,
+    );
+    let second = harness.create_file("bundle/build/extension.mjs", br#"
+        import { readFileSync } from 'node:fs';
+        import { dirname, join } from 'node:path';
+        import { fileURLToPath } from 'node:url';
+        export default function(pi) {
+            globalThis.provenanceOrder.push('second');
+            const asset = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'asset.txt'), 'utf8');
+            pi.registerCommand('bundle-policy', { handler: async () => {
+                let execError = '';
+                try { await pi.exec('pi-provenance-command-that-must-not-run', []); }
+                catch (error) { execError = String(error.message || error); }
+                return { asset, env: process.env.PROVENANCE_TEST_VALUE ?? null, execError };
+            }});
+        }
+    "#);
+    let specs = vec![
+        JsExtensionLoadSpec::from_entry_path(first).expect("first spec"),
+        JsExtensionLoadSpec::from_entry_path(second).expect("second spec"),
+    ];
+    assert!(specs.iter().all(|spec| spec.extension_id == "extension"));
+    let mut policy = pi::extensions::ExtensionPolicy::default();
+    policy.deny_caps.retain(|cap| cap != "exec" && cap != "env");
+    policy
+        .default_caps
+        .extend(["exec".to_string(), "env".to_string()]);
+    policy.per_extension.insert(
+        "extension".to_string(),
+        pi::extensions::ExtensionOverride {
+            deny: vec!["exec".to_string(), "env".to_string()],
+            ..Default::default()
+        },
+    );
+    let (manager, _) = start_provenance_fixture(&harness, policy);
+    common::run_async(async move {
+        manager
+            .load_js_extensions(specs)
+            .await
+            .expect("same package loads one realm");
+        assert_eq!(
+            manager
+                .execute_command("bundle-order", "", 5000)
+                .await
+                .unwrap(),
+            json!(["first", "second"])
+        );
+        let observed = manager
+            .execute_command("bundle-policy", "", 5000)
+            .await
+            .unwrap();
+        assert_eq!(observed["asset"], "package asset");
+        assert!(
+            observed["env"].is_null(),
+            "legacy per-owner env deny must remain active: {observed}"
+        );
+        assert!(
+            observed["execError"]
+                .as_str()
+                .is_some_and(|error| error.to_ascii_lowercase().contains("denied")),
+            "native hostcall must retain legacy per-owner exec denial: {observed}"
+        );
+        assert!(manager.shutdown(Duration::from_secs(5)).await);
+    });
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn distinct_owners_in_one_declared_package_keep_private_leaf_boundaries() {
+    let harness = common::TestHarness::new("provenance_private_leaves");
+    harness.create_file(
+        "bundle/package.json",
+        br#"{
+        "name":"shared-package", "type":"module",
+        "pi":{"extensions":["./left/left.mjs","./right/right.mjs"]}
+    }"#,
+    );
+    harness.create_file("bundle/left/private.txt", b"left private");
+    harness.create_file("bundle/right/private.txt", b"right private");
+    harness.create_file(
+        "bundle/right/helper.mjs",
+        b"export default 'right private module';",
+    );
+    let left = harness.create_file("bundle/left/left.mjs", br#"
+        import { readFileSync, writeFileSync } from 'node:fs';
+        import { dirname, join } from 'node:path';
+        import { fileURLToPath } from 'node:url';
+        export default function(pi) {
+            const root = dirname(fileURLToPath(import.meta.url));
+            pi.registerCommand('probe-private-leaves', { handler: async () => {
+                let read = false, write = false, imported = false;
+                try { readFileSync(join(root, '..', 'right', 'private.txt'), 'utf8'); read = true; } catch (_) {}
+                try { writeFileSync(join(root, '..', 'right', 'created.txt'), 'foreign'); write = true; } catch (_) {}
+                try { await import('../right/helper.mjs'); imported = true; } catch (_) {}
+                return { own: readFileSync(join(root, 'private.txt'), 'utf8'), read, write, imported };
+            }});
+        }
+    "#);
+    let right = harness.create_file("bundle/right/right.mjs", br#"
+        import { readFileSync } from 'node:fs';
+        import { dirname, join } from 'node:path';
+        import { fileURLToPath } from 'node:url';
+        export default function(pi) {
+            pi.registerCommand('right-private', { handler: () =>
+                readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'private.txt'), 'utf8') });
+        }
+    "#);
+    let specs = vec![
+        JsExtensionLoadSpec::from_entry_path(left).unwrap(),
+        JsExtensionLoadSpec::from_entry_path(right).unwrap(),
+    ];
+    assert_ne!(specs[0].extension_id, specs[1].extension_id);
+    let (manager, _) =
+        start_provenance_fixture(&harness, pi::extensions::ExtensionPolicy::default());
+    let untouched = harness.temp_dir().join("bundle/right/private.txt");
+    common::run_async(async move {
+        manager
+            .load_js_extensions(specs)
+            .await
+            .expect("separate owners in shared declared package");
+        let observed = manager
+            .execute_command("probe-private-leaves", "", 5000)
+            .await
+            .unwrap();
+        assert_eq!(
+            observed,
+            json!({ "own":"left private", "read":false, "write":false, "imported":false })
+        );
+        assert_eq!(
+            manager
+                .execute_command("right-private", "", 5000)
+                .await
+                .unwrap(),
+            json!("right private")
+        );
+        assert_eq!(std::fs::read_to_string(untouched).unwrap(), "right private");
+        assert!(manager.shutdown(Duration::from_secs(5)).await);
+    });
+}

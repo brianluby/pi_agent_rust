@@ -14,6 +14,7 @@ mod common;
 use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
 use pi::extensions_js::PiJsRuntimeConfig;
 use pi::package_manager::{PackageManager, ResolveExtensionSourcesOptions};
+use pi::session::{Session, SessionHandle};
 use pi::tools::ToolRegistry;
 use serde_json::Value;
 use std::sync::Arc;
@@ -870,4 +871,653 @@ export default function init(pi: any): void {
     assert_eq!(manager.list_flags().len(), 1);
 
     write_jsonl_artifacts(&harness);
+}
+
+/// Reproduces the package, storage and SQLite initialization sequence used by
+/// context-mode 1.0.169 (build/adapters/base.js, build/db-base.js and
+/// build/session/db.js). This is a real database across two cold PiJS realms;
+/// no hostcall interceptor or database stub participates in this test.
+#[test]
+fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let base = pi::extensions::safe_canonicalize(temp.path());
+    let workspace = base.join("workspace");
+    let home = base.join("home");
+    let package = base.join("npm/node_modules/context-mode");
+    let entry = package.join("build/adapters/pi/extension.js");
+    std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        package.join("package.json"),
+        r#"{
+        "name": "context-mode", "version": "1.0.169", "type": "module",
+        "pi": { "extensions": ["./build/adapters/pi/extension.js"] }
+    }"#,
+    )
+    .unwrap();
+    std::fs::write(package.join("build/db.js"), r#"
+        import { createRequire } from 'node:module';
+        import { Database as ESMDatabase } from 'bun:sqlite';
+        const require = createRequire(import.meta.url);
+        const { Database } = require('bun:sqlite');
+        if (Database !== ESMDatabase) throw new Error('SQLite module identities diverged');
+
+        export function openSessionDB(path) {
+            const db = new Database(path);
+            db.prepare('PRAGMA journal_mode = WAL').all();
+            db.prepare('PRAGMA busy_timeout = 5000').all();
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS session_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    data_hash TEXT NOT NULL,
+                    UNIQUE(session_id, type, data_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id);
+            `);
+            const insert = db.prepare('INSERT OR IGNORE INTO session_events (session_id, type, data, data_hash) VALUES (?, ?, ?, ?)');
+            const write = db.transaction((sessionId, type, data) => {
+                insert.run(sessionId, type, data, data);
+                insert.run(sessionId, type, data, data);
+            });
+            return { db, write };
+        }
+    "#).unwrap();
+    std::fs::write(&entry, r#"
+        import { mkdirSync } from 'node:fs';
+        import { createHash } from 'node:crypto';
+        import { homedir } from 'node:os';
+        import { join } from 'node:path';
+        import { openSessionDB } from '../../db.js';
+        export default function piExtension(pi) {
+            const directory = join(homedir(), '.pi', 'context-mode', 'sessions');
+            mkdirSync(directory, { recursive: true });
+            const { db, write } = openSessionDB(join(directory, 'project-fixture.db'));
+            let sessionId = '';
+            let sessionFile = null;
+            pi.on('session_start', (_event, ctx) => {
+                // context-mode 1.0.169 derives its database key from this path.
+                // A constant fixture ID masks loss of history on cold resume.
+                sessionFile = ctx.sessionManager?.getSessionFile?.();
+                sessionId = sessionFile && typeof sessionFile === 'string'
+                    ? createHash('sha256').update(sessionFile).digest('hex').slice(0, 16)
+                    : `pi-${Date.now()}`;
+                write(sessionId, 'session_start', 'started');
+            });
+            pi.on('tool_result', (event) => write(sessionId, 'tool_result', event.toolName));
+            pi.registerCommand('ctx-storage-stats', {
+                description: 'Only registers after persistent SQLite initialization',
+                handler: async () => ({ display: JSON.stringify({
+                    sessionFile, sessionId,
+                    count: db.prepare('SELECT count(*) AS count FROM session_events WHERE session_id = ?').get(sessionId).count,
+                    rows: db.prepare('SELECT type, data FROM session_events WHERE session_id = ? ORDER BY id').all(sessionId),
+                    sessionCount: db.prepare('SELECT count(DISTINCT session_id) AS count FROM session_events').get().count,
+                }) }),
+            });
+            pi.registerCommand('ctx-storage-close', { handler: async () => { db.close(); return { display: 'closed' }; } });
+        }
+    "#).unwrap();
+
+    let load = |session: Arc<asupersync::sync::Mutex<Session>>| {
+        let manager = ExtensionManager::new();
+        manager.set_session(Arc::new(SessionHandle(session)));
+        let tools = Arc::new(ToolRegistry::new(&[], &workspace, None));
+        let mut policy = pi::extensions::ExtensionPolicy::default();
+        policy.deny_caps.retain(|cap| cap != "env");
+        policy.default_caps.push("env".to_string());
+        let config = PiJsRuntimeConfig {
+            cwd: workspace.display().to_string(),
+            env: std::collections::HashMap::from([(
+                "HOME".to_string(),
+                home.display().to_string(),
+            )]),
+            disk_cache_dir: None,
+            ..Default::default()
+        };
+        let runtime = common::run_async(JsExtensionRuntimeHandle::start_with_policy(
+            config,
+            tools,
+            manager.clone(),
+            policy,
+        ))
+        .expect("start runtime");
+        manager.set_js_runtime(runtime);
+        let spec = JsExtensionLoadSpec::from_entry_path(&entry).unwrap();
+        let loading_manager = manager.clone();
+        common::run_async(async move { loading_manager.load_js_extensions(vec![spec]).await })
+            .expect("load npm-style extension through production loader");
+        assert!(manager.has_command("ctx-storage-stats"));
+        manager
+    };
+    let stats = |manager: &ExtensionManager| {
+        let manager = manager.clone();
+        let result = common::run_async(async move {
+            manager.execute_command("ctx-storage-stats", "", 5000).await
+        })
+        .unwrap();
+        serde_json::from_str::<Value>(result["display"].as_str().unwrap()).unwrap()
+    };
+    let close = |manager: ExtensionManager| {
+        common::run_async(async move {
+            manager
+                .execute_command("ctx-storage-close", "", 5000)
+                .await
+                .unwrap();
+            assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+        });
+    };
+    let dispatch = |manager: &ExtensionManager, event, data| {
+        let manager = manager.clone();
+        common::run_async(async move { manager.dispatch_event(event, data).await }).unwrap();
+    };
+
+    let transcripts = base.join("transcripts");
+    let mut fresh_session = Session::create_with_dir(Some(transcripts.clone()));
+    fresh_session.header.cwd = workspace.display().to_string();
+    fresh_session
+        .reserve_persistence_path()
+        .expect("reserve session identity before loading");
+    let session_file = fresh_session
+        .session_file()
+        .expect("future transcript")
+        .to_path_buf();
+    assert!(fresh_session.path.is_none());
+    assert!(
+        !transcripts.exists(),
+        "reserving an identity must not create a transcript"
+    );
+    let shared = Arc::new(asupersync::sync::Mutex::new(fresh_session));
+    let manager = load(Arc::clone(&shared));
+    assert_eq!(stats(&manager)["count"], 0);
+    dispatch(
+        &manager,
+        pi::extensions::ExtensionEventName::SessionStart,
+        None,
+    );
+    let initial = stats(&manager);
+    assert_eq!(initial["count"], 1);
+    assert_eq!(initial["sessionFile"], session_file.display().to_string());
+    assert!(!initial["sessionId"].as_str().unwrap().starts_with("pi-"));
+    common::run_async(async move {
+        let cx = pi::agent_cx::AgentCx::for_request();
+        let mut session = shared.lock(cx.cx()).await.expect("session lock");
+        session.set_name("Durable context-mode session");
+        session.save().await.expect("first native session save");
+    });
+    assert!(session_file.is_file());
+    close(manager);
+    assert!(
+        home.join(".pi/context-mode/sessions/project-fixture.db")
+            .is_file()
+    );
+
+    let reopen_path = session_file.to_str().unwrap().to_string();
+    let reopened = common::run_async(async move { Session::open(&reopen_path).await })
+        .expect("cold native transcript reopen");
+    let manager = load(Arc::new(asupersync::sync::Mutex::new(reopened)));
+    dispatch(
+        &manager,
+        pi::extensions::ExtensionEventName::SessionStart,
+        None,
+    );
+    let resumed = stats(&manager);
+    assert_eq!(resumed["sessionId"], initial["sessionId"]);
+    assert_eq!(resumed["sessionFile"], initial["sessionFile"]);
+    assert_eq!(
+        resumed["sessionCount"], 1,
+        "resume must not orphan a second database identity"
+    );
+    assert_eq!(
+        resumed["rows"],
+        serde_json::json!([{"type":"session_start","data":"started"}])
+    );
+    assert_eq!(
+        stats(&manager)["count"],
+        1,
+        "unique event dedup survives a cold reload"
+    );
+    dispatch(
+        &manager,
+        pi::extensions::ExtensionEventName::ToolResult,
+        Some(serde_json::json!({"toolName":"read"})),
+    );
+    assert_eq!(
+        stats(&manager)["rows"],
+        serde_json::json!([
+            {"type":"session_start","data":"started"},
+            {"type":"tool_result","data":"read"},
+        ])
+    );
+    close(manager);
+}
+
+#[test]
+fn npm_invalid_state_namespace_does_not_block_unrelated_extension_loading() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let base = pi::extensions::safe_canonicalize(temp.path());
+    let home = base.join("home");
+    std::fs::create_dir_all(home.join(".pi")).unwrap();
+    let invalid = home.join(".pi/broken-state");
+    #[cfg(unix)]
+    {
+        let outside = base.join("private-data");
+        std::fs::write(&outside, "must remain inaccessible").unwrap();
+        std::os::unix::fs::symlink(outside, &invalid).unwrap();
+    }
+    #[cfg(not(unix))]
+    std::fs::write(&invalid, "must remain inaccessible").unwrap();
+
+    let mut specs = Vec::new();
+    for (package_name, entry_name, source) in [
+        (
+            "broken-state",
+            "broken.js",
+            r#"
+            import { readFileSync } from 'node:fs';
+            import { homedir } from 'node:os';
+            import { join } from 'node:path';
+            export default function(pi) {
+                let denied = false;
+                try { readFileSync(join(homedir(), '.pi', 'broken-state'), 'utf8'); }
+                catch (_) { denied = true; }
+                pi.registerCommand('broken-state-check', { handler: async () => ({ display: denied ? 'denied' : 'escaped' }) });
+            }
+        "#,
+        ),
+        (
+            "healthy-state",
+            "healthy.js",
+            r#"
+            import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
+            import { homedir } from 'node:os';
+            import { join } from 'node:path';
+            export default function(pi) {
+                const root = join(homedir(), '.pi', 'healthy-state');
+                mkdirSync(root, { recursive: true });
+                writeFileSync(join(root, 'state.txt'), 'persistent');
+                let peerDenied = false;
+                try { readFileSync(join(homedir(), '.pi', 'broken-state'), 'utf8'); }
+                catch (_) { peerDenied = true; }
+                pi.registerCommand('healthy-state-check', { handler: async () => ({ display: peerDenied ? readFileSync(join(root, 'state.txt'), 'utf8') : 'escaped' }) });
+            }
+        "#,
+        ),
+    ] {
+        let package = base.join("npm/node_modules").join(package_name);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("package.json"), serde_json::json!({
+            "name": package_name, "type": "module", "pi": {"extensions": [format!("./{entry_name}")]}
+        }).to_string()).unwrap();
+        let entry = package.join(entry_name);
+        std::fs::write(&entry, source).unwrap();
+        specs.push(JsExtensionLoadSpec::from_entry_path(entry).unwrap());
+    }
+
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], &home, None));
+    let mut policy = pi::extensions::ExtensionPolicy::default();
+    policy.deny_caps.retain(|cap| cap != "env");
+    policy.default_caps.push("env".to_string());
+    let config = PiJsRuntimeConfig {
+        // The protected namespaces are deliberately below cwd: ordinary
+        // workspace access must not override a denied storage capability.
+        cwd: home.display().to_string(),
+        env: std::collections::HashMap::from([("HOME".to_string(), home.display().to_string())]),
+        disk_cache_dir: None,
+        ..Default::default()
+    };
+    let runtime = common::run_async(JsExtensionRuntimeHandle::start_with_policy(
+        config,
+        tools,
+        manager.clone(),
+        policy,
+    ))
+    .expect("start runtime");
+    manager.set_js_runtime(runtime);
+    let loading_manager = manager.clone();
+    common::run_async(async move { loading_manager.load_js_extensions(specs).await })
+        .expect("invalid storage namespace must not block either factory");
+    common::run_async(async move {
+        assert_eq!(
+            manager
+                .execute_command("broken-state-check", "", 5000)
+                .await
+                .unwrap()["display"],
+            "denied"
+        );
+        assert_eq!(
+            manager
+                .execute_command("healthy-state-check", "", 5000)
+                .await
+                .unwrap()["display"],
+            "persistent"
+        );
+        assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+    });
+    assert_eq!(
+        std::fs::read_to_string(home.join(".pi/healthy-state/state.txt")).unwrap(),
+        "persistent"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn npm_peer_without_env_cannot_access_owner_state_under_configured_workspace_home() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let base = pi::extensions::safe_canonicalize(temp.path());
+    let workspace = base.join("workspace");
+    let home = workspace.join("configured-home");
+    let state_root = home.join(".pi/owned-state");
+    let state_path = state_root.join("counter.txt");
+    std::fs::create_dir_all(&state_root).unwrap();
+    // Existing state makes a peer loaded before the owner's factory a real
+    // disclosure test, rather than an ENOENT failure on an absent directory.
+    std::fs::write(&state_path, "0").unwrap();
+    let ordinary_path = workspace.join("ordinary.txt");
+    std::fs::write(&ordinary_path, "ordinary workspace content").unwrap();
+
+    let owner_package = base.join("npm/node_modules/owned-state");
+    let peer_package = base.join("npm/node_modules/state-peer");
+    for (package, name, entry) in [
+        (&owner_package, "owned-state", "owner.js"),
+        (&peer_package, "state-peer", "peer.js"),
+    ] {
+        std::fs::create_dir_all(package).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            serde_json::json!({
+                "name": name, "type": "module", "pi": {"extensions": [format!("./{entry}")]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let owner_entry = owner_package.join("owner.js");
+    std::fs::write(
+        &owner_entry,
+        r#"
+        import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+        import { homedir } from 'node:os';
+        import { join } from 'node:path';
+        export default function(pi) {
+            const root = join(homedir(), '.pi', 'owned-state');
+            mkdirSync(root, { recursive: true });
+            const path = join(root, 'counter.txt');
+            const previous = Number(readFileSync(path, 'utf8'));
+            writeFileSync(path, String(previous + 1));
+            pi.registerCommand('owned-state-count', {
+                handler: async () => ({ display: readFileSync(path, 'utf8') }),
+            });
+        }
+        "#,
+    )
+    .unwrap();
+    let state_json = serde_json::to_string(&state_path).unwrap();
+    let ordinary_json = serde_json::to_string(&ordinary_path).unwrap();
+    let peer_entry = peer_package.join("peer.js");
+    std::fs::write(
+        &peer_entry,
+        format!(
+            r#"
+        import {{ readFileSync, writeFileSync }} from 'node:fs';
+        export default function(pi) {{
+            const state = {state_json};
+            const ordinary = {ordinary_json};
+            const probes = {{}};
+            for (const name of ['__pi_host_check_read_access', '__pi_host_check_write_access',
+                '__pi_host_read_file_sync', '__pi_host_persistent_storage_mutate']) {{
+                if (typeof globalThis[name] !== 'function') throw new Error('missing native bridge ' + name);
+            }}
+            for (const [name, operation] of [
+                ['read', () => readFileSync(state, 'utf8')],
+                ['write', () => writeFileSync(state, 'peer corruption')],
+                ['nativeReadCheck', () => globalThis.__pi_host_check_read_access(state)],
+                ['nativeWriteCheck', () => globalThis.__pi_host_check_write_access(state)],
+                ['nativeRead', () => globalThis.__pi_host_read_file_sync(state)],
+                ['nativeWrite', () => globalThis.__pi_host_persistent_storage_mutate('write', state,
+                    JSON.stringify({{data: Buffer.from('peer corruption').toString('base64')}}))],
+            ]) {{
+                try {{ operation(); probes[name] = 'allowed'; }}
+                catch (error) {{ probes[name] = String(error && error.message || error); }}
+            }}
+            const workspaceRead = readFileSync(ordinary, 'utf8');
+            const workspaceNativeRead = Buffer.from(globalThis.__pi_host_read_file_sync(ordinary), 'base64').toString('utf8');
+            writeFileSync(ordinary + '.peer', 'permitted workspace write');
+            const workspaceWrite = readFileSync(ordinary + '.peer', 'utf8');
+            pi.registerCommand('state-peer-check', {{ handler: async () => ({{ display: JSON.stringify({{
+                probes, workspaceRead, workspaceNativeRead, workspaceWrite,
+                homeHidden: process.env.HOME === undefined && pi.env.get('HOME') === undefined,
+            }}) }}) }});
+        }}
+        "#
+        ),
+    )
+    .unwrap();
+    let owner_spec = JsExtensionLoadSpec::from_entry_path(owner_entry).unwrap();
+    let peer_spec = JsExtensionLoadSpec::from_entry_path(peer_entry).unwrap();
+    assert_ne!(owner_spec.extension_id, peer_spec.extension_id);
+
+    let load = || {
+        let manager = ExtensionManager::new();
+        let tools = Arc::new(ToolRegistry::new(&[], &workspace, None));
+        let mut policy = pi::extensions::ExtensionPolicy {
+            mode: pi::extensions::ExtensionPolicyMode::Strict,
+            deny_caps: Vec::new(),
+            default_caps: vec!["read".to_string(), "write".to_string()],
+            ..Default::default()
+        };
+        policy.per_extension.insert(
+            owner_spec.extension_id.clone(),
+            pi::extensions::ExtensionOverride {
+                allow: vec!["env".to_string()],
+                ..Default::default()
+            },
+        );
+        policy.per_extension.insert(
+            peer_spec.extension_id.clone(),
+            pi::extensions::ExtensionOverride {
+                deny: vec!["env".to_string()],
+                ..Default::default()
+            },
+        );
+        let config = PiJsRuntimeConfig {
+            cwd: workspace.display().to_string(),
+            env: std::collections::HashMap::from([(
+                "HOME".to_string(),
+                home.display().to_string(),
+            )]),
+            disk_cache_dir: None,
+            ..Default::default()
+        };
+        let runtime = common::run_async(JsExtensionRuntimeHandle::start_with_policy(
+            config,
+            tools,
+            manager.clone(),
+            policy,
+        ))
+        .expect("start mixed-policy runtime");
+        manager.set_js_runtime(runtime);
+        let loading_manager = manager.clone();
+        let specs = vec![peer_spec.clone(), owner_spec.clone()];
+        common::run_async(async move { loading_manager.load_js_extensions(specs).await })
+            .expect("load peer before storage owner with complete boundaries");
+        manager
+    };
+
+    for expected_count in [1, 2] {
+        let manager = load();
+        common::run_async(async move {
+            let response = manager
+                .execute_command("state-peer-check", "", 5000)
+                .await
+                .unwrap();
+            let checks: Value =
+                serde_json::from_str(response["display"].as_str().unwrap()).unwrap();
+            assert_eq!(checks["homeHidden"], true, "{checks}");
+            assert_eq!(checks["workspaceRead"], "ordinary workspace content");
+            assert_eq!(checks["workspaceNativeRead"], "ordinary workspace content");
+            assert_eq!(checks["workspaceWrite"], "permitted workspace write");
+            for (operation, error) in checks["probes"].as_object().unwrap() {
+                let error = error.as_str().unwrap();
+                assert!(
+                    error.contains("denied") || error.contains("not granted"),
+                    "{operation} must fail because of its storage boundary: {checks}"
+                );
+            }
+            assert_eq!(
+                manager
+                    .execute_command("owned-state-count", "", 5000)
+                    .await
+                    .unwrap()["display"],
+                expected_count.to_string(),
+                "only the owner can increment its persistent counter"
+            );
+            assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+        });
+        assert_eq!(
+            std::fs::read_to_string(&state_path).unwrap(),
+            expected_count.to_string(),
+            "owner state survives cold realm reloads without peer corruption"
+        );
+    }
+}
+
+/// Follow context-mode's driver selection and JSON imports through the real
+/// compiler/resolver, with repairs disabled. Optional native drivers must not
+/// become eager imports when the Bun SQLite branch supplies the real database.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn context_mode_driver_selection_and_encoded_module_paths_load_without_stubs() {
+    let harness = common::TestHarness::new("context_mode_module_graph");
+    let cwd = harness.temp_dir().to_path_buf();
+    let prefix = "extensions/context # % λ";
+    harness.create_file(
+        &format!("{prefix}/package.json"),
+        br#"{"name":"context-mode-loader-fixture","type":"module","pi":{"extensions":["./entry.mjs"]}}"#,
+    );
+    harness.create_file(
+        &format!("{prefix}/driver.mjs"),
+        br"
+import { createRequire } from 'node:module';
+export function openDatabase() {
+    const require = createRequire(import.meta.url);
+    if (globalThis.Bun) {
+        const Database = require(['bun', 'sqlite'].join(':')).Database;
+        return new Database(':memory:');
+    }
+    return new (require('better-sqlite3'))(':memory:');
+}
+",
+    );
+    let factory = harness.create_file(
+        &format!("{prefix}/factory.cjs"),
+        br"
+const { basename } = require('node:path');
+module.exports = value => ({ value, filename: __filename, directory: __dirname, basename: basename(__filename) });
+",
+    );
+    harness.create_file(&format!("{prefix}/value.cjs"), b"module.exports = 41;\n");
+    harness.create_file(
+        &format!("{prefix}/side-effect.cjs"),
+        b"const path = require ('node:path'); globalThis.loaderSideEffect = path.basename('/fixture/loaded');\n",
+    );
+    harness.create_file(
+        &format!("{prefix}/consumer.cjs"),
+        br"
+require('./side-effect.cjs');
+const createValue = require('./factory.cjs');
+const value = require('./value.cjs');
+module.exports = createValue(value);
+",
+    );
+    harness.create_file(&format!("{prefix}/prices.json"), br#"{"price":3}"#);
+    harness.create_file(
+        &format!("{prefix}/helper #%.mjs"),
+        b"export const count = 7;\n",
+    );
+    let entry = harness.create_file(
+        &format!("{prefix}/entry.mjs"),
+        br"
+import { openDatabase } from './driver.mjs';
+import importedValue from './consumer.cjs';
+import './side-effect.cjs';
+import catalog from './prices.json' with { type: 'json' };
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+export default async function (pi) {
+    const filename = fileURLToPath(import.meta.url);
+    const helperUrl = pathToFileURL(join(dirname(filename), 'helper #%.mjs')).href;
+    const { count } = await import(helperUrl);
+    const database = openDatabase();
+    database.exec('CREATE TABLE usage (count INTEGER NOT NULL)');
+    database.query('INSERT INTO usage (count) VALUES (?)').run(count);
+    const row = database.query('SELECT count * ? AS cost FROM usage').get(catalog.price);
+    database.close();
+    const result = { row, importedValue, filename, helperUrl, sideEffect: globalThis.loaderSideEffect };
+    pi.registerCommand('loaded-module-result', {
+        handler: async () => ({ display: JSON.stringify(result) }),
+    });
+}
+",
+    );
+    let spec = JsExtensionLoadSpec::from_entry_path(&entry).expect("module fixture load spec");
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let config = PiJsRuntimeConfig {
+        cwd: cwd.display().to_string(),
+        repair_mode: pi::extensions_js::RepairMode::Off,
+        disk_cache_dir: None,
+        env: std::collections::HashMap::from([("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string())]),
+        ..Default::default()
+    };
+    let runtime = common::run_async(JsExtensionRuntimeHandle::start(
+        config,
+        tools,
+        manager.clone(),
+    ))
+    .expect("start strict module loader runtime");
+    manager.set_js_runtime(runtime);
+    let response = common::run_async(async move {
+        manager
+            .load_js_extensions(vec![spec])
+            .await
+            .expect("load real module graph without optional native driver");
+        let response = manager
+            .execute_command("loaded-module-result", "", 5000)
+            .await
+            .expect("execute command registered after SQLite initialization");
+        assert!(manager.shutdown(std::time::Duration::from_secs(5)).await);
+        response
+    });
+    let result: Value = serde_json::from_str(response["display"].as_str().unwrap()).unwrap();
+    assert_eq!(result["row"]["cost"], 21, "{result}");
+    assert_eq!(result["sideEffect"], "loaded", "{result}");
+    assert_eq!(result["importedValue"]["value"], 41, "{result}");
+    assert_eq!(result["importedValue"]["basename"], "factory.cjs");
+    assert_eq!(
+        result["filename"],
+        pi::extensions::safe_canonicalize(&entry)
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        result["importedValue"]["filename"],
+        pi::extensions::safe_canonicalize(&factory)
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        result["importedValue"]["directory"],
+        pi::extensions::safe_canonicalize(factory.parent().unwrap())
+            .display()
+            .to_string()
+    );
+    let helper_url = result["helperUrl"].as_str().unwrap();
+    assert!(
+        helper_url.contains("%23") && helper_url.contains("%25") && helper_url.contains("%CE%BB"),
+        "{helper_url}"
+    );
 }

@@ -49,6 +49,7 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as StdOrdering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::thread;
@@ -10903,7 +10904,7 @@ impl NativeRustExtensionLoadSpec {
 #[cfg(any())]
 mod native_runtime_experimental;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 struct JsExtensionSnapshot {
     id: String,
     #[serde(default)]
@@ -10928,6 +10929,22 @@ struct JsExtensionSnapshot {
     event_hooks: Vec<String>,
     #[serde(default)]
     active_tools: Option<Vec<String>>,
+}
+
+impl JsExtensionSnapshot {
+    fn tool_definitions(&self) -> Result<Vec<ExtensionToolDef>> {
+        self.tools
+            .iter()
+            .map(|tool| {
+                serde_json::from_value(tool.clone()).map_err(|error| {
+                    Error::extension(format!(
+                        "Invalid tool definition in JS extension {}: {error}",
+                        self.id
+                    ))
+                })
+            })
+            .collect()
+    }
 }
 
 #[cfg(feature = "wasm-host")]
@@ -11120,6 +11137,7 @@ impl JsRuntimeHost {
             inner,
             snapshot: Arc::clone(&self.manager_snapshot),
             snapshot_version: Arc::clone(&self.manager_snapshot_version),
+            runtime_owner_lifetime: None,
         })
     }
 }
@@ -11287,11 +11305,37 @@ enum JsRuntimeCommand {
 
 struct JsRuntimeShard {
     extension_id: String,
-    runtime: PiJsRuntime,
+    runtime: Rc<PiJsRuntime>,
     snapshot: JsExtensionSnapshot,
+    /// An idle turn polls at most one FIFO dispatch. Retaining its future here
+    /// preserves its admission lease, provenance and eventual completion while
+    /// the actor receives commands or advances another extension's timers.
+    pending_idle_dispatch: Option<PendingIdleHostcall>,
     /// Terminal pump failure retained so unrelated shards can continue while
     /// future calls targeting this shard still receive the original failure.
     pump_fault: Option<String>,
+}
+
+struct PendingIdleHostcall {
+    call_id: String,
+    future: futures::future::LocalBoxFuture<'static, Option<(String, HostcallOutcome, u64)>>,
+}
+
+impl JsRuntimeShard {
+    fn cancel_idle_dispatch(&mut self) {
+        if let Some(pending) = self.pending_idle_dispatch.take() {
+            self.runtime.cancel_hostcall(&pending.call_id);
+            // Dropping the dispatch also releases admission/UI leases and
+            // invokes native subprocess cancellation guards before shutdown.
+            drop(pending);
+        }
+    }
+}
+
+impl Drop for JsRuntimeShard {
+    fn drop(&mut self) {
+        self.cancel_idle_dispatch();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -11667,6 +11711,62 @@ fn short_warm_pool_fingerprint(fingerprint: &str) -> &str {
     fingerprint.get(..16).unwrap_or(fingerprint)
 }
 
+/// External ownership is separate from the manager's internal Arc count.
+/// A pending hostcall can retain a manager or UI lease across an await without
+/// keeping its own actor alive after all application owners have gone away.
+#[derive(Default)]
+struct JsRuntimeOwnerLifetime {
+    actors: Mutex<Vec<Weak<JsActorLifecycle>>>,
+}
+
+impl JsRuntimeOwnerLifetime {
+    fn register_actor(&self, actor: &Arc<JsActorLifecycle>) {
+        let mut actors = self
+            .actors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        actors.retain(|actor| actor.strong_count() > 0);
+        actors.push(Arc::downgrade(actor));
+    }
+}
+
+impl Drop for JsRuntimeOwnerLifetime {
+    fn drop(&mut self) {
+        for actor in self
+            .actors
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+        {
+            actor.stop();
+        }
+    }
+}
+
+struct JsActorLifecycle {
+    stopped: std::sync::atomic::AtomicBool,
+    // The actor must not keep its own command channel open. Dropping an
+    // unattached or replaced handle still closes the receiver naturally.
+    sender: mpsc::WeakSender<JsRuntimeCommand>,
+}
+
+impl JsActorLifecycle {
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(StdOrdering::Acquire)
+    }
+
+    fn stop(&self) {
+        // An empty receive must wake. A full queue already wakes the
+        // actor, which checks the latch before processing more work.
+        if !self.stopped.swap(true, StdOrdering::AcqRel)
+            && let Some(sender) = self.sender.upgrade()
+        {
+            let _ = sender.try_send(JsRuntimeCommand::Shutdown);
+        }
+    }
+}
+
 /// Handle to the JS extension runtime thread.
 ///
 /// Cloning shares the same underlying runtime. Call [`shutdown`](Self::shutdown)
@@ -11675,6 +11775,10 @@ fn short_warm_pool_fingerprint(fingerprint: &str) -> &str {
 /// `exit_signal`.
 pub struct JsExtensionRuntimeHandle {
     sender: mpsc::Sender<JsRuntimeCommand>,
+    actor_lifecycle: Weak<JsActorLifecycle>,
+    /// Only handles held by application code own this lifetime. The handle
+    /// stored inside the same manager is non-owning to avoid an actor cycle.
+    runtime_owner_lifetime: Option<Arc<JsRuntimeOwnerLifetime>>,
     /// Weak manager access used only to capture trusted Session provenance
     /// before root JS commands enter the runtime thread.
     manager_ref: Weak<Mutex<ExtensionManagerInner>>,
@@ -11692,6 +11796,8 @@ impl Clone for JsExtensionRuntimeHandle {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            actor_lifecycle: self.actor_lifecycle.clone(),
+            runtime_owner_lifetime: self.runtime_owner_lifetime.clone(),
             manager_ref: self.manager_ref.clone(),
             compat_scan_mode: self.compat_scan_mode,
             exit_signal: Arc::clone(&self.exit_signal),
@@ -11708,19 +11814,19 @@ impl Clone for JsExtensionRuntimeHandle {
 /// explicit maps), capture the Pi process environment once at runtime start.
 /// Per-key disclosure is still mediated inside `__pi_env_get_native` (the
 /// policy's `SecretBroker` with its `disclosure_allowlist`, or the default
-/// secret filter), and the JS `process.env` proxy deliberately cannot
-/// enumerate keys, so this only lets policy-permitted lookups observe real
-/// values.
+/// secret filter). The JS `process.env` snapshot enumerates only keys permitted
+/// by that same filter and omits bindings unsuitable for child environments,
+/// allowing safe copies without exposing secret names or values.
 fn apply_env_capability(config: &mut PiJsRuntimeConfig, policy: &ExtensionPolicy) {
-    // Full capability model, mirroring check_exec_capability: global deny →
-    // default_caps allow → mode fallback (Strict/Prompt = deny). A bare
-    // deny-list check would grant a Strict policy without "env" in
-    // deny_caps a full process-env snapshot the mode says to withhold.
-    if policy.deny_caps.iter().any(|cap| cap == "env") {
-        return;
-    }
-    let allowed = policy.default_caps.iter().any(|cap| cap == "env")
-        || matches!(policy.mode, ExtensionPolicyMode::Permissive);
+    // Capture once when at least one realm can use the snapshot. Each runtime
+    // applies evaluate_for again with its immutable owner before exposing any
+    // keys, values or child environment. A global deny still defeats every
+    // extension override, and Prompt never becomes implicit permission.
+    let allowed = policy.evaluate("env").decision == PolicyDecision::Allow
+        || policy
+            .per_extension
+            .keys()
+            .any(|owner| policy.evaluate_for("env", Some(owner)).decision == PolicyDecision::Allow);
     if !allowed {
         return;
     }
@@ -11794,6 +11900,14 @@ impl JsExtensionRuntimeHandle {
         let policy = policy.unwrap_or_default();
         let runtime_policy = policy.clone();
 
+        let runtime_owner_lifetime = manager.runtime_owner_lifetime.clone().unwrap_or_default();
+        let actor_lifecycle = Arc::new(JsActorLifecycle {
+            stopped: std::sync::atomic::AtomicBool::new(false),
+            sender: tx.downgrade(),
+        });
+        runtime_owner_lifetime.register_actor(&actor_lifecycle);
+        let actor_lifecycle_ref = Arc::downgrade(&actor_lifecycle);
+
         apply_env_capability(&mut config, &policy);
 
         let manager_ref = Arc::downgrade(&manager.inner);
@@ -11850,7 +11964,46 @@ impl JsExtensionRuntimeHandle {
 
                 let mut shard_set = JsRuntimeShardSet::default();
 
-                while let Ok(cmd) = rx.recv(&cx).await {
+                while !actor_lifecycle.is_stopped() {
+                    // Commands, especially lifecycle operations, take priority
+                    // over idle JavaScript. Only the receive is timed: an idle
+                    // dispatch is retained in its shard across scheduler turns.
+                    let cmd = match rx.try_recv() {
+                        Ok(cmd) => cmd,
+                        Err(mpsc::RecvError::Empty) => {
+                            if let Some(delay) = idle_runtime_poll_delay(&shard_set) {
+                                match timeout(extension_wait_now(), delay, rx.recv(&cx)).await {
+                                    Ok(Ok(cmd)) => cmd,
+                                    Ok(Err(_)) => break,
+                                    Err(_) => {
+                                        if actor_lifecycle.is_stopped() {
+                                            break;
+                                        }
+                                        // A command may have arrived exactly at
+                                        // the timer boundary. Do not run an idle
+                                        // turn ahead of an already queued command.
+                                        match rx.try_recv() {
+                                            Ok(cmd) => cmd,
+                                            Err(mpsc::RecvError::Empty) => {
+                                                pump_idle_runtime_shards(&mut shard_set, &host).await;
+                                                continue;
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                }
+                            } else {
+                                let Ok(cmd) = rx.recv(&cx).await else {
+                                    break;
+                                };
+                                cmd
+                            }
+                        }
+                        Err(_) => break,
+                    };
+                    if actor_lifecycle.is_stopped() {
+                        break;
+                    }
                     match cmd {
                         JsRuntimeCommand::Shutdown => break,
                         JsRuntimeCommand::LoadExtensions {
@@ -11959,7 +12112,8 @@ impl JsExtensionRuntimeHandle {
                                 let _ = reply.send(&cx, Err(err));
                                 continue;
                             }
-                            let result = get_registered_tools_from_shards(&shard_set).await;
+                            let result =
+                                get_registered_tools_from_shards(&mut shard_set, deadline).await;
                             let _ = reply.send(&cx, result);
                         }
                         JsRuntimeCommand::PumpOnce { deadline, reply } => {
@@ -12628,6 +12782,10 @@ impl JsExtensionRuntimeHandle {
                         }
                     }
                 }
+                // Release retained dispatch futures and their admission/UI
+                // leases before acknowledging shutdown to application code.
+                // Each shard cancels its pending call before dropping its realm.
+                drop(shard_set);
                 // Signal that the runtime thread has exited its event loop.
                 let _ = exit_tx.send(&cx, ());
                 tracing::info!(
@@ -12645,6 +12803,8 @@ impl JsExtensionRuntimeHandle {
 
         Ok(Self {
             sender: tx,
+            actor_lifecycle: actor_lifecycle_ref,
+            runtime_owner_lifetime: Some(runtime_owner_lifetime),
             manager_ref,
             compat_scan_mode,
             exit_signal: Arc::new(Mutex::new(Some(exit_rx))),
@@ -12684,15 +12844,21 @@ impl JsExtensionRuntimeHandle {
 
     /// Request the JS runtime thread to shut down gracefully.
     ///
-    /// Sends a `Shutdown` command and waits up to `budget` for the thread
+    /// Signals shutdown and waits up to `budget` for the thread
     /// to exit its event loop.  Returns `true` if the runtime exited
     /// within the budget.
     pub async fn shutdown(&self, budget: Duration) -> bool {
         let cx = Cx::for_request();
         let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
 
-        // Send shutdown command (ignore error if channel already closed).
-        let _ = self.sender.send(&cx, JsRuntimeCommand::Shutdown).await;
+        // Stop is a latch, not an ordinary queued command. In particular,
+        // waiting to send into a full queue must not consume an unbounded
+        // amount of time before the cleanup budget starts.
+        if let Some(actor) = self.actor_lifecycle.upgrade() {
+            actor.stop();
+        } else {
+            let _ = self.sender.try_send(JsRuntimeCommand::Shutdown);
+        }
 
         // Take the exit signal — only the first caller can await it.
         let exit_rx = {
@@ -13492,6 +13658,13 @@ fn collect_extension_entries_from_dir(dir: &Path) -> Vec<PathBuf> {
 // direction was independently proposed in PR #169 by @CCherry07).
 
 fn read_pi_extensions_from_package(package_json_path: &Path) -> Result<Option<Vec<String>>> {
+    let Some(json) = read_js_package_manifest(package_json_path)? else {
+        return Ok(None);
+    };
+    pi_extensions_from_manifest(&json, package_json_path)
+}
+
+fn read_js_package_manifest(package_json_path: &Path) -> Result<Option<Value>> {
     if !package_json_path.is_file() {
         return Ok(None);
     }
@@ -13508,6 +13681,13 @@ fn read_pi_extensions_from_package(package_json_path: &Path) -> Result<Option<Ve
             package_json_path.display()
         ))
     })?;
+    Ok(Some(json))
+}
+
+fn pi_extensions_from_manifest(
+    json: &Value,
+    package_json_path: &Path,
+) -> Result<Option<Vec<String>>> {
     let Some(pi) = json.get("pi") else {
         return Ok(None);
     };
@@ -13658,20 +13838,65 @@ fn is_independent_extensions_root(dir: &Path) -> bool {
 /// workspace clustering, no example scanning (bd-4bumf; see the module note
 /// above).
 fn discover_related_extension_entries(primary: &Path) -> Result<Vec<PathBuf>> {
+    discover_related_extension_entries_with_cache(primary, &mut HashMap::new())
+}
+
+#[derive(Clone)]
+struct JsPackageEntrySnapshot {
+    entries: Option<Vec<PathBuf>>,
+    establishes_boundary: bool,
+}
+
+type JsPackageEntryCache = HashMap<PathBuf, JsPackageEntrySnapshot>;
+
+fn cached_package_extension_entries(
+    manifest: &Path,
+    cache: &mut JsPackageEntryCache,
+) -> Result<JsPackageEntrySnapshot> {
+    let manifest = safe_canonicalize(manifest);
+    if let Some(entries) = cache.get(&manifest) {
+        return Ok(entries.clone());
+    }
+    let json = read_js_package_manifest(&manifest)?.ok_or_else(|| {
+        Error::extension(format!(
+            "Package manifest disappeared: {}",
+            manifest.display()
+        ))
+    })?;
+    let entries = pi_extensions_from_manifest(&json, &manifest)?.map(|entries| {
+        resolve_package_declared_entries(manifest.parent().unwrap_or(&manifest), &entries)
+    });
+    // A module-format scope does not create an independent package. Keep
+    // this exception exact: arbitrary unnamed package manifests still bind.
+    let type_only_scope = json.as_object().is_some_and(|object| {
+        object.len() == 1
+            && matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("module" | "commonjs")
+            )
+    });
+    let snapshot = JsPackageEntrySnapshot {
+        entries,
+        establishes_boundary: !type_only_scope,
+    };
+    cache.insert(manifest, snapshot.clone());
+    Ok(snapshot)
+}
+
+fn discover_related_extension_entries_with_cache(
+    primary: &Path,
+    cache: &mut JsPackageEntryCache,
+) -> Result<Vec<PathBuf>> {
     let canonical_primary = safe_canonicalize(primary);
     let mut out = vec![canonical_primary.clone()];
     let mut seen = BTreeSet::new();
     let _ = seen.insert(canonical_primary.clone());
 
     let mut selected_resolved: Vec<PathBuf> = Vec::new();
-    for package_json in find_package_json_ancestors(primary.parent()) {
-        let Some(package_dir) = package_json.parent() else {
+    for package_json in find_package_json_ancestors(canonical_primary.parent()) {
+        let Some(resolved) = cached_package_extension_entries(&package_json, cache)?.entries else {
             continue;
         };
-        let Some(package_entries) = read_pi_extensions_from_package(&package_json)? else {
-            continue;
-        };
-        let resolved = resolve_package_declared_entries(package_dir, &package_entries);
         if !resolved.contains(&canonical_primary) {
             continue;
         }
@@ -13689,7 +13914,100 @@ fn discover_related_extension_entries(primary: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-type GroupedJsExtensionSpecs<'a> = Vec<(String, Vec<(&'a JsExtensionLoadSpec, Vec<PathBuf>)>)>;
+#[derive(Debug, PartialEq, Eq)]
+enum JsExtensionProvenance {
+    DeclaredPackage(PathBuf),
+    Directory(PathBuf),
+    IndependentEntry(PathBuf),
+}
+
+impl JsExtensionProvenance {
+    fn path(&self) -> &Path {
+        match self {
+            Self::DeclaredPackage(path) | Self::Directory(path) | Self::IndependentEntry(path) => {
+                path
+            }
+        }
+    }
+
+    fn filesystem_root(&self) -> PathBuf {
+        match self {
+            Self::IndependentEntry(path) => path.parent().unwrap_or(path).to_path_buf(),
+            Self::DeclaredPackage(path) | Self::Directory(path) => path.clone(),
+        }
+    }
+}
+
+fn js_extension_provenance(
+    entry: &Path,
+    cache: &mut JsPackageEntryCache,
+) -> Result<JsExtensionProvenance> {
+    let is_node_modules = |name: &std::ffi::OsStr| {
+        name == "node_modules"
+            || (cfg!(windows)
+                && name
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("node_modules")))
+    };
+    let entry = safe_canonicalize(entry);
+    let parent = entry
+        .parent()
+        .ok_or_else(|| Error::extension("JS extension entry has no parent directory"))?;
+    for directory in parent.ancestors() {
+        let manifest = directory.join("package.json");
+        if manifest.is_file() {
+            let manifest = safe_canonicalize(&manifest);
+            // A nearer package is a boundary even when it does not declare
+            // this entry. An outer workspace cannot claim nested packages.
+            if manifest.parent() != Some(directory) {
+                break;
+            }
+            let snapshot = cached_package_extension_entries(&manifest, cache)?;
+            if snapshot
+                .entries
+                .is_some_and(|entries| entries.contains(&entry))
+            {
+                return Ok(JsExtensionProvenance::DeclaredPackage(
+                    directory.to_path_buf(),
+                ));
+            }
+            if snapshot.establishes_boundary {
+                break;
+            }
+        }
+        // Missing manifests do not turn installed dependency directories
+        // into portions of the containing workspace package.
+        let installed_package = directory.parent().is_some_and(|parent| {
+            parent.file_name().is_some_and(is_node_modules)
+                || (parent
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with('@'))
+                    && parent
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(is_node_modules))
+        });
+        if installed_package {
+            break;
+        }
+    }
+    Ok(if is_independent_extensions_root(parent) {
+        JsExtensionProvenance::IndependentEntry(entry)
+    } else {
+        JsExtensionProvenance::Directory(parent.to_path_buf())
+    })
+}
+
+#[derive(Debug)]
+struct JsExtensionSpecPlan<'a> {
+    spec: &'a JsExtensionLoadSpec,
+    entry_paths: Vec<PathBuf>,
+    filesystem_roots: Vec<PathBuf>,
+    declared_package_root: Option<PathBuf>,
+}
+
+type GroupedJsExtensionSpecs<'a> = Vec<(String, Vec<JsExtensionSpecPlan<'a>>)>;
 
 fn group_js_extension_specs<'a>(
     specs: &'a [JsExtensionLoadSpec],
@@ -13697,6 +14015,8 @@ fn group_js_extension_specs<'a>(
 ) -> Result<GroupedJsExtensionSpecs<'a>> {
     let mut group_by_id = HashMap::<String, usize>::new();
     let mut grouped_specs = GroupedJsExtensionSpecs::new();
+    let mut provenance_by_id = HashMap::<String, JsExtensionProvenance>::new();
+    let mut package_entries = JsPackageEntryCache::new();
     for spec in specs {
         if spec.extension_id.trim().is_empty() {
             return Err(Error::extension("JS extension id cannot be empty"));
@@ -13705,7 +14025,53 @@ fn group_js_extension_specs<'a>(
         // set drives both peer-boundary metadata and the subsequent load, so a
         // concurrent manifest/filesystem change cannot create an unclassified
         // extension root between two discovery passes.
-        let entry_paths = resolve_extension_load_entry_paths(spec, explicit_entry_paths)?;
+        let entry_paths =
+            resolve_extension_load_entry_paths(spec, explicit_entry_paths, &mut package_entries)?;
+        let provenance = js_extension_provenance(&spec.entry_path, &mut package_entries)?;
+        for entry_path in &entry_paths {
+            let entry_provenance = js_extension_provenance(entry_path, &mut package_entries)?;
+            if entry_provenance != provenance {
+                return Err(Error::extension(format!(
+                    "Ambiguous JS extension provenance for {}: declared entry {} belongs to {}, outside primary origin {}",
+                    spec.extension_id,
+                    entry_path.display(),
+                    entry_provenance.path().display(),
+                    provenance.path().display(),
+                )));
+            }
+        }
+        let controlling_root = provenance.filesystem_root();
+        let mut filesystem_roots = Vec::new();
+        let mut seen_roots = HashSet::new();
+        for entry in &entry_paths {
+            // Keep the leaf boundaries as well as the containing package:
+            // distinct explicit owners in one package must not inherit each
+            // other's deeper directories through their shared package root.
+            if let Some(parent) = entry.parent()
+                && seen_roots.insert(parent.to_path_buf())
+            {
+                filesystem_roots.push(parent.to_path_buf());
+            }
+            if seen_roots.insert(controlling_root.clone()) {
+                filesystem_roots.push(controlling_root.clone());
+            }
+        }
+        let declared_package_root = match &provenance {
+            JsExtensionProvenance::DeclaredPackage(root) => Some(root.clone()),
+            _ => None,
+        };
+        if let Some(previous) = provenance_by_id.get(&spec.extension_id) {
+            if previous != &provenance {
+                return Err(Error::extension(format!(
+                    "Ambiguous JS extension provenance: id {} resolves to unrelated origins {} and {}; assign distinct explicit extension identities",
+                    spec.extension_id,
+                    previous.path().display(),
+                    provenance.path().display(),
+                )));
+            }
+        } else {
+            provenance_by_id.insert(spec.extension_id.clone(), provenance);
+        }
         let group_index = match group_by_id.entry(spec.extension_id.clone()) {
             std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -13715,7 +14081,12 @@ fn group_js_extension_specs<'a>(
                 index
             }
         };
-        grouped_specs[group_index].1.push((spec, entry_paths));
+        grouped_specs[group_index].1.push(JsExtensionSpecPlan {
+            spec,
+            entry_paths,
+            filesystem_roots,
+            declared_package_root,
+        });
     }
     Ok(grouped_specs)
 }
@@ -13725,8 +14096,8 @@ fn collect_js_extension_roots(
 ) -> Result<Vec<(String, Vec<PathBuf>)>> {
     let mut leaf_root_owner = HashMap::<PathBuf, String>::new();
     for (extension_id, extension_specs) in grouped_specs {
-        for (_, entry_paths) in extension_specs {
-            for entry_path in entry_paths {
+        for plan in extension_specs {
+            for entry_path in &plan.entry_paths {
                 let Some(parent) = entry_path.parent() else {
                     continue;
                 };
@@ -13758,16 +14129,424 @@ fn collect_js_extension_roots(
     for (extension_id, extension_specs) in grouped_specs {
         let mut roots = Vec::new();
         let mut seen = BTreeSet::new();
-        for (_, entry_paths) in extension_specs {
-            for root in collect_extension_roots_from_paths(entry_paths) {
+        for plan in extension_specs {
+            for root in &plan.filesystem_roots {
                 if seen.insert(root.clone()) {
-                    roots.push(root);
+                    roots.push(root.clone());
                 }
             }
         }
         roots_by_id.push((extension_id.clone(), roots));
     }
     Ok(roots_by_id)
+}
+
+/// Only an installed npm package may claim its matching application namespace.
+/// A name in an unrelated ancestor manifest grants no filesystem authority.
+fn npm_application_storage_namespace(package_dir: &Path, name: &str) -> Option<PathBuf> {
+    fn safe_component(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 100
+            && value.as_bytes()[0].is_ascii_alphanumeric()
+            && value
+                .bytes()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == b'-')
+            && !matches!(
+                value,
+                "con"
+                    | "prn"
+                    | "aux"
+                    | "nul"
+                    | "com1"
+                    | "com2"
+                    | "com3"
+                    | "com4"
+                    | "com5"
+                    | "com6"
+                    | "com7"
+                    | "com8"
+                    | "com9"
+                    | "lpt1"
+                    | "lpt2"
+                    | "lpt3"
+                    | "lpt4"
+                    | "lpt5"
+                    | "lpt6"
+                    | "lpt7"
+                    | "lpt8"
+                    | "lpt9"
+            )
+    }
+    if let Some(scoped) = name.strip_prefix('@') {
+        let (scope, package) = scoped.split_once('/')?;
+        if !safe_component(scope) || !safe_component(package) {
+            return None;
+        }
+        let scope_dir = package_dir.parent()?;
+        if package_dir.file_name()?.to_str()? != package
+            || scope_dir.file_name()?.to_str()? != format!("@{scope}")
+            || scope_dir.parent()?.file_name()? != "node_modules"
+        {
+            return None;
+        }
+        return Some(PathBuf::from(format!("@{scope}")).join(package));
+    }
+    if !safe_component(name)
+        || matches!(
+            name,
+            "agent"
+                | "agents"
+                | "extensions"
+                | "extension-data"
+                | "cache"
+                | "config"
+                | "auth"
+                | "settings"
+                | "models"
+                | "sessions"
+                | "skills"
+                | "prompts"
+                | "themes"
+        )
+        || package_dir.file_name()?.to_str()? != name
+        || package_dir.parent()?.file_name()? != "node_modules"
+    {
+        return None;
+    }
+    Some(PathBuf::from(name))
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct JsApplicationStorageNamespaces {
+    owned: Vec<(String, Vec<PathBuf>)>,
+    denied: Vec<PathBuf>,
+}
+
+fn collect_js_application_storage_namespaces(
+    grouped_specs: &GroupedJsExtensionSpecs<'_>,
+) -> JsApplicationStorageNamespaces {
+    let mut namespace_owners: HashMap<PathBuf, (String, PathBuf)> = HashMap::new();
+    let mut owner_origins: HashMap<String, PathBuf> = HashMap::new();
+    let mut ambiguous_owners = BTreeSet::new();
+    let mut unclassified_owners = BTreeSet::new();
+    let mut out = Vec::new();
+    for (extension_id, specs) in grouped_specs {
+        let mut namespaces = BTreeSet::new();
+        for plan in specs {
+            for entry in &plan.entry_paths {
+                let mut classified = false;
+                // Persistent authority follows the same admitted package
+                // boundary as module/filesystem roots, never a fresh search
+                // through outer packages that happen to name this entry.
+                for manifest in plan
+                    .declared_package_root
+                    .iter()
+                    .map(|root| root.join("package.json"))
+                {
+                    let Some(package_dir) = manifest.parent() else {
+                        continue;
+                    };
+                    if !entry.starts_with(package_dir) {
+                        continue;
+                    }
+                    let Ok(Some(declared)) = read_pi_extensions_from_package(&manifest) else {
+                        continue;
+                    };
+                    if !resolve_package_declared_entries(package_dir, &declared).contains(entry) {
+                        continue;
+                    }
+                    let Some(json) = fs::read_to_string(&manifest)
+                        .ok()
+                        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                    else {
+                        continue;
+                    };
+                    let Some(namespace) = json
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .and_then(|name| npm_application_storage_namespace(package_dir, name))
+                    else {
+                        continue;
+                    };
+                    let origin = (extension_id.clone(), package_dir.to_path_buf());
+                    if let Some(previous) =
+                        owner_origins.insert(extension_id.clone(), package_dir.to_path_buf())
+                        && previous != package_dir
+                    {
+                        ambiguous_owners.insert(extension_id.clone());
+                        tracing::warn!(
+                            extension_id,
+                            previous_origin = %previous.display(),
+                            origin = %package_dir.display(),
+                            "Automatic persistent storage disabled for an ambiguous npm owner; distinct host-assigned extension identities are required"
+                        );
+                    }
+                    if let Some(previous) =
+                        namespace_owners.insert(namespace.clone(), origin.clone())
+                        && previous != origin
+                    {
+                        ambiguous_owners.insert(previous.0.clone());
+                        ambiguous_owners.insert(extension_id.clone());
+                        tracing::warn!(
+                            extension_id,
+                            previous_owner = %previous.0,
+                            namespace = %namespace.display(),
+                            previous_origin = %previous.1.display(),
+                            origin = %package_dir.display(),
+                            "Automatic persistent storage disabled for conflicting namespace owners; explicit host storage configuration is required"
+                        );
+                    }
+                    namespaces.insert(namespace);
+                    classified = true;
+                    break;
+                }
+                if !classified {
+                    unclassified_owners.insert(extension_id.clone());
+                }
+            }
+        }
+        out.push((extension_id.clone(), namespaces));
+    }
+    let mut result = JsApplicationStorageNamespaces::default();
+    let mut denied = BTreeSet::new();
+    for (owner, namespaces) in out {
+        if !namespaces.is_empty() && unclassified_owners.contains(&owner) {
+            ambiguous_owners.insert(owner.clone());
+            tracing::warn!(
+                extension_id = %owner,
+                "Automatic persistent storage disabled because an npm owner also groups unrelated entries; distinct host-assigned extension identities are required"
+            );
+        }
+        if ambiguous_owners.contains(&owner) {
+            // Suppress every grant for a colliding principal, including its
+            // otherwise unique namespaces. Keep denied namespaces as foreign
+            // boundaries so workspace access cannot restore the lost grant.
+            denied.extend(namespaces);
+            result.owned.push((owner, Vec::new()));
+        } else {
+            result.owned.push((owner, namespaces.into_iter().collect()));
+        }
+    }
+    result.denied = denied.into_iter().collect();
+    result
+}
+
+#[cfg(test)]
+mod application_storage_tests {
+    use super::*;
+
+    /// Exercise the namespace collector's independent deny defense with
+    /// plans that production grouping now rejects before runtime creation.
+    fn storage_plans_without_group_admission(
+        specs: &[JsExtensionLoadSpec],
+    ) -> GroupedJsExtensionSpecs<'_> {
+        let mut groups = GroupedJsExtensionSpecs::new();
+        for spec in specs {
+            let explicit = HashSet::from([spec.entry_path.clone()]);
+            for (id, plans) in
+                group_js_extension_specs(std::slice::from_ref(spec), &explicit).unwrap()
+            {
+                if let Some((_, grouped)) = groups.iter_mut().find(|(owner, _)| owner == &id) {
+                    grouped.extend(plans);
+                } else {
+                    groups.push((id, plans));
+                }
+            }
+        }
+        groups
+    }
+
+    #[test]
+    fn nested_package_entry_cannot_borrow_an_ancestor_root_or_storage_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let outer = temp.path().join("node_modules/outer");
+        let inner = outer.join("node_modules/inner");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(
+            outer.join("package.json"),
+            json!({"name":"outer", "pi":{"extensions":["./node_modules/inner/extension.mjs"]}})
+                .to_string(),
+        )
+        .unwrap();
+        fs::write(inner.join("package.json"), r#"{"name":"inner"}"#).unwrap();
+        let entry = inner.join("extension.mjs");
+        fs::write(&entry, "export default function() {}").unwrap();
+        let specs = vec![JsExtensionLoadSpec::from_entry_path(entry).unwrap()];
+        let explicit = HashSet::from([specs[0].entry_path.clone()]);
+        let grouped = group_js_extension_specs(&specs, &explicit).unwrap();
+        assert_eq!(
+            collect_js_extension_roots(&grouped).unwrap(),
+            vec![("extension".to_string(), vec![safe_canonicalize(&inner)])]
+        );
+        assert_eq!(
+            collect_js_application_storage_namespaces(&grouped),
+            JsApplicationStorageNamespaces {
+                owned: vec![("extension".to_string(), Vec::new())],
+                denied: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn npm_storage_namespaces_require_matching_install_identity_and_reserve_pi_data() {
+        assert_eq!(
+            npm_application_storage_namespace(
+                Path::new("npm/node_modules/context-mode"),
+                "context-mode"
+            ),
+            Some(PathBuf::from("context-mode"))
+        );
+        assert_eq!(
+            npm_application_storage_namespace(
+                Path::new("npm/node_modules/@scope/state"),
+                "@scope/state"
+            ),
+            Some(PathBuf::from("@scope/state"))
+        );
+        for (path, name) in [
+            ("some/project", "context-mode"),
+            ("node_modules/other", "context-mode"),
+            ("node_modules/agent", "agent"),
+            ("node_modules/auth", "auth"),
+            ("node_modules/auth.json", "auth.json"),
+            ("node_modules/nul", "nul"),
+            ("node_modules/com1", "com1"),
+            ("node_modules/context-mode", "../context-mode"),
+            ("node_modules/context-mode", "context-mode:stream"),
+            ("node_modules/@scope/state", "@scope/../agent"),
+        ] {
+            assert!(
+                npm_application_storage_namespace(Path::new(path), name).is_none(),
+                "{path}: {name}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn npm_storage_namespaces_support_windows_drive_and_unc_install_paths() {
+        for path in [
+            r"C:\Users\alice\AppData\Roaming\npm\node_modules\context-mode",
+            r"\\server\share\npm\node_modules\context-mode",
+        ] {
+            assert_eq!(
+                npm_application_storage_namespace(Path::new(path), "context-mode"),
+                Some(PathBuf::from("context-mode"))
+            );
+        }
+    }
+
+    #[test]
+    fn storage_discovery_requires_declared_entry_and_suppresses_ambiguous_owners() {
+        let temp = tempfile::tempdir().unwrap();
+        let make_package = |prefix: &str, declaration: &str| {
+            let root = temp.path().join(prefix).join("node_modules/context-mode");
+            fs::create_dir_all(root.join("build/adapters/pi")).unwrap();
+            fs::write(
+                root.join("package.json"),
+                json!({
+                    "name": "context-mode", "pi": {"extensions": [declaration]}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let entry = root.join("build/adapters/pi/extension.js");
+            fs::write(&entry, "export default function(pi) {}").unwrap();
+            JsExtensionLoadSpec::from_entry_path(entry).unwrap()
+        };
+        let valid = make_package("a", "./build/adapters/pi/extension.js");
+        let unrelated = make_package("b", "./different.js");
+        let specs = vec![valid.clone()];
+        let explicit = specs.iter().map(|spec| spec.entry_path.clone()).collect();
+        let grouped = group_js_extension_specs(&specs, &explicit).unwrap();
+        assert_eq!(
+            collect_js_application_storage_namespaces(&grouped),
+            JsApplicationStorageNamespaces {
+                owned: vec![(
+                    valid.extension_id.clone(),
+                    vec![PathBuf::from("context-mode")]
+                )],
+                denied: Vec::new(),
+            }
+        );
+
+        let specs = vec![unrelated];
+        let explicit = specs.iter().map(|spec| spec.entry_path.clone()).collect();
+        let grouped = group_js_extension_specs(&specs, &explicit).unwrap();
+        assert!(
+            collect_js_application_storage_namespaces(&grouped).owned[0]
+                .1
+                .is_empty()
+        );
+
+        let collision = make_package("c", "./build/adapters/pi/extension.js");
+        let other_root = temp.path().join("d/node_modules/independent-state");
+        fs::create_dir_all(&other_root).unwrap();
+        fs::write(
+            other_root.join("package.json"),
+            json!({
+                "name": "independent-state", "pi": {"extensions": ["./independent.js"]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            other_root.join("independent.js"),
+            "export default function(pi) {}",
+        )
+        .unwrap();
+        let independent =
+            JsExtensionLoadSpec::from_entry_path(other_root.join("independent.js")).unwrap();
+        let specs = vec![valid.clone(), collision.clone(), independent.clone()];
+        let explicit = specs.iter().map(|spec| spec.entry_path.clone()).collect();
+        assert!(group_js_extension_specs(&specs, &explicit).is_err());
+        let grouped = storage_plans_without_group_admission(&specs);
+        let discovered = collect_js_application_storage_namespaces(&grouped);
+        assert_eq!(
+            discovered.owned,
+            vec![
+                (valid.extension_id.clone(), Vec::new()),
+                (
+                    independent.extension_id.clone(),
+                    vec![PathBuf::from("independent-state")]
+                ),
+            ]
+        );
+        assert_eq!(discovered.denied, vec![PathBuf::from("context-mode")]);
+
+        // Distinct principals claiming the same namespace both lose all
+        // automatic authority, including a unique namespace of either owner.
+        let mut collision = collision;
+        collision.extension_id = "different-owner".to_string();
+        let mut shared_identity = independent;
+        shared_identity.extension_id.clone_from(&valid.extension_id);
+        let specs = vec![valid.clone(), collision, shared_identity];
+        let explicit = specs.iter().map(|spec| spec.entry_path.clone()).collect();
+        assert!(group_js_extension_specs(&specs, &explicit).is_err());
+        let grouped = storage_plans_without_group_admission(&specs);
+        let discovered = collect_js_application_storage_namespaces(&grouped);
+        assert!(discovered.owned.iter().all(|(_, roots)| roots.is_empty()));
+        assert_eq!(
+            discovered.denied,
+            vec![
+                PathBuf::from("context-mode"),
+                PathBuf::from("independent-state")
+            ]
+        );
+
+        // A loose entry with the same legacy filename-derived ID cannot
+        // borrow the verified package's persistent storage capability.
+        let loose = temp.path().join("loose/extension.js");
+        fs::create_dir_all(loose.parent().unwrap()).unwrap();
+        fs::write(&loose, "export default function(pi) {}").unwrap();
+        let specs = vec![valid, JsExtensionLoadSpec::from_entry_path(loose).unwrap()];
+        let explicit = specs.iter().map(|spec| spec.entry_path.clone()).collect();
+        assert!(group_js_extension_specs(&specs, &explicit).is_err());
+        let grouped = storage_plans_without_group_admission(&specs);
+        let discovered = collect_js_application_storage_namespaces(&grouped);
+        assert!(discovered.owned.iter().all(|(_, roots)| roots.is_empty()));
+        assert_eq!(discovered.denied, vec![PathBuf::from("context-mode")]);
+    }
 }
 
 fn js_runtime_shard_config(
@@ -13811,7 +14590,7 @@ fn js_runtime_shard_config(
     Ok(config)
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn build_js_runtime_shards(
     warm_pool: &crate::extensions_js::WarmIsolatePool,
     policy: &ExtensionPolicy,
@@ -13831,8 +14610,11 @@ async fn build_js_runtime_shards(
     let grouped_specs = group_js_extension_specs(specs, &explicit_entry_paths)?;
     let shard_count = grouped_specs.len();
     let extension_roots_by_id = collect_js_extension_roots(&grouped_specs)?;
+    let application_namespaces = collect_js_application_storage_namespaces(&grouped_specs);
 
-    let mut candidate = JsRuntimeShardSet::default();
+    let mut prepared = Vec::with_capacity(shard_count);
+    let mut application_roots_by_id = Vec::with_capacity(shard_count);
+    let mut denied_application_roots = BTreeSet::new();
     for (shard_index, (extension_id, extension_specs)) in grouped_specs.into_iter().enumerate() {
         let shard_config = js_runtime_shard_config(warm_pool, shard_count, shard_index)?;
 
@@ -13844,29 +14626,90 @@ async fn build_js_runtime_shards(
         )
         .await?;
 
+        // Resolve a namespace only in its owner's realm. A peer may have a
+        // different env capability and therefore a different effective HOME;
+        // recomputing the owner's path there would leave its real files
+        // unprotected when they happen to be below the shared workspace.
+        let mut roots = Vec::new();
+        if let Some((_, namespaces)) = application_namespaces
+            .owned
+            .iter()
+            .find(|(owner, _)| owner == &extension_id)
+        {
+            roots.extend(
+                namespaces
+                    .iter()
+                    .filter_map(|namespace| runtime.application_storage_root(namespace)),
+            );
+        }
+        application_roots_by_id.push((extension_id.clone(), roots));
+        // Ambiguous namespaces have no owner. Protect every realm's possible
+        // base, so no peer can recover authority through workspace access.
+        denied_application_roots.extend(
+            application_namespaces
+                .denied
+                .iter()
+                .filter_map(|namespace| runtime.application_storage_root(namespace)),
+        );
+        prepared.push((extension_id, extension_specs, runtime));
+    }
+
+    // Establish the same complete boundaries in every realm before running
+    // any guest factory, including a peer loaded before the storage owner.
+    for (extension_id, _, runtime) in &prepared {
+        for (owner, roots) in &application_roots_by_id {
+            for root in roots {
+                if owner == extension_id {
+                    if let Err(error) = runtime.add_persistent_storage_root(root.clone(), owner) {
+                        tracing::warn!(
+                            extension_id = %owner,
+                            root = %root.display(),
+                            %error,
+                            "Automatic persistent storage disabled because its namespace is unsafe or inaccessible"
+                        );
+                        runtime.register_foreign_persistent_storage_root(root.clone(), owner)?;
+                    }
+                } else {
+                    runtime.register_foreign_persistent_storage_root(root.clone(), owner)?;
+                }
+            }
+        }
+        for root in &denied_application_roots {
+            // Deny-only registration deliberately has no corresponding
+            // owned grant, even if an extension chose this sentinel ID.
+            runtime.register_foreign_persistent_storage_root(
+                root.clone(),
+                "<unassigned-persistent-storage>",
+            )?;
+        }
+
         // Files under another extension's root must remain a protected
         // boundary even when both extensions live below the workspace cwd.
         // Register peer roots as metadata only; this intentionally grants no
         // read/write capability to the current shard.
         for (foreign_extension_id, roots) in &extension_roots_by_id {
-            if foreign_extension_id == &extension_id {
+            if foreign_extension_id == extension_id {
                 continue;
             }
             for root in roots {
                 runtime.register_foreign_extension_root_boundary(root, foreign_extension_id);
             }
         }
+    }
 
-        for (spec, entry_paths) in extension_specs {
-            load_one_extension(&runtime, host, spec, &entry_paths, origin, root_deadline).await?;
+    let mut candidate = JsRuntimeShardSet::default();
+    for (extension_id, extension_specs, runtime) in prepared {
+        for plan in extension_specs {
+            load_one_extension(&runtime, host, &plan, origin, root_deadline).await?;
         }
 
         let snapshot =
             require_single_shard_snapshot(snapshot_extensions(&runtime).await?, &extension_id)?;
         candidate.shards.push(JsRuntimeShard {
             extension_id,
-            runtime,
+            runtime: Rc::new(runtime),
             snapshot,
+            pending_idle_dispatch: None,
             pump_fault: None,
         });
     }
@@ -13913,17 +14756,35 @@ fn require_single_shard_snapshot(
             snapshot.id
         )));
     }
+    // Owner routes and advertised schemas must come from the same validated
+    // snapshot. A malformed definition cannot be advertised or claim a name.
+    snapshot.tool_definitions()?;
     Ok(snapshot)
 }
 
 #[allow(clippy::future_not_send)]
 async fn get_registered_tools_from_shards(
-    shards: &JsRuntimeShardSet,
+    shards: &mut JsRuntimeShardSet,
+    deadline: Instant,
 ) -> Result<Vec<ExtensionToolDef>> {
     let mut tools = Vec::new();
-    for (shard_index, shard) in shards.shards.iter().enumerate() {
-        shards.ensure_shard_healthy(shard_index)?;
-        tools.extend(shard.runtime.get_registered_tools().await?);
+    for shard_index in 0..shards.shards.len() {
+        if shards.shards[shard_index].pump_fault.is_some() {
+            continue;
+        }
+        js_runtime_remaining_timeout_ms(deadline, "tools query")?;
+        if refresh_runtime_shard_snapshot(shards, shard_index)
+            .await
+            .is_err()
+        {
+            // Snapshot validation quarantines only its owner. Keep its last
+            // accepted names reserved in the route indexes, but omit its
+            // tools so the Agent can retire stale wrappers and keep peers live.
+            continue;
+        }
+        let mut definitions = shards.shards[shard_index].snapshot.tool_definitions()?;
+        definitions.sort_by(|left, right| left.name.encode_utf16().cmp(right.name.encode_utf16()));
+        tools.extend(definitions);
     }
     Ok(tools)
 }
@@ -13934,7 +14795,8 @@ async fn scrub_and_drop_runtime_shards(
     warm_pool: &crate::extensions_js::WarmIsolatePool,
 ) -> Result<()> {
     let mut errors = Vec::new();
-    for shard in &shards.shards {
+    for shard in &mut shards.shards {
+        shard.cancel_idle_dispatch();
         match shard.runtime.scrub_for_cold_drop().await {
             Ok(report) if report.inventoried_state_cleared => {
                 warm_pool.record_reset();
@@ -13975,11 +14837,12 @@ async fn scrub_and_drop_runtime_shards(
 async fn load_one_extension(
     runtime: &PiJsRuntime,
     host: &JsRuntimeHost,
-    spec: &JsExtensionLoadSpec,
-    entry_paths: &[PathBuf],
+    plan: &JsExtensionSpecPlan<'_>,
     origin: Option<&SessionActionOrigin>,
     root_deadline: Instant,
 ) -> Result<()> {
+    let spec = plan.spec;
+    let entry_paths = &plan.entry_paths;
     if entry_paths.len() > 1 {
         tracing::info!(
             event = "ext.load.multi_entry",
@@ -13994,8 +14857,8 @@ async fn load_one_extension(
     // bundled assets (HTML templates, markdown docs, etc.) within the
     // extension's own directory tree, and so the resolver can detect
     // monorepo escape patterns (Pattern 3).
-    for root in collect_extension_roots_from_paths(entry_paths) {
-        runtime.add_extension_root_with_id(root, Some(spec.extension_id.as_str()));
+    for root in &plan.filesystem_roots {
+        runtime.add_extension_root_with_id(root.clone(), Some(spec.extension_id.as_str()));
     }
 
     let meta = json!({
@@ -14058,9 +14921,11 @@ async fn load_one_extension(
 fn resolve_extension_load_entry_paths(
     spec: &JsExtensionLoadSpec,
     explicit_entry_paths: &HashSet<PathBuf>,
+    package_entries: &mut JsPackageEntryCache,
 ) -> Result<Vec<PathBuf>> {
     let explicit_primary = safe_canonicalize(&spec.entry_path);
-    let mut entry_paths = discover_related_extension_entries(&spec.entry_path)?;
+    let mut entry_paths =
+        discover_related_extension_entries_with_cache(&spec.entry_path, package_entries)?;
     if explicit_entry_paths.len() > 1 {
         entry_paths.retain(|entry_path| {
             let canonical = safe_canonicalize(entry_path);
@@ -14092,6 +14957,7 @@ async fn refresh_runtime_shard_snapshot(
     shards: &mut JsRuntimeShardSet,
     shard_index: usize,
 ) -> Result<()> {
+    shards.ensure_shard_healthy(shard_index)?;
     let extension_id = shards
         .shards
         .get(shard_index)
@@ -14118,6 +14984,9 @@ async fn refresh_runtime_shard_snapshot(
             ));
         }
     };
+    if new_snapshot == shards.shards[shard_index].snapshot {
+        return Ok(());
+    }
     let old_snapshot = std::mem::replace(&mut shards.shards[shard_index].snapshot, new_snapshot);
     if let Err(err) = shards.rebuild_indexes() {
         shards.shards[shard_index].snapshot = old_snapshot;
@@ -14156,6 +15025,8 @@ fn quarantine_runtime_shard(
     );
     let fault = format!("JS extension shard {extension_id} quarantined: {reason}");
     if let Some(shard) = shards.shards.get_mut(shard_index) {
+        shard.cancel_idle_dispatch();
+        shard.runtime.cancel_native_resources_for_quarantine();
         shard.pump_fault = Some(fault.clone());
     }
     tracing::error!(
@@ -14394,7 +15265,15 @@ async fn dispatch_extension_event_across_shards_until(
         .event_owners
         .get(event_name)
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|&index| {
+            shards
+                .shards
+                .get(index)
+                .is_some_and(|shard| shard.pump_fault.is_none())
+        })
+        .collect::<Vec<_>>();
     if owners.is_empty() {
         return Ok(Value::Null);
     }
@@ -14530,6 +15409,59 @@ async fn dispatch_extension_event_across_shards_until(
             result.insert("systemPrompt".to_string(), Value::String(system_prompt));
         }
         return Ok(Value::Object(result));
+    }
+
+    if event_name == "context" {
+        let mut messages = event_payload
+            .get("messages")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let mut saw_handler_result = false;
+        for phase in ["direct", "event_bus"] {
+            for &shard_index in &owners {
+                let mut payload = event_payload.as_object().cloned().unwrap_or_default();
+                payload.insert("messages".to_string(), messages.clone());
+                let Some(value) = dispatch_extension_event_phase_sharded(
+                    shards,
+                    host,
+                    JsEventPhaseDispatch {
+                        shard_index,
+                        event_name,
+                        event_payload: Value::Object(payload),
+                        ctx_payload,
+                        phase,
+                        batch_id,
+                        origin,
+                        deadline,
+                    },
+                )
+                .await?
+                else {
+                    continue;
+                };
+                let next = if value.is_array() {
+                    Some(value)
+                } else {
+                    value.get("messages").cloned()
+                };
+                match next {
+                    Some(Value::Array(next)) => {
+                        messages = Value::Array(next);
+                        saw_handler_result = true;
+                    }
+                    Some(Value::Null) => {
+                        messages = Value::Array(Vec::new());
+                        saw_handler_result = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        return Ok(if saw_handler_result {
+            json!({ "messages": messages })
+        } else {
+            Value::Null
+        });
     }
 
     if event_name == "resources_discover" {
@@ -14730,6 +15662,9 @@ async fn create_event_batch_contexts(
 ) -> Result<Vec<usize>> {
     let mut created = Vec::with_capacity(shards.shards.len());
     for (shard_index, shard) in shards.shards.iter().enumerate() {
+        if shard.pump_fault.is_some() {
+            continue;
+        }
         let bridge_secret = shard.runtime.bridge_secret().to_string();
         let result = shard
             .runtime
@@ -15200,6 +16135,7 @@ async fn cancel_extension_provider_stream_simple_sharded(
     stream_id: &str,
     deadline: Instant,
     origin: Option<&SessionActionOrigin>,
+    refresh_registry: bool,
 ) -> Result<()> {
     let timeout = remaining_js_task_timeout(deadline, "provider stream cancel")?;
     let task_id = next_runtime_task_id("task-provider-stream-cancel");
@@ -15227,9 +16163,22 @@ async fn cancel_extension_provider_stream_simple_sharded(
         origin_guard
     };
 
-    let _ =
-        await_js_task_in_shards_and_refresh(shards, host, shard_index, &task_id, timeout, deadline)
-            .await?;
+    if refresh_registry {
+        let _ = await_js_task_in_shards_and_refresh(
+            shards,
+            host,
+            shard_index,
+            &task_id,
+            timeout,
+            deadline,
+        )
+        .await?;
+    } else {
+        // A quarantined iterator may run its cleanup, but it cannot replace
+        // the owner's last accepted registrations or reserve fresh names.
+        let _ =
+            await_js_task_in_shards(shards, host, shard_index, &task_id, timeout, deadline).await?;
+    }
     drop(origin_guard);
     Ok(())
 }
@@ -15258,11 +16207,14 @@ async fn cancel_extension_provider_stream_simple_best_effort(
         stream_id,
         deadline,
         origin,
+        prior_fault.is_none(),
     )
     .await;
     if let Some(prior_fault) = prior_fault
         && let Some(shard) = shards.shards.get_mut(shard_index)
     {
+        shard.cancel_idle_dispatch();
+        shard.runtime.cancel_native_resources_for_quarantine();
         shard.pump_fault = Some(prior_fault);
     }
     result
@@ -15329,6 +16281,94 @@ async fn cancel_active_provider_streams_for_replacement(
     }
 }
 
+/// Dispatch one request through the same identity, policy and admission gates
+/// for command-driven and idle actor work.
+#[allow(clippy::future_not_send)]
+async fn dispatch_js_hostcall_for_owner(
+    runtime: &PiJsRuntime,
+    host: &JsRuntimeHost,
+    expected_owner: Option<&str>,
+    root_deadline: Option<Instant>,
+    req: HostcallRequest,
+) -> Option<(String, HostcallOutcome, u64)> {
+    let call_id = req.call_id.clone();
+    if !runtime.is_hostcall_active(&call_id) {
+        tracing::debug!(
+            event = "pijs.hostcall.skip_cancelled",
+            call_id = %call_id,
+            "Skipping hostcall dispatch because call is no longer pending"
+        );
+        return None;
+    }
+    let extension_id = req.extension_id.clone();
+    let queue_wait_ms = runtime.hostcall_queue_wait_ms(&call_id).unwrap_or(0);
+    let dispatch_started = Instant::now();
+    let outcome = if let Some(expected_owner) = expected_owner
+        && req.extension_id.as_deref() != Some(expected_owner)
+    {
+        tracing::error!(
+            event = "pijs.hostcall.owner_mismatch",
+            call_id = %call_id,
+            expected_owner,
+            claimed_owner = ?req.extension_id,
+            "Rejected hostcall whose claimed extension owner does not match its runtime shard"
+        );
+        HostcallOutcome::Error {
+            code: "extension_identity_mismatch".to_string(),
+            message: format!(
+                "Runtime shard {expected_owner} rejected hostcall claiming extension {:?}",
+                req.extension_id
+            ),
+        }
+    } else if let Some(deadline) = root_deadline {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Some((
+                call_id,
+                HostcallOutcome::Error {
+                    code: "timeout".to_string(),
+                    message: "Root JavaScript task deadline elapsed before hostcall dispatch"
+                        .to_string(),
+                },
+                0,
+            ));
+        };
+        timeout(
+            wall_now(),
+            remaining,
+            Box::pin(dispatch_hostcall_with_runtime(Some(runtime), host, req)),
+        )
+        .await
+        .unwrap_or_else(|_| HostcallOutcome::Error {
+            code: "timeout".to_string(),
+            message: "Root JavaScript task deadline elapsed during hostcall dispatch".to_string(),
+        })
+    } else {
+        dispatch_hostcall_with_runtime(Some(runtime), host, req).await
+    };
+    if runtime.has_deferred_hostcall(&call_id) {
+        runtime.set_deferred_hostcall_deadline(&call_id, root_deadline);
+        return None;
+    }
+    let elapsed = dispatch_started.elapsed();
+    let execution_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+    let outcome_code = match &outcome {
+        HostcallOutcome::Success(_) => "success",
+        HostcallOutcome::StreamChunk { .. } => "stream",
+        HostcallOutcome::Error { code, .. } => code.as_str(),
+    };
+    tracing::debug!(
+        event = "pijs.hostcall.dispatch_timing",
+        call_id = %call_id,
+        extension_id = ?extension_id,
+        queue_wait_ms,
+        execution_ms,
+        outcome_code = %outcome_code,
+        "Hostcall dispatch timing"
+    );
+    Some((call_id, outcome, elapsed_ns))
+}
+
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn pump_js_runtime_once_for_owner(
     runtime: &PiJsRuntime,
@@ -15338,94 +16378,6 @@ async fn pump_js_runtime_once_for_owner(
 ) -> Result<bool> {
     fn drain_requests(runtime: &PiJsRuntime) -> std::collections::VecDeque<HostcallRequest> {
         runtime.drain_hostcall_requests()
-    }
-
-    /// Dispatch a single hostcall request, recording timing and returning
-    /// the completion pair plus elapsed nanoseconds for AMAC telemetry.
-    async fn dispatch_one(
-        runtime: &PiJsRuntime,
-        host: &JsRuntimeHost,
-        expected_owner: Option<&str>,
-        root_deadline: Option<Instant>,
-        req: HostcallRequest,
-    ) -> Option<(String, HostcallOutcome, u64)> {
-        let call_id = req.call_id.clone();
-        if !runtime.is_hostcall_active(&call_id) {
-            tracing::debug!(
-                event = "pijs.hostcall.skip_cancelled",
-                call_id = %call_id,
-                "Skipping hostcall dispatch because call is no longer pending"
-            );
-            return None;
-        }
-        let extension_id = req.extension_id.clone();
-        let queue_wait_ms = runtime.hostcall_queue_wait_ms(&call_id).unwrap_or(0);
-        let dispatch_started = Instant::now();
-        let outcome = if let Some(expected_owner) = expected_owner
-            && req.extension_id.as_deref() != Some(expected_owner)
-        {
-            tracing::error!(
-                event = "pijs.hostcall.owner_mismatch",
-                call_id = %call_id,
-                expected_owner,
-                claimed_owner = ?req.extension_id,
-                "Rejected hostcall whose claimed extension owner does not match its runtime shard"
-            );
-            HostcallOutcome::Error {
-                code: "extension_identity_mismatch".to_string(),
-                message: format!(
-                    "Runtime shard {expected_owner} rejected hostcall claiming extension {:?}",
-                    req.extension_id
-                ),
-            }
-        } else if let Some(deadline) = root_deadline {
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Some((
-                    call_id,
-                    HostcallOutcome::Error {
-                        code: "timeout".to_string(),
-                        message: "Root JavaScript task deadline elapsed before hostcall dispatch"
-                            .to_string(),
-                    },
-                    0,
-                ));
-            };
-            timeout(
-                wall_now(),
-                remaining,
-                Box::pin(dispatch_hostcall_with_runtime(Some(runtime), host, req)),
-            )
-            .await
-            .unwrap_or_else(|_| HostcallOutcome::Error {
-                code: "timeout".to_string(),
-                message: "Root JavaScript task deadline elapsed during hostcall dispatch"
-                    .to_string(),
-            })
-        } else {
-            dispatch_hostcall_with_runtime(Some(runtime), host, req).await
-        };
-        if runtime.has_deferred_hostcall(&call_id) {
-            runtime.set_deferred_hostcall_deadline(&call_id, root_deadline);
-            return None;
-        }
-        let elapsed = dispatch_started.elapsed();
-        let execution_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-        let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
-        let outcome_code = match &outcome {
-            HostcallOutcome::Success(_) => "success",
-            HostcallOutcome::StreamChunk { .. } => "stream",
-            HostcallOutcome::Error { code, .. } => code.as_str(),
-        };
-        tracing::debug!(
-            event = "pijs.hostcall.dispatch_timing",
-            call_id = %call_id,
-            extension_id = ?extension_id,
-            queue_wait_ms,
-            execution_ms,
-            outcome_code = %outcome_code,
-            "Hostcall dispatch timing"
-        );
-        Some((call_id, outcome, elapsed_ns))
     }
 
     async fn dispatch_requests(
@@ -15467,7 +16419,8 @@ async fn pump_js_runtime_once_for_owner(
         let mut completions = Vec::with_capacity(pending.len());
         for req in pending {
             if let Some((call_id, outcome, elapsed_ns)) =
-                dispatch_one(runtime, host, expected_owner, root_deadline, req).await
+                dispatch_js_hostcall_for_owner(runtime, host, expected_owner, root_deadline, req)
+                    .await
             {
                 // Feed timing to AMAC even when disabled, so telemetry
                 // is ready if toggled on later.
@@ -15517,8 +16470,14 @@ async fn pump_js_runtime_once_for_owner(
             );
 
             for req in group.requests {
-                if let Some((call_id, outcome, elapsed_ns)) =
-                    dispatch_one(runtime, host, expected_owner, root_deadline, req).await
+                if let Some((call_id, outcome, elapsed_ns)) = dispatch_js_hostcall_for_owner(
+                    runtime,
+                    host,
+                    expected_owner,
+                    root_deadline,
+                    req,
+                )
+                .await
                 {
                     AMAC_EXECUTOR.with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
                     completions.push((call_id, outcome));
@@ -15579,6 +16538,302 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
     pump_js_runtime_once_for_owner(runtime, host, None, None).await
 }
 
+/// Poll a retained dispatch exactly once. A pending hostcall keeps its future
+/// and all cancellation guards until a later turn or explicit shard teardown.
+#[allow(clippy::future_not_send)]
+async fn poll_idle_hostcall(shard: &mut JsRuntimeShard) {
+    let Some(mut pending) = shard.pending_idle_dispatch.take() else {
+        return;
+    };
+    if !shard.runtime.is_hostcall_active(&pending.call_id) {
+        return;
+    }
+    let outcome =
+        futures::future::poll_fn(|cx| std::task::Poll::Ready(pending.future.as_mut().poll(cx)))
+            .await;
+    match outcome {
+        std::task::Poll::Pending => shard.pending_idle_dispatch = Some(pending),
+        std::task::Poll::Ready(Some((call_id, outcome, elapsed_ns))) => {
+            AMAC_EXECUTOR.with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
+            shard.runtime.complete_hostcall(call_id, outcome);
+        }
+        std::task::Poll::Ready(None) => {}
+    }
+}
+
+struct IdleRuntimeProgress {
+    has_pending: bool,
+    ran_javascript: bool,
+}
+
+/// Advance one shard without awaiting arbitrary host I/O. The per-turn bound
+/// is one FIFO dispatch poll and one scheduler tick, under the runtime's
+/// existing JavaScript interruption and microtask budgets.
+#[allow(clippy::future_not_send)]
+async fn pump_idle_runtime_shard(
+    shard: &mut JsRuntimeShard,
+    host: &JsRuntimeHost,
+) -> Result<IdleRuntimeProgress> {
+    let jobs_drained = shard.runtime.drain_microtasks().await?;
+    if shard.pending_idle_dispatch.is_none()
+        && let Some(request) = shard.runtime.pop_hostcall_request()
+    {
+        let call_id = request.call_id.clone();
+        let runtime = Rc::clone(&shard.runtime);
+        let host = host.clone();
+        let owner = shard.extension_id.clone();
+        shard.pending_idle_dispatch = Some(PendingIdleHostcall {
+            call_id,
+            future: Box::pin(async move {
+                // The dispatcher recovers saved Session provenance by call
+                // id; a later command's active origin cannot relabel it.
+                dispatch_js_hostcall_for_owner(&runtime, &host, Some(&owner), None, request).await
+            }),
+        });
+    }
+    poll_idle_hostcall(shard).await;
+    let tick = shard.runtime.tick().await?;
+    Ok(IdleRuntimeProgress {
+        has_pending: shard.pending_idle_dispatch.is_some() || shard.runtime.has_pending(),
+        ran_javascript: jobs_drained > 0 || tick.ran_macrotask || tick.jobs_drained > 0,
+    })
+}
+
+fn idle_runtime_poll_delay(shards: &JsRuntimeShardSet) -> Option<Duration> {
+    shards
+        .shards
+        .iter()
+        .filter(|shard| shard.pump_fault.is_none())
+        .filter_map(|shard| {
+            let delay = shard.runtime.idle_poll_delay_ms();
+            if shard.pending_idle_dispatch.is_some() {
+                Some(delay.unwrap_or(10).min(10))
+            } else {
+                delay
+            }
+        })
+        .min()
+        // Even immediately ready JavaScript yields to the native timer/I/O
+        // driver. Repeated self-wakes alone can starve subprocess readiness.
+        .map(|delay_ms| Duration::from_millis(delay_ms.max(1)))
+}
+
+/// Fair idle progress visits one ready shard per turn. A pending hostcall in
+/// one owner never prevents timers or completions in another from advancing.
+#[allow(clippy::future_not_send)]
+async fn pump_idle_runtime_shards(shards: &mut JsRuntimeShardSet, host: &JsRuntimeHost) {
+    let shard_count = shards.shards.len();
+    if shard_count == 0 {
+        return;
+    }
+    let start = shards.pump_cursor % shard_count;
+    for offset in 0..shard_count {
+        let shard_index = (start + offset) % shard_count;
+        let shard = &mut shards.shards[shard_index];
+        if shard.pump_fault.is_some()
+            || (shard.pending_idle_dispatch.is_none()
+                && shard.runtime.pending_hostcall_count() == 0
+                && shard.runtime.idle_poll_delay_ms() != Some(0))
+        {
+            continue;
+        }
+        let result = pump_idle_runtime_shard(shard, host).await;
+        shards.pump_cursor = (shard_index + 1) % shard_count;
+        match result {
+            Ok(progress) if progress.ran_javascript => {
+                // Timer and child-process callbacks can register tools after
+                // their initiating task has returned. Publish their routes
+                // before the actor accepts another command. A pending native
+                // I/O poll with no JS progress needs no registry serialization.
+                let _ = refresh_runtime_shard_snapshot(shards, shard_index).await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let _ = quarantine_runtime_shard(
+                    shards,
+                    shard_index,
+                    &format!("idle runtime pump failed: {error}"),
+                );
+            }
+        }
+        break;
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn pump_runtime_shard_for_command(
+    shard: &mut JsRuntimeShard,
+    host: &JsRuntimeHost,
+    root_deadline: Option<Instant>,
+) -> Result<bool> {
+    if shard.pending_idle_dispatch.is_some() {
+        // A command may depend on idle initialization already in progress.
+        // Poll that same future without overtaking it with newer hostcalls or
+        // attaching the new command's deadline to the earlier operation.
+        pump_idle_runtime_shard(shard, host)
+            .await
+            .map(|progress| progress.has_pending)
+    } else {
+        pump_js_runtime_once_for_owner(
+            &shard.runtime,
+            host,
+            Some(&shard.extension_id),
+            root_deadline,
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod idle_runtime_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    struct CompletedHostcalls(Mutex<Vec<String>>);
+
+    impl HostcallInterceptor for CompletedHostcalls {
+        fn intercept(&self, request: &HostcallRequest) -> Option<HostcallOutcome> {
+            let HostcallKind::Tool { name } = &request.kind else {
+                panic!("unexpected hostcall in FIFO fixture");
+            };
+            self.0.lock().expect("hostcall log").push(name.clone());
+            Some(HostcallOutcome::Success(Value::Null))
+        }
+    }
+
+    struct PendingDrop(Rc<Cell<usize>>);
+
+    impl Drop for PendingDrop {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn command_pumps_retain_idle_future_and_preserve_hostcall_fifo() {
+        futures::executor::block_on(async {
+            let directory = tempfile::tempdir().expect("fixture directory");
+            let manager = ExtensionManager::new();
+            let intercepted = Arc::new(CompletedHostcalls(Mutex::new(Vec::new())));
+            let host = JsRuntimeHost {
+                tools: Arc::new(ToolRegistry::new(&[], directory.path(), None)).into(),
+                manager_ref: Arc::downgrade(&manager.inner),
+                manager_snapshot: Arc::clone(&manager.snapshot),
+                manager_snapshot_version: Arc::clone(&manager.snapshot_version),
+                http: Arc::new(HttpConnector::with_defaults()),
+                policy: ExtensionPolicy::default(),
+                interceptor: Some(intercepted.clone()),
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+                crate::scheduler::WallClock,
+                PiJsRuntimeConfig {
+                    cwd: directory.path().display().to_string(),
+                    disk_cache_dir: None,
+                    ..Default::default()
+                },
+                None,
+                "idle-fifo-fixture".to_string(),
+            )
+            .await
+            .expect("fixture runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.completed = [];
+                    pi.tool('first', {}).then(() => completed.push('first'));
+                    pi.tool('second', {}).then(() => completed.push('second'));
+                    "#,
+                )
+                .await
+                .expect("queue FIFO hostcalls");
+            let request = runtime.pop_hostcall_request().expect("first request");
+            assert!(matches!(&request.kind, HostcallKind::Tool { name } if name == "first"));
+            let gate = Rc::new(Cell::new(false));
+            let polls = Rc::new(Cell::new(0));
+            let drops = Rc::new(Cell::new(0));
+            let pending = {
+                let gate = Rc::clone(&gate);
+                let polls = Rc::clone(&polls);
+                let drops = Rc::clone(&drops);
+                PendingIdleHostcall {
+                    call_id: request.call_id.clone(),
+                    future: Box::pin(async move {
+                        let _guard = PendingDrop(drops);
+                        futures::future::poll_fn(|_cx| {
+                            polls.set(polls.get() + 1);
+                            if gate.get() {
+                                std::task::Poll::Ready(())
+                            } else {
+                                std::task::Poll::Pending
+                            }
+                        })
+                        .await;
+                        Some((request.call_id, HostcallOutcome::Success(Value::Null), 0))
+                    }),
+                }
+            };
+            let mut shard = JsRuntimeShard {
+                extension_id: "idle-fifo-fixture".to_string(),
+                runtime: Rc::new(runtime),
+                snapshot: serde_json::from_value(json!({ "id": "idle-fifo-fixture" }))
+                    .expect("fixture snapshot"),
+                pending_idle_dispatch: Some(pending),
+                pump_fault: None,
+            };
+            for _ in 0..3 {
+                assert!(
+                    pump_runtime_shard_for_command(&mut shard, &host, None)
+                        .await
+                        .expect("poll retained dispatch")
+                );
+            }
+            assert_eq!(polls.get(), 3, "each pump polls the same future once");
+            assert_eq!(drops.get(), 0, "Pending must keep its cleanup guard");
+            assert!(intercepted.0.lock().expect("hostcall log").is_empty());
+            assert_eq!(
+                shard
+                    .runtime
+                    .read_global_json("completed")
+                    .await
+                    .expect("pending state"),
+                json!([])
+            );
+
+            gate.set(true);
+            pump_runtime_shard_for_command(&mut shard, &host, None)
+                .await
+                .expect("complete earlier request");
+            assert_eq!(drops.get(), 1);
+            assert!(shard.pending_idle_dispatch.is_none());
+            assert!(intercepted.0.lock().expect("hostcall log").is_empty());
+            assert_eq!(
+                shard
+                    .runtime
+                    .read_global_json("completed")
+                    .await
+                    .expect("first completion"),
+                json!(["first"])
+            );
+
+            pump_runtime_shard_for_command(&mut shard, &host, None)
+                .await
+                .expect("dispatch later request");
+            assert_eq!(*intercepted.0.lock().expect("hostcall log"), ["second"]);
+            assert_eq!(
+                shard
+                    .runtime
+                    .read_global_json("completed")
+                    .await
+                    .expect("ordered completions"),
+                json!(["first", "second"])
+            );
+            assert_eq!(shard.runtime.pending_hostcall_count(), 0);
+            assert_eq!(shard.runtime.idle_poll_delay_ms(), None);
+        });
+    }
+}
+
 #[allow(clippy::future_not_send)]
 async fn pump_js_runtime_shards_once(
     shards: &mut JsRuntimeShardSet,
@@ -15603,19 +16858,13 @@ async fn pump_js_runtime_shards_once_for_target(
     // A target wait must not drain a peer's arbitrary hostcall queue before it
     // can re-check its own task/deadline. Pump only the target here; peers make
     // progress when they are targeted by their own command or by an explicit
-    // untargeted PumpOnce round. This keeps per-extension latency independent
+    // untargeted PumpOnce or idle turn. This keeps per-extension latency independent
     // from slow or adversarial work queued in another shard.
     if let Some(shard_index) = target_shard_index {
         shards.ensure_shard_healthy(shard_index)?;
         let pending = {
-            let shard = &shards.shards[shard_index];
-            pump_js_runtime_once_for_owner(
-                &shard.runtime,
-                host,
-                Some(&shard.extension_id),
-                root_deadline,
-            )
-            .await
+            let shard = &mut shards.shards[shard_index];
+            pump_runtime_shard_for_command(shard, host, root_deadline).await
         };
         return match pending {
             Ok(pending) => {
@@ -15627,6 +16876,10 @@ async fn pump_js_runtime_shards_once_for_target(
                 let fault = format!(
                     "JS extension shard {extension_id} quarantined after runtime pump failure: {err}"
                 );
+                shards.shards[shard_index].cancel_idle_dispatch();
+                shards.shards[shard_index]
+                    .runtime
+                    .cancel_native_resources_for_quarantine();
                 shards.shards[shard_index].pump_fault = Some(fault.clone());
                 Err(Error::extension(fault))
             }
@@ -15642,14 +16895,14 @@ async fn pump_js_runtime_shards_once_for_target(
             continue;
         }
         let pump_result = {
-            let shard = &shards.shards[shard_index];
-            pump_js_runtime_once_for_owner(
-                &shard.runtime,
-                host,
-                Some(shard.extension_id.as_str()),
-                root_deadline,
-            )
-            .await
+            let shard = &mut shards.shards[shard_index];
+            pump_runtime_shard_for_command(shard, host, root_deadline).await
+        };
+        let pump_result = match pump_result {
+            Ok(pending) => refresh_runtime_shard_snapshot(shards, shard_index)
+                .await
+                .map(|()| pending),
+            Err(error) => Err(error),
         };
         match pump_result {
             Ok(pending) => has_pending |= pending,
@@ -15658,6 +16911,10 @@ async fn pump_js_runtime_shards_once_for_target(
                 let fault = format!(
                     "JS extension shard {extension_id} quarantined after runtime pump failure: {err}"
                 );
+                shards.shards[shard_index].cancel_idle_dispatch();
+                shards.shards[shard_index]
+                    .runtime
+                    .cancel_native_resources_for_quarantine();
                 shards.shards[shard_index].pump_fault = Some(fault.clone());
                 if first_fault.is_none() {
                     first_fault = Some(fault.clone());
@@ -17961,6 +19218,34 @@ async fn dispatch_shared_allowed_legacy(
             } else {
                 None
             };
+            if call
+                .params
+                .get("options")
+                .and_then(|options| options.get("persistent"))
+                == Some(&Value::Bool(true))
+            {
+                let Some(runtime) = ctx.js_runtime else {
+                    return HostcallOutcome::Error {
+                        code: "invalid_request".to_string(),
+                        message: "Persistent exec requires an owning JavaScript runtime"
+                            .to_string(),
+                    };
+                };
+                let options = &call.params["options"];
+                return match runtime.spawn_process_session(
+                    ctx.extension_id,
+                    cmd,
+                    &args,
+                    options,
+                    Box::new(move || drop(subprocess_accounting)),
+                ) {
+                    Ok(value) => HostcallOutcome::Success(value),
+                    Err(message) => HostcallOutcome::Error {
+                        code: "io".to_string(),
+                        message,
+                    },
+                };
+            }
             dispatch_hostcall_exec_ref(
                 ctx.js_runtime,
                 &call.call_id,
@@ -19160,6 +20445,8 @@ export default async function(pi) {{
         let (sender, receiver) = mpsc::channel(4);
         let runtime = JsExtensionRuntimeHandle {
             sender,
+            actor_lifecycle: Weak::new(),
+            runtime_owner_lifetime: None,
             manager_ref: Weak::new(),
             compat_scan_mode: false,
             exit_signal: Arc::new(Mutex::new(None)),
@@ -20812,6 +22099,10 @@ pub(crate) struct RegistrySnapshot {
 #[derive(Clone)]
 pub struct ExtensionManager {
     inner: Arc<Mutex<ExtensionManagerInner>>,
+    /// Present for application-owned managers, absent for actor-internal
+    /// views reconstructed through weak references. Internal hostcalls and
+    /// subprocess accounting must not keep the runtime's external owner alive.
+    runtime_owner_lifetime: Option<Arc<JsRuntimeOwnerLifetime>>,
     /// Lock-free read path: immutable snapshot swapped via RCU.
     /// Readers grab the `Arc` via `RwLock::read()` (uncontended fast path).
     /// Writers hold the mutex, build a new snapshot, then swap under a brief
@@ -20840,6 +22131,7 @@ impl ExtensionManagerHandle {
     fn upgrade(&self) -> Option<ExtensionManager> {
         self.inner.upgrade().map(|inner| ExtensionManager {
             inner,
+            runtime_owner_lifetime: None,
             snapshot: self
                 .snapshot
                 .clone()
@@ -21053,13 +22345,12 @@ impl Drop for ExtensionRegion {
         if self.shutdown_done.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        // Best-effort: the Weak reference in JsRuntimeHost will fail to
-        // upgrade once the ExtensionManager's Arc refcount drops, causing
-        // the runtime thread to observe channel closure and exit.
+        // Releasing the final application manager/handle lifetime signals the
+        // actor even if a pending hostcall still retains an internal manager.
         tracing::debug!(
             event = "extension_region.drop_without_shutdown",
             "ExtensionRegion dropped without explicit shutdown; \
-             runtime thread will exit on Arc release"
+             runtime thread will exit when the last application owner releases it"
         );
     }
 }

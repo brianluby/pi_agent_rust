@@ -585,3 +585,43 @@ fn apply_env_capability_preserves_caller_supplied_snapshot() {
         Some("kept")
     );
 }
+
+#[test]
+fn apply_env_capability_accounts_for_owner_grants_without_overriding_global_denial() {
+    let mut policy = ExtensionPolicy {
+        mode: ExtensionPolicyMode::Strict,
+        deny_caps: Vec::new(),
+        default_caps: Vec::new(),
+        ..ExtensionPolicy::default()
+    };
+    policy.per_extension.insert(
+        "permitted-owner".to_string(),
+        ExtensionOverride {
+            allow: vec!["ENV".to_string()],
+            ..ExtensionOverride::default()
+        },
+    );
+    let mut config = crate::extensions_js::PiJsRuntimeConfig {
+        env: HashMap::from([("PI_FIXTURE".to_string(), "captured-once".to_string())]),
+        ..Default::default()
+    };
+    apply_env_capability(&mut config, &policy);
+    assert!(
+        !config.deny_env,
+        "an explicit owner grant needs its supplied snapshot"
+    );
+    assert_eq!(config.env.len(), 1, "do not widen a supplied snapshot");
+    assert_eq!(
+        policy.evaluate_for("env", Some("other-owner")).decision,
+        PolicyDecision::Deny
+    );
+
+    policy.deny_caps.push("EnV".to_string());
+    let mut denied = crate::extensions_js::PiJsRuntimeConfig::default();
+    apply_env_capability(&mut denied, &policy);
+    assert!(denied.deny_env);
+    assert!(
+        denied.env.is_empty(),
+        "a global deny must prevent capture even with owner allow"
+    );
+}

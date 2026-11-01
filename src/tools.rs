@@ -290,7 +290,10 @@ pub trait ToolInvocationHost: Send + Sync {
     /// Capture non-secret model affinity before presenting a sampling review.
     /// Standalone or custom hosts must explicitly opt into this capability.
     fn sampling_model(&self) -> Result<ToolSamplingModel> {
-        Err(Error::tool("mcp", "sampling is unavailable for this caller"))
+        Err(Error::tool(
+            "mcp",
+            "sampling is unavailable for this caller",
+        ))
     }
 
     /// Recheck live session ownership after a user review can have suspended.
@@ -310,7 +313,10 @@ pub trait ToolInvocationHost: Send + Sync {
         _request: ToolSamplingRequest,
         _expected_session: &str,
     ) -> Result<ToolSamplingResult> {
-        Err(Error::tool("mcp", "sampling is unavailable for this caller"))
+        Err(Error::tool(
+            "mcp",
+            "sampling is unavailable for this caller",
+        ))
     }
 }
 
@@ -5785,12 +5791,12 @@ pub fn unknown_tool_names(requested: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// The requested names that are real tools `--tools` has no say over, paired
-/// with what does decide them.
+/// Requested names whose construction depends on a separate activation path,
+/// paired with the setting or prerequisite that supplies them.
 ///
-/// Listing one of these is harmless but has no effect, which is worth saying:
-/// the user asked for a tool by name and pi is about to decide its presence on
-/// other grounds entirely.
+/// Naming one does not enable its backend, but can override a configured
+/// load-mode exclusion once that backend supplies the tool. Explain both
+/// prerequisites and overrides instead of treating the name as a typo.
 #[must_use]
 pub fn unselectable_tool_names(requested: &[&str]) -> Vec<(String, &'static str)> {
     requested
@@ -5884,13 +5890,13 @@ impl ToolRegistry {
         "submit_plan",
     ];
 
-    /// Tools pi provides that `--tools` does not select, and what decides them.
+    /// Tools constructed outside the `--tools` match, and their prerequisites.
     ///
-    /// These reach the registry outside the `--tools` match, so naming one on
-    /// the flag changes nothing. That is worth telling the user, and it is not
-    /// the same thing as a typo: before this list existed, `--tools xdev` was
-    /// answered with "xdev is not a tool pi provides", which is false about the
-    /// dispatcher the entire discoverable tier hangs off.
+    /// Naming one does not enable its backend. Explicit names can still
+    /// override configured load-mode exclusions for automatically added tools.
+    /// Before this list existed, `--tools xdev` was answered with "xdev is not
+    /// a tool pi provides", which is false about the dispatcher the entire
+    /// discoverable tier hangs off.
     ///
     /// The second field is the whole message a user needs to actually get the
     /// tool, so keep it specific enough to act on.
@@ -5902,7 +5908,8 @@ impl ToolRegistry {
         ),
         (
             "manage_skill",
-            "always registered; it cannot touch user-authored skills, so it needs no opt-in",
+            "available by default; tools.loadMode.manage_skill=off disables implicit access, \
+             and an explicit --tools name overrides that restriction",
         ),
         ("retain", MEMORY_BANK_HOW),
         ("recall", MEMORY_BANK_HOW),
@@ -6207,8 +6214,19 @@ impl ToolRegistry {
         }
 
         // manage_skill (bd-cv653.4.2): CRUD over the isolated managed-skills
-        // dir; always available — it can never touch user-authored skills.
+        // dir; available by default, subject to the load-mode filter below.
         tools.push(Box::new(ManageSkillTool));
+
+        // The resolved selection is authoritative. Configured Off overrides
+        // also exclude automatically added tools that were not selected by
+        // name, before their definitions can enter the discovery snapshot.
+        // Only explicit overrides count: subagent's default Off tier must not
+        // undo a deliberate opt-in.
+        tools.retain(|tool| {
+            enabled.contains(&tool.name())
+                || crate::xdev::configured_tier(tool.name(), config)
+                    != Some(crate::xdev::LoadMode::Off)
+        });
 
         // Tool load modes (bd-cv653.1.6): register the xdev dispatcher when
         // the enabled set contains discoverable-tier tools and `xdev` itself
@@ -6425,6 +6443,91 @@ impl ToolRegistry {
                 self.tools.push(Arc::from(tool));
             }
         }
+    }
+
+    /// Publish a complete extension catalog while retaining exact ownership.
+    /// A later host replacement must not be mistaken for one of our wrappers
+    /// merely because it has the same name or extension origin.
+    fn reconcile_extension_tools(
+        &mut self,
+        previous: &[Arc<dyn Tool>],
+        replacements: Vec<Box<dyn Tool>>,
+        active: Option<&[String]>,
+        initial: bool,
+    ) -> Vec<Arc<dyn Tool>> {
+        let owned = |tool: &Arc<dyn Tool>| previous.iter().any(|old| Arc::ptr_eq(old, tool));
+        let foreign_names: std::collections::HashSet<String> = self
+            .tools
+            .iter()
+            .chain(&self.inactive)
+            .filter(|tool| !owned(tool))
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let mut replacements: std::collections::BTreeMap<String, Arc<dyn Tool>> = replacements
+            .into_iter()
+            .map(|mut tool| {
+                tool.bind_job_session_scope(self.job_session_scope.clone());
+                tool.bind_model_scope(self.model_scope.clone());
+                tool.bind_cost_scope(self.cost_scope.clone());
+                tool.bind_text_file_client_scope(self.text_file_client_scope.clone());
+                tool.bind_terminal_client_scope(self.terminal_client_scope.clone());
+                (tool.name().to_string(), Arc::from(tool))
+            })
+            .collect();
+        let is_active =
+            |name: &str| active.is_none_or(|names| names.iter().any(|candidate| candidate == name));
+        let initial_names: std::collections::HashSet<String> = if initial {
+            replacements
+                .keys()
+                .filter(|name| is_active(name))
+                .cloned()
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        let mut published = Vec::with_capacity(replacements.len());
+        let old_active = std::mem::take(&mut self.tools);
+        let old_inactive = std::mem::take(&mut self.inactive);
+        for (was_active, old_tools) in [(true, old_active), (false, old_inactive)] {
+            for tool in old_tools {
+                if owned(&tool) || initial_names.contains(tool.name()) {
+                    // push/extend can replace an active name while an older
+                    // wrapper with that name is shelved. Retire the stale
+                    // wrapper too; a refresh cannot resurrect it over the host.
+                    if !initial && foreign_names.contains(tool.name()) {
+                        replacements.remove(tool.name());
+                        continue;
+                    }
+                    if let Some(next) = replacements.remove(tool.name()) {
+                        published.push(Arc::clone(&next));
+                        if is_active(next.name()) {
+                            self.tools.push(next);
+                        } else {
+                            self.inactive.push(next);
+                        }
+                    }
+                } else if was_active {
+                    self.tools.push(tool);
+                } else {
+                    self.inactive.push(tool);
+                }
+            }
+        }
+        for (name, next) in replacements {
+            if foreign_names.contains(&name) {
+                // Initial publication above preserves the existing ability
+                // to override a built-in. Automatic later refreshes cannot
+                // overwrite host/MCP registrations mounted in the meantime.
+                continue;
+            }
+            published.push(Arc::clone(&next));
+            if is_active(&name) {
+                self.tools.push(next);
+            } else {
+                self.inactive.push(next);
+            }
+        }
+        published
     }
 
     /// Reconcile one manager's authoritative catalog without replacing any
@@ -6645,6 +6748,40 @@ impl SharedToolRegistry {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         changed
+    }
+
+    /// Atomically refresh wrappers, including inactive registrations. Rebind
+    /// execution handles even when their schemas are unchanged, but invalidate
+    /// the provider schema cache only when its visible definitions change.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) fn reconcile_extension_tools(
+        &self,
+        previous: &[Arc<dyn Tool>],
+        replacements: Vec<Box<dyn Tool>>,
+        active: Option<&[String]>,
+        initial: bool,
+    ) -> Vec<Arc<dyn Tool>> {
+        let mut guard = self
+            .inner
+            .registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut next = guard.clone_shallow();
+        let published = next.reconcile_extension_tools(previous, replacements, active, initial);
+        let schema_changed = guard.tools.len() != next.tools.len()
+            || guard.tools.iter().zip(&next.tools).any(|(before, after)| {
+                before.name() != after.name()
+                    || before.label() != after.label()
+                    || before.description() != after.description()
+                    || before.parameters() != after.parameters()
+            });
+        *guard = Arc::new(next);
+        if schema_changed {
+            self.inner
+                .version
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        published
     }
 
     /// Publish a modified registry: shallow-copy the current snapshot, apply
@@ -26943,6 +27080,112 @@ mod tests {
 mod known_tool_name_tests {
     use super::*;
 
+    #[test]
+    fn configured_off_excludes_automatic_tools_before_discovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "browser": { "enableBrowser": true },
+            "computer": { "enableComputer": true },
+            "media": {
+                "enableInspectImage": true,
+                "enableReadMedia": true,
+                "enableGenerateImage": true,
+                "enableTts": true
+            }
+        }))
+        .expect("automatic tool settings");
+        let automatic = [
+            "browser",
+            "computer",
+            "inspect_image",
+            "read_media",
+            "generate_image",
+            "tts",
+            "manage_skill",
+        ];
+        let baseline = ToolRegistry::new(&["read"], dir.path(), Some(&config));
+        for name in automatic {
+            assert!(
+                baseline.get(name).is_some(),
+                "{name} must be present before denial"
+            );
+        }
+
+        config.tools = Some(crate::config::ToolSettings {
+            load_mode: Some(
+                automatic
+                    .into_iter()
+                    .map(|name| (name.to_string(), "off".to_string()))
+                    .collect(),
+            ),
+            ..Default::default()
+        });
+        let registry = ToolRegistry::new(&["read"], dir.path(), Some(&config));
+        assert!(registry.get("read").is_some());
+        assert_eq!(registry.tools().len(), 1);
+        assert!(registry.discoverable_index().is_empty());
+        for name in automatic {
+            assert!(registry.get(name).is_none(), "{name} must not be callable");
+            assert!(
+                !registry.is_discoverable(name),
+                "{name} must not be discoverable"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_names_override_configured_off_without_filtering_default_tiers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opted_in = ToolRegistry::new(&["subagent"], dir.path(), None);
+        assert_eq!(
+            crate::xdev::default_tier("subagent"),
+            crate::xdev::LoadMode::Off
+        );
+        assert!(opted_in.get("subagent").is_some());
+
+        let selected = [
+            "eval",
+            "github",
+            "security_scan",
+            "subagent",
+            "browser",
+            "computer",
+            "inspect_image",
+            "read_media",
+            "generate_image",
+            "tts",
+            "manage_skill",
+        ];
+        let config = Config {
+            tools: Some(crate::config::ToolSettings {
+                load_mode: Some(
+                    selected
+                        .into_iter()
+                        .map(|name| (name.to_string(), "off".to_string()))
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let registry = ToolRegistry::new(&selected, dir.path(), Some(&config));
+        for name in selected {
+            assert!(
+                registry.get(name).is_some(),
+                "{name} explicit selection must win"
+            );
+            assert_eq!(
+                registry
+                    .tools()
+                    .iter()
+                    .filter(|tool| tool.name() == name)
+                    .count(),
+                1,
+                "{name} must be registered once"
+            );
+        }
+    }
+
     /// Joined after construction by the session host, so the registry builds
     /// nothing for them and neither does this test.
     const HOST_COUPLED: &[&str] = &["ask", "todo", "submit_plan"];
@@ -27105,7 +27348,7 @@ mod known_tool_name_tests {
         // `--tools`' own default must not contain a name pi drops.
         use clap::Parser as _;
         let cli = crate::cli::Cli::parse_from(["pi"]);
-        let requested = cli.enabled_tools();
+        let requested = cli.enabled_tools(&Config::default());
         assert!(!requested.is_empty(), "the default set should not be empty");
         assert!(
             unknown_tool_names(&requested).is_empty(),

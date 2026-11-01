@@ -626,6 +626,9 @@ struct AcpSessionState {
     /// model changes so a selected ad-hoc model remains available to return to.
     available_models: Vec<ModelEntry>,
     cwd: PathBuf,
+    /// Effective settings admitted when this session was constructed.
+    config: Arc<Config>,
+    global_dir: PathBuf,
     /// Remains reachable during a turn so EOF/exit can close external tools.
     mcp: Option<Arc<mcp::SessionMcp>>,
 }
@@ -645,6 +648,7 @@ pub struct AcpLaunchOptions {
     pub thinking: Option<String>,
     pub models: Option<String>,
     pub api_key: Option<String>,
+    pub subagent_fallback_policy: Option<crate::failover::ChildFallbackPolicy>,
     pub tools: Option<String>,
     pub no_tools: bool,
     /// Host-level refusal of all client-supplied MCP servers.
@@ -676,7 +680,8 @@ impl AcpLaunchOptions {
             thinking: cli.thinking.clone(),
             models: cli.models.clone(),
             api_key: crate::models::normalize_api_key_opt(cli.api_key.clone()),
-            tools: Some(cli.tools.clone()),
+            subagent_fallback_policy: cli.subagent_fallback_policy.clone(),
+            tools: cli.tools.clone(),
             no_tools: cli.no_tools,
             no_mcp: cli.no_mcp,
             system_prompt: cli.system_prompt.clone(),
@@ -713,9 +718,9 @@ impl AcpLaunchOptions {
         cli.thinking.clone_from(&self.thinking);
         cli.models.clone_from(&self.models);
         cli.api_key = crate::models::normalize_api_key_opt(self.api_key.clone());
-        if let Some(tools) = &self.tools {
-            cli.tools.clone_from(tools);
-        }
+        cli.subagent_fallback_policy
+            .clone_from(&self.subagent_fallback_policy);
+        cli.tools.clone_from(&self.tools);
         cli.no_tools = self.no_tools;
         cli.no_mcp = self.no_mcp;
         cli.system_prompt.clone_from(&self.system_prompt);
@@ -738,10 +743,22 @@ impl AcpLaunchOptions {
     }
 }
 
+/// Settings provenance captured by the process launching the ACP server.
+/// Relative configuration overrides remain anchored at the launch workspace.
+#[derive(Clone)]
+pub struct AcpSettingsSource {
+    pub global_dir: PathBuf,
+    pub config_override: Option<PathBuf>,
+    pub workspace_trust_env: Option<String>,
+    pub launch_cwd: PathBuf,
+}
+
 /// Options for starting the ACP server.
 #[derive(Clone)]
 pub struct AcpOptions {
     pub config: Config,
+    /// None preserves a programmatic host's supplied configuration.
+    pub settings_source: Option<AcpSettingsSource>,
     pub launch: AcpLaunchOptions,
     pub available_models: Vec<ModelEntry>,
     /// Full model registry (every known/loaded model, not just the ready ones in
@@ -764,6 +781,68 @@ pub struct AcpOptions {
     /// its resource loader (`--no-skills` and trust applied), so the model
     /// in an editor session knows which skills it can load.
     pub skills_prompt: Option<String>,
+}
+
+impl AcpOptions {
+    fn global_dir(&self) -> PathBuf {
+        self.settings_source
+            .as_ref()
+            .map_or_else(Config::global_dir, |source| source.global_dir.clone())
+    }
+
+    /// Resolve once before constructing a new, restored, or forked session.
+    /// Reattaching a live session keeps that session's admitted snapshot.
+    fn for_workspace(&self, cwd: &std::path::Path) -> Result<Self> {
+        let mut resolved = self.clone();
+        if let Some(source) = &self.settings_source {
+            let config_override = source.config_override.as_deref().map(|path| {
+                Config::resolve_config_override_path(path, &source.launch_cwd)
+            });
+            let global = Config::load_with_roots_and_project_trust(
+                config_override.as_deref(),
+                &source.global_dir,
+                cwd,
+                false,
+            )?;
+            let state = crate::workspace_trust::establish(
+                cwd,
+                &source.global_dir.join(crate::workspace_trust::TRUST_STORE_FILE),
+                &crate::workspace_trust::TrustInputs {
+                    // main already recorded the launch workspace/digest only.
+                    cli_trust: false,
+                    trust_all_workspaces: global.trust_all_workspaces.unwrap_or(false),
+                    env_override: source.workspace_trust_env.clone(),
+                    interactive: false,
+                },
+                |_| Ok(false),
+            )?;
+            resolved.config = Config::load_with_roots_and_project_trust(
+                config_override.as_deref(),
+                &source.global_dir,
+                cwd,
+                state.trusted,
+            )?;
+            if !state.trusted
+                && let Some(surface) = &state.surface
+            {
+                eprintln!(
+                    "Warning: project-local ACP settings were skipped for untrusted workspace {}. Trust that workspace with Pi before reopening it.",
+                    surface.workspace_display
+                );
+            }
+            // Startup resources can include launch-workspace skills.
+            if !state.trusted
+                || crate::workspace_trust::workspace_key(cwd)
+                    != crate::workspace_trust::workspace_key(&source.launch_cwd)
+            {
+                resolved.skills_prompt = None;
+            }
+        }
+        if let Some(policy) = &self.launch.subagent_fallback_policy {
+            policy.apply_to_config(&mut resolved.config);
+        }
+        Ok(resolved)
+    }
 }
 
 #[derive(Clone)]
@@ -1163,15 +1242,6 @@ async fn run(
                                 continue;
                             }
                         };
-                        let message_content =
-                            match content::extract_prompt_content(prompt_blocks, &options.config) {
-                                Ok(content) => content,
-                                Err(err) => {
-                                    let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, err));
-                                    continue;
-                                }
-                            };
-
                         let session_state = {
                             sessions
                                 .lock(&cx)
@@ -1186,6 +1256,28 @@ async fn run(
                                 format!("Session not found: {session_id}"),
                             ));
                             continue;
+                        };
+
+                        let session_config = match session_state.lock(&cx).await {
+                            Ok(state) => Arc::clone(&state.config),
+                            Err(_) => {
+                                let _ = out_tx.send(json_rpc_error(
+                                    id,
+                                    INTERNAL_ERROR,
+                                    "Session settings are unavailable",
+                                ));
+                                continue;
+                            }
+                        };
+                        let message_content = match content::extract_prompt_content(
+                            prompt_blocks,
+                            &session_config,
+                        ) {
+                            Ok(content) => content,
+                            Err(err) => {
+                                let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, err));
+                                continue;
+                            }
                         };
 
                         // Per spec, only one prompt turn may be active per session.
@@ -1283,11 +1375,12 @@ async fn run(
                             }
                             continue;
                         };
-                        let known = sessions
+                        let session_state = sessions
                             .lock(&cx)
                             .await
-                            .is_ok_and(|sessions| sessions.contains_key(session_id));
-                        if !known {
+                            .ok()
+                            .and_then(|sessions| sessions.get(session_id).cloned());
+                        let Some(session_state) = session_state else {
                             if request.id.is_some() {
                                 let _ = out_tx.send(json_rpc_error(
                                     id,
@@ -1296,11 +1389,24 @@ async fn run(
                                 ));
                             }
                             continue;
-                        }
+                        };
+                        let session_config = match session_state.lock(&cx).await {
+                            Ok(state) => Arc::clone(&state.config),
+                            Err(_) => {
+                                if request.id.is_some() {
+                                    let _ = out_tx.send(json_rpc_error(
+                                        id,
+                                        INTERNAL_ERROR,
+                                        "Session settings are unavailable",
+                                    ));
+                                }
+                                continue;
+                            }
+                        };
                         match steering::Input::parse(
                             &request.params,
                             request.id.clone(),
-                            &options.config,
+                            &session_config,
                         ) {
                             Ok(input) => out_tx.enqueue_steering(session_id, input),
                             Err(error) => {
@@ -2137,7 +2243,7 @@ fn resolve_acp_selection(
         session,
         &registry,
         &scoped_models,
-        &Config::global_dir(),
+        &options.global_dir(),
         Some(fallback),
     )
     .map_err(|error| Error::config(error.to_string()))
@@ -2149,6 +2255,7 @@ fn resolve_acp_selection(
 fn build_acp_system_prompt(
     cli: &crate::cli::Cli,
     cwd: &std::path::Path,
+    global_dir: &std::path::Path,
     enabled_tools: &[&str],
     config: &Config,
     skills_prompt: Option<&str>,
@@ -2165,7 +2272,7 @@ fn build_acp_system_prompt(
         cwd,
         enabled_tools,
         skills_prompt.filter(|block| enabled_tools.contains(&"read") && !block.is_empty()),
-        &Config::global_dir(),
+        global_dir,
         &package_dir,
         test_mode,
         !cli.hide_cwd_in_prompt,
@@ -2180,12 +2287,13 @@ fn build_acp_system_prompt(
     Ok(prompt)
 }
 
-/// Apply the host's requested tools or CLI defaults, excluding terminal-only
-/// tools with no ACP surface. Every call still reaches the editor's permission
-/// hook because ACP sessions carry no terminal approval state.
-fn acp_enabled_tools(cli: &crate::cli::Cli) -> Vec<String> {
+/// Apply the host's requested tools or defaults plus trusted settings,
+/// excluding terminal-only tools with no ACP surface. Every call still reaches
+/// the editor's permission hook because ACP sessions carry no terminal approval
+/// state.
+fn acp_enabled_tools(cli: &crate::cli::Cli, config: &Config) -> Vec<String> {
     const HOST_COUPLED: [&str; 3] = ["ask", "todo", "submit_plan"];
-    cli.enabled_tools()
+    cli.enabled_tools(config)
         .into_iter()
         .filter(|name| !HOST_COUPLED.contains(name))
         .map(String::from)
@@ -2221,19 +2329,21 @@ fn handle_session_new(
     let servers = mcp::parse_servers(params, &cwd, options.launch.no_mcp)
         .map_err(Error::session)?
         .unwrap_or_default();
+    let options = options.for_workspace(&cwd)?;
 
     // Create the backing session. Persists to disk when --session-dir is set
     // (save_enabled), otherwise in-memory (existing default behavior).
     let (session, save_enabled) =
         new_acp_session(options.session_dir.as_ref(), &options.config, &cwd);
-    let (id, mut state) = build_acp_session(
+    let (id, mut state) = build_acp_session_with_budget(
         session,
         save_enabled,
         cwd.clone(),
-        options,
+        &options,
         permission_client,
+        None,
     )?;
-    let mcp_state = mcp::prepare(&cwd, &Config::global_dir(), servers);
+    let mcp_state = mcp::prepare(&cwd, &state.global_dir, servers);
     if let (Some(agent), Some(mcp_state)) = (state.agent_session.as_mut(), mcp_state.as_ref()) {
         mcp::mount(agent.session_mut(), mcp_state);
     }
@@ -2251,11 +2361,14 @@ fn build_acp_session(
     options: &AcpOptions,
     permission_client: Option<&AcpPermissionClient>,
 ) -> Result<(String, AcpSessionState)> {
-    build_acp_session_with_budget(session, save_enabled, cwd, options, permission_client, None)
+    let options = options.for_workspace(&cwd)?;
+    build_acp_session_with_budget(session, save_enabled, cwd, &options, permission_client, None)
 }
 
 /// Forks keep their source's live account, including pending requests, while
 /// receiving independent tools, editor permissions, terminals and MCP state.
+/// Callers resolve options.for_workspace once before backing-store/budget
+/// creation and pass that same snapshot throughout construction.
 fn build_acp_session_with_budget(
     mut session: Session,
     save_enabled: bool,
@@ -2269,9 +2382,9 @@ fn build_acp_session_with_budget(
     auth.set_command_working_directory(&cwd)?;
 
     let mut cli = options.launch.selection_cli()?;
-    let enabled_tools = acp_enabled_tools(&cli);
+    let enabled_tools = acp_enabled_tools(&cli, &options.config);
     let enabled_tools: Vec<&str> = enabled_tools.iter().map(String::as_str).collect();
-    let tools = if cli.no_tools {
+    let tools = if cli.builtin_tools_disabled() {
         ToolRegistry::without_builtins(Some(&options.config))
     } else {
         ToolRegistry::new(&enabled_tools, &cwd, Some(&options.config))
@@ -2346,6 +2459,7 @@ fn build_acp_session_with_budget(
     let system_prompt = build_acp_system_prompt(
         &cli,
         &cwd,
+        &options.global_dir(),
         &enabled_tools,
         &options.config,
         options.skills_prompt.as_deref(),
@@ -2400,12 +2514,13 @@ fn build_acp_session_with_budget(
     // Wire the model registry and auth storage so the session can switch
     // provider/model at runtime via `session/set_model` (set_provider_model
     // needs the registry to find the target model and resolve its credentials).
-    let agent_session = AgentSession::new(agent, session_arc, save_enabled, compaction_settings)
+    let mut agent_session = AgentSession::new(agent, session_arc, save_enabled, compaction_settings)
         .with_runtime_handle(options.runtime_handle.clone())
         .with_model_registry(registry.clone())
         .with_auth_storage(auth.clone())
         .with_api_key_override(cli.api_key.clone())
         .with_memory_settings(options.config.memory.as_ref());
+    agent_session.set_child_fallback_policy(cli.subagent_fallback_policy.clone());
     // Keep the exact configured AgentSession for the lifetime of the editor
     // session. The SDK owns one durable recovery driver and its cross-turn
     // fallback state; rebuilding a handle per prompt would lose that state.
@@ -2425,6 +2540,8 @@ fn build_acp_session_with_budget(
             agent_session: Some(agent_session),
             available_models,
             cwd,
+            config: Arc::new(options.config.clone()),
+            global_dir: options.global_dir(),
             mcp: None,
         },
     ))
@@ -2438,6 +2555,7 @@ async fn arm_acp_prewalk(state: &mut AcpSessionState, options: &AcpOptions) -> R
     if cli.no_prewalk || (!cli.prewalk && cli.prewalk_into.is_none()) {
         return Ok(());
     }
+    let config = Arc::clone(&state.config);
     let handle = state
         .agent_session
         .as_mut()
@@ -2449,9 +2567,9 @@ async fn arm_acp_prewalk(state: &mut AcpSessionState, options: &AcpOptions) -> R
     let target = crate::app::resolve_prewalk_target(
         cli.prewalk_into
             .as_deref()
-            .unwrap_or_else(|| options.config.prewalk_into()),
+            .unwrap_or_else(|| config.prewalk_into()),
         &cli,
-        &options.config,
+        &config,
         registry,
         &state.cwd,
     )
@@ -3526,6 +3644,8 @@ mod tests {
             )),
             available_models: Vec::new(),
             cwd: root.to_path_buf(),
+            config: Arc::new(Config::default()),
+            global_dir: root.to_path_buf(),
             mcp: None,
         }));
         (state, provider, stored)
@@ -4083,6 +4203,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let auth = AuthStorage::load(root.path().join("auth.json")).unwrap();
             let options = AcpOptions {
+                settings_source: None,
                 config: Config::default(),
                 launch: AcpLaunchOptions::default(),
                 available_models: Vec::new(),
@@ -4432,7 +4553,7 @@ mod tests {
         let cli = AcpLaunchOptions::default()
             .selection_cli()
             .expect("neutral ACP CLI");
-        let tools = acp_enabled_tools(&cli);
+        let tools = acp_enabled_tools(&cli, &Config::default());
         for expected in [
             "read",
             "bash",
@@ -4454,12 +4575,332 @@ mod tests {
         }
     }
 
+    #[test]
+    fn acp_launch_preserves_optional_tool_settings_and_explicit_selection() {
+        use clap::Parser as _;
+
+        const OPTIONAL: [&str; 4] = ["eval", "github", "security_scan", "subagent"];
+        let config: Config = serde_json::from_value(json!({
+            "tools": {
+                "enableEval": true,
+                "enableGithub": true,
+                "enableSecurityScan": true,
+                "enableSubagent": true
+            }
+        }))
+        .expect("optional tool settings");
+        let defaults = crate::xdev::default_enabled_tools().join(",");
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let root = tempfile::tempdir().expect("ACP workspace");
+        for (args, expected, no_builtins) in [
+            (vec!["pi", "--acp"], true, false),
+            (vec!["pi", "--acp", "--tools", "read"], false, false),
+            (vec!["pi", "--acp", "--tools", defaults.as_str()], false, false),
+            (vec!["pi", "--acp", "--tools", ""], false, true),
+            (vec!["pi", "--acp", "--tools", " , "], false, true),
+            (vec!["pi", "--acp", "--no-tools"], false, true),
+        ] {
+            let cli = crate::cli::Cli::try_parse_from(args).expect("ACP launch CLI");
+            let mut options = selection_options(
+                config.clone(),
+                vec![ready_selection_model("openai", "gpt-4o")],
+                runtime.handle(),
+            );
+            options.launch = AcpLaunchOptions::from_cli(&cli);
+            assert_eq!(options.launch.tools, cli.tools);
+            options.launch.provider = Some("openai".to_string());
+            options.launch.model = Some("gpt-4o".to_string());
+            options.launch.api_key = Some("acp-optional-tools-key".to_string());
+            options.launch.no_context_files = true;
+            let (session, save_enabled) = new_acp_session(None, &config, root.path());
+            let (_, state) = build_acp_session(
+                session,
+                save_enabled,
+                root.path().to_path_buf(),
+                &options,
+                None,
+            )
+            .expect("build editor session");
+            let handle = state.agent_session.as_ref().expect("editor agent session");
+            for name in OPTIONAL {
+                assert_eq!(handle.has_tool(name), expected, "{name}");
+            }
+            for name in ["ask", "todo", "submit_plan"] {
+                assert!(!handle.has_tool(name), "ACP host-only tool {name}");
+            }
+            if no_builtins {
+                assert!(handle.session().agent.shared_tools().snapshot().tools().is_empty());
+            }
+        }
+    }
+
+    fn write_acp_settings(path: &std::path::Path, value: Value) {
+        std::fs::create_dir_all(path.parent().expect("settings parent")).unwrap();
+        std::fs::write(path, value.to_string()).unwrap();
+    }
+
+    fn trust_acp_settings(cwd: &std::path::Path, global_dir: &std::path::Path) {
+        let surface = crate::workspace_trust::WorkspaceTrustSurface::scan(cwd)
+            .unwrap()
+            .expect("workspace settings surface");
+        let mut store = crate::workspace_trust::WorkspaceTrustStore::load(
+            &global_dir.join(crate::workspace_trust::TRUST_STORE_FILE),
+        );
+        store
+            .record(
+                &crate::workspace_trust::workspace_key(cwd),
+                &surface.digest,
+                crate::workspace_trust::TrustDecision::Trusted,
+            )
+            .unwrap();
+    }
+
+    fn acp_workspace_options(root: &std::path::Path, runtime: RuntimeHandle) -> AcpOptions {
+        let launch_cwd = root.join("launch");
+        let global_dir = root.join("global");
+        std::fs::create_dir_all(&launch_cwd).unwrap();
+        std::fs::create_dir_all(&global_dir).unwrap();
+        let config: Config = serde_json::from_value(json!({
+            "tools": {
+                "enableEval": true,
+                "enableGithub": true,
+                "enableSecurityScan": true,
+                "enableSubagent": true
+            },
+            "media": { "maxBytes": 99 }
+        }))
+        .unwrap();
+        let mut options = selection_options(
+            config,
+            vec![ready_selection_model("openai", "gpt-4o")],
+            runtime,
+        );
+        options.settings_source = Some(AcpSettingsSource {
+            global_dir,
+            config_override: None,
+            workspace_trust_env: None,
+            launch_cwd,
+        });
+        options.launch.provider = Some("openai".into());
+        options.launch.model = Some("gpt-4o".into());
+        options.launch.api_key = Some("acp-workspace-fixture-key".into());
+        options.launch.no_context_files = true;
+        options.launch.system_prompt = Some("ACP workspace settings fixture".into());
+        options.skills_prompt = Some("launch-workspace-skill-marker".into());
+        options
+    }
+
+    fn assert_acp_optional_tools(state: &AcpSessionState, expected: &[&str]) {
+        let handle = state.agent_session.as_ref().expect("constructed agent");
+        for name in ["eval", "github", "security_scan", "subagent"] {
+            assert_eq!(handle.has_tool(name), expected.contains(&name), "{name}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn acp_new_sessions_admit_only_the_requested_workspace_snapshot() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let options = acp_workspace_options(root.path(), runtime.handle());
+        let source = options.settings_source.as_ref().unwrap();
+        write_acp_settings(
+            &source.global_dir.join("settings.json"),
+            json!({ "media": { "maxBytes": 2 } }),
+        );
+        write_acp_settings(
+            &source.launch_cwd.join(".pi/settings.json"),
+            serde_json::to_value(&options.config).unwrap(),
+        );
+        trust_acp_settings(&source.launch_cwd, &source.global_dir);
+        assert!(
+            options
+                .for_workspace(&source.launch_cwd)
+                .unwrap()
+                .skills_prompt
+                .is_some()
+        );
+        let cwd = root.path().join("target");
+        let params = json!({ "cwd": cwd, "mcpServers": [] });
+        let audio = json!({ "type": "audio", "mimeType": "audio/wav", "data": "AQID" });
+        let steering_params = json!({ "prompt": [audio.clone()] });
+        for (name, setting) in [
+            ("eval", "enableEval"),
+            ("github", "enableGithub"),
+            ("security_scan", "enableSecurityScan"),
+            ("subagent", "enableSubagent"),
+        ] {
+            let mut project = json!({
+                "trustAllWorkspaces": true,
+                "tools": { (setting): true },
+                "media": { "maxBytes": 3 }
+            });
+            write_acp_settings(&cwd.join(".pi/settings.json"), project.clone());
+            let (_, untrusted) = handle_session_new(&params, &options, None).unwrap();
+            assert_acp_optional_tools(&untrusted, &[]);
+            assert_eq!(untrusted.global_dir, source.global_dir);
+            assert!(
+                content::extract_prompt_content(std::slice::from_ref(&audio), &untrusted.config)
+                    .is_err()
+            );
+            assert!(
+                steering::Input::parse(&steering_params, Some(json!(7)), &untrusted.config).is_err()
+            );
+            assert!(options.for_workspace(&cwd).unwrap().skills_prompt.is_none());
+
+            trust_acp_settings(&cwd, &source.global_dir);
+            let (_, trusted) = handle_session_new(&params, &options, None).unwrap();
+            assert_acp_optional_tools(&trusted, &[name]);
+            assert!(
+                content::extract_prompt_content(std::slice::from_ref(&audio), &trusted.config)
+                    .is_ok()
+            );
+            assert!(
+                steering::Input::parse(&steering_params, Some(json!(8)), &trusted.config).is_ok()
+            );
+            assert!(options.for_workspace(&cwd).unwrap().skills_prompt.is_none());
+
+            project["tools"][setting] = json!(false);
+            write_acp_settings(&cwd.join(".pi/settings.json"), project);
+            let (_, changed) = handle_session_new(&params, &options, None).unwrap();
+            assert_acp_optional_tools(&changed, &[]);
+            assert!(
+                content::extract_prompt_content(std::slice::from_ref(&audio), &changed.config)
+                    .is_err()
+            );
+            // An already admitted session retains its exact input/tool policy.
+            assert_acp_optional_tools(&trusted, &[name]);
+            assert!(
+                content::extract_prompt_content(std::slice::from_ref(&audio), &trusted.config)
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn acp_operator_config_path_and_tool_controls_keep_their_authority() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut options = acp_workspace_options(root.path(), runtime.handle());
+        let cwd = root.path().join("target");
+        let source = options.settings_source.as_ref().unwrap().clone();
+        write_acp_settings(
+            &source.global_dir.join("settings.json"),
+            serde_json::to_value(&options.config).unwrap(),
+        );
+        write_acp_settings(
+            &cwd.join(".pi/settings.json"),
+            serde_json::to_value(&options.config).unwrap(),
+        );
+        trust_acp_settings(&cwd, &source.global_dir);
+        let params = json!({ "cwd": cwd, "mcpServers": [] });
+        options.launch.tools = Some("read".into());
+        let (_, restricted) = handle_session_new(&params, &options, None).unwrap();
+        assert_acp_optional_tools(&restricted, &[]);
+        assert!(restricted.agent_session.as_ref().unwrap().has_tool("read"));
+        options.launch.no_tools = true;
+        let (_, disabled) = handle_session_new(&params, &options, None).unwrap();
+        assert!(
+            disabled
+                .agent_session
+                .as_ref()
+                .unwrap()
+                .session()
+                .agent
+                .shared_tools()
+                .snapshot()
+                .tools()
+                .is_empty()
+        );
+        options.launch.no_tools = false;
+        options.launch.tools = None;
+
+        // The operator's relative path stays anchored at launch, even when
+        // another workspace supplies a different file with the same name.
+        write_acp_settings(
+            &source.launch_cwd.join("operator.json"),
+            json!({ "tools": { "enableGithub": true } }),
+        );
+        write_acp_settings(
+            &cwd.join("operator.json"),
+            json!({ "tools": { "enableSubagent": true } }),
+        );
+        let captured = options.settings_source.as_mut().unwrap();
+        captured.config_override = Some(PathBuf::from("operator.json"));
+        captured.workspace_trust_env = Some("untrusted".into());
+        let (_, overridden) = handle_session_new(&params, &options, None).unwrap();
+        assert_acp_optional_tools(&overridden, &["github"]);
+        assert_eq!(overridden.global_dir, source.global_dir);
+        assert!(options.for_workspace(&cwd).unwrap().skills_prompt.is_none());
+
+        // Programmatic hosts without filesystem provenance still own their
+        // supplied configuration and resource block.
+        options.settings_source = None;
+        let (_, supplied) = handle_session_new(&params, &options, None).unwrap();
+        assert_acp_optional_tools(&supplied, &["eval", "github", "security_scan", "subagent"]);
+        assert!(options.for_workspace(&cwd).unwrap().skills_prompt.is_some());
+    }
+
+    #[test]
+    fn acp_workspace_loading_preserves_native_child_recovery_ownership() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut options = acp_workspace_options(root.path(), runtime.handle());
+        let cwd = root.path().join("target");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let policy: crate::failover::ChildFallbackPolicy = json!({
+            "role": "smol",
+            "retry": { "fallbackChains": { "smol": ["openai/parent-fallback"] } },
+            "disabled_providers": ["blocked-by-parent"]
+        })
+        .to_string()
+        .parse()
+        .unwrap();
+        options.launch.subagent_fallback_policy = Some(policy);
+        let ambient = HashMap::from([(
+            "default".to_string(),
+            vec!["openai/ambient-fallback".to_string()],
+        )]);
+        let params = json!({ "cwd": cwd, "mcpServers": [] });
+        for filesystem_source in [true, false] {
+            if !filesystem_source {
+                options.settings_source = None;
+            }
+            let (_, state) = handle_session_new(&params, &options, None).unwrap();
+            assert!(
+                state
+                    .config
+                    .disabled_providers
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|provider| provider == "blocked-by-parent")
+            );
+            let chain = state
+                .agent_session
+                .as_ref()
+                .unwrap()
+                .session()
+                .resolve_fallback_chain(
+                    &ambient,
+                    "openai",
+                    "gpt-4o",
+                    options.model_registry.models(),
+                )
+                .expect("parent-owned role chain");
+            assert_eq!(chain.entries, vec!["openai/parent-fallback"]);
+        }
+    }
+
     /// ACP sessions get pi's real system prompt (full tool guidance, every
     /// context file) plus the editor note, not the old hand-written one.
     #[test]
     fn acp_system_prompt_is_pi_prompt_with_context_files() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("CLAUDE.md"), "acp-claude-md-marker").expect("write");
+        let global = tempfile::tempdir().expect("captured global directory");
+        std::fs::write(global.path().join("AGENTS.md"), "acp-captured-global-marker")
+            .expect("write global instructions");
         let tools = ["read", "bash", "edit", "write", "grep", "find", "ls"];
         let cli = AcpLaunchOptions::default()
             .selection_cli()
@@ -4467,6 +4908,7 @@ mod tests {
         let prompt = build_acp_system_prompt(
             &cli,
             dir.path(),
+            global.path(),
             &tools,
             &Config::default(),
             Some("\n\n<available_skills>acp-skill-marker</available_skills>"),
@@ -4481,6 +4923,10 @@ mod tests {
         // Context files are skipped in PI_TEST_MODE by design.
         if std::env::var_os("PI_TEST_MODE").is_none() {
             assert!(prompt.contains("acp-claude-md-marker"), "CLAUDE.md is read");
+            assert!(
+                prompt.contains("acp-captured-global-marker"),
+                "global instructions use the captured directory"
+            );
         }
     }
 
@@ -4564,6 +5010,7 @@ mod tests {
         runtime_handle: RuntimeHandle,
     ) -> AcpOptions {
         AcpOptions {
+            settings_source: None,
             config,
             launch: AcpLaunchOptions::default(),
             available_models: models.clone(),
@@ -5523,6 +5970,7 @@ mod tests {
         entry.model.base_url = "https://acp-credential.invalid/v1".to_string();
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         let options = AcpOptions {
+            settings_source: None,
             config: Config::default(),
             launch: AcpLaunchOptions {
                 provider: Some(provider_id.clone()),
@@ -5648,6 +6096,8 @@ mod tests {
             )),
             available_models: registry.get_available(),
             cwd: PathBuf::from("."),
+            config: Arc::new(Config::default()),
+            global_dir: PathBuf::from("."),
             mcp: None,
         }));
         (state, auth, registry)
