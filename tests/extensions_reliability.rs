@@ -1352,11 +1352,11 @@ fn idle_npm_package(
             "name": name,
             "version": "1.0.0",
             "type": "module",
-            "pi": { "extensions": ["./extension.mjs"] },
+            "pi": { "extensions": ["./index.mjs"] },
         }))
         .expect("package manifest"),
     );
-    let entry = harness.create_file(format!("{package}/extension.mjs"), source.as_bytes());
+    let entry = harness.create_file(format!("{package}/index.mjs"), source.as_bytes());
     JsExtensionLoadSpec::from_entry_path(entry).expect("idle extension spec")
 }
 

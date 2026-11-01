@@ -290,7 +290,7 @@ impl SqliteRuntime {
     /// An interrupted engine is never recycled as a clean runtime.
     pub(super) fn reset(&mut self) -> Result<()> {
         if self.poisoned {
-            return Err("SQLite worker timed out; this PiJS runtime cannot be reused".into());
+            return Err("SQLite runtime is retired and cannot be reused".into());
         }
         if let Some(worker) = self.worker.as_mut() {
             worker
@@ -302,6 +302,17 @@ impl SqliteRuntime {
         // Never recycle database ids: a retained JS object must not acquire a
         // new owner's connection after a runtime reset.
         Ok(())
+    }
+
+    /// Permanently revoke a quarantined realm without flushing retained writes.
+    /// The worker owns cancellation and native cleanup; its process permit is
+    /// held until the actual thread exits, even if cancellation is delayed.
+    pub(super) fn retire(&mut self) {
+        self.poisoned = true;
+        self.databases.clear();
+        if let Some(mut worker) = self.worker.take() {
+            worker.retire();
+        }
     }
 
     fn dispatch(
@@ -476,14 +487,20 @@ fn authorize_database(
     policy: Option<&ExtensionPolicy>,
     readonly: bool,
 ) -> Result<PathBuf> {
-    for capability in if readonly {
-        &["read"][..]
-    } else {
-        &["read", "write"][..]
-    } {
+    // A read-only main pager still enters FrankenSQLite's native namespace
+    // protocol. Opening an existing or copied database can create or repair
+    // coordination files before query_only is enabled. Require authority for
+    // those writes before entering the worker, including on read-only opens.
+    for capability in ["read", "write"] {
         if policy.is_some_and(|policy| {
             policy.evaluate_for(capability, owner).decision != PolicyDecision::Allow
         }) {
+            if readonly && capability == "write" {
+                return Err(
+                    "SQLite write capability denied: native coordination files require write permission even for readonly connections"
+                        .into(),
+                );
+            }
             return Err(format!("SQLite {capability} capability denied"));
         }
     }
@@ -1110,7 +1127,7 @@ struct Worker {
     thread: Option<JoinHandle<()>>,
     cancel: Arc<Mutex<Option<Cancel>>>,
     stopped: Arc<AtomicBool>,
-    timed_out: Arc<AtomicBool>,
+    discard_on_stop: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -1124,10 +1141,10 @@ impl Worker {
         let (sender, receiver) = mpsc::sync_channel::<Work>(1);
         let cancel = Arc::new(Mutex::new(None::<Cancel>));
         let stopped = Arc::new(AtomicBool::new(false));
-        let timed_out = Arc::new(AtomicBool::new(false));
+        let discard_on_stop = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let worker_stopped = Arc::clone(&stopped);
-        let worker_timed_out = Arc::clone(&timed_out);
+        let worker_discard_on_stop = Arc::clone(&discard_on_stop);
         let thread = std::thread::Builder::new()
             .name("pijs-sqlite".into())
             .stack_size(16 * 1024 * 1024)
@@ -1157,18 +1174,19 @@ impl Worker {
                         break;
                     }
                 }
-                // The worker owns every !Send engine and its cleanup. A timed
-                // out caller never drops connections on the QuickJS thread.
+                // The worker owns every !Send engine and its cleanup. Timeout
+                // and quarantine never drop engines on the QuickJS thread.
                 for (_, mut database) in databases {
                     database.conn.root_cx().cancel();
-                    if !worker_timed_out.load(Ordering::Acquire) && database.verify_paths().is_ok()
+                    if !worker_discard_on_stop.load(Ordering::Acquire)
+                        && database.verify_paths().is_ok()
                     {
                         let _ = futures::executor::block_on(
                             database.conn.close_without_checkpoint_in_place(),
                         );
                     }
-                    // A deadline or namespace failure must not enter async
-                    // close with its independent teardown Cx: even the
+                    // Deadline, quarantine and namespace failures must not
+                    // enter async close with its independent teardown Cx: even the
                     // no-checkpoint variant can commit retained writes.
                     // Connection::drop cancels/reclaims state without SQL
                     // commit, rollback or checkpoint I/O.
@@ -1180,7 +1198,7 @@ impl Worker {
             thread: Some(thread),
             cancel,
             stopped,
-            timed_out,
+            discard_on_stop,
         })
     }
 
@@ -1243,13 +1261,19 @@ impl Worker {
                 }
             }
         }
-        self.timed_out.store(true, Ordering::Release);
-        self.stop();
+        self.retire();
         // Cooperative engine checkpoints acknowledge cancellation. Never join
         // an unacknowledged thread on the UI path. Its permit remains live
         // until the thread really exits, bounding detached work process-wide.
         let _ = response.recv_timeout(CANCEL_GRACE);
         Err(budget.timeout_error())
+    }
+
+    fn retire(&mut self) {
+        // Publish the no-flush decision before cancellation can wake the
+        // worker into its terminal cleanup. Normal Drop remains graceful.
+        self.discard_on_stop.store(true, Ordering::Release);
+        self.stop();
     }
 
     fn stop(&mut self) {
@@ -2077,7 +2101,7 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "host cancellation must stay bounded"
         );
-        assert!(contender.timed_out.load(Ordering::Acquire));
+        assert!(contender.discard_on_stop.load(Ordering::Acquire));
         assert!(
             contender
                 .call(Command::Request(Request::InTransaction { id: 1 }))
@@ -2102,6 +2126,91 @@ mod tests {
             .expect("durable rows after timed-out writer has exited");
         assert_eq!(rows["rows"], json!([[1], [3]]));
         locker.call(Command::Reset).expect("close verifier");
+    }
+
+    #[test]
+    fn quarantined_runtime_discards_uncommitted_writes_and_cannot_reopen() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = crate::extensions::safe_canonicalize(temp.path());
+        let path = root.join("quarantined.db");
+        let mut worker = Worker::start().expect("worker");
+        open_file(&mut worker, 1, &path);
+        exec(
+            &mut worker,
+            1,
+            "PRAGMA journal_mode=WAL; CREATE TABLE events(id INTEGER PRIMARY KEY); INSERT INTO events VALUES(1)",
+        );
+        exec(
+            &mut worker,
+            1,
+            "BEGIN IMMEDIATE; INSERT INTO events VALUES(99)",
+        );
+        assert_eq!(
+            worker
+                .call(Command::Request(Request::InTransaction { id: 1 }))
+                .expect("native transaction is live"),
+            true
+        );
+        // Keep only the join handle so this test can observe real teardown
+        // after the production retirement path has dropped its controller.
+        let thread = worker.thread.take().expect("native worker thread");
+        let mut runtime = SqliteRuntime {
+            worker: Some(worker),
+            databases: HashMap::from([(
+                1,
+                DatabaseOwner {
+                    extension_id: Some("quarantined".into()),
+                    path: Some(path.clone()),
+                    readonly: false,
+                },
+            )]),
+            next_id: 1,
+            poisoned: false,
+        };
+        runtime.retire();
+        runtime.retire(); // Repeated quarantine is idempotent.
+        assert!(runtime.worker.is_none());
+        assert!(runtime.databases.is_empty());
+        assert!(runtime.reset().is_err());
+        let modules = Rc::new(RefCell::new(PiJsModuleState::new()));
+        let denied = runtime
+            .dispatch(
+                Request::Open {
+                    path: ":memory:".into(),
+                    readonly: false,
+                    create: true,
+                    strict: false,
+                    safe_integers: false,
+                },
+                Some("quarantined".into()),
+                &root,
+                &modules,
+                None,
+            )
+            .expect_err("a quarantined realm cannot start a replacement worker");
+        assert_eq!(denied.code, "SQLITE_INTERRUPT");
+        assert!(runtime.worker.is_none());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !thread.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(thread.is_finished(), "quarantined native worker must exit");
+        thread.join().expect("native cleanup did not panic");
+
+        let mut verifier = Worker::start().expect("independent surviving worker");
+        open_file(&mut verifier, 1, &path);
+        exec(&mut verifier, 1, "INSERT INTO events VALUES(2)");
+        let rows = verifier
+            .call(Command::Request(Request::Query {
+                id: 1,
+                sql: "SELECT id FROM events ORDER BY id".into(),
+                bindings: Bindings::default(),
+                mode: QueryMode::Values,
+            }))
+            .expect("read reopened durable state");
+        assert_eq!(rows["rows"], json!([[1], [2]]));
+        verifier.call(Command::Reset).expect("close verifier");
     }
 
     #[test]

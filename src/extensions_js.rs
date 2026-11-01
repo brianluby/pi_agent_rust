@@ -18682,6 +18682,20 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         )
     }
 
+    /// Cancel native work retained by a permanently quarantined realm.
+    ///
+    /// Unlike a cold-drop scrub, this never runs guest cleanup or asks SQLite
+    /// to close/checkpoint a connection. The actor retains the failed realm's
+    /// diagnostic state, but process and SQLite worker permits remain with
+    /// their workers only until cancellation actually finishes.
+    pub(crate) fn cancel_native_resources_for_quarantine(&self) {
+        self.process_sessions.close_all();
+        self.sqlite_state.borrow_mut().retire();
+        let streams = std::mem::take(&mut *self.deferred_hostcalls.borrow_mut());
+        drop(streams);
+        self.hostcall_queue.borrow_mut().clear();
+    }
+
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
     /// Scrub observable realm state before the runtime is dropped.
     ///

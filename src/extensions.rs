@@ -10904,7 +10904,7 @@ impl NativeRustExtensionLoadSpec {
 #[cfg(any())]
 mod native_runtime_experimental;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 struct JsExtensionSnapshot {
     id: String,
     #[serde(default)]
@@ -10929,6 +10929,22 @@ struct JsExtensionSnapshot {
     event_hooks: Vec<String>,
     #[serde(default)]
     active_tools: Option<Vec<String>>,
+}
+
+impl JsExtensionSnapshot {
+    fn tool_definitions(&self) -> Result<Vec<ExtensionToolDef>> {
+        self.tools
+            .iter()
+            .map(|tool| {
+                serde_json::from_value(tool.clone()).map_err(|error| {
+                    Error::extension(format!(
+                        "Invalid tool definition in JS extension {}: {error}",
+                        self.id
+                    ))
+                })
+            })
+            .collect()
+    }
 }
 
 #[cfg(feature = "wasm-host")]
@@ -12096,7 +12112,8 @@ impl JsExtensionRuntimeHandle {
                                 let _ = reply.send(&cx, Err(err));
                                 continue;
                             }
-                            let result = get_registered_tools_from_shards(&shard_set).await;
+                            let result =
+                                get_registered_tools_from_shards(&mut shard_set, deadline).await;
                             let _ = reply.send(&cx, result);
                         }
                         JsRuntimeCommand::PumpOnce { deadline, reply } => {
@@ -14472,17 +14489,35 @@ fn require_single_shard_snapshot(
             snapshot.id
         )));
     }
+    // Owner routes and advertised schemas must come from the same validated
+    // snapshot. A malformed definition cannot be advertised or claim a name.
+    snapshot.tool_definitions()?;
     Ok(snapshot)
 }
 
 #[allow(clippy::future_not_send)]
 async fn get_registered_tools_from_shards(
-    shards: &JsRuntimeShardSet,
+    shards: &mut JsRuntimeShardSet,
+    deadline: Instant,
 ) -> Result<Vec<ExtensionToolDef>> {
     let mut tools = Vec::new();
-    for (shard_index, shard) in shards.shards.iter().enumerate() {
-        shards.ensure_shard_healthy(shard_index)?;
-        tools.extend(shard.runtime.get_registered_tools().await?);
+    for shard_index in 0..shards.shards.len() {
+        if shards.shards[shard_index].pump_fault.is_some() {
+            continue;
+        }
+        js_runtime_remaining_timeout_ms(deadline, "tools query")?;
+        if refresh_runtime_shard_snapshot(shards, shard_index)
+            .await
+            .is_err()
+        {
+            // Snapshot validation quarantines only its owner. Keep its last
+            // accepted names reserved in the route indexes, but omit its
+            // tools so the Agent can retire stale wrappers and keep peers live.
+            continue;
+        }
+        let mut definitions = shards.shards[shard_index].snapshot.tool_definitions()?;
+        definitions.sort_by(|left, right| left.name.encode_utf16().cmp(right.name.encode_utf16()));
+        tools.extend(definitions);
     }
     Ok(tools)
 }
@@ -14652,6 +14687,7 @@ async fn refresh_runtime_shard_snapshot(
     shards: &mut JsRuntimeShardSet,
     shard_index: usize,
 ) -> Result<()> {
+    shards.ensure_shard_healthy(shard_index)?;
     let extension_id = shards
         .shards
         .get(shard_index)
@@ -14678,6 +14714,9 @@ async fn refresh_runtime_shard_snapshot(
             ));
         }
     };
+    if new_snapshot == shards.shards[shard_index].snapshot {
+        return Ok(());
+    }
     let old_snapshot = std::mem::replace(&mut shards.shards[shard_index].snapshot, new_snapshot);
     if let Err(err) = shards.rebuild_indexes() {
         shards.shards[shard_index].snapshot = old_snapshot;
@@ -14717,6 +14756,7 @@ fn quarantine_runtime_shard(
     let fault = format!("JS extension shard {extension_id} quarantined: {reason}");
     if let Some(shard) = shards.shards.get_mut(shard_index) {
         shard.cancel_idle_dispatch();
+        shard.runtime.cancel_native_resources_for_quarantine();
         shard.pump_fault = Some(fault.clone());
     }
     tracing::error!(
@@ -14955,7 +14995,15 @@ async fn dispatch_extension_event_across_shards_until(
         .event_owners
         .get(event_name)
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|&index| {
+            shards
+                .shards
+                .get(index)
+                .is_some_and(|shard| shard.pump_fault.is_none())
+        })
+        .collect::<Vec<_>>();
     if owners.is_empty() {
         return Ok(Value::Null);
     }
@@ -15344,6 +15392,9 @@ async fn create_event_batch_contexts(
 ) -> Result<Vec<usize>> {
     let mut created = Vec::with_capacity(shards.shards.len());
     for (shard_index, shard) in shards.shards.iter().enumerate() {
+        if shard.pump_fault.is_some() {
+            continue;
+        }
         let bridge_secret = shard.runtime.bridge_secret().to_string();
         let result = shard
             .runtime
@@ -15814,6 +15865,7 @@ async fn cancel_extension_provider_stream_simple_sharded(
     stream_id: &str,
     deadline: Instant,
     origin: Option<&SessionActionOrigin>,
+    refresh_registry: bool,
 ) -> Result<()> {
     let timeout = remaining_js_task_timeout(deadline, "provider stream cancel")?;
     let task_id = next_runtime_task_id("task-provider-stream-cancel");
@@ -15841,9 +15893,22 @@ async fn cancel_extension_provider_stream_simple_sharded(
         origin_guard
     };
 
-    let _ =
-        await_js_task_in_shards_and_refresh(shards, host, shard_index, &task_id, timeout, deadline)
-            .await?;
+    if refresh_registry {
+        let _ = await_js_task_in_shards_and_refresh(
+            shards,
+            host,
+            shard_index,
+            &task_id,
+            timeout,
+            deadline,
+        )
+        .await?;
+    } else {
+        // A quarantined iterator may run its cleanup, but it cannot replace
+        // the owner's last accepted registrations or reserve fresh names.
+        let _ =
+            await_js_task_in_shards(shards, host, shard_index, &task_id, timeout, deadline).await?;
+    }
     drop(origin_guard);
     Ok(())
 }
@@ -15872,11 +15937,14 @@ async fn cancel_extension_provider_stream_simple_best_effort(
         stream_id,
         deadline,
         origin,
+        prior_fault.is_none(),
     )
     .await;
     if let Some(prior_fault) = prior_fault
         && let Some(shard) = shards.shards.get_mut(shard_index)
     {
+        shard.cancel_idle_dispatch();
+        shard.runtime.cancel_native_resources_for_quarantine();
         shard.pump_fault = Some(prior_fault);
     }
     result
@@ -16223,12 +16291,20 @@ async fn poll_idle_hostcall(shard: &mut JsRuntimeShard) {
     }
 }
 
+struct IdleRuntimeProgress {
+    has_pending: bool,
+    ran_javascript: bool,
+}
+
 /// Advance one shard without awaiting arbitrary host I/O. The per-turn bound
 /// is one FIFO dispatch poll and one scheduler tick, under the runtime's
 /// existing JavaScript interruption and microtask budgets.
 #[allow(clippy::future_not_send)]
-async fn pump_idle_runtime_shard(shard: &mut JsRuntimeShard, host: &JsRuntimeHost) -> Result<bool> {
-    let _ = shard.runtime.drain_microtasks().await?;
+async fn pump_idle_runtime_shard(
+    shard: &mut JsRuntimeShard,
+    host: &JsRuntimeHost,
+) -> Result<IdleRuntimeProgress> {
+    let jobs_drained = shard.runtime.drain_microtasks().await?;
     if shard.pending_idle_dispatch.is_none()
         && let Some(request) = shard.runtime.pop_hostcall_request()
     {
@@ -16246,8 +16322,11 @@ async fn pump_idle_runtime_shard(shard: &mut JsRuntimeShard, host: &JsRuntimeHos
         });
     }
     poll_idle_hostcall(shard).await;
-    let _ = shard.runtime.tick().await?;
-    Ok(shard.pending_idle_dispatch.is_some() || shard.runtime.has_pending())
+    let tick = shard.runtime.tick().await?;
+    Ok(IdleRuntimeProgress {
+        has_pending: shard.pending_idle_dispatch.is_some() || shard.runtime.has_pending(),
+        ran_javascript: jobs_drained > 0 || tick.ran_macrotask || tick.jobs_drained > 0,
+    })
 }
 
 fn idle_runtime_poll_delay(shards: &JsRuntimeShardSet) -> Option<Duration> {
@@ -16290,12 +16369,22 @@ async fn pump_idle_runtime_shards(shards: &mut JsRuntimeShardSet, host: &JsRunti
         }
         let result = pump_idle_runtime_shard(shard, host).await;
         shards.pump_cursor = (shard_index + 1) % shard_count;
-        if let Err(error) = result {
-            let _ = quarantine_runtime_shard(
-                shards,
-                shard_index,
-                &format!("idle runtime pump failed: {error}"),
-            );
+        match result {
+            Ok(progress) if progress.ran_javascript => {
+                // Timer and child-process callbacks can register tools after
+                // their initiating task has returned. Publish their routes
+                // before the actor accepts another command. A pending native
+                // I/O poll with no JS progress needs no registry serialization.
+                let _ = refresh_runtime_shard_snapshot(shards, shard_index).await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let _ = quarantine_runtime_shard(
+                    shards,
+                    shard_index,
+                    &format!("idle runtime pump failed: {error}"),
+                );
+            }
         }
         break;
     }
@@ -16311,7 +16400,9 @@ async fn pump_runtime_shard_for_command(
         // A command may depend on idle initialization already in progress.
         // Poll that same future without overtaking it with newer hostcalls or
         // attaching the new command's deadline to the earlier operation.
-        pump_idle_runtime_shard(shard, host).await
+        pump_idle_runtime_shard(shard, host)
+            .await
+            .map(|progress| progress.has_pending)
     } else {
         pump_js_runtime_once_for_owner(
             &shard.runtime,
@@ -16516,6 +16607,9 @@ async fn pump_js_runtime_shards_once_for_target(
                     "JS extension shard {extension_id} quarantined after runtime pump failure: {err}"
                 );
                 shards.shards[shard_index].cancel_idle_dispatch();
+                shards.shards[shard_index]
+                    .runtime
+                    .cancel_native_resources_for_quarantine();
                 shards.shards[shard_index].pump_fault = Some(fault.clone());
                 Err(Error::extension(fault))
             }
@@ -16534,6 +16628,12 @@ async fn pump_js_runtime_shards_once_for_target(
             let shard = &mut shards.shards[shard_index];
             pump_runtime_shard_for_command(shard, host, root_deadline).await
         };
+        let pump_result = match pump_result {
+            Ok(pending) => refresh_runtime_shard_snapshot(shards, shard_index)
+                .await
+                .map(|()| pending),
+            Err(error) => Err(error),
+        };
         match pump_result {
             Ok(pending) => has_pending |= pending,
             Err(err) => {
@@ -16542,6 +16642,9 @@ async fn pump_js_runtime_shards_once_for_target(
                     "JS extension shard {extension_id} quarantined after runtime pump failure: {err}"
                 );
                 shards.shards[shard_index].cancel_idle_dispatch();
+                shards.shards[shard_index]
+                    .runtime
+                    .cancel_native_resources_for_quarantine();
                 shards.shards[shard_index].pump_fault = Some(fault.clone());
                 if first_fault.is_none() {
                     first_fault = Some(fault.clone());

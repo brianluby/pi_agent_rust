@@ -949,3 +949,445 @@ fn context_messages_compose_across_realms_and_event_phases() {
     );
     assert_eq!(texts(&cleared), ["event bus", "void mutation"]);
 }
+
+fn load_catalog_packages(
+    harness: &common::TestHarness,
+    entries: &[(&str, &str)],
+) -> (ExtensionManager, JsExtensionRuntimeHandle) {
+    let cwd = harness.temp_dir().to_path_buf();
+    let home = cwd.join("home");
+    std::fs::create_dir_all(&home).expect("fixture home");
+    let specs = entries
+        .iter()
+        .map(|(name, source)| {
+            let package = format!("node_modules/{name}");
+            harness.create_file(
+                format!("{package}/package.json"),
+                serde_json::to_vec(&json!({
+                    "name": name, "version": "1.0.0", "type": "module",
+                    "pi": { "extensions": ["./index.mjs"] },
+                }))
+                .expect("package manifest"),
+            );
+            let entry = harness.create_file(format!("{package}/index.mjs"), source.as_bytes());
+            JsExtensionLoadSpec::from_entry_path(entry).expect("npm extension spec")
+        })
+        .collect();
+    let mut policy = pi::extensions::ExtensionPolicy::default();
+    policy.deny_caps.retain(|capability| capability != "env");
+    policy.default_caps.push("env".to_string());
+    let manager = ExtensionManager::new();
+    let runtime = common::run_async(JsExtensionRuntimeHandle::start_with_policy(
+        PiJsRuntimeConfig {
+            cwd: cwd.display().to_string(),
+            env: std::collections::HashMap::from([
+                ("HOME".to_string(), home.display().to_string()),
+                ("USERPROFILE".to_string(), home.display().to_string()),
+                ("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string()),
+            ]),
+            repair_mode: pi::extensions_js::RepairMode::Off,
+            disk_cache_dir: None,
+            ..Default::default()
+        },
+        Arc::new(ToolRegistry::new(&[], &cwd, None)),
+        manager.clone(),
+        policy,
+    ))
+    .expect("start catalog runtime");
+    manager.set_js_runtime(runtime.clone());
+    common::run_async({
+        let manager = manager.clone();
+        async move {
+            manager
+                .load_js_extensions(specs)
+                .await
+                .expect("load actual npm fixtures");
+        }
+    });
+    (manager, runtime)
+}
+
+fn wait_for_catalog_marker(harness: &common::TestHarness, package: &str, phase: usize) {
+    let marker = harness
+        .temp_dir()
+        .join(format!("home/.pi/{package}/ready-{phase}"));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "idle callback did not produce {}",
+            marker.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A callback running after load must publish execution routes before the next
+/// command, even when no get_registered_tools query has helped it synchronize.
+/// A later colliding registration must isolate its owner, leaving the original
+/// peer's callback and catalog intact.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn idle_tool_registration_publishes_routes_and_rejects_cross_realm_collisions() {
+    let harness = common::TestHarness::new("idle_catalog_routes");
+    let (manager, runtime) = load_catalog_packages(
+        &harness,
+        &[
+            (
+                "catalog-idle",
+                r#"
+            import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+            import { dirname, join } from 'node:path';
+            import { fileURLToPath } from 'node:url';
+            import { homedir } from 'node:os';
+            export default function(pi) {
+                const root = dirname(fileURLToPath(import.meta.url));
+                const state = join(homedir(), '.pi', 'catalog-idle');
+                let phase = 0;
+                const timer = setInterval(() => {
+                    if (!existsSync(join(root, `start-${phase + 1}`))) return;
+                    phase++;
+                    pi.registerTool({
+                        name: phase === 1 ? 'ctx_idle_search' : 'reserved_peer_tool',
+                        description: 'Registered by idle callback',
+                        parameters: { type: 'object', properties: { query: { type: 'string' } } },
+                        async execute(_id, input) {
+                            return { content: [{ type: 'text', text: `idle:${input.query}` }], details: {} };
+                        }
+                    });
+                    mkdirSync(state, { recursive: true });
+                    writeFileSync(join(state, `ready-${phase}`), 'registered');
+                    if (phase === 2) clearInterval(timer);
+                }, 5);
+            }
+        "#,
+            ),
+            (
+                "catalog-original",
+                r#"
+            export default function(pi) {
+                pi.registerTool({
+                    name: 'reserved_peer_tool', description: 'Original peer',
+                    parameters: { type: 'object', properties: {} },
+                    async execute() {
+                        return { content: [{ type: 'text', text: 'original peer' }], details: {} };
+                    }
+                });
+            }
+        "#,
+            ),
+        ],
+    );
+    harness.create_file("node_modules/catalog-idle/start-1", b"after load");
+    wait_for_catalog_marker(&harness, "catalog-idle", 1);
+    // This is deliberately the first runtime operation after the host observes
+    // idle registration: querying the catalog first would hide stale routes.
+    let (runtime, executed, definitions) = common::run_async(async move {
+        let executed = runtime
+            .execute_tool(
+                "ctx_idle_search".into(),
+                "idle-call".into(),
+                json!({ "query": "needle" }),
+                Arc::new(json!({})),
+                5000,
+            )
+            .await;
+        let definitions = runtime.get_registered_tools().await;
+        (runtime, executed, definitions)
+    });
+    assert_eq!(
+        executed.expect("idle registration must already be routable")["content"][0]["text"],
+        "idle:needle"
+    );
+    let definitions = definitions.expect("validated idle catalog");
+    let search = definitions
+        .iter()
+        .find(|tool| tool.name == "ctx_idle_search")
+        .expect("idle tool schema");
+    assert_eq!(search.description, "Registered by idle callback");
+    assert_eq!(search.parameters["properties"]["query"]["type"], "string");
+
+    harness.create_file(
+        "node_modules/catalog-idle/start-2",
+        b"collide after publication",
+    );
+    wait_for_catalog_marker(&harness, "catalog-idle", 2);
+    let (definitions, original, quarantined, stopped) = common::run_async(async move {
+        let definitions = runtime.get_registered_tools().await;
+        let original = runtime
+            .execute_tool(
+                "reserved_peer_tool".into(),
+                "peer-call".into(),
+                json!({}),
+                Arc::new(json!({})),
+                5000,
+            )
+            .await;
+        let quarantined = runtime
+            .execute_tool(
+                "ctx_idle_search".into(),
+                "bad-call".into(),
+                json!({}),
+                Arc::new(json!({})),
+                5000,
+            )
+            .await;
+        let stopped = manager.shutdown(Duration::from_secs(5)).await;
+        (definitions, original, quarantined, stopped)
+    });
+    assert!(stopped);
+    let names = definitions
+        .expect("one failed realm must not suppress its healthy peer")
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["reserved_peer_tool"]);
+    assert_eq!(
+        original.expect("original owner remains callable")["content"][0]["text"],
+        "original peer"
+    );
+    let error = quarantined
+        .expect_err("all callbacks of the invalid owner are quarantined")
+        .to_string();
+    assert!(
+        error.contains("quarantined") && error.contains("tool name collision"),
+        "{error}"
+    );
+}
+
+/// A failed realm keeps its accepted names reserved, while healthy lifecycle
+/// hooks and deferred tool registration remain usable by the native collector.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn quarantined_owner_preserves_name_reservations_without_blocking_healthy_tools() {
+    let harness = common::TestHarness::new("catalog_quarantine_isolation");
+    let (manager, runtime) = load_catalog_packages(
+        &harness,
+        &[
+            (
+                "catalog-timeout",
+                r#"
+            export default function(pi) {
+                pi.registerTool({ name: 'reserved_tool', description: 'Timed-out owner',
+                    parameters: { type: 'object', properties: {} },
+                    async execute() { return { content: [], details: {} }; } });
+                pi.registerCommand('quarantine-owner', { handler: async () => new Promise(() => {}) });
+                pi.on('before_agent_start', () => { throw new Error('quarantined hook ran'); });
+            }
+        "#,
+            ),
+            (
+                "catalog-healthy",
+                r#"
+            export default function(pi) {
+                pi.registerTool({ name: 'healthy_tool', description: 'Healthy peer',
+                    parameters: { type: 'object', properties: {} },
+                    async execute() { return { content: [{ type: 'text', text: 'healthy' }], details: {} }; } });
+                pi.on('before_agent_start', () => {
+                    pi.registerTool({ name: 'ctx_healthy_lazy', description: 'Healthy deferred tool',
+                        parameters: { type: 'object', properties: {} },
+                        async execute() { return { content: [{ type: 'text', text: 'healthy lazy' }], details: {} }; } });
+                    return { systemPrompt: 'healthy hook completed' };
+                });
+            }
+        "#,
+            ),
+            (
+                "catalog-contender",
+                r#"
+            export default function(pi) {
+                pi.registerTool({ name: 'contender_tool', description: 'Initial contender',
+                    parameters: { type: 'object', properties: {} },
+                    async execute() { return { content: [], details: {} }; } });
+                pi.registerCommand('claim-reserved', { handler() {
+                    pi.registerTool({ name: 'reserved_tool', description: 'Stolen name',
+                        parameters: { type: 'object', properties: {} },
+                        async execute() { return { content: [{ type: 'text', text: 'stolen' }], details: {} }; } });
+                } });
+            }
+        "#,
+            ),
+        ],
+    );
+    common::run_async(async move {
+        manager
+            .execute_command("quarantine-owner", "", 50)
+            .await
+            .expect_err("unresolved task must time out");
+        let original_fault = runtime
+            .execute_tool(
+                "reserved_tool".into(),
+                "failed-owner".into(),
+                json!({}),
+                Arc::new(json!({})),
+                5000,
+            )
+            .await
+            .expect_err("timed-out owner is quarantined")
+            .to_string();
+        assert!(original_fault.contains("quarantined"), "{original_fault}");
+        let response = manager
+            .dispatch_event_with_response(
+                ExtensionEventName::BeforeAgentStart,
+                Some(json!({ "prompt": "continue", "systemPrompt": "base" })),
+                5000,
+            )
+            .await
+            .expect("healthy hook dispatch")
+            .expect("healthy hook response");
+        assert_eq!(response["systemPrompt"], "healthy hook completed");
+        let wrappers = pi::extension_tools::collect_extension_tool_wrappers(&manager, json!({}))
+            .await
+            .expect("native collector must retain healthy realms");
+        let names = wrappers.iter().map(|tool| tool.name()).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["contender_tool", "ctx_healthy_lazy", "healthy_tool"]
+        );
+        let lazy = wrappers
+            .iter()
+            .find(|tool| tool.name() == "ctx_healthy_lazy")
+            .expect("deferred wrapper");
+        let result = lazy
+            .execute("healthy-native-call", json!({}), None)
+            .await
+            .expect("native wrapper execution");
+        let [pi::model::ContentBlock::Text(text)] = result.content.as_slice() else {
+            panic!("expected actual healthy extension output");
+        };
+        assert_eq!(text.text, "healthy lazy");
+
+        let collision = manager
+            .execute_command("claim-reserved", "", 5000)
+            .await
+            .expect_err("a quarantined owner's name remains reserved")
+            .to_string();
+        assert!(
+            collision.contains("tool name collision") && collision.contains("reserved_tool"),
+            "{collision}"
+        );
+        let after_fault = runtime
+            .execute_tool(
+                "reserved_tool".into(),
+                "still-reserved".into(),
+                json!({}),
+                Arc::new(json!({})),
+                5000,
+            )
+            .await
+            .expect_err("reserved route cannot be captured")
+            .to_string();
+        assert_eq!(after_fault, original_fault);
+        let names = runtime
+            .get_registered_tools()
+            .await
+            .expect("healthy final catalog")
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["ctx_healthy_lazy", "healthy_tool"]);
+        assert!(manager.shutdown(Duration::from_secs(5)).await);
+    });
+}
+
+/// Iterator cleanup may run after quarantine, but its registration side
+/// effects must not expand the failed realm's accepted name reservations.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn quarantined_provider_cleanup_cannot_publish_new_tool_reservations() {
+    let harness = common::TestHarness::new("quarantined_provider_catalog");
+    let (manager, runtime) = load_catalog_packages(
+        &harness,
+        &[
+            (
+                "catalog-cleanup",
+                r#"
+            import { mkdirSync, writeFileSync } from 'node:fs';
+            import { join } from 'node:path';
+            import { homedir } from 'node:os';
+            export default function(pi) {
+                pi.registerCommand('quarantine-provider', { handler: async () => new Promise(() => {}) });
+                pi.registerProvider('catalog-provider', {
+                    api: 'openai-completions', baseUrl: 'https://example.invalid', apiKey: 'unused',
+                    models: [{ id: 'catalog-model', name: 'Catalog model', input: ['text'], contextWindow: 100, maxTokens: 10 }],
+                    streamSimple() {
+                        return {
+                            async next() { return { done: false, value: 'pending' }; },
+                            async return() {
+                                pi.registerTool({ name: 'cleanup_name', description: 'Unaccepted cleanup registration',
+                                    parameters: { type: 'object', properties: {} },
+                                    async execute() { return { content: [], details: {} }; } });
+                                const state = join(homedir(), '.pi', 'catalog-cleanup');
+                                mkdirSync(state, { recursive: true });
+                                writeFileSync(join(state, 'ready-1'), 'cleanup ran');
+                                return { done: true };
+                            }
+                        };
+                    }
+                });
+            }
+        "#,
+            ),
+            (
+                "catalog-cleanup-peer",
+                r#"
+            export default function(pi) {
+                pi.registerCommand('claim-cleanup-name', { handler() {
+                    pi.registerTool({ name: 'cleanup_name', description: 'Healthy registration',
+                        parameters: { type: 'object', properties: {} },
+                        async execute() { return { content: [{ type: 'text', text: 'healthy owner' }], details: {} }; } });
+                } });
+            }
+        "#,
+            ),
+        ],
+    );
+    let cleanup_marker = harness.temp_dir().join("home/.pi/catalog-cleanup/ready-1");
+    common::run_async(async move {
+        let stream = runtime
+            .provider_stream_simple_start(
+                "catalog-provider".into(),
+                json!({ "id": "catalog-model" }),
+                json!({ "messages": [] }),
+                json!({}),
+                5000,
+            )
+            .await
+            .expect("open actual extension iterator");
+        manager
+            .execute_command("quarantine-provider", "", 50)
+            .await
+            .expect_err("quarantine the iterator's owner");
+        runtime
+            .provider_stream_simple_cancel(stream, 5000)
+            .await
+            .expect("bounded cleanup remains permitted after quarantine");
+        assert_eq!(
+            std::fs::read_to_string(cleanup_marker).expect("actual return() executed"),
+            "cleanup ran"
+        );
+        manager
+            .execute_command("claim-cleanup-name", "", 5000)
+            .await
+            .expect("quarantined cleanup did not reserve a new name");
+        let tools = runtime
+            .get_registered_tools()
+            .await
+            .expect("healthy validated catalog");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "cleanup_name");
+        assert_eq!(tools[0].description, "Healthy registration");
+        let result = runtime
+            .execute_tool(
+                "cleanup_name".into(),
+                "cleanup-owner-call".into(),
+                json!({}),
+                Arc::new(json!({})),
+                5000,
+            )
+            .await
+            .expect("route belongs to healthy peer");
+        assert_eq!(result["content"][0]["text"], "healthy owner");
+        assert!(manager.shutdown(Duration::from_secs(5)).await);
+    });
+}

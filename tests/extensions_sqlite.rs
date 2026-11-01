@@ -2,7 +2,7 @@
 //! The fixtures exercise the API shape used by context-mode's Bun adapter,
 //! including durable session data, migrations, transactions and RETURNING.
 
-use pi::extensions::{ExtensionPolicy, ExtensionPolicyMode};
+use pi::extensions::{ExtensionPolicy, ExtensionPolicyMode, safe_canonicalize};
 use pi::extensions_js::{PiJsRuntime, PiJsRuntimeConfig};
 use pi::scheduler::DeterministicClock;
 use serde_json::{Value, json};
@@ -191,7 +191,7 @@ fn sqlite_imports_initialize_a_persistent_session_database_and_reopen_it() {
     let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
     futures::executor::block_on(async {
         let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical tempdir");
+        let root = safe_canonicalize(temp.path());
         let storage = root.join(".pi/context-mode");
         let database = storage.join("sessions/project.db");
         let path = serde_json::to_string(&database.to_string_lossy()).expect("path");
@@ -274,7 +274,7 @@ fn sqlite_busy_error_reaches_context_mode_retry_and_preserves_persistent_state()
     let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
     futures::executor::block_on(async {
         let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
+        let root = safe_canonicalize(temp.path());
         let storage = root.join("storage");
         std::fs::create_dir(&storage).expect("storage");
         let path = serde_json::to_string(&storage.join("retry.db")).unwrap();
@@ -342,7 +342,7 @@ fn sqlite_default_transactions_serialize_writers_and_publish_autocommit_results(
     let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
     futures::executor::block_on(async {
         let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
+        let root = safe_canonicalize(temp.path());
         let storage = root.join("storage");
         std::fs::create_dir(&storage).expect("storage");
         let path = serde_json::to_string(&storage.join("single-writer.db")).unwrap();
@@ -444,7 +444,7 @@ fn sqlite_guest_sql_cannot_restore_engine_specific_concurrent_transactions() {
 fn sqlite_native_wal_interoperates_with_a_live_stock_node_connection() {
     let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
     let temp = tempfile::tempdir().expect("tempdir");
-    let root = temp.path().canonicalize().expect("canonical root");
+    let root = safe_canonicalize(temp.path());
     let storage = root.join("storage");
     std::fs::create_dir(&storage).expect("storage");
     let database = storage.join("mixed-engines.db");
@@ -585,7 +585,7 @@ fn sqlite_engine_errors_remain_distinct_from_admission_and_nested_rollback_error
     let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
     futures::executor::block_on(async {
         let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
+        let root = safe_canonicalize(temp.path());
         let storage = root.join("storage");
         std::fs::create_dir(&storage).expect("storage");
         let invalid = storage.join("invalid.db");
@@ -962,7 +962,7 @@ fn sqlite_file_open_requires_its_own_storage_grant_and_write_capability() {
     let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
     futures::executor::block_on(async {
         let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
+        let root = safe_canonicalize(temp.path());
         let storage = root.join("owner");
         std::fs::create_dir(&storage).expect("storage");
         let own = serde_json::to_string(&storage.join("own.db").to_string_lossy()).unwrap();
@@ -1025,6 +1025,145 @@ fn sqlite_file_open_requires_its_own_storage_grant_and_write_capability() {
     });
 }
 
+#[test]
+#[allow(clippy::too_many_lines)]
+fn sqlite_readonly_open_requires_write_authority_before_native_namespace_repair() {
+    let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = safe_canonicalize(temp.path());
+        let storage = root.join("storage");
+        std::fs::create_dir(&storage).expect("storage");
+        let source = storage.join("source.db");
+        let copied = storage.join("copied.db");
+        let main_only = storage.join("main-only.db");
+        let source_json = serde_json::to_string(&source.to_string_lossy()).unwrap();
+        let copied_json = serde_json::to_string(&copied.to_string_lossy()).unwrap();
+        let main_only_json = serde_json::to_string(&main_only.to_string_lossy()).unwrap();
+        let seed = runtime(&root, "owner", None).await;
+        seed.add_persistent_storage_root(storage.clone(), "owner")
+            .expect("seed storage grant");
+        assert_eq!(
+            evaluate(
+                &seed,
+                &format!(
+                    r#"
+                const db = new sqlite.Database({source_json});
+                db.exec("CREATE TABLE data(value TEXT); INSERT INTO data VALUES ('durable')");
+                db.close();
+                globalThis.sqliteResult = true;
+            "#
+                )
+            )
+            .await,
+            json!(true)
+        );
+        drop(seed);
+
+        // Both are ordinary database copies, not adversarial symlinks. The
+        // first keeps stale native file-identity records; the second has no
+        // namespace records. The engine repairs the stale records during open
+        // even when its main pager is read-only. File capability admission is
+        // conservative and does not depend on which companions exist today.
+        std::fs::copy(&source, &copied).expect("copy main database");
+        std::fs::copy(&source, &main_only).expect("copy without namespace");
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            std::fs::copy(
+                storage.join(format!("source.db{suffix}")),
+                storage.join(format!("copied.db{suffix}")),
+            )
+            .expect("copy native namespace sidecar");
+        }
+        let snapshot = || {
+            std::fs::read_dir(&storage)
+                .expect("storage entries")
+                .map(|entry| {
+                    let entry = entry.expect("storage entry");
+                    (
+                        entry.file_name(),
+                        std::fs::read(entry.path()).expect("database family bytes"),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        let mut policy = ExtensionPolicy {
+            mode: ExtensionPolicyMode::Strict,
+            ..Default::default()
+        };
+        policy.deny_caps.push("write".into());
+        let restricted = runtime(&root, "owner", Some(policy)).await;
+        restricted
+            .add_persistent_storage_root(storage.clone(), "owner")
+            .expect("restricted storage grant");
+        let rejected = evaluate(
+            &restricted,
+            &format!(
+                r#"
+            const results = [];
+            for (const path of [{copied_json}, {main_only_json}]) {{
+              for (const readonly of [true, false]) {{
+                try {{
+                  const db = new sqlite.Database(path, {{readonly, create:true}});
+                  db.close();
+                  results.push(false);
+                }} catch (error) {{
+                  const message = String(error);
+                  results.push(message.includes('SQLite write capability denied') &&
+                    (!readonly || message.includes('native coordination files')));
+                }}
+              }}
+            }}
+            globalThis.sqliteResult = results;
+        "#
+            ),
+        )
+        .await;
+        assert_eq!(rejected, json!([true, true, true, true]));
+        assert_eq!(
+            snapshot(),
+            before,
+            "denial must precede all native file I/O"
+        );
+        drop(restricted);
+
+        // Positive control: the very same copied database opens with the
+        // appropriate capability, repairs its identity, and remains SQL
+        // read-only. This proves the fixture reaches a real native repair.
+        let namespace = storage.join("copied.db-fsqlite-ns-use");
+        let copied_identity = std::fs::read(&namespace).expect("copied identity");
+        let allowed = runtime(&root, "owner", None).await;
+        allowed
+            .add_persistent_storage_root(storage, "owner")
+            .expect("allowed storage grant");
+        let result = evaluate(
+            &allowed,
+            &format!(
+                r#"
+            const db = new sqlite.Database({copied_json}, {{readonly:true, create:true}});
+            let writeDenied = false;
+            try {{ db.exec("INSERT INTO data VALUES ('forbidden')"); }}
+            catch (error) {{ writeDenied = error.code === 'SQLITE_READONLY'; }}
+            globalThis.sqliteResult = {{
+              rows:db.query('SELECT value FROM data').all(), writeDenied,
+            }};
+            db.close();
+        "#
+            ),
+        )
+        .await;
+        assert_eq!(
+            result,
+            json!({"rows":[{"value":"durable"}], "writeDenied":true})
+        );
+        assert_ne!(
+            std::fs::read(namespace).expect("rebound native identity"),
+            copied_identity,
+            "permitted read-only open must rebind the copied native namespace"
+        );
+    });
+}
+
 #[cfg(unix)]
 #[test]
 fn sqlite_rejects_database_and_companion_symlinks_without_touching_targets() {
@@ -1032,7 +1171,7 @@ fn sqlite_rejects_database_and_companion_symlinks_without_touching_targets() {
     use std::os::unix::fs::symlink;
     futures::executor::block_on(async {
         let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
+        let root = safe_canonicalize(temp.path());
         let storage = root.join("storage");
         std::fs::create_dir(&storage).expect("storage");
         let outside = root.join("outside");
@@ -1092,11 +1231,16 @@ fn sqlite_fts5_search_uses_real_indexed_content() {
 }
 
 #[test]
-fn sqlite_readonly_memory_is_enforced_by_the_native_engine() {
+fn sqlite_memory_obeys_sql_readonly_without_filesystem_capabilities() {
     let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
     futures::executor::block_on(async {
         let temp = tempfile::tempdir().expect("tempdir");
-        let runtime = runtime(temp.path(), "readonly", None).await;
+        let mut policy = ExtensionPolicy {
+            mode: ExtensionPolicyMode::Strict,
+            ..Default::default()
+        };
+        policy.deny_caps.extend(["read".into(), "write".into()]);
+        let runtime = runtime(temp.path(), "readonly", Some(policy)).await;
         let result = evaluate(
             &runtime,
             r#"
@@ -1104,12 +1248,21 @@ fn sqlite_readonly_memory_is_enforced_by_the_native_engine() {
             let writeDenied = false;
             try { db.prepare('CREATE TABLE forbidden(value TEXT)').run(); }
             catch { writeDenied = true; }
-            globalThis.sqliteResult = {writeDenied, row: db.query('SELECT 42 AS value').get()};
+            const row = db.query('SELECT 42 AS value').get();
             db.close();
+            const memory = new sqlite.Database(':memory:');
+            memory.exec('CREATE TABLE data(value); INSERT INTO data VALUES (7)');
+            globalThis.sqliteResult = {
+              writeDenied, row, writable:memory.query('SELECT value FROM data').get(),
+            };
+            memory.close();
         "#,
         )
         .await;
-        assert_eq!(result, json!({"writeDenied": true, "row": {"value": 42}}));
+        assert_eq!(
+            result,
+            json!({"writeDenied":true, "row":{"value":42}, "writable":{"value":7}})
+        );
     });
 }
 
@@ -1119,7 +1272,7 @@ fn sqlite_rejects_preexisting_schema_triggers() {
     let _serial = SQLITE_TEST_LOCK.lock().expect("SQLite test lock");
     futures::executor::block_on(async {
         let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
+        let root = safe_canonicalize(temp.path());
         let storage = root.join("storage");
         std::fs::create_dir(&storage).expect("storage");
         let path = storage.join("preexisting.db");
@@ -1163,7 +1316,7 @@ fn sqlite_retires_a_handle_if_a_companion_becomes_a_symlink() {
     use std::os::unix::fs::symlink;
     futures::executor::block_on(async {
         let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
+        let root = safe_canonicalize(temp.path());
         let storage = root.join("storage");
         std::fs::create_dir(&storage).expect("storage");
         let path = storage.join("live.db");

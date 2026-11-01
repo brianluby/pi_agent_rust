@@ -157,8 +157,12 @@ error classifications. Nested transactions preserve the original error when
 SQLite has already rolled back the entire transaction.
 
 File-backed databases require an extension-owned persistent storage grant and
-the corresponding read/write capabilities. `:memory:` databases acquire no
-filesystem permission. Database handles cannot be transferred to another
+both read and write capabilities, including connections opened with
+`readonly: true`. The native engine can create or repair coordination files
+while opening an existing or copied database, before SQL execution begins.
+The bridge checks these capabilities before entering the engine; `readonly`
+still enforces SQL query-only behavior. `:memory:` databases require neither
+filesystem capability. Database handles cannot be transferred to another
 extension. SQL batches are admitted in full before their first statement runs;
 SQL cannot acquire additional paths through `ATTACH`, `VACUUM INTO`, loadable
 extensions, filesystem functions, arbitrary virtual-table modules, or writable
@@ -440,6 +444,16 @@ before_agent_start, as context-mode does after MCP tools/list, are therefore
 available in that request and through the shared execution registry. Later
 definition changes reach the next provider request; unchanged visible schemas
 retain their cache version.
+
+Registrations made by idle timers and subprocess callbacks update the same
+validated snapshot used by discovery and execution routing. An invalid
+registration quarantines its owner without blocking healthy extensions'
+catalogs or event hooks. The last accepted names of a quarantined owner remain
+reserved until unload, so another extension cannot take over its routes.
+Quarantine cancels retained native requests and subprocesses and retires its
+SQLite worker without an asynchronous close that could flush retained writes.
+Resource permits remain held until the actual workers finish. Best-effort
+provider-stream cleanup cannot publish new registrations from a failed owner.
 
 Reconciliation retains inactive registrations for setActiveTools restoration
 and removes only the exact wrappers it previously published. Initial active
