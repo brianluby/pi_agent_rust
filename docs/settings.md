@@ -96,7 +96,14 @@ and overrides these four flags, including when the list is empty or exactly
 matches the default list. For example, `pi --tools read,grep,find,ls` does not
 enable any of these four tools, even if all four settings are `true`.
 Conversely, `pi --tools read,eval` selects `eval` even when `enableEval` is
-`false`. `--no-tools` disables built-in tools regardless of either source.
+`false`.
+
+`--no-tools` and an explicit `--tools ""` disable all built-in tools, including
+settings-gated browser, computer, media, and memory tools. A value containing
+only whitespace or commas also selects no built-ins. The SDK's explicit empty
+`enabled_tools` list and ACP sessions follow the same rule. Extensions and MCP
+servers retain their existing loading and trust controls. Plan mode cannot
+reintroduce a built-in tool excluded by this selection.
 
 The same flags work in a trusted project's `.pi/settings.json`. For example,
 `{"tools":{"enableEval":false}}` disables a global `enableEval: true` while
@@ -106,12 +113,24 @@ cannot activate these tools or override global choices. Editing the project
 settings invalidates a stored trust decision. `PI_CONFIG_PATH` retains its
 existing explicit single-file behavior and skips the global/project merge.
 
-`tools.loadMode.<name>` (also `tools.load_mode.<name>`) controls exposure of
-already selected tools: `essential`, `discoverable`, or `off`. It does not
-activate an optional tool by itself. These activation flags use the existing
-tool registry and do not grant new approval permissions, extension capabilities,
-or child-agent tools. In particular, native children's explicit tool allowlists
-still override inherited optional-tool settings.
+`tools.loadMode.<name>` (also `tools.load_mode.<name>`) configures tool exposure
+as `essential`, `discoverable`, or `off`. An explicit `off` setting excludes a
+tool from implicit selection, including tools automatically added by browser,
+computer, media, and memory settings, and the default `manage_skill` tool.
+For example, `{"tools":{"enableEval":true,"loadMode":{"eval":"off"}}}` keeps
+`eval` disabled when `--tools` is omitted. An explicit `--tools eval` overrides
+that exclusion. Explicit names do not enable a separate backend: the memory
+bank still requires `memory.backend` to be `"local"` or `"cass"`. The generated
+`xdev` dispatcher still requires discoverable tools and is disabled by
+`loadMode.xdev: "off"`.
+
+`subagent` remains activatable with `enableSubagent: true`: its built-in
+off-by-default tier is not an explicit `loadMode.subagent: "off"` setting.
+
+Load modes never activate an optional tool by themselves. These activation
+flags use the existing tool registry and do not grant new approval permissions,
+extension capabilities, or child-agent tools. In particular, native children's
+explicit tool allowlists still override inherited optional-tool settings.
 
 ### Appearance
 

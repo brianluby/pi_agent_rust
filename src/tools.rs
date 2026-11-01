@@ -5791,12 +5791,12 @@ pub fn unknown_tool_names(requested: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// The requested names that are real tools `--tools` has no say over, paired
-/// with what does decide them.
+/// Requested names whose construction depends on a separate activation path,
+/// paired with the setting or prerequisite that supplies them.
 ///
-/// Listing one of these is harmless but has no effect, which is worth saying:
-/// the user asked for a tool by name and pi is about to decide its presence on
-/// other grounds entirely.
+/// Naming one does not enable its backend, but can override a configured
+/// load-mode exclusion once that backend supplies the tool. Explain both
+/// prerequisites and overrides instead of treating the name as a typo.
 #[must_use]
 pub fn unselectable_tool_names(requested: &[&str]) -> Vec<(String, &'static str)> {
     requested
@@ -5890,13 +5890,13 @@ impl ToolRegistry {
         "submit_plan",
     ];
 
-    /// Tools pi provides that `--tools` does not select, and what decides them.
+    /// Tools constructed outside the `--tools` match, and their prerequisites.
     ///
-    /// These reach the registry outside the `--tools` match, so naming one on
-    /// the flag changes nothing. That is worth telling the user, and it is not
-    /// the same thing as a typo: before this list existed, `--tools xdev` was
-    /// answered with "xdev is not a tool pi provides", which is false about the
-    /// dispatcher the entire discoverable tier hangs off.
+    /// Naming one does not enable its backend. Explicit names can still
+    /// override configured load-mode exclusions for automatically added tools.
+    /// Before this list existed, `--tools xdev` was answered with "xdev is not
+    /// a tool pi provides", which is false about the dispatcher the entire
+    /// discoverable tier hangs off.
     ///
     /// The second field is the whole message a user needs to actually get the
     /// tool, so keep it specific enough to act on.
@@ -5908,7 +5908,8 @@ impl ToolRegistry {
         ),
         (
             "manage_skill",
-            "always registered; it cannot touch user-authored skills, so it needs no opt-in",
+            "available by default; tools.loadMode.manage_skill=off disables implicit access, \
+             and an explicit --tools name overrides that restriction",
         ),
         ("retain", MEMORY_BANK_HOW),
         ("recall", MEMORY_BANK_HOW),
@@ -6213,8 +6214,19 @@ impl ToolRegistry {
         }
 
         // manage_skill (bd-cv653.4.2): CRUD over the isolated managed-skills
-        // dir; always available — it can never touch user-authored skills.
+        // dir; available by default, subject to the load-mode filter below.
         tools.push(Box::new(ManageSkillTool));
+
+        // The resolved selection is authoritative. Configured Off overrides
+        // also exclude automatically added tools that were not selected by
+        // name, before their definitions can enter the discovery snapshot.
+        // Only explicit overrides count: subagent's default Off tier must not
+        // undo a deliberate opt-in.
+        tools.retain(|tool| {
+            enabled.contains(&tool.name())
+                || crate::xdev::configured_tier(tool.name(), config)
+                    != Some(crate::xdev::LoadMode::Off)
+        });
 
         // Tool load modes (bd-cv653.1.6): register the xdev dispatcher when
         // the enabled set contains discoverable-tier tools and `xdev` itself
@@ -27067,6 +27079,112 @@ mod tests {
 #[cfg(test)]
 mod known_tool_name_tests {
     use super::*;
+
+    #[test]
+    fn configured_off_excludes_automatic_tools_before_discovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "browser": { "enableBrowser": true },
+            "computer": { "enableComputer": true },
+            "media": {
+                "enableInspectImage": true,
+                "enableReadMedia": true,
+                "enableGenerateImage": true,
+                "enableTts": true
+            }
+        }))
+        .expect("automatic tool settings");
+        let automatic = [
+            "browser",
+            "computer",
+            "inspect_image",
+            "read_media",
+            "generate_image",
+            "tts",
+            "manage_skill",
+        ];
+        let baseline = ToolRegistry::new(&["read"], dir.path(), Some(&config));
+        for name in automatic {
+            assert!(
+                baseline.get(name).is_some(),
+                "{name} must be present before denial"
+            );
+        }
+
+        config.tools = Some(crate::config::ToolSettings {
+            load_mode: Some(
+                automatic
+                    .into_iter()
+                    .map(|name| (name.to_string(), "off".to_string()))
+                    .collect(),
+            ),
+            ..Default::default()
+        });
+        let registry = ToolRegistry::new(&["read"], dir.path(), Some(&config));
+        assert!(registry.get("read").is_some());
+        assert_eq!(registry.tools().len(), 1);
+        assert!(registry.discoverable_index().is_empty());
+        for name in automatic {
+            assert!(registry.get(name).is_none(), "{name} must not be callable");
+            assert!(
+                !registry.is_discoverable(name),
+                "{name} must not be discoverable"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_names_override_configured_off_without_filtering_default_tiers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opted_in = ToolRegistry::new(&["subagent"], dir.path(), None);
+        assert_eq!(
+            crate::xdev::default_tier("subagent"),
+            crate::xdev::LoadMode::Off
+        );
+        assert!(opted_in.get("subagent").is_some());
+
+        let selected = [
+            "eval",
+            "github",
+            "security_scan",
+            "subagent",
+            "browser",
+            "computer",
+            "inspect_image",
+            "read_media",
+            "generate_image",
+            "tts",
+            "manage_skill",
+        ];
+        let config = Config {
+            tools: Some(crate::config::ToolSettings {
+                load_mode: Some(
+                    selected
+                        .into_iter()
+                        .map(|name| (name.to_string(), "off".to_string()))
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let registry = ToolRegistry::new(&selected, dir.path(), Some(&config));
+        for name in selected {
+            assert!(
+                registry.get(name).is_some(),
+                "{name} explicit selection must win"
+            );
+            assert_eq!(
+                registry
+                    .tools()
+                    .iter()
+                    .filter(|tool| tool.name() == name)
+                    .count(),
+                1,
+                "{name} must be registered once"
+            );
+        }
+    }
 
     /// Joined after construction by the session host, so the registry builds
     /// nothing for them and neither does this test.

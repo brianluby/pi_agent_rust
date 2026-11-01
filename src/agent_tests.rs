@@ -8414,6 +8414,92 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
     }
 
     #[test]
+    fn configured_off_optional_tools_stay_out_of_the_provider_context() {
+        use clap::Parser as _;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        for (setting, name) in [
+            ("enableEval", "eval"),
+            ("enableGithub", "github"),
+            ("enableSecurityScan", "security_scan"),
+            ("enableSubagent", "subagent"),
+        ] {
+            let config = serde_json::from_value(json!({
+                "tools": { (setting): true, "loadMode": { (name): "off" } }
+            }))
+            .expect("optional tool off config");
+            for (cli, included) in [
+                (crate::cli::Cli::parse_from(["pi"]), false),
+                (crate::cli::Cli::parse_from(["pi", "--tools", name]), true),
+            ] {
+                let tools = ToolRegistry::new(
+                    &cli.enabled_tools(&config),
+                    temp.path(),
+                    Some(&config),
+                );
+                assert_eq!(tools.get(name).is_some(), included, "{name}");
+                let mut agent =
+                    Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+                assert_eq!(
+                    agent.build_context().tools.iter().any(|tool| tool.name == name),
+                    included,
+                    "{name} must follow effective selection in the provider request"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_xdev_cannot_run_or_promote_registered_discoverable_tools() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            std::fs::write(
+                temp.path().join("main.rs"),
+                "fn main() { let _ = compute().unwrap(); }\n",
+            )
+            .expect("write fixture");
+            let config: crate::config::Config = serde_json::from_value(json!({
+                "tools": { "loadMode": { "xdev": "off" } }
+            }))
+            .expect("disabled dispatcher config");
+            let tools = ToolRegistry::new(&["ast_grep"], temp.path(), Some(&config));
+            assert!(tools.get("ast_grep").is_some());
+            assert!(tools.is_discoverable("ast_grep"));
+            assert!(tools.get("xdev").is_none());
+            let mut agent =
+                Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+            for action in ["run", "promote"] {
+                let call = xdev_call(
+                    action,
+                    Some("ast_grep"),
+                    Some(json!({"pattern": "$EXPR.unwrap()", "path": "."})),
+                );
+                let (output, failed) = agent
+                    .execute_tool_without_hooks(&call, Arc::new(|_| {}), None)
+                    .await;
+                assert!(failed && output.is_error, "disabled xdev {action}");
+                assert!(
+                    matches!(
+                        output.content.as_slice(),
+                        [ContentBlock::Text(text)]
+                            if text.text == "Error: Tool 'xdev' not found"
+                    ),
+                    "{output:?}"
+                );
+                assert!(
+                    !agent
+                        .build_context()
+                        .tools
+                        .iter()
+                        .any(|tool| tool.name == "ast_grep" || tool.name == "xdev"),
+                    "rejected promotion must not expand the provider schema"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn xdev_list_and_describe_via_tool_execute() {
         let runtime = RuntimeBuilder::current_thread()
             .build()

@@ -93,19 +93,24 @@ pub fn default_tier(name: &str) -> LoadMode {
     LoadMode::Discoverable
 }
 
-/// Effective tier for a tool: `tools.loadMode.<name>` override > default
-/// table. Unknown override values are ignored (a warning is the caller's job).
+/// Explicit `tools.loadMode.<name>` override, without the default tier.
+///
+/// An absent or unknown override returns `None`. This distinction matters for
+/// opt-in tools: their default `Off` tier must not veto an explicit activation.
 #[must_use]
-pub fn tier_for(name: &str, config: Option<&Config>) -> LoadMode {
-    if let Some(mode) = config
+pub fn configured_tier(name: &str, config: Option<&Config>) -> Option<LoadMode> {
+    config
         .and_then(|c| c.tools.as_ref())
         .and_then(|t| t.load_mode.as_ref())
         .and_then(|modes| modes.get(name))
         .and_then(|raw| LoadMode::from_name(raw))
-    {
-        return mode;
-    }
-    default_tier(name)
+}
+
+/// Effective tier for a tool: `tools.loadMode.<name>` override > default
+/// table. Unknown override values are ignored (a warning is the caller's job).
+#[must_use]
+pub fn tier_for(name: &str, config: Option<&Config>) -> LoadMode {
+    configured_tier(name, config).unwrap_or_else(|| default_tier(name))
 }
 
 /// Names of built-in tools enabled by default when the user passes no
@@ -460,6 +465,29 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(tier_for("grep", Some(&config)), LoadMode::Essential);
+    }
+
+    #[test]
+    fn configured_tier_distinguishes_missing_invalid_and_explicit_off() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "tools": {
+                "loadMode": {
+                    "eval": " OFF ",
+                    "bash": "DISCOVERABLE",
+                    "subagent": "not-a-load-mode"
+                }
+            }
+        }))
+        .expect("load mode config");
+        assert_eq!(configured_tier("eval", Some(&config)), Some(LoadMode::Off));
+        assert_eq!(
+            configured_tier("bash", Some(&config)),
+            Some(LoadMode::Discoverable)
+        );
+        assert_eq!(configured_tier("subagent", Some(&config)), None);
+        assert_eq!(configured_tier("read", Some(&config)), None);
+        assert_eq!(configured_tier("subagent", None), None);
+        assert_eq!(tier_for("subagent", Some(&config)), LoadMode::Off);
     }
 
     #[test]

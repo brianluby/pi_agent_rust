@@ -2270,7 +2270,7 @@ fn build_acp_session_with_budget(
     let mut cli = options.launch.selection_cli()?;
     let enabled_tools = acp_enabled_tools(&cli, &options.config);
     let enabled_tools: Vec<&str> = enabled_tools.iter().map(String::as_str).collect();
-    let tools = if cli.no_tools {
+    let tools = if cli.builtin_tools_disabled() {
         ToolRegistry::without_builtins(Some(&options.config))
     } else {
         ToolRegistry::new(&enabled_tools, &cwd, Some(&options.config))
@@ -4470,12 +4470,13 @@ mod tests {
         let defaults = crate::xdev::default_enabled_tools().join(",");
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         let root = tempfile::tempdir().expect("ACP workspace");
-        for (args, expected) in [
-            (vec!["pi", "--acp"], true),
-            (vec!["pi", "--acp", "--tools", "read"], false),
-            (vec!["pi", "--acp", "--tools", defaults.as_str()], false),
-            (vec!["pi", "--acp", "--tools", ""], false),
-            (vec!["pi", "--acp", "--no-tools"], false),
+        for (args, expected, no_builtins) in [
+            (vec!["pi", "--acp"], true, false),
+            (vec!["pi", "--acp", "--tools", "read"], false, false),
+            (vec!["pi", "--acp", "--tools", defaults.as_str()], false, false),
+            (vec!["pi", "--acp", "--tools", ""], false, true),
+            (vec!["pi", "--acp", "--tools", " , "], false, true),
+            (vec!["pi", "--acp", "--no-tools"], false, true),
         ] {
             let cli = crate::cli::Cli::try_parse_from(args).expect("ACP launch CLI");
             let mut options = selection_options(
@@ -4505,7 +4506,7 @@ mod tests {
             for name in ["ask", "todo", "submit_plan"] {
                 assert!(!handle.has_tool(name), "ACP host-only tool {name}");
             }
-            if cli.no_tools {
+            if no_builtins {
                 assert!(handle.session().agent.shared_tools().snapshot().tools().is_empty());
             }
         }

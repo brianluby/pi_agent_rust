@@ -4210,7 +4210,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         // The default registry carries an undo recorder (bd-cv653.3.13) so
         // SDK-driven surfaces (ftui, embedders) can offer /undo //redo too.
         || {
-            if cli.no_tools {
+            if cli.builtin_tools_disabled() {
                 return ToolRegistry::without_builtins(Some(&config));
             }
             ToolRegistry::with_mutation_recorder(
@@ -7108,12 +7108,14 @@ mod tests {
             .into_iter()
             .map(str::to_string)
             .collect();
-        for (configured, selected, expected) in [
-            (true, None, true),
-            (true, Some(vec!["read".to_string()]), false),
-            (true, Some(explicit_defaults), false),
-            (true, Some(Vec::new()), false),
-            (false, Some(all_optional), true),
+        for (configured, selected, expected, no_builtins) in [
+            (true, None, true, false),
+            (true, Some(vec!["read".to_string()]), false, false),
+            (true, Some(explicit_defaults), false, false),
+            (true, Some(Vec::new()), false, true),
+            (true, Some(vec![String::new()]), false, true),
+            (true, Some(vec![" , ".to_string()]), false, true),
+            (false, Some(all_optional), true, false),
         ] {
             let tmp = tempdir().expect("tempdir");
             std::fs::create_dir_all(tmp.path().join(".pi")).expect("project settings directory");
@@ -7130,7 +7132,6 @@ mod tests {
                 .to_string(),
             )
             .expect("write optional tool settings");
-            let no_builtins = selected.as_ref().is_some_and(Vec::is_empty);
             let options = SessionOptions {
                 workspace_trusted: true,
                 enabled_tools: selected,

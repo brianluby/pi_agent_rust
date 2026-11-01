@@ -2342,9 +2342,9 @@ async fn run(
     // what this printed before — tells them something false about a tool they
     // can actually have.
     for (name, how) in pi::tools::unselectable_tool_names(&shared_enabled_tools) {
-        eprintln!("Warning: --tools: \"{name}\" is not selected with --tools; {how}");
+        eprintln!("Warning: --tools: \"{name}\": {how}");
     }
-    let shared_tools = pi::tools::SharedToolRegistry::new(if cli.no_tools {
+    let shared_tools = pi::tools::SharedToolRegistry::new(if cli.builtin_tools_disabled() {
         ToolRegistry::without_builtins(Some(&config))
     } else {
         ToolRegistry::with_mutation_recorder(
@@ -3056,11 +3056,12 @@ async fn run(
         ]);
     }
     // submit_plan shares the agent's plan-mode state (bd-cv653.3.5); it is
-    // registered when built-ins are enabled, and self-errors outside plan mode.
+    // registered only when selected, and self-errors outside plan mode.
     {
         let plan_state = agent_session.agent.plan_state();
         let auto_approve = cli.plan_yolo || config.plan_auto_approve();
-        if !cli.no_tools {
+        let submit_plan_enabled = enabled_tools.contains(&"submit_plan");
+        if submit_plan_enabled {
             agent_session
                 .agent
                 .extend_tools(vec![Box::new(pi::plan::SubmitPlanTool::new(
@@ -3068,7 +3069,7 @@ async fn run(
                     auto_approve,
                 )) as Box<dyn pi::tools::Tool>]);
         }
-        if cli.plan_mode && !cli.no_tools {
+        if cli.plan_mode && submit_plan_enabled {
             plan_state.enter_planning();
             let cx = pi::agent_cx::AgentCx::for_request();
             if let Ok(mut inner) = agent_session.session.lock(cx.cx()).await {
@@ -3078,7 +3079,7 @@ async fn run(
                 );
             }
         } else if cli.plan_mode {
-            eprintln!("Warning: --plan-mode is unavailable while --no-tools is enabled");
+            eprintln!("Warning: --plan-mode requires the submit_plan tool to be enabled");
         }
     }
     agent_session.advisor = advisor_options(&cli, &config, &model_registry, &auth)

@@ -1844,6 +1844,117 @@ mod tests {
         }
     }
 
+    #[test]
+    fn explicit_builtin_disable_policy_normalizes_empty_lists() {
+        let config = optional_tool_config(true);
+        for (args, disabled) in [
+            (vec!["pi"], false),
+            (vec!["pi", "--tools", "read, ,"], false),
+            (vec!["pi", "--tools", "unknown-tool"], false),
+            (vec!["pi", "--tools", ""], true),
+            (vec!["pi", "--tools", " ,\t,\n "], true),
+            (vec!["pi", "--tools=, ,"], true),
+            (vec!["pi", "--no-tools", "--tools", "read"], true),
+        ] {
+            let cli = Cli::parse_from(args);
+            assert_eq!(cli.builtin_tools_disabled(), disabled);
+            if disabled {
+                assert!(cli.enabled_tools(&config).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn configured_off_removes_default_tools_unless_cli_selects_them() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let config = serde_json::from_value(serde_json::json!({
+            "tools": { "loadMode": { "bash": "off" } }
+        }))
+        .expect("load mode config");
+        let cli = Cli::parse_from(["pi"]);
+        let enabled = cli.enabled_tools(&config);
+        assert!(!enabled.contains(&"bash"));
+        let registry =
+            crate::tools::ToolRegistry::new(&enabled, cwd.path(), Some(&config));
+        assert!(registry.get("bash").is_none());
+
+        let defaults = crate::xdev::default_enabled_tools().join(",");
+        for explicit in ["bash", defaults.as_str()] {
+            let cli = Cli::parse_from(["pi", "--tools", explicit]);
+            let enabled = cli.enabled_tools(&config);
+            assert!(enabled.contains(&"bash"));
+            let registry =
+                crate::tools::ToolRegistry::new(&enabled, cwd.path(), Some(&config));
+            assert!(registry.get("bash").is_some());
+            if explicit == defaults.as_str() {
+                assert_eq!(enabled, crate::xdev::default_enabled_tools());
+            }
+        }
+    }
+
+    #[test]
+    fn configured_off_optional_tools_are_unavailable_unless_cli_selects_them() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        for (setting, name) in OPTIONAL_TOOL_SETTINGS {
+            let config = serde_json::from_value(serde_json::json!({
+                "tools": { (setting): true, "loadMode": { (name): " OFF " } }
+            }))
+            .expect("optional tool off config");
+            let cli = Cli::parse_from(["pi"]);
+            let enabled = cli.enabled_tools(&config);
+            assert!(!enabled.contains(&name), "{name}");
+            let registry =
+                crate::tools::ToolRegistry::new(&enabled, cwd.path(), Some(&config));
+            assert!(registry.get(name).is_none(), "{name}");
+            assert!(!registry.tools().iter().any(|tool| tool.name() == name));
+            assert!(!registry.discoverable_index().iter().any(|(tool, _)| tool == name));
+
+            let explicit = format!("read,{name}");
+            let cli = Cli::parse_from(["pi", "--tools", explicit.as_str()]);
+            assert_eq!(cli.enabled_tools(&config), ["read", name]);
+            let registry = crate::tools::ToolRegistry::new(
+                &cli.enabled_tools(&config),
+                cwd.path(),
+                Some(&config),
+            );
+            assert!(registry.get(name).is_some(), "explicit {name}");
+        }
+    }
+
+    #[test]
+    fn absent_and_unknown_load_modes_do_not_cancel_opt_in_activation() {
+        let cli = Cli::parse_from(["pi"]);
+        let mut config = optional_tool_config(true);
+        let expected = cli.enabled_tools(&config);
+        assert!(expected.contains(&"subagent"), "default Off is not a settings veto");
+        config.tools.as_mut().expect("tool settings").load_mode = Some(
+            ["bash", "eval", "github", "security_scan", "subagent"]
+                .into_iter()
+                .map(|name| (name.to_string(), "not-a-load-mode".to_string()))
+                .collect(),
+        );
+        assert_eq!(cli.enabled_tools(&config), expected);
+    }
+
+    #[test]
+    fn implicit_off_modes_are_distinct_from_disabling_all_builtins() {
+        let cli = Cli::parse_from(["pi"]);
+        let config = crate::config::Config {
+            tools: Some(crate::config::ToolSettings {
+                load_mode: Some(
+                    crate::xdev::default_enabled_tools()
+                        .into_iter()
+                        .map(|name| (name.to_string(), "off".to_string()))
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(cli.enabled_tools(&config).is_empty());
+        assert!(!cli.builtin_tools_disabled());
+    }
+
     // ── 7. Invalid inputs ────────────────────────────────────────────
 
     #[test]
@@ -3381,14 +3492,30 @@ impl Cli {
             .collect()
     }
 
+    /// Whether the invocation explicitly disables all built-in tools.
+    ///
+    /// An explicit list containing only commas and whitespace is empty after
+    /// normalization, just like `--tools ""`. Host construction must use this
+    /// policy as well as selection so implicit built-ins cannot reappear.
+    #[must_use]
+    pub fn builtin_tools_disabled(&self) -> bool {
+        self.no_tools
+            || self
+                .tools
+                .as_deref()
+                .is_some_and(|tools| tools.split(',').all(|name| name.trim().is_empty()))
+    }
+
     /// Resolve the enabled tool names from CLI selection and effective settings.
     ///
     /// Callers must supply configuration loaded with the workspace-trust
     /// decision. An explicit `--tools` list (including an empty list or the
     /// default list) is authoritative: configured opt-ins must not expand a
-    /// restricted SDK session or native child agent's tool access.
+    /// restricted SDK session or native child agent's tool access. Without an
+    /// explicit list, configured `loadMode: "off"` entries disable both default
+    /// tools and configured opt-ins before the registry is constructed.
     pub fn enabled_tools(&self, config: &crate::config::Config) -> Vec<&str> {
-        if self.no_tools {
+        if self.builtin_tools_disabled() {
             return Vec::new();
         }
         if let Some(tools) = &self.tools {
@@ -3414,6 +3541,9 @@ impl Cli {
                 }
             }
         }
+        enabled.retain(|name| {
+            crate::xdev::configured_tier(name, Some(config)) != Some(crate::xdev::LoadMode::Off)
+        });
         enabled
     }
 }

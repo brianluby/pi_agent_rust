@@ -6755,6 +6755,10 @@ impl Agent {
         tool_call: &ToolCall,
         on_event: AgentEventHandler,
     ) -> Option<ToolOutput> {
+        // The dispatcher must itself be mounted. Keep the same snapshot for
+        // its target so a disabled xdev cannot execute or promote other tools.
+        let registry = self.tools.snapshot();
+        registry.get("xdev")?;
         let args = &tool_call.arguments;
         let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
         match action {
@@ -6763,7 +6767,6 @@ impl Agent {
                 if name.is_empty() {
                     return Some(Self::xdev_text_output("xdev run requires a `name`", true));
                 }
-                let registry = self.tools.snapshot();
                 if !registry.is_discoverable(name) {
                     return Some(Self::xdev_text_output(
                         &if registry.get(name).is_some() {
@@ -6821,7 +6824,6 @@ impl Agent {
                         true,
                     ));
                 }
-                let registry = self.tools.snapshot();
                 if !registry.is_discoverable(name) {
                     return Some(Self::xdev_text_output(
                         &if registry.get(name).is_some() {

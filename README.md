@@ -421,7 +421,7 @@ remains reachable. The tier table and default enabled list live in
   `local` or `cass` (local memory plus read-only project history)
 - **Default-enabled**: `jobs` (background bash job control) and `hub` (PTY
   service supervision), alongside the essential tier. The default `--tools`
-  list names 19 tools; the registry always adds `manage_skill` and, when any
+  list names 19 tools; the registry adds `manage_skill` by default and, when any
   discoverable tool is enabled, the `xdev` dispatcher
 - **Settings or `--tools` opt-in extras**: `eval` (`tools.enableEval`),
   `github` (`tools.enableGithub`), `security_scan`
@@ -552,15 +552,21 @@ To enable optional tools across launches, add their flags to the existing
 Each flag defaults to `false` and also accepts snake_case (`enable_eval`,
 `enable_github`, `enable_security_scan`, `enable_subagent`). With no `--tools`
 argument, enabled extras join the existing defaults. An explicit `--tools`
-list overrides these flags for that run, even if empty or equal to the default
-list; `--no-tools` disables all built-ins. Trusted project flags override global
-flags individually, including `false`; untrusted project settings are excluded.
+list overrides these flags for that run, even if it equals the default list.
+`--no-tools` and an empty, whitespace-only, or comma-only `--tools` value disable
+all built-ins, including settings-gated extras. Extensions and MCP servers retain
+their own loading controls. Trusted project flags override global flags
+individually, including `false`; untrusted project settings are excluded.
 Existing approval policies and native child-agent allowlists still apply.
 See [Optional-tool settings](docs/settings.md#optional-tools).
 
 Per-tool exposure is configurable via `tools.loadMode.<name>` set to
-`essential`, `discoverable`, or `off`. Load modes do not activate an optional
-tool by themselves. An explicit `--tools` selection remains available:
+`essential`, `discoverable`, or `off`. A configured `off` entry excludes a tool
+from implicit selection, including tools automatically added by settings and
+`manage_skill`. An explicit `--tools` name overrides that exclusion without
+enabling a separate backend such as the memory bank. The generated `xdev`
+dispatcher remains disabled by `tools.loadMode.xdev: "off"`. Load modes do not
+activate an optional tool by themselves. An explicit tool selection remains available:
 
 ```bash
 pi --tools read,bash,edit,write,grep,find,ls,hashline_edit,subagent \
@@ -1236,7 +1242,7 @@ Interactive file references:
 | `--provider <NAME>` | Force provider for this run (aliases supported) |
 | `--model <MODEL>` | Model to use (auto-select fallback: `anthropic/claude-sonnet-4-6`, then `anthropic/claude-opus-4-7`, then `openai/gpt-5.1-codex`) |
 | `--thinking <LEVEL>` | Thinking level: off/minimal/low/medium/high/xhigh/max |
-| `--tools <TOOLS>` | Comma-separated tool list; overrides optional-tool activation settings for this run |
+| `--tools <TOOLS>` | Comma-separated tool list; overrides optional-tool activation settings for this run. An empty list disables all built-ins |
 | `--no-tools` | Disable built-in tools, including tools enabled in settings |
 | `--api-key <KEY>` | API key (or use provider-specific env vars such as `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) |
 | `--extension-policy safe|balanced|permissive` | Extension capability profile |
