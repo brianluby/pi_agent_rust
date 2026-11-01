@@ -239,7 +239,7 @@ fn build_vcr_system_prompt_for_args(
     let mut args: Vec<&str> = vec!["pi"];
     args.extend(args_fn());
     let cli = cli::Cli::try_parse_from(args).expect("parse vcr cli args");
-    let enabled_tools = cli.enabled_tools();
+    let enabled_tools = cli.enabled_tools(&pi::config::Config::default());
     let global_dir = env_root.join("agent");
     let package_dir = env_root.join("packages");
     build_system_prompt(
@@ -271,8 +271,8 @@ fn vcr_anthropic_tool_schemas(cwd: &Path) -> Vec<Value> {
     let mut args: Vec<&str> = vec!["pi"];
     args.extend(vcr_interactive_args());
     let cli = cli::Cli::try_parse_from(args).expect("parse vcr cli args");
-    let enabled = cli.enabled_tools();
     let config = pi::config::Config::default();
+    let enabled = cli.enabled_tools(&config);
     let registry = pi::tools::ToolRegistry::new(&enabled, cwd, Some(&config));
     let mut schemas: Vec<Value> = registry
         .tools()

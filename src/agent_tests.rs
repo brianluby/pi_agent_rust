@@ -8253,6 +8253,7 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
             let config = crate::config::Config {
                 tools: Some(crate::config::ToolSettings {
                     load_mode: Some(HashMap::from([("eval".to_string(), "discoverable".to_string())])),
+                    ..Default::default()
                 }),
                 ..crate::config::Config::default()
             };

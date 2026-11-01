@@ -91,7 +91,35 @@ fn empty_definition_argv_is_accepted_by_the_real_cli_without_builtin_tools() {
     args.extend(child_args(&agent, "inspect", None, None, None, None));
     let cli = crate::cli::Cli::try_parse_from(args).unwrap();
     assert!(cli.no_tools);
-    assert!(cli.enabled_tools().is_empty());
+    assert!(cli.enabled_tools(&crate::config::Config::default()).is_empty());
+}
+
+#[test]
+#[cfg(feature = "tui")]
+fn persistent_optional_tools_cannot_expand_child_tool_permissions() {
+    use clap::Parser as _;
+
+    let config: crate::config::Config = serde_json::from_value(json!({
+        "tools": {
+            "enableEval": true,
+            "enableGithub": true,
+            "enableSecurityScan": true,
+            "enableSubagent": true
+        }
+    }))
+    .expect("optional tool settings");
+    for extra in ["", "tools: read, grep", "tools: []"] {
+        let agent = definition(extra).expect("child agent definition");
+        let mut args = vec![std::ffi::OsString::from("pi")];
+        args.extend(child_args(&agent, "inspect", None, None, None, None));
+        let cli = crate::cli::Cli::try_parse_from(args).expect("child CLI");
+        assert!(cli.tools.is_some(), "child selection is always explicit");
+        let enabled = cli.enabled_tools(&config);
+        assert_eq!(enabled, cli.enabled_tools(&crate::config::Config::default()));
+        for name in ["eval", "github", "security_scan", "subagent"] {
+            assert!(!enabled.contains(&name), "{extra:?} gained {name}");
+        }
+    }
 }
 
 #[test]

@@ -566,15 +566,12 @@ pub struct Cli {
     #[arg(long)]
     pub no_tools: bool,
 
-    /// Specific tools to enable (comma-separated). Default: the essential
-    /// set plus discoverable tools behind the xdev dispatcher (bd-cv653.1.6);
-    /// `subagent` stays opt-in only.
-    #[arg(
-        long,
-        value_name = "TOOLS",
-        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit,web_search,ast_grep,ast_edit,lsp,debug,ask,todo,submit_plan,jobs,hub,current_time"
-    )]
-    pub tools: String,
+    /// Specific tools to enable (comma-separated), overriding optional-tool
+    /// activation in settings. When omitted, use the default tool set plus
+    /// configured opt-ins (`tools.enableEval`, `enableGithub`,
+    /// `enableSecurityScan`, `enableSubagent`).
+    #[arg(long, value_name = "TOOLS")]
+    pub tools: Option<String>,
 
     // === Extensions ===
     /// Load extension file (can use multiple times)
@@ -1626,7 +1623,7 @@ mod tests {
     fn default_tools() {
         let cli = Cli::parse_from(["pi"]);
         assert_eq!(
-            cli.enabled_tools(),
+            cli.enabled_tools(&crate::config::Config::default()),
             vec![
                 "read",
                 "bash",
@@ -1654,25 +1651,197 @@ mod tests {
     #[test]
     fn custom_tools_list() {
         let cli = Cli::parse_from(["pi", "--tools", "read,grep,find,ls"]);
-        assert_eq!(cli.enabled_tools(), vec!["read", "grep", "find", "ls"]);
+        assert_eq!(
+            cli.enabled_tools(&crate::config::Config::default()),
+            vec!["read", "grep", "find", "ls"]
+        );
     }
 
     #[test]
     fn no_tools_flag_returns_empty() {
         let cli = Cli::parse_from(["pi", "--no-tools"]);
-        assert!(cli.enabled_tools().is_empty());
+        assert!(
+            cli.enabled_tools(&crate::config::Config::default())
+                .is_empty()
+        );
     }
 
     #[test]
     fn tools_with_spaces_trimmed() {
         let cli = Cli::parse_from(["pi", "--tools", "read, bash, edit"]);
-        assert_eq!(cli.enabled_tools(), vec!["read", "bash", "edit"]);
+        assert_eq!(
+            cli.enabled_tools(&crate::config::Config::default()),
+            vec!["read", "bash", "edit"]
+        );
     }
 
     #[test]
     fn tools_ignore_empty_entries_and_duplicates() {
         let cli = Cli::parse_from(["pi", "--tools", "read,, bash,read, ,grep,bash"]);
-        assert_eq!(cli.enabled_tools(), vec!["read", "bash", "grep"]);
+        assert_eq!(
+            cli.enabled_tools(&crate::config::Config::default()),
+            vec!["read", "bash", "grep"]
+        );
+    }
+
+    const OPTIONAL_TOOL_SETTINGS: [(&str, &str); 4] = [
+        ("enableEval", "eval"),
+        ("enableGithub", "github"),
+        ("enableSecurityScan", "security_scan"),
+        ("enableSubagent", "subagent"),
+    ];
+
+    fn optional_tool_config(enabled: bool) -> crate::config::Config {
+        crate::config::Config {
+            tools: Some(crate::config::ToolSettings {
+                enable_eval: Some(enabled),
+                enable_github: Some(enabled),
+                enable_security_scan: Some(enabled),
+                enable_subagent: Some(enabled),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn optional_tools_remain_disabled_unless_configured() {
+        let cli = Cli::parse_from(["pi"]);
+        for config in [crate::config::Config::default(), optional_tool_config(false)] {
+            assert_eq!(
+                cli.enabled_tools(&config),
+                crate::xdev::default_enabled_tools()
+            );
+        }
+    }
+
+    #[test]
+    fn each_optional_tool_can_be_enabled_independently() {
+        let cli = Cli::parse_from(["pi"]);
+        for (setting, name) in OPTIONAL_TOOL_SETTINGS {
+            let config = serde_json::from_value(serde_json::json!({
+                "tools": { (setting): true }
+            }))
+            .expect("optional tool config");
+            let mut expected = crate::xdev::default_enabled_tools();
+            expected.push(name);
+            assert_eq!(cli.enabled_tools(&config), expected, "{setting}");
+        }
+    }
+
+    #[test]
+    fn explicit_tools_override_configured_opt_ins_even_when_equal_to_defaults() {
+        let config = optional_tool_config(true);
+        let defaults = crate::xdev::default_enabled_tools().join(",");
+        let cli = Cli::parse_from(["pi", "--tools", defaults.as_str()]);
+        assert!(cli.tools.is_some());
+        assert_eq!(
+            cli.enabled_tools(&config),
+            crate::xdev::default_enabled_tools()
+        );
+
+        for args in [
+            vec!["pi", "--tools", "read"],
+            vec!["pi", "--tools=read"],
+        ] {
+            let cli = Cli::parse_from(args);
+            assert_eq!(cli.enabled_tools(&config), ["read"]);
+        }
+    }
+
+    #[test]
+    fn explicit_optional_tools_override_disabled_settings_and_are_deduplicated() {
+        let config = optional_tool_config(false);
+        let cli = Cli::parse_from([
+            "pi",
+            "--tools",
+            "eval, github,security_scan,subagent,eval, ,github",
+        ]);
+        assert_eq!(
+            cli.enabled_tools(&config),
+            ["eval", "github", "security_scan", "subagent"]
+        );
+    }
+
+    #[test]
+    fn empty_and_disabled_cli_selections_suppress_configured_opt_ins() {
+        let config = optional_tool_config(true);
+        for args in [
+            vec!["pi", "--tools", ""],
+            vec!["pi", "--tools=,"],
+            vec!["pi", "--no-tools"],
+            vec!["pi", "--no-tools", "--tools", "eval,github,security_scan,subagent"],
+        ] {
+            let cli = Cli::parse_from(args);
+            assert!(cli.enabled_tools(&config).is_empty());
+        }
+    }
+
+    #[test]
+    fn extension_flag_preprocessing_preserves_explicit_tool_selection() {
+        let config = optional_tool_config(true);
+        let defaults = crate::xdev::default_enabled_tools().join(",");
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--custom-extension-flag".to_string(),
+            format!("--tools={defaults}"),
+        ])
+        .expect("parse explicit selection with extension flag");
+        assert_eq!(parsed.extension_flags.len(), 1);
+        assert_eq!(
+            parsed.cli.enabled_tools(&config),
+            crate::xdev::default_enabled_tools()
+        );
+    }
+
+    #[test]
+    fn configured_optional_tools_reach_the_existing_registry_once() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let config = optional_tool_config(true);
+        let cli = Cli::parse_from(["pi"]);
+        let registry =
+            crate::tools::ToolRegistry::new(&cli.enabled_tools(&config), cwd.path(), Some(&config));
+
+        for (_, name) in OPTIONAL_TOOL_SETTINGS {
+            assert!(registry.get(name).is_some(), "{name} must be registered");
+            assert_eq!(
+                registry.tools().iter().filter(|tool| tool.name() == name).count(),
+                1,
+                "{name} must be registered once"
+            );
+        }
+        for name in ["eval", "github", "security_scan"] {
+            assert!(registry.is_discoverable(name), "{name}");
+        }
+
+        // The registry must not independently add configured tools to an
+        // explicit restricted selection (SDKs and native children use this).
+        let cli = Cli::parse_from(["pi", "--tools", "read"]);
+        let registry =
+            crate::tools::ToolRegistry::new(&cli.enabled_tools(&config), cwd.path(), Some(&config));
+        for (_, name) in OPTIONAL_TOOL_SETTINGS {
+            assert!(registry.get(name).is_none(), "{name} must remain excluded");
+        }
+    }
+
+    #[test]
+    fn load_modes_do_not_grant_optional_tool_activation() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let cli = Cli::parse_from(["pi"]);
+        for (setting, name) in OPTIONAL_TOOL_SETTINGS {
+            for tools in [
+                serde_json::json!({ "loadMode": { (name): "essential" } }),
+                serde_json::json!({ (setting): false, "loadMode": { (name): "essential" } }),
+            ] {
+                let config = serde_json::from_value(serde_json::json!({ "tools": tools }))
+                    .expect("load mode config");
+                let enabled = cli.enabled_tools(&config);
+                assert!(!enabled.contains(&name), "{setting}");
+                let registry =
+                    crate::tools::ToolRegistry::new(&enabled, cwd.path(), Some(&config));
+                assert!(registry.get(name).is_none(), "{name}");
+            }
+        }
     }
 
     // ── 7. Invalid inputs ────────────────────────────────────────────
@@ -2102,7 +2271,11 @@ mod tests {
         assert!(cli.args.is_empty());
         // The bare-invocation default must stay in lockstep with the
         // canonical default-enabled tool list.
-        assert_eq!(cli.tools, crate::xdev::default_enabled_tools().join(","));
+        assert!(cli.tools.is_none());
+        assert_eq!(
+            cli.enabled_tools(&crate::config::Config::default()),
+            crate::xdev::default_enabled_tools()
+        );
     }
 
     // ── 11. Combined flags ───────────────────────────────────────────
@@ -2249,7 +2422,7 @@ mod tests {
         assert!(cli.print);
         assert!(cli.verbose);
         assert!(cli.no_tools);
-        assert_eq!(cli.tools, "read,bash");
+        assert_eq!(cli.tools.as_deref(), Some("read,bash"));
         assert_eq!(cli.thinking.as_deref(), Some("high"));
         assert_eq!(cli.extension, vec!["ext.js"]);
         assert!(cli.no_extensions);
@@ -3208,18 +3381,39 @@ impl Cli {
             .collect()
     }
 
-    /// Get enabled tools as a list
-    pub fn enabled_tools(&self) -> Vec<&str> {
+    /// Resolve the enabled tool names from CLI selection and effective settings.
+    ///
+    /// Callers must supply configuration loaded with the workspace-trust
+    /// decision. An explicit `--tools` list (including an empty list or the
+    /// default list) is authoritative: configured opt-ins must not expand a
+    /// restricted SDK session or native child agent's tool access.
+    pub fn enabled_tools(&self, config: &crate::config::Config) -> Vec<&str> {
         if self.no_tools {
-            vec![]
-        } else {
+            return Vec::new();
+        }
+        if let Some(tools) = &self.tools {
             let mut seen = HashSet::new();
-            self.tools
+            return tools
                 .split(',')
                 .map(str::trim)
                 .filter(|name| !name.is_empty())
                 .filter(|name| seen.insert(*name))
-                .collect()
+                .collect();
         }
+
+        let mut enabled = crate::xdev::default_enabled_tools();
+        if let Some(settings) = &config.tools {
+            for (name, opt_in) in [
+                ("eval", settings.enable_eval),
+                ("github", settings.enable_github),
+                ("security_scan", settings.enable_security_scan),
+                ("subagent", settings.enable_subagent),
+            ] {
+                if opt_in == Some(true) && !enabled.contains(&name) {
+                    enabled.push(name);
+                }
+            }
+        }
+        enabled
     }
 }

@@ -88,7 +88,7 @@ pub struct Config {
     /// path prefix wins.
     #[serde(alias = "modelScopeOverrides")]
     pub model_scope_overrides: Option<Vec<ModelScopeOverride>>,
-    /// Tool load modes (`tools.loadMode`, bd-cv653.1.6).
+    /// Optional-tool activation and load modes (`tools.loadMode`).
     pub tools: Option<ToolSettings>,
     /// Plan-mode settings (bd-cv653.3.5).
     pub plan: Option<PlanSettings>,
@@ -544,14 +544,30 @@ pub struct ModelScopeOverride {
     pub disabled_providers: Option<Vec<String>>,
 }
 
-/// Tool load-mode configuration (bd-cv653.1.6).
+/// Optional-tool activation and load-mode configuration.
 ///
+/// The `enable*` settings opt in to additional tools when no explicit
+/// `--tools` list was supplied. Unset flags inherit lower-priority settings
+/// and otherwise default to false; `--no-tools` disables all built-ins.
 /// `loadMode` maps a tool name to `essential` (always in the provider
-/// schema), `discoverable` (behind the xdev dispatcher), or `off`. The
-/// `--tools` CLI flag wins over every entry here.
+/// schema), `discoverable` (behind the xdev dispatcher), or `off` and does
+/// not activate an optional tool by itself.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolSettings {
+    /// Enable persistent evaluation sessions. Default: false.
+    #[serde(alias = "enableEval")]
+    pub enable_eval: Option<bool>,
+    /// Enable GitHub operations through the configured `gh` executable.
+    /// Default: false.
+    #[serde(alias = "enableGithub")]
+    pub enable_github: Option<bool>,
+    /// Enable the security scanner. Default: false.
+    #[serde(alias = "enableSecurityScan")]
+    pub enable_security_scan: Option<bool>,
+    /// Enable native child-agent delegation. Default: false.
+    #[serde(alias = "enableSubagent")]
+    pub enable_subagent: Option<bool>,
     #[serde(alias = "loadMode")]
     pub load_mode: Option<std::collections::HashMap<String, String>>,
 }
@@ -2433,7 +2449,7 @@ fn merge_plan(base: Option<PlanSettings>, other: Option<PlanSettings>) -> Option
     }
 }
 
-/// Merge tool settings (other wins per tool-mode entry).
+/// Merge tool settings (other wins per activation flag and tool-mode entry).
 fn merge_tools(base: Option<ToolSettings>, other: Option<ToolSettings>) -> Option<ToolSettings> {
     match (base, other) {
         (Some(base), Some(other)) => {
@@ -2442,6 +2458,10 @@ fn merge_tools(base: Option<ToolSettings>, other: Option<ToolSettings>) -> Optio
                 modes.extend(other_modes);
             }
             Some(ToolSettings {
+                enable_eval: other.enable_eval.or(base.enable_eval),
+                enable_github: other.enable_github.or(base.enable_github),
+                enable_security_scan: other.enable_security_scan.or(base.enable_security_scan),
+                enable_subagent: other.enable_subagent.or(base.enable_subagent),
                 load_mode: if modes.is_empty() { None } else { Some(modes) },
             })
         }
@@ -2710,6 +2730,7 @@ mod tests {
         package_dir_from_env, sessions_dir_from_env, unrecognised_setting_keys,
     };
     use crate::agent::QueueMode;
+    use clap::Parser;
     use proptest::prelude::*;
     use proptest::string::string_regex;
     use serde_json::{Value, json};
@@ -3190,6 +3211,233 @@ mod tests {
             std::fs::create_dir_all(parent).expect("create parent dir");
         }
         std::fs::write(path, contents).expect("write file");
+    }
+
+    const OPTIONAL_TOOL_SETTINGS: [(&str, &str, &str); 4] = [
+        ("eval", "enableEval", "enable_eval"),
+        ("github", "enableGithub", "enable_github"),
+        ("security_scan", "enableSecurityScan", "enable_security_scan"),
+        ("subagent", "enableSubagent", "enable_subagent"),
+    ];
+
+    fn assert_optional_tool_selection(config: &Config, expected: &[&str]) {
+        let cli = crate::cli::Cli::try_parse_from(["pi"]).expect("default CLI");
+        let enabled = cli.enabled_tools(config);
+        for (name, _, _) in OPTIONAL_TOOL_SETTINGS {
+            assert_eq!(
+                enabled.contains(&name),
+                expected.contains(&name),
+                "optional tool {name} in {enabled:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_tool_defaults_and_global_setting_aliases() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let path = global_dir.join("settings.json");
+
+        let missing =
+            Config::load_with_roots(None, &global_dir, &cwd).expect("missing settings");
+        assert_optional_tool_selection(&missing, &[]);
+        for content in [
+            r#"{}"#,
+            r#"{"tools":{}}"#,
+            r#"{"tools":{"loadMode":{"eval":"essential","github":"essential","security_scan":"essential","subagent":"essential"}}}"#,
+        ] {
+            write_file(&path, content);
+            let config =
+                Config::load_with_roots(None, &global_dir, &cwd).expect("load defaults");
+            assert_optional_tool_selection(&config, &[]);
+        }
+
+        for (name, camel, snake) in OPTIONAL_TOOL_SETTINGS {
+            for key in [camel, snake] {
+                for value in [json!(true), json!(false), Value::Null] {
+                    let expected = if value == json!(true) {
+                        vec![name]
+                    } else {
+                        vec![]
+                    };
+                    let content = json!({"tools":{(key):value}}).to_string();
+                    assert!(unrecognised_setting_keys(&content).is_empty());
+                    write_file(&path, &content);
+                    let config = Config::load_with_roots(None, &global_dir, &cwd)
+                        .expect("load optional-tool setting");
+                    assert_optional_tool_selection(&config, &expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optional_tool_project_flags_merge_independently_and_honor_trust() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let global_path = global_dir.join("settings.json");
+        let project_path = cwd.join(".pi/settings.json");
+        let names: Vec<&str> = OPTIONAL_TOOL_SETTINGS
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect();
+
+        for global_enabled in [true, false] {
+            write_file(
+                &global_path,
+                &json!({"tools":{
+                    "enableEval":global_enabled,
+                    "enableGithub":global_enabled,
+                    "enableSecurityScan":global_enabled,
+                    "enableSubagent":global_enabled,
+                    "loadMode":{"read":"essential","ast_grep":"discoverable"}
+                }})
+                .to_string(),
+            );
+            for (name, key, _) in OPTIONAL_TOOL_SETTINGS {
+                write_file(
+                    &project_path,
+                    &json!({"tools":{
+                        (key):!global_enabled,
+                        "loadMode":{"ast_grep":"essential"}
+                    }})
+                    .to_string(),
+                );
+                let trusted = Config::load_with_roots_and_project_trust(
+                    None,
+                    &global_dir,
+                    &cwd,
+                    true,
+                )
+                .expect("trusted project settings");
+                let expected: Vec<&str> = names
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        if global_enabled {
+                            *candidate != name
+                        } else {
+                            *candidate == name
+                        }
+                    })
+                    .collect();
+                assert_optional_tool_selection(&trusted, &expected);
+                let modes = trusted
+                    .tools
+                    .as_ref()
+                    .and_then(|tools| tools.load_mode.as_ref())
+                    .expect("merged tool modes");
+                assert_eq!(modes.get("read").map(String::as_str), Some("essential"));
+                assert_eq!(modes.get("ast_grep").map(String::as_str), Some("essential"));
+
+                let untrusted = Config::load_with_roots_and_project_trust(
+                    None,
+                    &global_dir,
+                    &cwd,
+                    false,
+                )
+                .expect("global settings only");
+                assert_optional_tool_selection(
+                    &untrusted,
+                    if global_enabled { &names } else { &[] },
+                );
+            }
+            for content in [
+                r#"{"tools":{}}"#,
+                r#"{"tools":{"enableEval":null,"enableGithub":null,"enableSecurityScan":null,"enableSubagent":null}}"#,
+            ] {
+                write_file(&project_path, content);
+                let inherited = Config::load_with_roots(None, &global_dir, &cwd)
+                    .expect("inherit unset project flags");
+                assert_optional_tool_selection(
+                    &inherited,
+                    if global_enabled { &names } else { &[] },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn optional_tool_invalid_types_fail_only_for_loaded_settings_files() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let global_path = global_dir.join("settings.json");
+        let project_path = cwd.join(".pi/settings.json");
+
+        for (_, camel, snake) in OPTIONAL_TOOL_SETTINGS {
+            for key in [camel, snake] {
+                for value in [json!("true"), json!(1), json!([]), json!({})] {
+                    let content = json!({"tools":{(key):value}}).to_string();
+                    write_file(&global_path, &content);
+                    let error = Config::load_with_roots_and_project_trust(
+                        None,
+                        &global_dir,
+                        &cwd,
+                        false,
+                    )
+                    .expect_err("invalid global setting must fail");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(global_path.to_str().expect("UTF-8 path"))
+                    );
+
+                    write_file(&global_path, "{}");
+                    write_file(&project_path, &content);
+                    let error = Config::load_with_roots_and_project_trust(
+                        None,
+                        &global_dir,
+                        &cwd,
+                        true,
+                    )
+                    .expect_err("invalid trusted project setting must fail");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(project_path.to_str().expect("UTF-8 path"))
+                    );
+                    let ignored = Config::load_with_roots_and_project_trust(
+                        None,
+                        &global_dir,
+                        &cwd,
+                        false,
+                    )
+                    .expect("untrusted project settings must not be parsed");
+                    assert_optional_tool_selection(&ignored, &[]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optional_tool_explicit_config_override_replaces_both_settings_scopes() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let all_enabled = r#"{"tools":{"enableEval":true,"enableGithub":true,"enableSecurityScan":true,"enableSubagent":true}}"#;
+        write_file(&global_dir.join("settings.json"), all_enabled);
+        write_file(&cwd.join(".pi/settings.json"), all_enabled);
+        let override_path = std::path::Path::new("custom-settings.json");
+
+        for (name, key, _) in OPTIONAL_TOOL_SETTINGS {
+            write_file(
+                &cwd.join(override_path),
+                &json!({"tools":{(key):true}}).to_string(),
+            );
+            for trusted in [true, false] {
+                let config = Config::load_with_roots_and_project_trust(
+                    Some(override_path),
+                    &global_dir,
+                    &cwd,
+                    trusted,
+                )
+                .expect("explicit configuration override");
+                assert_optional_tool_selection(&config, &[name]);
+            }
+        }
     }
 
     #[test]

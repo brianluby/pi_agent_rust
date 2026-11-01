@@ -539,6 +539,7 @@ pub fn establish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     fn write(path: &Path, content: &str) {
         if let Some(parent) = path.parent() {
@@ -1004,6 +1005,122 @@ mod tests {
         .expect("establish");
         assert!(!state.trusted, "digest change must invalidate stored trust");
         assert_eq!(state.source, TrustSource::Prompt);
+    }
+
+    #[test]
+    fn optional_tool_activation_changes_require_fresh_workspace_trust() {
+        let cli = crate::cli::Cli::try_parse_from(["pi"]).expect("default CLI");
+        for (name, setting) in [
+            ("eval", "enableEval"),
+            ("github", "enableGithub"),
+            ("security_scan", "enableSecurityScan"),
+            ("subagent", "enableSubagent"),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cwd = dir.path().join("workspace");
+            let global_dir = dir.path().join("global");
+            let store_path = dir.path().join("trust.json");
+            let settings_path = cwd.join(".pi/settings.json");
+            write(
+                &settings_path,
+                &serde_json::json!({"tools":{(setting):false}}).to_string(),
+            );
+            let original = establish(
+                &cwd,
+                &store_path,
+                &TrustInputs {
+                    cli_trust: true,
+                    ..inputs()
+                },
+                no_prompt,
+            )
+            .expect("trust original settings");
+            assert!(original.trusted);
+            let remembered = establish(&cwd, &store_path, &inputs(), no_prompt)
+                .expect("unchanged settings retain trust");
+            assert!(remembered.trusted);
+            assert_eq!(remembered.source, TrustSource::Store);
+
+            write(
+                &settings_path,
+                &serde_json::json!({"tools":{(setting):true}}).to_string(),
+            );
+            let changed = establish(&cwd, &store_path, &inputs(), no_prompt)
+                .expect("changed settings must fail closed noninteractively");
+            assert!(!changed.trusted, "enabling {name} must invalidate trust");
+            assert_eq!(changed.source, TrustSource::NonInteractive);
+            assert_ne!(
+                original.surface.as_ref().expect("original surface").digest,
+                changed.surface.as_ref().expect("changed surface").digest
+            );
+            let ignored = Config::load_with_roots_and_project_trust(
+                None,
+                &global_dir,
+                &cwd,
+                changed.trusted,
+            )
+            .expect("load without untrusted project settings");
+            assert!(!cli.enabled_tools(&ignored).contains(&name));
+
+            let approved = establish(
+                &cwd,
+                &store_path,
+                &TrustInputs {
+                    interactive: true,
+                    ..inputs()
+                },
+                |_| Ok(true),
+            )
+            .expect("approve changed settings");
+            assert!(approved.trusted);
+            assert_eq!(approved.source, TrustSource::Prompt);
+            let accepted = Config::load_with_roots_and_project_trust(
+                None,
+                &global_dir,
+                &cwd,
+                approved.trusted,
+            )
+            .expect("load newly trusted project settings");
+            assert!(cli.enabled_tools(&accepted).contains(&name));
+        }
+    }
+
+    #[test]
+    fn optional_tool_settings_cannot_grant_their_own_workspace_trust() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().join("workspace");
+        let global_dir = dir.path().join("global");
+        let store_path = dir.path().join("trust.json");
+        write(
+            &cwd.join(".pi/settings.json"),
+            r#"{"trustAllWorkspaces":true,"tools":{"enableEval":true,"enableGithub":true,"enableSecurityScan":true,"enableSubagent":true}}"#,
+        );
+        // Startup reads trustAllWorkspaces from operator-controlled settings
+        // before allowing any project settings into the effective config.
+        let global =
+            Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, false)
+                .expect("load operator-controlled settings");
+        let state = establish(
+            &cwd,
+            &store_path,
+            &TrustInputs {
+                trust_all_workspaces: global.trust_all_workspaces.unwrap_or(false),
+                ..inputs()
+            },
+            no_prompt,
+        )
+        .expect("establish trust");
+        assert!(!state.trusted);
+        assert_eq!(state.source, TrustSource::NonInteractive);
+        assert!(!store_path.exists());
+        let config =
+            Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, state.trusted)
+                .expect("load untrusted workspace config");
+        let cli = crate::cli::Cli::try_parse_from(["pi"]).expect("default CLI");
+        let enabled = cli.enabled_tools(&config);
+        for name in ["eval", "github", "security_scan", "subagent"] {
+            assert!(!enabled.contains(&name), "project must not grant {name}");
+        }
     }
 
     #[test]

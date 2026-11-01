@@ -372,8 +372,9 @@ pub struct SessionOptions {
     pub prewalk: Option<crate::prewalk::PrewalkTarget>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
-    /// Built-in selection. `None` keeps CLI defaults; an empty vector disables
-    /// all built-ins, including implicit configuration-driven tools.
+    /// Built-in selection. `None` uses defaults plus optional tools enabled by
+    /// trusted settings. A nonempty vector overrides that selection; an empty
+    /// vector disables all built-ins, including configuration-driven tools.
     ///
     /// Explicit extensions and MCP tools remain available. A custom
     /// [`ToolFactory`] controls its own registry; [`default_tool_registry`]
@@ -664,8 +665,9 @@ impl Default for SessionOptions {
 pub trait ToolFactory: Send + Sync {
     /// Build the registry for a new session.
     ///
-    /// - `enabled` is the resolved tool-name allowlist after
-    ///   [`SessionOptions::enabled_tools`] and CLI defaults are merged.
+    /// - `enabled` is the resolved tool-name allowlist: an explicit
+    ///   [`SessionOptions::enabled_tools`] list, or defaults plus trusted
+    ///   optional-tool settings when no list was supplied.
     /// - `cwd` is the working directory the session opened in.
     /// - `config` is pi's loaded [`Config`], passed through so custom
     ///   tools can read settings such as `block_images` without
@@ -3973,7 +3975,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             cli.no_tools = true;
         } else {
             cli.no_tools = false;
-            cli.tools = enabled_tools.join(",");
+            cli.tools = Some(enabled_tools.join(","));
         }
     }
 
@@ -4116,7 +4118,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     }
 
     let enabled_tools_owned = cli
-        .enabled_tools()
+        .enabled_tools(&config)
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
@@ -7050,12 +7052,30 @@ mod tests {
         std::fs::create_dir_all(&global_dir).expect("create global config dir");
         std::fs::write(
             global_dir.join("settings.json"),
-            r#"{"defaultThinkingLevel":"low"}"#,
+            serde_json::json!({
+                "defaultThinkingLevel": "low",
+                "tools": {
+                    "enableEval": false,
+                    "enableGithub": false,
+                    "enableSecurityScan": false,
+                    "enableSubagent": false
+                }
+            })
+            .to_string(),
         )
         .expect("write global settings");
         std::fs::write(
             cwd.join(".pi/settings.json"),
-            r#"{"defaultThinkingLevel":"high"}"#,
+            serde_json::json!({
+                "defaultThinkingLevel": "high",
+                "tools": {
+                    "enableEval": true,
+                    "enableGithub": true,
+                    "enableSecurityScan": true,
+                    "enableSubagent": true
+                }
+            })
+            .to_string(),
         )
         .expect("write project settings");
 
@@ -7066,6 +7086,67 @@ mod tests {
         let trusted =
             load_session_config(&cwd, &global_dir, None, true).expect("load trusted config");
         assert_eq!(trusted.default_thinking_level.as_deref(), Some("high"));
+        let cli = Cli::try_parse_from(["pi"]).expect("default CLI");
+        let untrusted_registry = default_tool_registry(
+            &cli.enabled_tools(&untrusted),
+            &cwd,
+            &untrusted,
+        );
+        let trusted_registry =
+            default_tool_registry(&cli.enabled_tools(&trusted), &cwd, &trusted);
+        for name in ["eval", "github", "security_scan", "subagent"] {
+            assert!(untrusted_registry.get(name).is_none(), "untrusted {name}");
+            assert!(trusted_registry.get(name).is_some(), "trusted {name}");
+        }
+    }
+
+    #[test]
+    fn sdk_sessions_resolve_optional_tools_before_building_the_registry() {
+        const OPTIONAL: [&str; 4] = ["eval", "github", "security_scan", "subagent"];
+        let all_optional = OPTIONAL.iter().map(|name| (*name).to_string()).collect();
+        let explicit_defaults = crate::xdev::default_enabled_tools()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for (configured, selected, expected) in [
+            (true, None, true),
+            (true, Some(vec!["read".to_string()]), false),
+            (true, Some(explicit_defaults), false),
+            (true, Some(Vec::new()), false),
+            (false, Some(all_optional), true),
+        ] {
+            let tmp = tempdir().expect("tempdir");
+            std::fs::create_dir_all(tmp.path().join(".pi")).expect("project settings directory");
+            std::fs::write(
+                tmp.path().join(".pi/settings.json"),
+                serde_json::json!({
+                    "tools": {
+                        "enableEval": configured,
+                        "enableGithub": configured,
+                        "enableSecurityScan": configured,
+                        "enableSubagent": configured
+                    }
+                })
+                .to_string(),
+            )
+            .expect("write optional tool settings");
+            let no_builtins = selected.as_ref().is_some_and(Vec::is_empty);
+            let options = SessionOptions {
+                workspace_trusted: true,
+                enabled_tools: selected,
+                no_context_files: true,
+                ..hermetic_session_options(tmp.path())
+            };
+            let handle = run_async(create_agent_session(options)).expect("create SDK session");
+            for name in OPTIONAL {
+                assert_eq!(handle.has_tool(name), expected, "{name}, config={configured}");
+            }
+            if no_builtins {
+                assert!(handle.session().agent.shared_tools().snapshot().tools().is_empty());
+            }
+            let shutdown = run_async(handle.shutdown_owned_resources());
+            assert!(shutdown.completed_cleanly());
+        }
     }
 
     #[test]

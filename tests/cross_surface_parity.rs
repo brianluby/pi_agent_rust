@@ -175,7 +175,7 @@ mod cli_combinations {
     #[test]
     fn tools_subset_with_provider() {
         let cli = Cli::parse_from(["pi", "--tools", "read,bash", "--provider", "anthropic"]);
-        assert_eq!(cli.tools, "read,bash");
+        assert_eq!(cli.tools.as_deref(), Some("read,bash"));
         assert_eq!(cli.provider.as_deref(), Some("anthropic"));
     }
 

@@ -440,6 +440,7 @@ mod tests {
         let config = Config {
             tools: Some(crate::config::ToolSettings {
                 load_mode: Some(modes),
+                ..Default::default()
             }),
             ..Config::default()
         };
@@ -454,6 +455,7 @@ mod tests {
         let config = Config {
             tools: Some(crate::config::ToolSettings {
                 load_mode: Some(bad),
+                ..Default::default()
             }),
             ..Config::default()
         };

@@ -850,7 +850,7 @@ fn cli_details(cli: &Cli, extension_flags: &[ExtensionCliFlag]) -> Value {
         "acp": cli.acp,
         "verbose": cli.verbose,
         "no_tools": cli.no_tools,
-        "tools": cli.tools.clone(),
+        "tools": cli.tools.clone().unwrap_or_else(|| pi::xdev::default_enabled_tools().join(",")),
         "extension": cli.extension.clone(),
         "extension_flags": extension_flags_value(extension_flags),
         "no_extensions": cli.no_extensions,

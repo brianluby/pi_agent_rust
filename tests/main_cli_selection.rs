@@ -1444,7 +1444,7 @@ fn prepare_initial_message_multiple_files_with_message() {
 #[test]
 fn cli_enabled_tools_default() {
     let cli = cli::Cli::parse_from(["pi"]);
-    let tools = cli.enabled_tools();
+    let tools = cli.enabled_tools(&Config::default());
     assert!(tools.contains(&"read"));
     assert!(tools.contains(&"bash"));
     assert!(tools.contains(&"edit"));
@@ -1454,7 +1454,7 @@ fn cli_enabled_tools_default() {
 #[test]
 fn cli_no_tools_returns_empty() {
     let cli = cli::Cli::parse_from(["pi", "--no-tools"]);
-    assert!(cli.enabled_tools().is_empty());
+    assert!(cli.enabled_tools(&Config::default()).is_empty());
 }
 
 fn cli_flag_parity_result(flag_args: &[&str]) -> Result<(), String> {

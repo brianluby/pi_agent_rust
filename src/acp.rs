@@ -676,7 +676,7 @@ impl AcpLaunchOptions {
             thinking: cli.thinking.clone(),
             models: cli.models.clone(),
             api_key: crate::models::normalize_api_key_opt(cli.api_key.clone()),
-            tools: Some(cli.tools.clone()),
+            tools: cli.tools.clone(),
             no_tools: cli.no_tools,
             no_mcp: cli.no_mcp,
             system_prompt: cli.system_prompt.clone(),
@@ -713,9 +713,7 @@ impl AcpLaunchOptions {
         cli.thinking.clone_from(&self.thinking);
         cli.models.clone_from(&self.models);
         cli.api_key = crate::models::normalize_api_key_opt(self.api_key.clone());
-        if let Some(tools) = &self.tools {
-            cli.tools.clone_from(tools);
-        }
+        cli.tools.clone_from(&self.tools);
         cli.no_tools = self.no_tools;
         cli.no_mcp = self.no_mcp;
         cli.system_prompt.clone_from(&self.system_prompt);
@@ -2180,12 +2178,13 @@ fn build_acp_system_prompt(
     Ok(prompt)
 }
 
-/// Apply the host's requested tools or CLI defaults, excluding terminal-only
-/// tools with no ACP surface. Every call still reaches the editor's permission
-/// hook because ACP sessions carry no terminal approval state.
-fn acp_enabled_tools(cli: &crate::cli::Cli) -> Vec<String> {
+/// Apply the host's requested tools or defaults plus trusted settings,
+/// excluding terminal-only tools with no ACP surface. Every call still reaches
+/// the editor's permission hook because ACP sessions carry no terminal approval
+/// state.
+fn acp_enabled_tools(cli: &crate::cli::Cli, config: &Config) -> Vec<String> {
     const HOST_COUPLED: [&str; 3] = ["ask", "todo", "submit_plan"];
-    cli.enabled_tools()
+    cli.enabled_tools(config)
         .into_iter()
         .filter(|name| !HOST_COUPLED.contains(name))
         .map(String::from)
@@ -2269,7 +2268,7 @@ fn build_acp_session_with_budget(
     auth.set_command_working_directory(&cwd)?;
 
     let mut cli = options.launch.selection_cli()?;
-    let enabled_tools = acp_enabled_tools(&cli);
+    let enabled_tools = acp_enabled_tools(&cli, &options.config);
     let enabled_tools: Vec<&str> = enabled_tools.iter().map(String::as_str).collect();
     let tools = if cli.no_tools {
         ToolRegistry::without_builtins(Some(&options.config))
@@ -4432,7 +4431,7 @@ mod tests {
         let cli = AcpLaunchOptions::default()
             .selection_cli()
             .expect("neutral ACP CLI");
-        let tools = acp_enabled_tools(&cli);
+        let tools = acp_enabled_tools(&cli, &Config::default());
         for expected in [
             "read",
             "bash",
@@ -4451,6 +4450,64 @@ mod tests {
                 !tools.iter().any(|t| t == host_only),
                 "{host_only} in {tools:?}"
             );
+        }
+    }
+
+    #[test]
+    fn acp_launch_preserves_optional_tool_settings_and_explicit_selection() {
+        use clap::Parser as _;
+
+        const OPTIONAL: [&str; 4] = ["eval", "github", "security_scan", "subagent"];
+        let config: Config = serde_json::from_value(json!({
+            "tools": {
+                "enableEval": true,
+                "enableGithub": true,
+                "enableSecurityScan": true,
+                "enableSubagent": true
+            }
+        }))
+        .expect("optional tool settings");
+        let defaults = crate::xdev::default_enabled_tools().join(",");
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let root = tempfile::tempdir().expect("ACP workspace");
+        for (args, expected) in [
+            (vec!["pi", "--acp"], true),
+            (vec!["pi", "--acp", "--tools", "read"], false),
+            (vec!["pi", "--acp", "--tools", defaults.as_str()], false),
+            (vec!["pi", "--acp", "--tools", ""], false),
+            (vec!["pi", "--acp", "--no-tools"], false),
+        ] {
+            let cli = crate::cli::Cli::try_parse_from(args).expect("ACP launch CLI");
+            let mut options = selection_options(
+                config.clone(),
+                vec![ready_selection_model("openai", "gpt-4o")],
+                runtime.handle(),
+            );
+            options.launch = AcpLaunchOptions::from_cli(&cli);
+            assert_eq!(options.launch.tools, cli.tools);
+            options.launch.provider = Some("openai".to_string());
+            options.launch.model = Some("gpt-4o".to_string());
+            options.launch.api_key = Some("acp-optional-tools-key".to_string());
+            options.launch.no_context_files = true;
+            let (session, save_enabled) = new_acp_session(None, &config, root.path());
+            let (_, state) = build_acp_session(
+                session,
+                save_enabled,
+                root.path().to_path_buf(),
+                &options,
+                None,
+            )
+            .expect("build editor session");
+            let handle = state.agent_session.as_ref().expect("editor agent session");
+            for name in OPTIONAL {
+                assert_eq!(handle.has_tool(name), expected, "{name}");
+            }
+            for name in ["ask", "todo", "submit_plan"] {
+                assert!(!handle.has_tool(name), "ACP host-only tool {name}");
+            }
+            if cli.no_tools {
+                assert!(handle.session().agent.shared_tools().snapshot().tools().is_empty());
+            }
         }
     }
 

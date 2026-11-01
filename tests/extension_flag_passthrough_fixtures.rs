@@ -140,7 +140,7 @@ fn test_extension_flag_passthrough_fixtures() {
             }
             "boolean_extension_flags_mixed_with_builtin" => {
                 assert!(parsed.cli.print);
-                assert_eq!(parsed.cli.tools, "grep,edit");
+                assert_eq!(parsed.cli.tools.as_deref(), Some("grep,edit"));
                 assert_extension_flag(&parsed, "unknown-flag", None);
                 assert_extension_flag(&parsed, "dry-run", None);
             }
@@ -308,6 +308,6 @@ fn test_typescript_parity_scenarios() {
         .expect("Should have ext-config flag");
     assert_eq!(ext_config.value, Some("config.json".to_string()));
 
-    assert_eq!(parsed3.cli.tools, "grep,edit".to_string());
+    assert_eq!(parsed3.cli.tools.as_deref(), Some("grep,edit"));
     assert_eq!(parsed3.cli.message_args(), vec!["analyze", "this"]);
 }

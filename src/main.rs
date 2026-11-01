@@ -2317,7 +2317,7 @@ async fn run(
     // through the same handle, so `pi.tool` hostcalls apply the session's
     // undo/workspace policy and see tools mounted after boot (extension
     // wrappers, MCP tools, plan tools).
-    let shared_enabled_tools = cli.enabled_tools();
+    let shared_enabled_tools = cli.enabled_tools(&config);
     // A name the registry does not know is dropped without a word, so
     // `--tools read,bsah,edit` hands the model two tools and reports three.
     let unknown_tools = pi::tools::unknown_tool_names(&shared_enabled_tools);
@@ -2694,7 +2694,7 @@ async fn run(
         None
     };
 
-    let enabled_tools = cli.enabled_tools();
+    let enabled_tools = cli.enabled_tools(&config);
     // CLI flag wins; fall back to PI_MAX_TOOL_ITERATIONS env, then default.
     // `clamp_max_tool_iterations` keeps invalid values out of the loop and
     // emits a warning instead of failing the run.
@@ -9534,7 +9534,7 @@ fn prompt_workspace_trust(
             "package entries"
         };
         eprintln!(
-            "  - .pi/settings.json ({} {noun}; npm/git installs run lifecycle scripts)",
+            "  - .pi/settings.json (optional tool activation and {} {noun}; npm/git installs run lifecycle scripts)",
             surface.package_count
         );
     }
