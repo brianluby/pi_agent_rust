@@ -133,6 +133,33 @@ cannot activate these tools or override global choices. Editing the project
 settings invalidates a stored trust decision. `PI_CONFIG_PATH` retains its
 existing explicit single-file behavior and skips the global/project merge.
 
+In the default terminal UI, omitting `--tools` keeps the selection driven by
+settings across session replacements. Global optional-tool settings are read
+again when `/new`, `/resume`, `/fork`, or `/reload` builds a session. An explicit
+CLI selection remains authoritative across those operations.
+
+A launch grant from `--trust`, a prompt, or the stored workspace decision
+applies to the admitted project configuration and executable resources.
+Changing that surface while Pi is running causes replacement and resource
+reload to report `PI_WORKSPACE_TRUST_RESTART_REQUIRED`. Restart Pi to
+re-establish trust and resolve the project resources together; approving the
+new digest in another process does not refresh cached paths in the running
+session. Refusal preserves the current session and previously loaded resources.
+Global `trustAllWorkspaces` and `PI_WORKSPACE_TRUST=trusted` retain their
+documented broad scope, while current global policy and stored trust are
+checked again. A workspace launched untrusted remains excluded until restart.
+The classic terminal UI also revalidates this admission before `/reload`
+resolves packages or refreshes resources; a refusal preserves its loaded
+prompts, skills, and current session.
+
+Enabling `subagent` grants access to bundled and global agent definitions.
+Project profiles from the nearest `.pi/agents/*.md` directory require workspace
+trust independently of that activation setting. They are part of the trust
+digest even when discovered in an ancestor directory: a profile can select
+child tools and override a bundled or global agent. Untrusted project profiles
+are excluded from both `scope: "both"` and `scope: "project"`.
+`scope: "user"` remains available without reading project profiles.
+
 `tools.loadMode.<name>` (also `tools.load_mode.<name>`) configures tool exposure
 as `essential`, `discoverable`, or `off`. An explicit `off` setting excludes a
 tool from implicit selection, including tools automatically added by browser,
@@ -147,10 +174,35 @@ bank still requires `memory.backend` to be `"local"` or `"cass"`. The generated
 `subagent` remains activatable with `enableSubagent: true`: its built-in
 off-by-default tier is not an explicit `loadMode.subagent: "off"` setting.
 
+Enabled `eval`, `github`, and `security_scan` use the `discoverable` tier by
+default. Pi lists their names and purposes in its default system prompt, and
+`xdev` can describe, run, or promote them. Use `loadMode.<name>: "essential"`
+to expose an enabled tool directly in the model's schema. If `xdev` is `off`,
+Pi omits the discovery instructions; use `essential` for tools that should
+remain directly available. A custom system prompt keeps its existing contract
+and does not receive Pi's automatic discovery inventory.
+
+`xdev run` checks approval and extension call hooks for both the dispatcher
+and the actual target, using the target's own name and arguments for its
+checks. A denial at either layer prevents execution. Existing policies on
+`xdev` still apply, so an interactive approval handler can ask at both layers
+when approval is required. Disabling either tool during a policy callback
+also prevents execution. Discovery does not bypass target-specific controls.
+
 Load modes never activate an optional tool by themselves. These activation
-flags use the existing tool registry and do not grant new approval permissions,
-extension capabilities, or child-agent tools. In particular, native children's
-explicit tool allowlists still override inherited optional-tool settings.
+flags use the existing tool registry and preserve existing approval and
+workspace-trust requirements.
+
+Native child agents keep their profile's built-in tool list across one-shot
+runs, retries, background runs, and persistent workers. Inherited settings
+cannot add optional tools or automatic browser, computer, media, memory, or
+`manage_skill` access beyond that list. A profile can name those tools
+explicitly; backend requirements still apply, including `memory.backend`
+for memory tools. The `xdev` dispatcher exposes only admitted discoverable
+targets. Extensions and MCP servers retain their separate loading and
+authorization controls; this built-in selection is not an operating-system
+sandbox. Ordinary operator launches keep their existing automatic-tool
+behavior.
 
 ### Appearance
 

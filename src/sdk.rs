@@ -398,6 +398,11 @@ pub struct SessionOptions {
     /// be loaded. Programmatic callers default to fail-closed; CLI hosts pass
     /// the decision produced by `workspace_trust::establish`.
     pub workspace_trusted: bool,
+    /// Launch admission for hosts that reuse discovered project resources.
+    /// When present, this guard revalidates before initialization and its
+    /// original decision takes precedence over `workspace_trusted`. Omit it
+    /// to retain the explicit trust contract for programmatic callers.
+    pub workspace_trust_guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
     pub no_session: bool,
     pub session_path: Option<PathBuf>,
     pub session_dir: Option<PathBuf>,
@@ -495,15 +500,20 @@ pub struct SessionOptions {
     /// Optional factory for the session's [`ToolRegistry`].
     ///
     /// When `None` (the default), [`create_agent_session`] builds the
-    /// built-in tool set from [`SessionOptions::enabled_tools`] exactly
-    /// as it always has — existing callers are unaffected.
+    /// built-in tool set from [`SessionOptions::enabled_tools`] and applies
+    /// the session's workspace admission to project agent definitions.
     ///
     /// Setting this lets a downstream embedder layer custom tools onto
     /// the registry: approval-gated wrappers around the built-ins, a
     /// read-only "plan mode" subset, a `Task` tool that spawns nested
     /// sandboxed sessions, etc. Implement [`ToolFactory`] on your own
     /// `Send + Sync` type and call [`default_tool_registry`] from inside
-    /// it to inherit the current built-in resolution rules.
+    /// it to inherit the current built-in resolution rules. That baseline
+    /// helper excludes project agent definitions; a factory must retain its
+    /// own admission to opt into them with [`ToolRegistry::with_workspace_trust`].
+    /// [`ToolFactory::create_tool_registry_with_context`] supplies the SDK's
+    /// effective admission and session resources without capturing stale values.
+    /// Use [`ExplicitBuiltinTools`] to suppress automatic built-in additions.
     ///
     /// Wrapped in `Arc` because [`SessionOptions`] is cloned through
     /// the session-handle pipeline and the factory may need to outlive
@@ -521,7 +531,8 @@ pub struct SessionOptions {
     /// `hashline_edit` (bd-cv653.3.13). `None` starts an empty one. A host
     /// that rebuilds the session, as FTUI does on `/new`, `/resume`, `/reload`
     /// and `/fork`, passes the same recorder so `/undo` keeps working across
-    /// the rebuild, as on the classic stack. Unused with a [`Self::tool_factory`].
+    /// the rebuild, as on the classic stack. [`ExplicitBuiltinTools`] uses it;
+    /// custom factories can opt in through [`ToolFactoryContext`].
     pub mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
 
     /// Session-level event listener invoked for every [`AgentEvent`].
@@ -613,6 +624,7 @@ impl Default for SessionOptions {
             out_default_enabled: false,
             working_directory: None,
             workspace_trusted: false,
+            workspace_trust_guard: None,
             package_dir: None,
             no_session: true,
             session_path: None,
@@ -671,12 +683,105 @@ pub trait ToolFactory: Send + Sync {
     /// - `cwd` is the working directory the session opened in.
     /// - `config` is pi's loaded [`Config`], passed through so custom
     ///   tools can read settings such as `block_images` without
-    ///   duplicating the config-loading logic.
+    ///   duplicating the config-loading logic. Receiving configuration does
+    ///   not grant workspace trust; the factory owns any explicit admission
+    ///   it supplies to [`ToolRegistry::with_workspace_trust`].
     fn create_tool_registry(&self, enabled: &[&str], cwd: &Path, config: &Config) -> ToolRegistry;
+
+    /// Build the registry with the SDK's resolved session admission.
+    ///
+    /// The default preserves existing factories' behavior. Override this to
+    /// share the session's workspace, undo recorder, and workspace admission
+    /// when constructing built-ins.
+    fn create_tool_registry_with_context(
+        &self,
+        enabled: &[&str],
+        cwd: &Path,
+        config: &Config,
+        _context: &ToolFactoryContext<'_>,
+    ) -> ToolRegistry {
+        self.create_tool_registry(enabled, cwd, config)
+    }
 }
 
-/// Build the same [`ToolRegistry`] [`create_agent_session`] uses by
-/// default.
+/// Session resources and admission resolved by the SDK before a factory runs.
+///
+/// The references describe the current session, including a resumed workspace.
+/// Receiving this context does not change an existing factory's behavior.
+#[non_exhaustive]
+pub struct ToolFactoryContext<'a> {
+    /// Caller-supplied undo recorder; built-in factories create a default when absent.
+    pub mutation_recorder: Option<&'a Arc<crate::undo::FileMutationRecorder>>,
+    /// The workspace shared by this session's tools.
+    pub workspace: Option<&'a crate::workspace::WorkspaceHandle>,
+    /// Effective admission after validating the session's workspace guard.
+    pub workspace_trusted: bool,
+    /// The guard that continues to constrain project-controlled resources.
+    pub workspace_trust_guard: Option<&'a crate::workspace_trust::WorkspaceTrustGuard>,
+}
+
+impl ToolFactoryContext<'_> {
+    fn explicit_builtin_registry(
+        &self,
+        enabled: &[&str],
+        cwd: &Path,
+        config: &Config,
+    ) -> ToolRegistry {
+        if enabled.is_empty() {
+            return ToolRegistry::without_builtins(Some(config));
+        }
+        ToolRegistry::with_builtin_tool_policy(
+            enabled,
+            cwd,
+            Some(config),
+            Some(self.mutation_recorder.cloned().unwrap_or_default()),
+            self.workspace,
+            self.workspace_trusted,
+            self.workspace_trust_guard,
+            false,
+        )
+    }
+}
+
+/// Construct only built-ins in the already resolved enabled-tool list.
+///
+/// Install this in [`SessionOptions::tool_factory`] to suppress automatic
+/// built-in additions while preserving the SDK's workspace and undo support.
+/// Configured optional-tool flags still contribute to the resolved list when
+/// [`SessionOptions::enabled_tools`] is `None`. A derived `xdev` dispatcher may
+/// expose the admitted discoverable tools. Extensions and MCP retain their
+/// separate admission paths.
+#[derive(Debug, Default)]
+pub struct ExplicitBuiltinTools;
+
+impl ToolFactory for ExplicitBuiltinTools {
+    fn create_tool_registry(&self, enabled: &[&str], cwd: &Path, config: &Config) -> ToolRegistry {
+        let context = ToolFactoryContext {
+            mutation_recorder: None,
+            workspace: None,
+            workspace_trusted: false,
+            workspace_trust_guard: None,
+        };
+        self.create_tool_registry_with_context(enabled, cwd, config, &context)
+    }
+
+    fn create_tool_registry_with_context(
+        &self,
+        enabled: &[&str],
+        cwd: &Path,
+        config: &Config,
+        context: &ToolFactoryContext<'_>,
+    ) -> ToolRegistry {
+        context.explicit_builtin_registry(enabled, cwd, config)
+    }
+}
+
+/// Build the standard built-in registry without project agent definitions.
+///
+/// This helper has no workspace admission. Global and bundled agent profiles
+/// remain available when `subagent` is selected; hosts that explicitly admit
+/// project profiles can use [`ToolRegistry::with_workspace_trust`]. The SDK's
+/// default construction passes its effective session admission to that method.
 ///
 /// Useful inside a [`ToolFactory`] impl when you want to start from
 /// the standard built-in tool set and then layer custom tools on top
@@ -3948,6 +4053,12 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     } else {
         requested_cwd
     };
+    let workspace_trusted = if let Some(guard) = &options.workspace_trust_guard {
+        guard.validate_workspace(&cwd)?;
+        guard.trusted()
+    } else {
+        options.workspace_trusted
+    };
 
     let mut cli = Cli::try_parse_from(["pi"])
         .map_err(|e| Error::validation(format!("CLI init failed: {e}")))?;
@@ -3979,13 +4090,25 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         }
     }
 
-    let global_dir = Config::global_dir();
-    let config_override = Config::config_path_override_from_env(&cwd);
+    let (global_dir, config_override) = options.workspace_trust_guard.as_ref().map_or_else(
+        || {
+            (
+                Config::global_dir(),
+                Config::config_path_override_from_env(&cwd),
+            )
+        },
+        |guard| {
+            (
+                guard.global_dir().to_path_buf(),
+                guard.config_override().map(Path::to_path_buf),
+            )
+        },
+    );
     let mut config = load_session_config(
         &cwd,
         &global_dir,
         config_override.as_deref(),
-        options.workspace_trusted,
+        workspace_trusted,
     )?;
     apply_session_out_config(&mut config, &options);
     let mut session = Session::new(&cli, &config).await?;
@@ -4032,7 +4155,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         // next save, including CLI --add-dir handed through the FTUI SDK.
         session.set_additional_roots(&workspace.additional_roots());
     }
-    let auth_path = Config::auth_path();
+    let auth_path = global_dir.join("auth.json");
     let auth_result = AuthStorage::load_async(auth_path.clone()).await;
     let mut auth = match auth_result {
         Ok(auth) => auth,
@@ -4206,6 +4329,12 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         secrets: config.secrets.clone(),
     };
 
+    let factory_context = ToolFactoryContext {
+        mutation_recorder: options.mutation_recorder.as_ref(),
+        workspace: workspace.as_ref(),
+        workspace_trusted,
+        workspace_trust_guard: options.workspace_trust_guard.as_ref(),
+    };
     let tools = options.tool_factory.as_ref().map_or_else(
         // The default registry carries an undo recorder (bd-cv653.3.13) so
         // SDK-driven surfaces (ftui, embedders) can offer /undo //redo too.
@@ -4213,15 +4342,24 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             if cli.builtin_tools_disabled() {
                 return ToolRegistry::without_builtins(Some(&config));
             }
-            ToolRegistry::with_mutation_recorder(
+            ToolRegistry::with_workspace_trust(
                 &enabled_tools,
                 &cwd,
                 Some(&config),
                 Some(options.mutation_recorder.clone().unwrap_or_default()),
                 workspace.as_ref(),
+                workspace_trusted,
+                options.workspace_trust_guard.as_ref(),
             )
         },
-        |factory| factory.create_tool_registry(&enabled_tools, &cwd, &config),
+        |factory| {
+            factory.create_tool_registry_with_context(
+                &enabled_tools,
+                &cwd,
+                &config,
+                &factory_context,
+            )
+        },
     );
     // Permission prompts belong to the host, not to the model-facing ask
     // capability. Every registry owns one picker even when "ask" is disabled.
@@ -4276,7 +4414,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             .set_stream_rule_source(crate::stream_rules::StreamRuleSource::new(
                 cwd.clone(),
                 global_dir.clone(),
-                options.workspace_trusted,
+                workspace_trusted,
             ))?;
     }
     // Session-coupled todo tool joins after construction (opt-in), matching
@@ -4395,12 +4533,12 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     };
 
     let mcp_manager = if let Some(mcp) = &options.mcp {
-        let global_dir = mcp.global_dir.clone().unwrap_or_else(Config::global_dir);
+        let global_dir = mcp.global_dir.clone().unwrap_or_else(|| global_dir.clone());
         let manager = Arc::new(crate::mcp::McpManager::bootstrap(
             &cwd,
             &global_dir,
             &mcp.config_paths,
-            options.workspace_trusted && config.mcp_project_config_enabled(),
+            workspace_trusted && config.mcp_project_config_enabled(),
         )?);
         if let Some(extension_manager) = agent_session
             .extensions
@@ -7147,6 +7285,426 @@ mod tests {
             }
             let shutdown = run_async(handle.shutdown_owned_resources());
             assert!(shutdown.completed_cleanly());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sdk_builtin_ceiling_survives_settings_driven_registry_construction() {
+        const AUTOMATIC: [&str; 7] = [
+            "browser",
+            "computer",
+            "inspect_image",
+            "read_media",
+            "generate_image",
+            "tts",
+            "manage_skill",
+        ];
+        let cases: &[(bool, Option<&[&str]>)] = &[
+            (false, Some(&["read", "grep"])),
+            (true, Some(&["read", "grep"])),
+            (
+                true,
+                Some(&[
+                    "read",
+                    "browser",
+                    "computer",
+                    "inspect_image",
+                    "read_media",
+                    "generate_image",
+                    "tts",
+                    "eval",
+                    "github",
+                    "security_scan",
+                    "subagent",
+                ]),
+            ),
+            (true, Some(&[])),
+            (true, None),
+        ];
+        for &(strict, selected) in cases {
+            let (_tmp, mut options) = guarded_optional_tool_fixture(true);
+            let global_dir = options
+                .workspace_trust_guard
+                .as_ref()
+                .expect("fixture admission")
+                .global_dir();
+            std::fs::write(
+                global_dir.join("settings.json"),
+                serde_json::json!({
+                    "browser": { "enableBrowser": true },
+                    "computer": { "enableComputer": true },
+                    "media": {
+                        "enableInspectImage": true,
+                        "enableReadMedia": true,
+                        "enableGenerateImage": true,
+                        "enableTts": true
+                    }
+                })
+                .to_string(),
+            )
+            .expect("global automatic tool settings");
+            options.tool_factory = strict.then(|| {
+                Arc::new(ExplicitBuiltinTools) as Arc<dyn ToolFactory>
+            });
+            options.enabled_tools =
+                selected.map(|names| names.iter().map(|name| (*name).to_string()).collect());
+            let handle = run_async(create_agent_session(options)).expect("create SDK session");
+            if let Some(selected) = selected {
+                for name in selected {
+                    assert!(handle.has_tool(name), "explicit {name}");
+                }
+            }
+            for name in AUTOMATIC {
+                assert_eq!(
+                    handle.has_tool(name),
+                    !strict || selected.is_some_and(|names| names.contains(&name)),
+                    "{name}, strict={strict}, selected={selected:?}"
+                );
+            }
+            for name in ["eval", "github", "security_scan", "subagent"] {
+                assert_eq!(
+                    handle.has_tool(name),
+                    selected.is_none_or(|names| names.contains(&name)),
+                    "{name}"
+                );
+            }
+            if strict {
+                let registry = handle.session().agent.shared_tools().snapshot();
+                if let Some(selected) = selected {
+                    assert!(
+                        registry.tools().iter().all(|tool| {
+                            selected.contains(&tool.name()) || tool.name() == "xdev"
+                        })
+                    );
+                    assert!(
+                        registry
+                            .discoverable_index()
+                            .iter()
+                            .all(|(name, _)| selected.contains(&name.as_str()))
+                    );
+                    assert_eq!(registry.builtins_disabled(), selected.is_empty());
+                }
+                assert_eq!(
+                    handle.has_tool("xdev"),
+                    !registry.discoverable_index().is_empty()
+                );
+            }
+            let shutdown = run_async(handle.shutdown_owned_resources());
+            assert!(shutdown.completed_cleanly());
+        }
+    }
+
+    fn guarded_optional_tool_fixture(trusted: bool) -> (tempfile::TempDir, SessionOptions) {
+        use crate::workspace_trust::{TRUST_STORE_FILE, TrustInputs, WorkspaceTrustGuard, establish};
+
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let global_dir = tmp.path().join("global");
+        std::fs::create_dir_all(cwd.join(".pi/extensions")).expect("project resources");
+        std::fs::create_dir_all(&global_dir).expect("global directory");
+        let settings = |enabled| {
+            serde_json::json!({
+                "tools": {
+                    "enableEval": enabled,
+                    "enableGithub": enabled,
+                    "enableSecurityScan": enabled,
+                    "enableSubagent": enabled
+                }
+            })
+            .to_string()
+        };
+        std::fs::write(global_dir.join("settings.json"), settings(false))
+            .expect("global optional tools disabled");
+        std::fs::write(cwd.join(".pi/settings.json"), settings(true))
+            .expect("project optional tools enabled");
+        std::fs::write(
+            cwd.join(".pi/extensions/trust_guard.js"),
+            "export default function init() {}\n",
+        )
+        .expect("benign project extension");
+        let inputs = TrustInputs {
+            cli_trust: trusted,
+            trust_all_workspaces: false,
+            env_override: None,
+            interactive: false,
+        };
+        let state = establish(&cwd, &global_dir.join(TRUST_STORE_FILE), &inputs, |_| {
+            panic!("noninteractive fixture must not prompt")
+        })
+        .expect("establish workspace trust");
+        assert_eq!(state.trusted, trusted);
+        let options = SessionOptions {
+            workspace_trusted: !trusted,
+            workspace_trust_guard: Some(WorkspaceTrustGuard::from_established(
+                &cwd,
+                &state,
+                &inputs,
+                &global_dir,
+                None,
+            )),
+            no_context_files: true,
+            ..hermetic_session_options(&cwd)
+        };
+        (tmp, options)
+    }
+
+    #[test]
+    fn sdk_guarded_sessions_reject_changed_project_resources_before_initialization() {
+        const OPTIONAL: [&str; 4] = ["eval", "github", "security_scan", "subagent"];
+        for changed_surface in ["settings", "extension"] {
+            let (_tmp, mut options) = guarded_optional_tool_fixture(true);
+            let cwd = options.working_directory.clone().expect("fixture workspace");
+            let extension_path = cwd.join(".pi/extensions/trust_guard.js");
+            options.extension_paths = vec![extension_path.clone()];
+            assert!(!options.workspace_trusted, "the captured grant must win");
+            let probe = cwd.join("still_live.txt");
+            std::fs::write(&probe, "the admitted session is still usable").expect("write read probe");
+            let handle = run_async(create_agent_session(options.clone()))
+                .expect("construct originally admitted session");
+            assert!(handle.extension_manager().is_some());
+            for name in OPTIONAL {
+                assert!(handle.has_tool(name), "captured grant enables {name}");
+            }
+
+            if changed_surface == "settings" {
+                std::fs::write(
+                    cwd.join(".pi/settings.json"),
+                    r#"{"tools":{"enableEval":false}}"#,
+                )
+                .expect("change project settings");
+            } else {
+                std::fs::write(
+                    &extension_path,
+                    "throw new Error('STALE_TRUST_EXTENSION_EXECUTED');\n\
+                     export default function init() {}\n",
+                )
+                .expect("poison the previously discovered extension");
+            }
+            let error = run_async(create_agent_session(options))
+                .err()
+                .expect("changed project resources must require renewed trust")
+                .to_string();
+            assert!(
+                error.contains("PI_WORKSPACE_TRUST_RESTART_REQUIRED"),
+                "{changed_surface}: {error}"
+            );
+            assert!(
+                !error.contains("STALE_TRUST_EXTENSION_EXECUTED"),
+                "the extension must not initialize before trust is checked: {error}"
+            );
+            for name in OPTIONAL {
+                assert!(handle.has_tool(name), "the original session retains {name}");
+            }
+            let tools = handle.session().agent.shared_tools().snapshot();
+            let output = run_async(tools.get("read").expect("live read tool").execute(
+                "after-rejected-rebuild",
+                serde_json::json!({"path": probe}),
+                None,
+            ))
+            .expect("the original session can still execute tools");
+            assert!(!output.is_error);
+            assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+        }
+    }
+
+    #[test]
+    fn sdk_guarded_denial_cannot_be_overridden_by_the_legacy_trust_boolean() {
+        let (_tmp, options) = guarded_optional_tool_fixture(false);
+        assert!(
+            options.workspace_trusted,
+            "the fixture supplies conflicting trust"
+        );
+        let handle = run_async(create_agent_session(options)).expect("create denied session");
+        for name in ["eval", "github", "security_scan", "subagent"] {
+            assert!(!handle.has_tool(name), "captured denial must exclude {name}");
+        }
+        assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn explicit_builtin_factory_keeps_session_scope_recorder_and_admission() {
+        use crate::workspace_trust::{
+            TRUST_STORE_FILE, TrustInputs, WorkspaceTrustGuard, establish,
+        };
+
+        let (tmp, mut options) = guarded_optional_tool_fixture(true);
+        let cwd = options.working_directory.clone().expect("fixture workspace");
+        let global_dir = tmp.path().join("global");
+        let agents = cwd.join(".pi/agents");
+        std::fs::create_dir_all(&agents).expect("project agent directory");
+        let definition = "---\nname: factory-context-probe\ndescription: Discovery sentinel\ntools: read\n---\nProject instructions\n";
+        for name in ["first.md", "second.md"] {
+            std::fs::write(agents.join(name), definition).expect("duplicate project role");
+        }
+        let inputs = TrustInputs {
+            cli_trust: true,
+            trust_all_workspaces: false,
+            env_override: None,
+            interactive: false,
+        };
+        let state = establish(&cwd, &global_dir.join(TRUST_STORE_FILE), &inputs, |_| {
+            panic!("noninteractive fixture must not prompt")
+        })
+        .expect("admit complete project surface");
+        options.workspace_trust_guard = Some(WorkspaceTrustGuard::from_established(
+            &cwd,
+            &state,
+            &inputs,
+            &global_dir,
+            None,
+        ));
+        assert!(!options.workspace_trusted, "the effective guard must win");
+
+        let additional = tmp.path().join("additional");
+        std::fs::create_dir(&additional).expect("additional root");
+        let path = additional.join("probe.txt");
+        std::fs::write(&path, "before").expect("original contents");
+        let mut workspace = crate::workspace::WorkspaceHandle::single(&cwd);
+        workspace.add_root(&additional);
+        let recorder = Arc::new(crate::undo::FileMutationRecorder::default());
+        options.workspace = Some(workspace.clone());
+        options.mutation_recorder = Some(Arc::clone(&recorder));
+        options.enabled_tools = Some(vec!["write".to_string(), "subagent".to_string()]);
+        options.tool_factory = Some(Arc::new(ExplicitBuiltinTools));
+
+        let handle = run_async(create_agent_session(options)).expect("strict SDK session");
+        let tools = handle.session().agent.shared_tools().snapshot();
+        assert!(Arc::ptr_eq(
+            &tools.mutation_recorder().expect("session undo recorder"),
+            &recorder,
+        ));
+        let write = tools.get("write").expect("selected write tool");
+        let written = run_async(write.execute(
+            "factory-context-write",
+            serde_json::json!({"path": path, "content": "after"}),
+            None,
+        ))
+        .expect("the factory must share the admitted additional root");
+        assert!(!written.is_error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after");
+        assert_eq!(recorder.undo(1, false).applied.len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
+        assert!(workspace.remove_root(&additional));
+        assert!(
+            run_async(write.execute(
+                "factory-context-revoked",
+                serde_json::json!({"path": path, "content": "must stay denied"}),
+                None,
+            ))
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
+
+        let subagent = tools.get("subagent").expect("selected subagent tool");
+        let probe = || {
+            run_async(subagent.execute(
+                "factory-context-discovery",
+                serde_json::json!({
+                    "agent": "missing-factory-context-probe",
+                    "task": "inspect discovery only",
+                    "scope": "project"
+                }),
+                None,
+            ))
+        };
+        let error = probe().err().expect("admitted duplicate profiles are parsed");
+        assert!(error.to_string().contains("PI_AGENT_DEFINITION_DUPLICATE"));
+        std::fs::write(agents.join("first.md"), format!("{definition}Changed\n"))
+            .expect("change the admitted profile");
+        let error = probe().err().expect("project admission must be revalidated");
+        assert!(
+            error
+                .to_string()
+                .contains("PI_WORKSPACE_TRUST_RESTART_REQUIRED")
+        );
+        assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+    }
+
+    #[test]
+    fn sdk_subagent_discovery_uses_the_session_admission_and_rechecks_project_changes() {
+        use crate::workspace_trust::{
+            TRUST_STORE_FILE, TrustInputs, WorkspaceTrustGuard, establish,
+        };
+
+        for trusted in [false, true] {
+            let (tmp, mut options) = guarded_optional_tool_fixture(trusted);
+            let cwd = options
+                .working_directory
+                .clone()
+                .expect("fixture workspace");
+            let global_dir = tmp.path().join("global");
+            std::fs::write(
+                global_dir.join("settings.json"),
+                r#"{"tools":{"enableSubagent":true}}"#,
+            )
+            .expect("persistently enable native subagents");
+            let agents = cwd.join(".pi/agents");
+            std::fs::create_dir_all(&agents).expect("project agents directory");
+            let definition = "---\nname: sdk-project-probe\ndescription: Discovery sentinel\ntools: bash,eval\n---\nProject instructions\n";
+            for name in ["first.md", "second.md"] {
+                std::fs::write(agents.join(name), definition).expect("duplicate project role");
+            }
+            let inputs = TrustInputs {
+                cli_trust: trusted,
+                trust_all_workspaces: false,
+                env_override: None,
+                interactive: false,
+            };
+            let state = establish(&cwd, &global_dir.join(TRUST_STORE_FILE), &inputs, |_| {
+                Ok(false)
+            })
+            .expect("admit complete project surface");
+            options.workspace_trust_guard = Some(WorkspaceTrustGuard::from_established(
+                &cwd,
+                &state,
+                &inputs,
+                &global_dir,
+                None,
+            ));
+            let handle = run_async(create_agent_session(options)).expect("create guarded session");
+            let tools = handle.session().agent.shared_tools().snapshot();
+            let tool = tools.get("subagent").expect("settings-enabled subagent");
+            // An unknown name exercises discovery without ever launching a child.
+            let probe = |scope| {
+                run_async(tool.execute(
+                    "sdk-agent-trust-probe",
+                    serde_json::json!({
+                        "agent": "missing-sdk-trust-probe",
+                        "task": "inspect discovery only",
+                        "scope": scope
+                    }),
+                    None,
+                ))
+            };
+            let user_only = probe("user").expect("global and bundled discovery remains usable");
+            assert!(user_only.is_error);
+            let discovered = probe("both");
+            if trusted {
+                let error = discovered
+                    .err()
+                    .expect("trusted duplicate definitions are parsed");
+                assert!(error.to_string().contains("PI_AGENT_DEFINITION_DUPLICATE"));
+                std::fs::write(agents.join("first.md"), format!("{definition}Changed\n"))
+                    .expect("mutate admitted project profile");
+                let error = probe("both")
+                    .err()
+                    .expect("stale project admission must fail");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("PI_WORKSPACE_TRUST_RESTART_REQUIRED")
+                );
+            } else {
+                let output = discovered.expect("denied project files must not be parsed");
+                assert!(output.is_error);
+                assert_eq!(
+                    output.details.expect("structured unknown-agent result")["results"][0]["error"],
+                    "Unknown agent: missing-sdk-trust-probe"
+                );
+            }
+            assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
         }
     }
 

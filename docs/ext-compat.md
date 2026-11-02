@@ -200,7 +200,14 @@ not a hard per-write disk quota.
 
 Database files and the engine's companion files are checked for symlinks,
 reparse points, and hard links, with pinned parent identities rechecked around
-operations. Guest filesystem APIs cannot create native links in a storage
+operations. This includes the migration marker, pre-migration database/WAL/SHM
+backups, their temporary files, the WAL/FEC lock, and Windows advisory locks for
+the main database, WAL, rollback journal, and WAL certificates. Native startup or
+maintenance can access these paths before guest SQL executes. They require the
+same storage grant and contribute to the aggregate database-family size limit.
+A link present before opening is rejected before the engine is entered; a
+new link discovered on an existing handle retires that handle without flushing
+retained writes. Guest filesystem APIs cannot create native links in a storage
 grant. FrankenSQLite's native VFS still opens pathnames: on Unix, this does not
 isolate the database from a separate native process with the same OS user
 identity concurrently replacing directories. Applications requiring that
@@ -255,6 +262,42 @@ exposes no snapshot keys or values. Pi
 advertises its configuration directory through `PI_CONFIG_DIR` metadata while
 preserving an explicitly configured value. This lets child integrations
 identify their host without receiving read access to a parent data directory.
+
+`PWD` and `PI_WORKSPACE_DIR` are reserved workspace metadata. Both follow the
+runtime's selected working directory, replacing stale values inherited from
+the launcher. This keeps context-mode's extension and MCP child on the selected
+project database when an SDK or resumed session uses a different directory.
+Windows snapshots contain one canonical spelling of each key. An admitted
+`PI_DETERMINISTIC_CWD` override follows the existing `process.cwd()` contract;
+an override hidden by environment policy or SecretBroker is never copied into
+these bindings. The metadata remains subject to environment disclosure policy
+and grants no filesystem access. Unrelated explicit bindings are preserved.
+
+For the provenance-validated `npm:context-mode` owner, the loader also prepares
+the package's supported `CONTEXT_MODE_SESSION_SUFFIX` override before its
+environment snapshot is created. It queries the real Git top-level directory
+and worktree inventory, canonicalizes the roots, and supplies the same raw
+eight-character hash that context-mode uses for a linked worktree. An empty
+value is generated only when successful queries establish the main worktree.
+The extension and its MCP child therefore use the same database filename even
+though ordinary guest synchronous process execution remains disabled. An
+explicit override, including an empty string, is preserved.
+
+This preparation requires the owner's environment, read, and exec capabilities
+to be allowed, plus normal SecretBroker disclosure of the suffix. It uses fixed
+Git queries, existing command mediation, a trusted absolute Git executable,
+and a clean noninteractive environment. The queries share a two-second budget
+bounded by the original extension-load deadline; each output stream is limited
+to 64 KiB, and native process ownership handles cancellation and cleanup.
+Returned repository paths do not become filesystem grants. Unrelated packages
+and ambiguous package owners do not trigger these queries.
+
+Unavailable Git metadata leaves the override unset rather than asserting an
+empty suffix. Automatic discovery accepts protected system Git installations;
+custom installations can supply the explicit supported suffix override. This
+is a session-start metadata snapshot, refreshed when the extension runtime is
+reloaded, and does not enable any general synchronous subprocess API.
+
 Context-mode's MCP server still needs a real Node or Bun executable on PATH.
 Its process launch and environment snapshot require the existing `exec` and
 `env` permissions; installing a package or granting storage does not enable
@@ -487,6 +530,26 @@ for an empty request. This deterministic normalization preserves explicit
 timestamps and does not repair malformed values or relax the persisted
 message schema. Context transformations affect the provider request without
 adding those injected messages to durable conversation history.
+
+### Tool-result capture and transforms
+
+`tool_result` events retain the existing flat `content`, `details`, and
+`isError` fields and also expose `result: { content, details, isError }`.
+Context-mode 1.0.169 reads this structured result to extract error text, facts,
+and MCP responses for its persistent session history and compaction snapshot.
+Without it, that adapter can record an error with empty text or miss facts in
+otherwise successful tool output.
+
+QuickJS handlers receive the accepted output from earlier handlers in the
+existing direct-handler order, followed by event-bus order, including across
+isolated realms. Each handler receives a fresh deep snapshot. Only explicitly
+returned, validated flat `content` and `details` fields change the result;
+in-place mutation, a void return, and null fields preserve prior accepted
+values. A malformed patch is rejected as a whole without undoing earlier
+transforms. The structured `result` view is rebuilt before the next handler,
+so it cannot expose output that an earlier handler has replaced. The host
+retains authority over `isError`; neither a returned error flag nor a returned
+nested `result` object changes the execution outcome or the transform contract.
 
 ### Session and State APIs
 

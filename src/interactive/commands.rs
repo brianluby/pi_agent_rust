@@ -155,6 +155,7 @@ pub enum SlashCommand {
     Clear,
     Model,
     Thinking,
+    Fast,
     ScopedModels,
     Exit,
     History,
@@ -219,6 +220,7 @@ impl SlashCommand {
             Self::Clear => "/clear",
             Self::Model => "/model",
             Self::Thinking => "/thinking",
+            Self::Fast => "/fast",
             Self::ScopedModels => "/scoped-models",
             Self::Exit => "/exit",
             Self::History => "/history",
@@ -278,6 +280,7 @@ impl SlashCommand {
         Self::Clear,
         Self::Model,
         Self::Thinking,
+        Self::Fast,
         Self::ScopedModels,
         Self::Exit,
         Self::History,
@@ -338,6 +341,7 @@ impl SlashCommand {
             // `/models` and `/effort` are OMP's spellings.
             "/model" | "/m" | "/models" => Self::Model,
             "/thinking" | "/think" | "/t" | "/effort" => Self::Thinking,
+            "/fast" => Self::Fast,
             "/scoped-models" | "/scoped" => Self::ScopedModels,
             "/exit" | "/quit" | "/q" => Self::Exit,
             "/history" | "/hist" => Self::History,
@@ -394,6 +398,7 @@ impl SlashCommand {
   /clear, /cls       - Clear conversation history
   /model, /m [id|provider/id] - Open model selector or switch directly
   /thinking, /t [level] - Set thinking level (off/minimal/low/medium/high/xhigh/max)
+  /fast [on|off|status|default|flex|scale|priority|ultrafast] - Select a supported serving tier
   /scoped-models [patterns|clear] - Show or set scoped models for cycling
   /history, /hist    - Show input history
   /export [path]     - Export conversation to HTML
@@ -2173,6 +2178,7 @@ impl PiApp {
             }
             SlashCommand::Model => self.handle_slash_model(args),
             SlashCommand::Thinking => self.handle_slash_thinking(args),
+            SlashCommand::Fast => self.handle_slash_fast(args),
             SlashCommand::ScopedModels => self.handle_slash_scoped_models(args),
             SlashCommand::Exit => Some(self.quit_cmd()),
             SlashCommand::History => {
@@ -4261,6 +4267,28 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         None
     }
 
+    fn handle_slash_fast(&mut self, args: &str) -> Option<Cmd> {
+        let Some(request) = crate::provider::ServiceTierCommand::parse(args) else {
+            self.status_message = Some(crate::provider::ServiceTierCommand::USAGE.to_string());
+            return None;
+        };
+        let Ok(mut agent) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
+        let entry = agent.handle.session().current_model_entry();
+        let provider = agent.provider();
+        let result = request.apply(
+            &mut agent.stream_options_mut().service_tier,
+            provider.name(),
+            provider.api(),
+            entry.as_ref().and_then(ModelEntry::service_tiers),
+        );
+        drop(agent);
+        self.status_message = Some(result);
+        None
+    }
+
     pub(super) fn handle_slash_thinking(&mut self, args: &str) -> Option<Cmd> {
         let value = args.trim();
         if value.is_empty() {
@@ -4437,6 +4465,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let config = self.config.clone();
         let cli = self.resource_cli.clone();
         let package_manager = self.package_manager.clone();
+        let workspace_trust_guard = self.workspace_trust_guard.clone();
         let cwd = self.cwd.clone();
         let event_tx = self.event_tx.clone();
         let extensions = self.extensions.clone();
@@ -4444,7 +4473,17 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
 
         runtime_handle.spawn(async move {
-            match ResourceLoader::load(&package_manager, &cwd, &config, &cli).await {
+            let global_dir = workspace_trust_guard
+                .as_ref()
+                .map_or_else(Config::global_dir, |guard| guard.global_dir().to_path_buf());
+            let loaded = async {
+                if let Some(guard) = &workspace_trust_guard {
+                    guard.validate_workspace(&cwd)?;
+                }
+                ResourceLoader::load(&package_manager, &cwd, &config, &cli).await
+            }
+            .await;
+            match loaded {
                 Ok(mut resources) => {
                     if let Some(manager) = extensions {
                         let discovered = manager.discover_resources(&cwd, "reload").await;
@@ -4459,15 +4498,16 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                         }
                     }
 
-                    let auth_result = crate::auth::AuthStorage::load_async(Config::auth_path())
-                        .await
-                        .and_then(|mut auth| {
-                            auth.set_command_working_directory(&cwd)?;
-                            Ok(auth)
-                        });
+                    let auth_result =
+                        crate::auth::AuthStorage::load_async(global_dir.join("auth.json"))
+                            .await
+                            .and_then(|mut auth| {
+                                auth.set_command_working_directory(&cwd)?;
+                                Ok(auth)
+                            });
                     let models_error = match auth_result {
                         Ok(auth) => {
-                            let models_path = default_models_path(&Config::global_dir());
+                            let models_path = default_models_path(&global_dir);
                             let registry = ModelRegistry::load(&auth, Some(models_path));
                             registry.error().map(ToString::to_string)
                         }
@@ -5421,6 +5461,7 @@ mod tests {
 
         app.set_reload_package_manager(
             PackageManager::new(cwd.to_path_buf()).with_project_trust(true),
+            None,
         );
         assert!(app.handle_slash_reload().is_none());
         let trusted = runtime().block_on(async {
@@ -5445,6 +5486,179 @@ mod tests {
                     .any(|skill| skill.name == expected),
                 "trusted reload should include {expected}"
             );
+        }
+    }
+
+    fn classic_reload_guard(
+        cwd: &Path,
+        global_dir: &Path,
+        trusted: bool,
+    ) -> crate::workspace_trust::WorkspaceTrustGuard {
+        let inputs = crate::workspace_trust::TrustInputs {
+            cli_trust: trusted,
+            trust_all_workspaces: false,
+            env_override: None,
+            interactive: false,
+        };
+        let state = crate::workspace_trust::establish(
+            cwd,
+            &global_dir.join(crate::workspace_trust::TRUST_STORE_FILE),
+            &inputs,
+            |_| Ok(false),
+        )
+        .expect("establish launch trust");
+        assert_eq!(state.trusted, trusted);
+        crate::workspace_trust::WorkspaceTrustGuard::from_established(
+            cwd, &state, &inputs, global_dir, None,
+        )
+    }
+
+    fn receive_reload_event(event_rx: &mut asupersync::channel::mpsc::Receiver<PiMsg>) -> PiMsg {
+        runtime().block_on(async {
+            let cx = Cx::for_testing();
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(30),
+                event_rx.recv(&cx),
+            )
+            .await
+            .expect("reload event before timeout")
+            .expect("reload event")
+        })
+    }
+
+    #[test]
+    fn classic_reload_rejects_changed_packages_and_preserves_loaded_prompts() {
+        let workspace = TempDir::new().expect("workspace");
+        let global = TempDir::new().expect("global configuration");
+        let cwd = workspace.path();
+        let project_dir = cwd.join(".pi");
+        let prompts = project_dir.join("prompts");
+        std::fs::create_dir_all(&prompts).expect("prompt directory");
+        let settings_path = project_dir.join("settings.json");
+        std::fs::write(&settings_path, r#"{"packages":[]}"#).expect("initial settings");
+        let prompt_path = prompts.join("trust-reload-281.md");
+        std::fs::write(&prompt_path, "Trusted $1").expect("initial prompt");
+        let guard = classic_reload_guard(cwd, global.path(), true);
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut event_rx) = build_bash_test_app(session, cwd);
+        app.resource_cli = ResourceCliOptions {
+            no_skills: true,
+            no_prompt_templates: true,
+            no_extensions: true,
+            no_themes: true,
+            skill_paths: Vec::new(),
+            prompt_paths: vec![prompt_path.to_string_lossy().into_owned()],
+            extension_paths: Vec::new(),
+            theme_paths: Vec::new(),
+        };
+        // Seed an actual loader without resolving any configured packages.
+        app.resources = runtime()
+            .block_on(ResourceLoader::load(
+                &app.package_manager,
+                cwd,
+                &app.config,
+                &app.resource_cli,
+            ))
+            .expect("initial explicit prompt");
+        app.autocomplete.provider.set_catalog(
+            crate::autocomplete::AutocompleteCatalog::from_resources(&app.resources),
+        );
+        app.resource_cli.no_prompt_templates = false;
+        app.set_reload_package_manager(
+            PackageManager::new(cwd.to_path_buf()).with_project_trust(true),
+            Some(guard),
+        );
+        let session_id = current_session_id(&app);
+        std::fs::write(&settings_path, r#"{"packages":["git:./missing-package"]}"#)
+            .expect("changed project package");
+        std::fs::write(&prompt_path, "Changed $1").expect("changed prompt");
+
+        assert!(app.handle_slash_reload().is_none());
+        let event = receive_reload_event(&mut event_rx);
+        assert!(matches!(&event, PiMsg::AgentError(error)
+            if error.contains("PI_WORKSPACE_TRUST_RESTART_REQUIRED")));
+        let _ = app.handle_pi_message(event);
+        assert_eq!(
+            app.resources.expand_input("/trust-reload-281 #281"),
+            "Trusted #281"
+        );
+        assert_eq!(current_session_id(&app), session_id);
+        assert_eq!(app.agent_state, AgentState::Idle);
+        for path in [
+            "git",
+            "npm",
+            "packages.lock.json",
+            "package-trust-audit.jsonl",
+        ] {
+            assert!(
+                !project_dir.join(path).exists(),
+                "created package state: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn classic_reload_keeps_a_denied_launch_inert_despite_a_trusted_manager() {
+        let workspace = TempDir::new().expect("workspace");
+        let global = TempDir::new().expect("global configuration");
+        let cwd = workspace.path();
+        let project_dir = cwd.join(".pi");
+        let prompts = project_dir.join("prompts");
+        std::fs::create_dir_all(&prompts).expect("prompt directory");
+        let settings_path = project_dir.join("settings.json");
+        let package_settings = r#"{"packages":["git:./missing-package"]}"#;
+        std::fs::write(&settings_path, package_settings).expect("untrusted package");
+        std::fs::write(prompts.join("trust-reload-project-281.md"), "Project $1")
+            .expect("project prompt");
+        let explicit_prompt = cwd.join("trust-reload-explicit-281.md");
+        std::fs::write(&explicit_prompt, "Explicit $1").expect("explicit prompt");
+        let guard = classic_reload_guard(cwd, global.path(), false);
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, mut event_rx) = build_bash_test_app(session, cwd);
+        app.resource_cli = ResourceCliOptions {
+            no_skills: true,
+            no_prompt_templates: false,
+            no_extensions: true,
+            no_themes: true,
+            skill_paths: Vec::new(),
+            prompt_paths: vec![explicit_prompt.to_string_lossy().into_owned()],
+            extension_paths: Vec::new(),
+            theme_paths: Vec::new(),
+        };
+        app.set_reload_package_manager(
+            PackageManager::new(cwd.to_path_buf()).with_project_trust(true),
+            Some(guard),
+        );
+
+        for settings in [package_settings, "malformed project configuration"] {
+            std::fs::write(&settings_path, settings).expect("update untrusted settings");
+            assert!(app.handle_slash_reload().is_none());
+            let event = receive_reload_event(&mut event_rx);
+            assert!(matches!(&event, PiMsg::ResourcesReloaded { .. }));
+            let _ = app.handle_pi_message(event);
+            assert_eq!(
+                app.resources
+                    .expand_input("/trust-reload-explicit-281 #281"),
+                "Explicit #281"
+            );
+            assert!(
+                app.resources
+                    .prompts()
+                    .iter()
+                    .all(|prompt| prompt.name != "trust-reload-project-281")
+            );
+            for path in [
+                "git",
+                "npm",
+                "packages.lock.json",
+                "package-trust-audit.jsonl",
+            ] {
+                assert!(
+                    !project_dir.join(path).exists(),
+                    "created package state: {path}"
+                );
+            }
         }
     }
 
@@ -6328,6 +6542,72 @@ mod tests {
             compat: None,
             oauth_config: None,
         }
+    }
+
+    #[test]
+    fn classic_fast_uses_current_catalog_and_preserves_selection_across_models() {
+        let temp = TempDir::new().expect("tempdir");
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(session, temp.path());
+        app.save_enabled = false;
+        let mut supported = test_model_entry("tier-relay", "supported");
+        supported.compat = Some(crate::models::CompatConfig {
+            service_tiers: Some(vec![crate::provider::ServiceTier::Ultrafast]),
+            ..crate::models::CompatConfig::default()
+        });
+        let plain = test_model_entry("tier-relay", "plain");
+        app.agent
+            .try_lock()
+            .expect("agent")
+            .handle
+            .session_mut()
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(vec![
+                supported.clone(),
+                plain.clone(),
+            ]));
+
+        for (entry, command, status) in [
+            (&supported, "ultrafast", "service_tier=ultrafast"),
+            (&supported, "on", "service_tier=ultrafast"),
+            (&plain, "status", "omitted"),
+            (&plain, "ultrafast", "unavailable"),
+            (&supported, "status", "service_tier=ultrafast"),
+        ] {
+            let provider = crate::providers::create_provider(entry, None).expect("provider");
+            app.switch_active_model(entry, provider, entry.api_key.as_deref(), "command")
+                .expect("switch model");
+            let (parsed, args) = SlashCommand::parse(&format!("/fast {command}"))
+                .map(|(parsed, args)| (parsed, args.to_string()))
+                .expect("registered command");
+            assert_eq!(parsed, SlashCommand::Fast);
+            assert!(app.handle_slash_command(parsed, &args).is_none());
+            assert!(
+                app.status_message
+                    .as_deref()
+                    .is_some_and(|text| text.contains(status))
+            );
+            assert_eq!(
+                app.agent
+                    .try_lock()
+                    .expect("agent")
+                    .stream_options()
+                    .service_tier
+                    .as_deref(),
+                Some("ultrafast")
+            );
+        }
+        assert!(
+            app.handle_slash_command(SlashCommand::Fast, "off")
+                .is_none()
+        );
+        assert_eq!(
+            app.agent
+                .try_lock()
+                .expect("agent")
+                .stream_options()
+                .service_tier,
+            None
+        );
     }
 
     #[test]

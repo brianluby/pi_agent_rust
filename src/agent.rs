@@ -2043,6 +2043,10 @@ pub struct Agent {
     /// Agent configuration.
     config: AgentConfig,
 
+    /// Reader-specific allowance for retained snapcompact source. A bare
+    /// provider swap resets this until the owning session installs its window.
+    snapcompact_text_tokens: u32,
+
     /// Optional extension manager for tool/event hooks.
     extensions: Option<ExtensionManager>,
 
@@ -2294,6 +2298,7 @@ impl Agent {
             provider,
             tools,
             config,
+            snapcompact_text_tokens: crate::compaction_snap::DEFAULT_SOURCE_TEXT_TOKENS,
             extensions: None,
             extension_tool_catalog: ExtensionToolCatalog::new(json!({})),
             messages: Vec::new(),
@@ -2785,6 +2790,7 @@ impl Agent {
         self.keyword_max_thinking_level = crate::model::ThinkingLevel::Off;
         self.tool_call_dialect = crate::dialects::Dialect::Native;
         self.config.model_accepts_images = false;
+        self.snapcompact_text_tokens = crate::compaction_snap::DEFAULT_SOURCE_TEXT_TOKENS;
     }
 
     #[must_use]
@@ -3071,11 +3077,31 @@ impl Agent {
         self.config.system_prompt = system_prompt;
     }
 
+    /// Estimate a session candidate using the same archive reading and budget
+    /// as this agent's next request, without changing its durable messages.
+    pub(crate) fn estimate_message_context_tokens(&self, messages: &[Message]) -> u64 {
+        compaction::estimate_model_context_tokens_for_model(
+            messages,
+            self.config.model_accepts_images && !self.config.block_images,
+            Some(self.snapcompact_text_tokens),
+            self.provider.name(),
+        )
+    }
+
     /// What the next completion request would carry: the system prompt,
     /// tool definitions and messages after the same filtering a real request
     /// applies. OMP `/dump` writes this beside the transcript.
     pub fn request_context_json(&mut self) -> serde_json::Value {
-        let context = self.build_context();
+        let accepts_images = self.config.model_accepts_images && !self.config.block_images;
+        let text_budget = self.snapcompact_text_tokens;
+        let provider = self.provider.name().to_string();
+        let mut context = self.build_context();
+        crate::compaction_snap::project_for_model(
+            context.messages.to_mut(),
+            accepts_images,
+            Some(text_budget),
+            &provider,
+        );
         let tools: Vec<serde_json::Value> = context
             .tools
             .iter()
@@ -3447,7 +3473,21 @@ impl Agent {
                         &mut total,
                         &mut labels,
                     )?;
-                    if let Some(details) = custom.details.as_mut() {
+                    if custom.custom_type == crate::compaction_snap::SNAPCOMPACT_MESSAGE_TYPE {
+                        if let Some(source) = crate::compaction_snap::source_for_custom(custom) {
+                            let screened = Self::secrets_transform_text(
+                                source,
+                                &mut staged_vault,
+                                mode,
+                                &extra,
+                                &mut total,
+                                &mut labels,
+                            )?;
+                            if screened != source {
+                                crate::compaction_snap::replace_source_text(custom, screened);
+                            }
+                        }
+                    } else if let Some(details) = custom.details.as_mut() {
                         *details = Self::secrets_transform_json(
                             details,
                             &mut staged_vault,
@@ -3545,7 +3585,11 @@ impl Agent {
                 }
                 Message::Custom(custom) => {
                     fields.push(Value::String(custom.content.clone()));
-                    if let Some(details) = &custom.details {
+                    if custom.custom_type == crate::compaction_snap::SNAPCOMPACT_MESSAGE_TYPE {
+                        if let Some(source) = crate::compaction_snap::source_for_custom(custom) {
+                            fields.push(Value::String(source.to_string()));
+                        }
+                    } else if let Some(details) = &custom.details {
                         fields.push(details.clone());
                     }
                 }
@@ -5180,7 +5224,16 @@ impl Agent {
         // context become stable placeholders (obfuscate) or a named refusal
         // (block) before any provider sees them. The vault is in-memory and
         // dies with the session.
-        let context = self.apply_secrets_outbound(context)?;
+        let mut context = self.apply_secrets_outbound(context)?;
+        // The entire retained source is screened before budget clipping, so
+        // assignments in an omitted middle still protect bare echoes in the
+        // kept ends. Providers never receive the native archive envelope.
+        crate::compaction_snap::project_for_model(
+            context.messages.to_mut(),
+            self.config.model_accepts_images && !self.config.block_images,
+            Some(self.snapcompact_text_tokens),
+            self.provider.name(),
+        );
 
         if checkpoint_cx.checkpoint().is_err()
             || abort.as_ref().is_some_and(AbortSignal::is_aborted)
@@ -6382,6 +6435,7 @@ impl Agent {
     /// Both top-level and eval-host calls enter the same policy/hook path.
     /// Nested calls additionally pin the session across approval and hook
     /// awaits; a session-switching prompt cannot authorize the replacement.
+    #[allow(clippy::too_many_lines)]
     async fn execute_tool_in_session(
         &self,
         tool_call: ToolCall,
@@ -6405,6 +6459,21 @@ impl Agent {
             }
         };
 
+        // Resolve before any policy await: an invalid route must not acquire
+        // an unapproved target through a callback that changes the registry.
+        // The executor checks the dispatcher and target again before running.
+        let xdev_target = match Self::resolve_xdev_run(&self.tools.snapshot(), &tool_call) {
+            Ok(target) => target,
+            Err(mut output) => {
+                self.mask_secrets_in_output(&mut output);
+                return (output, true);
+            }
+        };
+        let mut policy_calls = vec![&tool_call];
+        if let Some(target) = &xdev_target {
+            policy_calls.push(target);
+        }
+
         // Plan-mode gate (bd-cv653.3.5): Planning/PendingApproval reject any
         // tool whose effects intersect the mutation/process BARRIER set before
         // soliciting approval or running extensions.
@@ -6421,38 +6490,45 @@ impl Agent {
             );
         }
 
-        let approval_denied_output = self
-            .request_tool_approval(&tool_call, Arc::clone(&on_event))
-            .await;
-        if let Err(error) = self.check_invocation_session(expected_session).await {
-            return (Self::xdev_text_output(&error.to_string(), true), true);
-        }
-
-        let (mut output, is_error) = if let Some(output) = approval_denied_output {
-            (output, true)
-        } else if let Some(extensions) = &extensions {
-            let hook_started_at = Instant::now();
-            let hook_outcome = Self::dispatch_tool_call_hook(
-                extensions,
-                &tool_call,
-                self.config.fail_closed_hooks,
-            )
-            .await;
-            record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
+        // Preserve the dispatcher's own restrictions, then require the target
+        // to pass the same policy with its real name and restored arguments.
+        // An outer veto must not solicit target approval or run target hooks.
+        let mut entered_policy_calls = 0;
+        let mut blocked_output = None;
+        for (index, policy_call) in policy_calls.iter().enumerate() {
+            entered_policy_calls = index + 1;
+            let approval_denied_output = self
+                .request_tool_approval(policy_call, Arc::clone(&on_event))
+                .await;
             if let Err(error) = self.check_invocation_session(expected_session).await {
                 return (Self::xdev_text_output(&error.to_string(), true), true);
             }
-
-            if let Some(blocked_output) = hook_outcome {
-                (blocked_output, true)
-            } else {
-                let tool_started_at = Instant::now();
-                let outcome = self
-                    .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event), expected_session)
-                    .await;
-                record_local_tool_latency(&latency, tool_started_at.elapsed());
-                outcome
+            if let Some(output) = approval_denied_output {
+                blocked_output = Some(output);
+                break;
             }
+
+            if let Some(extensions) = &extensions {
+                let hook_started_at = Instant::now();
+                let hook_outcome = Self::dispatch_tool_call_hook(
+                    extensions,
+                    policy_call,
+                    self.config.fail_closed_hooks,
+                )
+                .await;
+                record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
+                if let Err(error) = self.check_invocation_session(expected_session).await {
+                    return (Self::xdev_text_output(&error.to_string(), true), true);
+                }
+                if let Some(output) = hook_outcome {
+                    blocked_output = Some(output);
+                    break;
+                }
+            }
+        }
+
+        let (mut output, is_error) = if let Some(output) = blocked_output {
+            (output, true)
         } else {
             let tool_started_at = Instant::now();
             let outcome = self
@@ -6465,10 +6541,28 @@ impl Agent {
         if let Err(error) = self.check_invocation_session(expected_session).await {
             return (Self::xdev_text_output(&error.to_string(), true), true);
         }
-        if let Some(extensions) = &extensions {
-            let hook_started_at = Instant::now();
-            Self::apply_tool_result_hook(extensions, &tool_call, &mut output, is_error).await;
-            record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
+        // Unwind only boundaries that were entered. Target hooks see the
+        // native result; dispatcher hooks see the routing envelope afterward.
+        for (index, policy_call) in policy_calls
+            .iter()
+            .take(entered_policy_calls)
+            .enumerate()
+            .rev()
+        {
+            if let Some(extensions) = &extensions {
+                let hook_started_at = Instant::now();
+                Self::apply_tool_result_hook(extensions, policy_call, &mut output, is_error).await;
+                record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
+                if let Err(error) = self.check_invocation_session(expected_session).await {
+                    return (Self::xdev_text_output(&error.to_string(), true), true);
+                }
+            }
+            if index > 0 {
+                output.details = Some(Self::xdev_dispatch_details(
+                    &policy_call.name,
+                    output.details.take(),
+                ));
+            }
         }
 
         // Mask any restored real values in the result heading back to the
@@ -6745,6 +6839,59 @@ impl Agent {
         self.execute_tool(tool_call, on_event, latency).await
     }
 
+    /// Resolve only an admitted xdev execution route. The same resolver runs
+    /// before policy callbacks and against the executor's current snapshot.
+    fn resolve_xdev_run(
+        registry: &ToolRegistry,
+        tool_call: &ToolCall,
+    ) -> std::result::Result<Option<ToolCall>, ToolOutput> {
+        if tool_call.name != "xdev"
+            || tool_call
+                .arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("list")
+                != "run"
+        {
+            return Ok(None);
+        }
+        if registry.get("xdev").is_none() {
+            return Err(Self::tool_not_found_output("xdev"));
+        }
+        let name = tool_call
+            .arguments
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if name.is_empty() {
+            return Err(Self::xdev_text_output("xdev run requires a `name`", true));
+        }
+        if !registry.is_discoverable(name) {
+            return Err(Self::xdev_text_output(
+                &if registry.get(name).is_some() {
+                    format!("{name:?} is already in the live schema — call it directly.")
+                } else {
+                    format!("No discoverable tool named {name:?}; use xdev list.")
+                },
+                true,
+            ));
+        }
+        if registry.get(name).is_none() {
+            return Err(Self::xdev_text_output(
+                &format!("Tool {name:?} not registered"),
+                true,
+            ));
+        }
+        let mut target = tool_call.clone();
+        target.name = name.to_string();
+        target.arguments = tool_call
+            .arguments
+            .get("args")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        Ok(Some(target))
+    }
+
     /// xdev dispatcher interception (bd-cv653.1.6). `run` executes the inner
     /// tool through the normal `Tool::execute` contract (its own input
     /// validation produces the named errors); `promote` moves the tool into
@@ -6763,27 +6910,15 @@ impl Agent {
         let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
         match action {
             "run" => {
-                let name = args.get("name").and_then(Value::as_str).unwrap_or("");
-                if name.is_empty() {
-                    return Some(Self::xdev_text_output("xdev run requires a `name`", true));
-                }
-                if !registry.is_discoverable(name) {
-                    return Some(Self::xdev_text_output(
-                        &if registry.get(name).is_some() {
-                            format!("{name:?} is already in the live schema — call it directly.")
-                        } else {
-                            format!("No discoverable tool named {name:?}; use xdev list.")
-                        },
-                        true,
-                    ));
-                }
-                let inner_args = args.get("args").cloned().unwrap_or_else(|| json!({}));
-                let Some(inner) = registry.get(name) else {
-                    return Some(Self::xdev_text_output(
-                        &format!("Tool {name:?} not registered"),
-                        true,
-                    ));
+                let inner_call = match Self::resolve_xdev_run(&registry, tool_call) {
+                    Ok(Some(target)) => target,
+                    Ok(None) => return None,
+                    Err(output) => return Some(output),
                 };
+                let Some(inner) = registry.get(&inner_call.name) else {
+                    return Some(Self::tool_not_found_output(&inner_call.name));
+                };
+                let inner_args = &inner_call.arguments;
                 let protect = |parts: &[&str]| {
                     let privacy = crate::text_completion::AuxiliaryPrivacy::from_settings(
                         self.config.secrets.as_ref(),
@@ -6799,7 +6934,7 @@ impl Agent {
                         &self.secrets_vault,
                     )
                 };
-                let mut output = inner
+                let output = inner
                     .execute_with_invocation(
                         &tool_call.id,
                         inner_args.clone(),
@@ -6812,8 +6947,7 @@ impl Agent {
                     )
                     .await
                     .unwrap_or_else(|err| Self::xdev_text_output(&err.to_string(), true));
-                self.record_prewalk_evidence(inner, &inner_args, &output);
-                output.details = Some(Self::xdev_dispatch_details(name, output.details.take()));
+                self.record_prewalk_evidence(inner, inner_args, &output);
                 Some(output)
             }
             "promote" => {
@@ -6940,8 +7074,8 @@ impl Agent {
         }
 
         // Load modes (bd-cv653.1.6): intercept the xdev dispatcher's
-        // run/promote actions so the inner tool executes through the normal
-        // path (effects/approval already applied to this outer call).
+        // run/promote actions. The policy pipeline has already admitted both
+        // the dispatcher and the resolved target; this lookup rechecks routing.
         if tool_call.name == "xdev"
             && let Some(output) = self.dispatch_xdev(tool_call, Arc::clone(&on_event)).await
         {
@@ -17129,11 +17263,15 @@ impl AgentSession {
     }
 
     pub fn new(
-        agent: Agent,
+        mut agent: Agent,
         session: Arc<Mutex<Session>>,
         save_enabled: bool,
         compaction_settings: ResolvedCompactionSettings,
     ) -> Self {
+        agent.snapcompact_text_tokens = compaction_settings
+            .context_window_tokens
+            .saturating_sub(compaction_settings.reserve_tokens)
+            / 2;
         // The job scope is shared by every snapshot of the registry, so
         // binding through the current one binds the live registry.
         agent
@@ -17605,6 +17743,8 @@ impl AgentSession {
 
     pub const fn set_compaction_context_window(&mut self, context_window_tokens: u32) {
         self.compaction_settings.context_window_tokens = context_window_tokens;
+        self.agent.snapcompact_text_tokens =
+            context_window_tokens.saturating_sub(self.compaction_settings.reserve_tokens) / 2;
     }
 
     /// The resolved compaction settings this session was constructed with.
@@ -20130,13 +20270,14 @@ impl AgentSession {
         // Count the context actually sent next, not the archived tree entries
         // or pre-compaction usage. Refuse a no-progress overflow recovery
         // before writing or installing its candidate.
-        let tokens_after =
-            compaction::estimate_model_context_tokens(&candidate.to_messages_for_current_path());
+        let tokens_after = self
+            .agent
+            .estimate_message_context_tokens(&candidate.to_messages_for_current_path());
         if require_reduction
             && tokens_after
-                >= compaction::estimate_model_context_tokens(
-                    &session.to_messages_for_current_path(),
-                )
+                >= self
+                    .agent
+                    .estimate_message_context_tokens(&session.to_messages_for_current_path())
         {
             return Err(Error::api(
                 "Context overflow recovery made no progress; compaction did not reduce the active context",
@@ -20338,9 +20479,9 @@ impl AgentSession {
                 // keep-recent budget. Aim to retain at most half the observed
                 // input while preserving the complete current authored turn,
                 // without inventing a different model capacity.
-                let tokens = compaction::estimate_model_context_tokens(
-                    &session.to_messages_for_current_path(),
-                );
+                let tokens = self
+                    .agent
+                    .estimate_message_context_tokens(&session.to_messages_for_current_path());
                 settings.keep_recent_tokens = settings
                     .keep_recent_tokens
                     .min(u32::try_from(tokens / 2).unwrap_or(u32::MAX));
@@ -23000,6 +23141,18 @@ fn apply_image_input_policy(
     block_images: bool,
     model_accepts_images: bool,
 ) {
+    // Source-bearing archives remain typed until full-source privacy screening
+    // completes. Frame-only archives have no extra source to screen.
+    if block_images || !model_accepts_images {
+        for message in messages.iter_mut() {
+            if !crate::compaction_snap::is_archive_message(message) {
+                crate::compaction_snap::strip_snapcompact_images(
+                    std::slice::from_mut(message),
+                    false,
+                );
+            }
+        }
+    }
     let placeholder = if block_images {
         BLOCK_IMAGES_PLACEHOLDER
     } else if !model_accepts_images {
@@ -23008,11 +23161,6 @@ fn apply_image_input_policy(
         return;
     };
 
-    if !model_accepts_images {
-        // Preserve snapcompact's named degradation and its text-only summary
-        // shape before replacing ordinary images with omission explanations.
-        crate::compaction_snap::strip_snapcompact_images(messages, false);
-    }
     let stats = filter_images_for_provider(messages, placeholder);
     if stats.removed_images > 0 {
         tracing::debug!(

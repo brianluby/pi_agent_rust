@@ -71,7 +71,7 @@ be breaking for Rust consumers.
 | `pi::sdk::{create_read_tool, create_bash_tool, create_edit_tool, create_write_tool, create_grep_tool, create_find_tool, create_ls_tool, create_hashline_edit_tool, create_all_tools}` | Stable | Default non-delegating tool constructors. |
 | `pi::sdk::{tool_to_definition, all_tool_definitions}` | Stable | Default non-delegating tool schema helpers. |
 | `pi::sdk::{SubscriptionId, EventListeners, EventSubscriber, OnStreamEvent, OnToolEnd, OnToolStart}` | Stable | Event subscription and hook types. |
-| `pi::sdk::{SessionOptions, ToolFactory, default_tool_registry}` | Stable | In-process session construction and custom tool registry extension points. |
+| `pi::sdk::{SessionOptions, ToolFactory, ToolFactoryContext, ExplicitBuiltinTools, default_tool_registry}` | Stable | In-process session construction and custom tool registry extension points. |
 | `pi::sdk::{AgentSessionHandle, AgentSessionState, create_agent_session}` | Stable | Primary in-process SDK entry point and state handle. |
 | `pi::sdk::{SessionPromptResult, SessionTransport, SessionTransportEvent, SessionTransportState}` | Stable | Unified in-process/RPC transport adapter. |
 | `pi::sdk::{RpcTransportClient, RpcTransportOptions}` | Stable | Subprocess RPC transport client. |
@@ -294,11 +294,83 @@ policy. A summary error or privacy refusal leaves the span intact. If an
 extension changes the session during summarization, the stale report is
 rejected without overwriting that change.
 
+### Tool selection and workspace trust
+
+`SessionOptions::enabled_tools: None` resolves the default tools and persistent
+optional-tool settings when each session is constructed. `Some(names)` is an
+explicit selection with CLI precedence; `Some(Vec::new())` disables built-in
+tools. Hosts rebuilding sessions should preserve `None` when the user omitted
+a tool selection, including when settings happen to disable every default
+tool. See [Optional tools](settings.md#optional-tools) for activation flags and
+load modes.
+
+To keep automatic built-ins within that resolved selection, install
+`ExplicitBuiltinTools` through the existing factory hook:
+
+```rust
+use pi::sdk::{ExplicitBuiltinTools, SessionOptions};
+use std::sync::Arc;
+
+let options = SessionOptions {
+    enabled_tools: Some(vec!["read".into(), "grep".into()]),
+    tool_factory: Some(Arc::new(ExplicitBuiltinTools)),
+    ..SessionOptions::default()
+};
+```
+
+This excludes automatic browser, computer, media, memory, and `manage_skill`
+tools unless the resolved list includes them. Backend prerequisites still
+apply. A derived `xdev` dispatcher exposes only the admitted discoverable
+tools, and an empty list retains the disabled-builtins policy. With
+`enabled_tools: None`, configured optional-tool flags still contribute to
+the resolved list. The ordinary default factory keeps its existing behavior.
+
+`ExplicitBuiltinTools` receives the current session's workspace, effective
+trust decision and guard, and undo recorder. These resources are resolved
+again for each session construction, including replacement sessions. Existing
+custom factories keep their `create_tool_registry` implementation and behavior;
+they can override `create_tool_registry_with_context` to use the same
+`ToolFactoryContext`. Extensions and MCP servers retain their separate loading
+and authorization controls.
+
+Programmatic callers keep the existing `workspace_trusted` contract when
+`workspace_trust_guard` is `None`, its default. Hosts that reuse discovered
+project extension paths or a launch package manager can capture the actual
+`workspace_trust::establish` result with
+`WorkspaceTrustGuard::from_established` and pass that guard in
+`SessionOptions::workspace_trust_guard`. Its original trust decision takes
+precedence over the boolean. The SDK verifies the requested workspace and
+current trust before loading settings, credentials, tools, MCP, or extensions,
+using the captured configuration roots.
+
+The default registry passes that same admission to `subagent` discovery.
+Project agent definitions are excluded when workspace trust is denied, while
+bundled and global definitions remain available. A guard also revalidates
+profile contents before delegation. Direct `SubagentTool` and `ToolRegistry`
+constructors default to excluding project profiles; standalone hosts can use
+`SubagentTool::with_project_trust` for an explicit decision, or
+`with_workspace_trust_guard` to retain a checked launch admission.
+Custom `ToolFactory` implementations own their registry policy and can pass
+the admission from `ToolFactoryContext` through
+`ToolRegistry::with_workspace_trust`, or use
+`ToolRegistry::with_builtin_tool_policy` to control automatic additions too.
+Merely receiving a `Config` does not grant project profile access.
+
+The guard never replays an earlier `--trust` flag. A changed scoped project
+surface or revoked grant produces `PI_WORKSPACE_TRUST_RESTART_REQUIRED`;
+a fresh launch must re-establish trust and resolve its resources. A previously
+denied launch cannot become trusted through a cloned options object.
+Hosts that reload resources outside SDK construction must also validate the
+guard before resolving packages or executing cached project paths. Both
+terminal UIs validate before resource loading; the default UI also validates
+before session replacement side effects.
+
 ### Stream rules
 
 SDK sessions load global stream rules from the configured agent directory and
-project rules when `SessionOptions.workspace_trusted` is true. Ambient rules
-are omitted when context-file loading is disabled. The shared agent enforces
+project rules when the effective workspace trust decision is true (the guard's
+decision when supplied, otherwise `SessionOptions.workspace_trusted`). Ambient
+rules are omitted when context-file loading is disabled. The shared agent enforces
 the rules across provider streams, cancels a matching draft before its tools
 execute, and records a bounded corrective retry in the transcript. The newest
 active-branch correction per rule survives compaction.

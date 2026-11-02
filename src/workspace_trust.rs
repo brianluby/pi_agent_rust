@@ -4,16 +4,17 @@
 //! A repository can select Git/npm packages via `.pi/settings.json` (whose npm
 //! lifecycle scripts run as the local user during install) and can auto-load
 //! JavaScript from `.pi/extensions/` (which may call `pi.exec` during session
-//! startup). Neither is model-generated content — it is deterministic
-//! configuration execution controlled by whoever authored the repository.
+//! startup). Project agent definitions can also select a child process's tool
+//! allowlist, skills and prompt. These are repository-authored capabilities,
+//! even when the model selects the profile by name.
 //!
 //! This module decides, before any of that resolution runs, whether the
 //! current workspace is trusted:
 //!
 //! - The decision is keyed to the canonical workspace path **and** a content
 //!   digest over the project-controlled surfaces (`.pi/settings.json`, every
-//!   file under `.pi/extensions/`, and project-local MCP configuration). Any
-//!   content change re-prompts.
+//!   file under `.pi/extensions/`, project-local MCP configuration, and the
+//!   nearest `.pi/agents/` profiles). Any content change re-prompts.
 //! - Interactive launches prompt once and persist the answer (trusted or
 //!   untrusted) in `<global_dir>/workspace-trust.json`.
 //! - Non-interactive launches (RPC, `--print`, piped stdin) fail closed:
@@ -46,6 +47,9 @@ const TRUST_STORE_VERSION: u32 = 1;
 const TRUST_SURFACE_DIGEST_DOMAIN: &[u8] = b"pi_agent_rust:workspace-trust-surface:v2";
 const MAX_TRUST_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_TRUST_EXTENSION_BYTES: usize = 16 * 1024 * 1024;
+// Match the bounded Markdown definition reader in subagents::definition.
+const MAX_TRUST_AGENT_DEFINITIONS: usize = 256;
+const MAX_TRUST_AGENT_BYTES: usize = 1024 * 1024;
 
 /// A recorded (or requested) trust decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +75,10 @@ pub struct WorkspaceTrustSurface {
     /// sorted. Explicit CLI and global MCP files are deliberate operator
     /// inputs and are not workspace trust surfaces.
     pub mcp_config_entries: Vec<String>,
+    /// Markdown profiles in the nearest `.pi/agents/` directory. Descendant
+    /// paths are relative to the workspace; inherited ancestor paths retain
+    /// their full origin. Entries are sorted and escaped for display.
+    pub agent_definition_entries: Vec<String>,
     /// Hex sha256 over the canonical surface manifest.
     pub digest: String,
 }
@@ -79,8 +87,8 @@ impl WorkspaceTrustSurface {
     /// Scan `cwd` for project-controlled executable surfaces.
     ///
     /// Returns `Ok(None)` when the workspace declares nothing to trust
-    /// (no `.pi/settings.json`, no `.pi/extensions/` entries, and no
-    /// project-local MCP configuration).
+    /// (no `.pi/settings.json`, no `.pi/extensions/` entries, no project-local
+    /// MCP configuration, and no effective project agent definitions).
     pub fn scan(cwd: &Path) -> Result<Option<Self>> {
         const PROJECT_MCP_CONFIGS: &[&str] = &[
             ".agents/mcp.json",
@@ -110,7 +118,18 @@ impl WorkspaceTrustSurface {
             }
         }
 
-        if settings_bytes.is_none() && extension_files.is_empty() && mcp_config_files.is_empty() {
+        let agent_directory = nearest_project_agents_dir(cwd);
+        let agent_files = agent_directory
+            .as_deref()
+            .map(collect_agent_definition_files)
+            .transpose()?
+            .unwrap_or_default();
+
+        if settings_bytes.is_none()
+            && extension_files.is_empty()
+            && mcp_config_files.is_empty()
+            && agent_files.is_empty()
+        {
             return Ok(None);
         }
 
@@ -155,6 +174,12 @@ impl WorkspaceTrustSurface {
             hash_surface_record(&mut surface_hasher, b"mcp", &relative, &bytes);
             mcp_config_entries.push(escaped_path(&relative));
         }
+        let agent_definition_entries = hash_agent_definitions(
+            &mut surface_hasher,
+            cwd,
+            agent_directory.as_deref(),
+            &agent_files,
+        )?;
 
         Ok(Some(Self {
             workspace_display: escaped_path(
@@ -164,9 +189,91 @@ impl WorkspaceTrustSurface {
             package_count,
             extension_entries,
             mcp_config_entries,
+            agent_definition_entries,
             digest: crate::package_manager::hex_encode(&surface_hasher.finalize()),
         }))
     }
+}
+
+/// Select the same nearest authored directory for trust admission and loading.
+/// An empty nearer directory intentionally shadows an ancestor's definitions.
+pub(crate) fn nearest_project_agents_dir(cwd: &Path) -> Option<PathBuf> {
+    let mut current = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    loop {
+        let candidate = current.join(Config::project_dir()).join("agents");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn collect_agent_definition_files(directory: &Path) -> Result<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(directory).map_err(|err| {
+        Error::config(format!(
+            "Failed to scan agent directory {}: {err}",
+            escaped_path(directory)
+        ))
+    })?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|err| Error::config(format!("Failed to enumerate agent definitions: {err}")))?
+            .path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+        {
+            if paths.len() >= MAX_TRUST_AGENT_DEFINITIONS {
+                return Err(Error::config(
+                    "PI_AGENT_DEFINITION_LIMIT: too many agent definitions in one directory",
+                ));
+            }
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn hash_agent_definitions(
+    hasher: &mut Sha256,
+    cwd: &Path,
+    directory: Option<&Path>,
+    files: &[PathBuf],
+) -> Result<Vec<String>> {
+    let mut entries = Vec::with_capacity(files.len());
+    if !files.is_empty()
+        && let Some(directory) = directory
+    {
+        // Both the selected logical directory and its resolved origin matter:
+        // identical profiles at another root can select different relative skills.
+        let canonical = std::fs::canonicalize(directory).map_err(|err| {
+            Error::config(format!(
+                "Failed to resolve agent directory {}: {err}",
+                escaped_path(directory)
+            ))
+        })?;
+        hash_surface_record(
+            hasher,
+            b"agent-directory",
+            directory,
+            canonical.as_os_str().as_encoded_bytes(),
+        );
+    }
+    for path in files {
+        let bytes = read_bounded_regular_file(path, MAX_TRUST_AGENT_BYTES)?.ok_or_else(|| {
+            Error::config(format!(
+                "Agent definition disappeared while scanning {}",
+                escaped_path(path)
+            ))
+        })?;
+        hash_surface_record(hasher, b"agent-definition", path, &bytes);
+        entries.push(escaped_path(path.strip_prefix(cwd).unwrap_or(path)));
+    }
+    Ok(entries)
 }
 
 fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Result<Option<Vec<u8>>> {
@@ -407,6 +514,157 @@ pub struct TrustInputs {
     pub interactive: bool,
 }
 
+/// Launch trust retained by CLI-owned sessions that reuse resolved resources.
+///
+/// A rebuilt session must not treat previously discovered project extensions
+/// as newly authorized explicit paths. Keep the original decision and surface
+/// digest, then recheck policy before any configuration or resource reload.
+/// Programmatic SDK callers can omit this guard and keep their explicit trust
+/// decision.
+#[derive(Debug, Clone)]
+pub struct WorkspaceTrustGuard {
+    origin: PathBuf,
+    origin_key: String,
+    trusted: bool,
+    source: TrustSource,
+    surface_digest: Option<String>,
+    global_dir: PathBuf,
+    config_override: Option<PathBuf>,
+    env_override: Option<String>,
+}
+
+impl WorkspaceTrustGuard {
+    /// Capture the decision that actually admitted the launch resources.
+    /// This does not scan again, grant trust, or retain `--trust` for replay.
+    #[must_use]
+    pub fn from_established(
+        cwd: &Path,
+        state: &WorkspaceTrustState,
+        inputs: &TrustInputs,
+        global_dir: &Path,
+        config_override: Option<&Path>,
+    ) -> Self {
+        let origin = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let global_dir =
+            std::path::absolute(global_dir).unwrap_or_else(|_| global_dir.to_path_buf());
+        let config_override = config_override.map(|path| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                origin.join(path)
+            }
+        });
+        Self {
+            origin_key: workspace_key(&origin),
+            origin,
+            trusted: state.trusted,
+            source: state.source,
+            surface_digest: state.surface.as_ref().map(|surface| surface.digest.clone()),
+            global_dir,
+            config_override,
+            env_override: inputs.env_override.clone(),
+        }
+    }
+
+    /// The original decision; revalidation never promotes a denied launch.
+    #[must_use]
+    pub const fn trusted(&self) -> bool {
+        self.trusted
+    }
+
+    #[must_use]
+    pub(crate) fn global_dir(&self) -> &Path {
+        &self.global_dir
+    }
+
+    #[must_use]
+    pub(crate) fn config_override(&self) -> Option<&Path> {
+        self.config_override.as_deref()
+    }
+
+    /// Verify that a replacement still uses the admitted launch workspace.
+    ///
+    /// # Errors
+    /// Returns an actionable restart error if the workspace or trust changed.
+    pub fn validate_workspace(&self, cwd: &Path) -> Result<()> {
+        if workspace_key(cwd) != self.origin_key {
+            return Err(self
+                .restart_required("the requested workspace differs from the launch workspace"));
+        }
+        self.validate_origin()
+    }
+
+    /// Revalidate the origin of cached project configuration and resources.
+    ///
+    /// # Errors
+    /// Returns an actionable restart error if the original grant is no longer
+    /// valid, its scoped surface changed, or current policy cannot be read.
+    pub fn validate_origin(&self) -> Result<()> {
+        if workspace_key(&self.origin) != self.origin_key {
+            return Err(
+                self.restart_required("the launch workspace path now resolves elsewhere"),
+            );
+        }
+        if !self.trusted {
+            return Ok(());
+        }
+
+        let global = Config::load_with_roots_and_project_trust(
+            self.config_override.as_deref(),
+            &self.global_dir,
+            &self.origin,
+            false,
+        )
+        .map_err(|error| {
+            self.restart_required(&format!("cannot reload operator settings: {error}"))
+        })?;
+        let inputs = TrustInputs {
+            cli_trust: false,
+            trust_all_workspaces: global.trust_all_workspaces.unwrap_or(false),
+            env_override: self.env_override.clone(),
+            interactive: false,
+        };
+        let current = establish(
+            &self.origin,
+            &self.global_dir.join(TRUST_STORE_FILE),
+            &inputs,
+            |_| Ok(false),
+        )
+        .map_err(|error| {
+            self.restart_required(&format!("cannot revalidate workspace trust: {error}"))
+        })?;
+        if !current.trusted {
+            return Err(self.restart_required("workspace trust is no longer granted"));
+        }
+
+        // `establish` returns NoSurface before consulting universal policy.
+        // A captured trusted environment override cannot change in this guard;
+        // global policy is read above on every validation.
+        let universal = matches!(
+            current.source,
+            TrustSource::EnvOverride | TrustSource::TrustAllConfig
+        ) || (current.source == TrustSource::NoSurface
+            && (self.source == TrustSource::EnvOverride
+                || (inputs.env_override.is_none() && inputs.trust_all_workspaces)));
+        if !universal
+            && current.surface.as_ref().map(|surface| surface.digest.as_str())
+                != self.surface_digest.as_deref()
+        {
+            return Err(self.restart_required(
+                "the project configuration or executable resources changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn restart_required(&self, reason: &str) -> Error {
+        Error::config(format!(
+            "PI_WORKSPACE_TRUST_RESTART_REQUIRED: {reason} for {}; restart Pi and re-establish workspace trust before rebuilding the session or reloading resources",
+            escaped_path(&self.origin)
+        ))
+    }
+}
+
 #[cfg(unix)]
 fn encoded_workspace_key(canonical: &Path) -> String {
     // The tag is part of the persistence contract. Changing it deliberately
@@ -562,6 +820,280 @@ mod tests {
         }
     }
 
+    fn guard_for(cwd: &Path, global_dir: &Path, trust_inputs: &TrustInputs) -> WorkspaceTrustGuard {
+        let state = establish(
+            cwd,
+            &global_dir.join(TRUST_STORE_FILE),
+            trust_inputs,
+            no_prompt,
+        )
+        .expect("establish launch trust");
+        WorkspaceTrustGuard::from_established(cwd, &state, trust_inputs, global_dir, None)
+    }
+
+    fn assert_restart_required(result: Result<()>) {
+        let error = result.expect_err("changed launch authority must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("PI_WORKSPACE_TRUST_RESTART_REQUIRED"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn reload_guard_keeps_the_admitted_digest_and_never_replays_cli_trust() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global = tempfile::tempdir().expect("global");
+        let settings = workspace.path().join(".pi/settings.json");
+        write(
+            &settings,
+            r#"{"tools":{"enable_eval":false,"enable_github":false,"enable_security_scan":false,"enable_subagent":false}}"#,
+        );
+        let trust_inputs = TrustInputs {
+            cli_trust: true,
+            ..inputs()
+        };
+        let store_path = global.path().join(TRUST_STORE_FILE);
+        let admitted = establish(workspace.path(), &store_path, &trust_inputs, no_prompt)
+            .expect("admit original settings");
+        let guard = WorkspaceTrustGuard::from_established(
+            workspace.path(),
+            &admitted,
+            &trust_inputs,
+            global.path(),
+            None,
+        );
+        assert!(guard.trusted());
+        guard
+            .validate_workspace(workspace.path())
+            .expect("unchanged workspace");
+
+        write(
+            &settings,
+            r#"{"tools":{"enable_eval":true,"enable_github":true,"enable_security_scan":true,"enable_subagent":true}}"#,
+        );
+        // Capturing after a mutation must still retain the digest from the
+        // actual admission, rather than scanning and granting the new bytes.
+        let late_guard = WorkspaceTrustGuard::from_established(
+            workspace.path(),
+            &admitted,
+            &trust_inputs,
+            global.path(),
+            None,
+        );
+        assert_restart_required(guard.validate_origin());
+        assert_restart_required(late_guard.validate_origin());
+
+        // A separate process can approve the new surface, but this session's
+        // cached resources still require resolution in a fresh launch.
+        let readmitted = establish(workspace.path(), &store_path, &trust_inputs, no_prompt)
+            .expect("admit changed settings separately");
+        assert_restart_required(guard.validate_origin());
+        let fresh_guard = WorkspaceTrustGuard::from_established(
+            workspace.path(),
+            &readmitted,
+            &trust_inputs,
+            global.path(),
+            None,
+        );
+        fresh_guard
+            .validate_origin()
+            .expect("freshly resolved launch");
+
+        let other = tempfile::tempdir().expect("other workspace");
+        write(&other.path().join(".pi/settings.json"), r#"{}"#);
+        assert_restart_required(fresh_guard.validate_workspace(other.path()));
+    }
+
+    #[test]
+    fn reload_guard_rejects_mutated_extensions_and_project_mcp() {
+        for (relative, before, after) in [
+            (
+                ".pi/extensions/hook.ts",
+                "export const value = 1;\n",
+                "export const value = 2;\n",
+            ),
+            (
+                ".agents/mcp.json",
+                r#"{"mcpServers":{}}"#,
+                r#"{"mcpServers":{"new":{"command":"new-server"}}}"#,
+            ),
+        ] {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let global = tempfile::tempdir().expect("global");
+            let path = workspace.path().join(relative);
+            write(&path, before);
+            let guard = guard_for(
+                workspace.path(),
+                global.path(),
+                &TrustInputs {
+                    cli_trust: true,
+                    ..inputs()
+                },
+            );
+            guard.validate_origin().expect("unchanged surface");
+            write(&path, after);
+            assert_restart_required(guard.validate_origin());
+        }
+    }
+
+    #[test]
+    fn reload_guard_rejects_new_surface_after_empty_workspace_admission() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global = tempfile::tempdir().expect("global");
+        let guard = guard_for(workspace.path(), global.path(), &inputs());
+        assert!(guard.trusted());
+        guard.validate_origin().expect("still empty");
+        write(
+            &workspace.path().join(".pi/settings.json"),
+            r#"{"tools":{"enable_eval":true,"enable_github":true,"enable_security_scan":true,"enable_subagent":true}}"#,
+        );
+        assert_restart_required(guard.validate_origin());
+    }
+
+    #[test]
+    fn reload_guard_honors_current_universal_policy_including_empty_surfaces() {
+        for via_env in [false, true] {
+            for initially_empty in [false, true] {
+                let workspace = tempfile::tempdir().expect("workspace");
+                let global = tempfile::tempdir().expect("global");
+                let settings = workspace.path().join(".pi/settings.json");
+                if !initially_empty {
+                    write(&settings, r#"{}"#);
+                }
+                let trust_inputs = if via_env {
+                    TrustInputs {
+                        env_override: Some(" TrUsTeD ".to_string()),
+                        ..inputs()
+                    }
+                } else {
+                    write(
+                        &global.path().join("settings.json"),
+                        r#"{"trustAllWorkspaces":true}"#,
+                    );
+                    TrustInputs {
+                        trust_all_workspaces: true,
+                        ..inputs()
+                    }
+                };
+                let guard = guard_for(workspace.path(), global.path(), &trust_inputs);
+                write(&settings, r#"{"tools":{"enable_subagent":true}}"#);
+                guard
+                    .validate_origin()
+                    .expect("universal policy remains active");
+                std::fs::rename(&settings, workspace.path().join("old-settings.json"))
+                    .expect("remove the last executable surface");
+                guard
+                    .validate_origin()
+                    .expect("universal policy also allows removal");
+            }
+        }
+    }
+
+    #[test]
+    fn reload_guard_observes_policy_revocation_and_malformed_operator_settings() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global = tempfile::tempdir().expect("global");
+        write(&workspace.path().join(".pi/settings.json"), r#"{}"#);
+        let global_settings = global.path().join("settings.json");
+        write(&global_settings, r#"{"trustAllWorkspaces":true}"#);
+        let global_guard = guard_for(
+            workspace.path(),
+            global.path(),
+            &TrustInputs {
+                trust_all_workspaces: true,
+                ..inputs()
+            },
+        );
+        write(&global_settings, r#"{"trustAllWorkspaces":false}"#);
+        assert_restart_required(global_guard.validate_origin());
+
+        let trust_inputs = TrustInputs {
+            cli_trust: true,
+            ..inputs()
+        };
+        let scoped_guard = guard_for(workspace.path(), global.path(), &trust_inputs);
+        let surface = WorkspaceTrustSurface::scan(workspace.path())
+            .expect("scan")
+            .expect("surface");
+        WorkspaceTrustStore::load(&global.path().join(TRUST_STORE_FILE))
+            .record(
+                &workspace_key(workspace.path()),
+                &surface.digest,
+                TrustDecision::Untrusted,
+            )
+            .expect("revoke stored trust");
+        assert_restart_required(scoped_guard.validate_origin());
+
+        let trusted_guard = guard_for(workspace.path(), global.path(), &trust_inputs);
+        write(&global_settings, r#"{"tools":{"enable_eval":"yes"}}"#);
+        assert_restart_required(trusted_guard.validate_origin());
+    }
+
+    #[test]
+    fn reload_guard_uses_the_anchored_operator_override() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global = tempfile::tempdir().expect("global");
+        write(&workspace.path().join(".pi/settings.json"), r#"{}"#);
+        write(
+            &global.path().join("settings.json"),
+            r#"{"trustAllWorkspaces":true}"#,
+        );
+        let operator_settings = workspace.path().join("operator.json");
+        write(&operator_settings, r#"{"trustAllWorkspaces":true}"#);
+        let trust_inputs = TrustInputs {
+            trust_all_workspaces: true,
+            ..inputs()
+        };
+        let state = establish(
+            workspace.path(),
+            &global.path().join(TRUST_STORE_FILE),
+            &trust_inputs,
+            no_prompt,
+        )
+        .expect("admit operator policy");
+        let guard = WorkspaceTrustGuard::from_established(
+            workspace.path(),
+            &state,
+            &trust_inputs,
+            global.path(),
+            Some(Path::new("operator.json")),
+        );
+        write(
+            &workspace.path().join(".pi/settings.json"),
+            r#"{"tools":{"enable_eval":true}}"#,
+        );
+        guard
+            .validate_origin()
+            .expect("relative override resolved at origin");
+        write(&operator_settings, r#"{"trustAllWorkspaces":false}"#);
+        assert_restart_required(guard.validate_origin());
+    }
+
+    #[test]
+    fn reload_guard_never_promotes_an_originally_untrusted_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global = tempfile::tempdir().expect("global");
+        write(&workspace.path().join(".pi/settings.json"), r#"{}"#);
+        let guard = guard_for(workspace.path(), global.path(), &inputs());
+        assert!(!guard.trusted());
+        write(
+            &workspace.path().join(".pi/settings.json"),
+            "malformed project configuration",
+        );
+        write(
+            &global.path().join("settings.json"),
+            r#"{"trustAllWorkspaces":true}"#,
+        );
+        guard
+            .validate_origin()
+            .expect("project configuration stays excluded");
+        assert!(!guard.trusted());
+        let other = tempfile::tempdir().expect("other workspace");
+        assert_restart_required(guard.validate_workspace(other.path()));
+    }
+
     #[test]
     fn scan_treats_a_file_where_a_surface_directory_is_expected_as_absent() {
         // A stray regular file named `.codex` (this repository carried one)
@@ -693,6 +1225,185 @@ mod tests {
             vec![".codex/config.toml", ".pi/mcp.json"]
         );
         assert_ne!(changed.digest, foreign_added.digest);
+    }
+
+    #[test]
+    fn scan_tracks_agent_profile_bytes_names_and_nearest_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        let cwd = project.join("nested");
+        std::fs::create_dir_all(&cwd).expect("workspace");
+        let ancestor = project.join(".pi/agents/scout.md");
+        write(&ancestor, "read-only profile");
+        let first = WorkspaceTrustSurface::scan(&cwd)
+            .expect("scan")
+            .expect("inherited profiles are a trust surface");
+        assert!(!first.has_project_settings);
+        assert!(first.extension_entries.is_empty());
+        assert!(first.mcp_config_entries.is_empty());
+        assert_eq!(
+            first.agent_definition_entries,
+            vec![escaped_path(&ancestor)]
+        );
+
+        write(&project.join(".pi/agents/notes.txt"), "ignored");
+        write(&project.join(".pi/agents/nested/ignored.md"), "ignored");
+        assert_eq!(
+            first.digest,
+            WorkspaceTrustSurface::scan(&cwd)
+                .expect("scan")
+                .expect("surface")
+                .digest,
+            "discovery is nonrecursive and Markdown-only"
+        );
+
+        write(&ancestor, "privileged profile");
+        let changed = WorkspaceTrustSurface::scan(&cwd)
+            .expect("scan")
+            .expect("surface");
+        assert_ne!(first.digest, changed.digest);
+        let renamed = project.join(".pi/agents/reviewer.MD");
+        std::fs::rename(&ancestor, &renamed).expect("rename fixture");
+        let renamed_surface = WorkspaceTrustSurface::scan(&cwd)
+            .expect("scan")
+            .expect("case-insensitive Markdown selection");
+        assert_ne!(changed.digest, renamed_surface.digest);
+        assert_eq!(
+            renamed_surface.agent_definition_entries,
+            vec![escaped_path(&renamed)]
+        );
+
+        // The loader stops at the nearest directory, even when it is empty.
+        let nearest = cwd.join(".pi/agents");
+        std::fs::create_dir_all(&nearest).expect("empty nearest directory");
+        assert!(WorkspaceTrustSurface::scan(&cwd).expect("scan").is_none());
+        write(&nearest.join("reviewer.MD"), "privileged profile");
+        let nearest_surface = WorkspaceTrustSurface::scan(&cwd)
+            .expect("scan")
+            .expect("nearest surface");
+        assert_eq!(
+            nearest_surface.agent_definition_entries,
+            vec![".pi/agents/reviewer.MD"]
+        );
+        assert_ne!(renamed_surface.digest, nearest_surface.digest);
+        write(&renamed, "ignored ancestor mutation");
+        assert_eq!(
+            nearest_surface.digest,
+            WorkspaceTrustSurface::scan(&cwd)
+                .expect("scan")
+                .expect("surface")
+                .digest
+        );
+    }
+
+    #[test]
+    fn agent_only_workspaces_require_admission_and_late_profiles_invalidate_empty_launches() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let global = tempfile::tempdir().expect("global");
+        let initially_empty = guard_for(workspace.path(), global.path(), &inputs());
+        assert!(initially_empty.trusted());
+        write(
+            &workspace.path().join(".pi/agents/scout.md"),
+            "---\nname: scout\ndescription: project\ntools: eval,github,security_scan,subagent\n---\nproject prompt",
+        );
+        assert_restart_required(initially_empty.validate_origin());
+        let denied = establish(
+            workspace.path(),
+            &global.path().join(TRUST_STORE_FILE),
+            &inputs(),
+            no_prompt,
+        )
+        .expect("noninteractive admission");
+        assert!(!denied.trusted);
+        assert_eq!(denied.source, TrustSource::NonInteractive);
+        let admitted = guard_for(
+            workspace.path(),
+            global.path(),
+            &TrustInputs {
+                cli_trust: true,
+                ..inputs()
+            },
+        );
+        admitted.validate_origin().expect("admitted profile");
+        assert_restart_required(initially_empty.validate_origin());
+    }
+
+    #[test]
+    fn scan_enforces_agent_definition_file_and_directory_bounds() {
+        let non_regular = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(non_regular.path().join(".pi/agents/directory.md"))
+            .expect("non-regular definition");
+        let error = WorkspaceTrustSurface::scan(non_regular.path())
+            .expect_err("non-regular definitions must fail closed");
+        assert!(error.to_string().contains("not a regular file"));
+
+        let oversized = tempfile::tempdir().expect("tempdir");
+        write(
+            &oversized.path().join(".pi/agents/scout.md"),
+            &"x".repeat(MAX_TRUST_AGENT_BYTES + 1),
+        );
+        let error = WorkspaceTrustSurface::scan(oversized.path())
+            .expect_err("oversized definition must fail closed");
+        assert!(error.to_string().contains("exceeds 1048576 bytes"));
+
+        let many = tempfile::tempdir().expect("tempdir");
+        for index in 0..MAX_TRUST_AGENT_DEFINITIONS {
+            write(
+                &many.path().join(format!(".pi/agents/{index}.md")),
+                "profile",
+            );
+        }
+        let accepted = WorkspaceTrustSurface::scan(many.path())
+            .expect("bounded scan")
+            .expect("profiles");
+        assert_eq!(
+            accepted.agent_definition_entries.len(),
+            MAX_TRUST_AGENT_DEFINITIONS
+        );
+        write(&many.path().join(".pi/agents/overflow.md"), "profile");
+        let error = WorkspaceTrustSurface::scan(many.path())
+            .expect_err("definition count is bounded before file reads");
+        assert!(error.to_string().contains("PI_AGENT_DEFINITION_LIMIT"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_binds_agent_directory_symlink_origin_and_escapes_profile_names() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path().join("workspace");
+        std::fs::create_dir_all(cwd.join(".pi")).expect("workspace");
+        let first_root = temp.path().join("profiles-first");
+        let second_root = temp.path().join("profiles-second");
+        let filename = "scout\n\u{1b}[2J.md";
+        for root in [&first_root, &second_root] {
+            write(&root.join(filename), "identical profile bytes");
+        }
+        let selected = cwd.join(".pi/agents");
+        symlink(&first_root, &selected).expect("first origin");
+        let first = WorkspaceTrustSurface::scan(&cwd)
+            .expect("scan")
+            .expect("surface");
+        let displayed = first.agent_definition_entries.join(" ");
+        assert!(!displayed.contains('\n'));
+        assert!(!displayed.contains('\u{1b}'));
+        assert!(displayed.contains("\\n"));
+        assert!(displayed.contains("\\u{1b}"));
+        std::fs::rename(&selected, cwd.join(".pi/agents.previous")).expect("retain old link");
+        symlink(&second_root, &selected).expect("second origin");
+        let second = WorkspaceTrustSurface::scan(&cwd)
+            .expect("scan")
+            .expect("surface");
+        assert_ne!(
+            first.digest, second.digest,
+            "origin changes must invalidate trust"
+        );
+
+        symlink("/dev/zero", second_root.join("device.md")).expect("non-regular target");
+        let error = WorkspaceTrustSurface::scan(&cwd)
+            .expect_err("agent device symlink must fail without reading");
+        assert!(error.to_string().contains("not a regular file"));
     }
 
     #[test]

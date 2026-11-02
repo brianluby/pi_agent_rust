@@ -891,6 +891,81 @@ impl PiApp {
             SettingsUiEntry::SteeringMode | SettingsUiEntry::FollowUpMode => {
                 self.toggle_queue_mode_setting(entry);
             }
+            SettingsUiEntry::EnableEval => {
+                let next = !self
+                    .config
+                    .tools
+                    .as_ref()
+                    .and_then(|tools| tools.enable_eval)
+                    .unwrap_or(false);
+                if self.persist_project_settings_patch(
+                    "tools.enableEval",
+                    json!({ "tools": { "enable_eval": next, "enableEval": null } }),
+                ) {
+                    self.config.tools.get_or_insert_default().enable_eval = Some(next);
+                    self.status_message = Some(format!(
+                        "Updated tools.enableEval: {} (new session)",
+                        bool_label(next)
+                    ));
+                }
+            }
+            SettingsUiEntry::EnableGithub => {
+                let next = !self
+                    .config
+                    .tools
+                    .as_ref()
+                    .and_then(|tools| tools.enable_github)
+                    .unwrap_or(false);
+                if self.persist_project_settings_patch(
+                    "tools.enableGithub",
+                    json!({ "tools": { "enable_github": next, "enableGithub": null } }),
+                ) {
+                    self.config.tools.get_or_insert_default().enable_github = Some(next);
+                    self.status_message = Some(format!(
+                        "Updated tools.enableGithub: {} (new session)",
+                        bool_label(next)
+                    ));
+                }
+            }
+            SettingsUiEntry::EnableSecurityScan => {
+                let next = !self
+                    .config
+                    .tools
+                    .as_ref()
+                    .and_then(|tools| tools.enable_security_scan)
+                    .unwrap_or(false);
+                if self.persist_project_settings_patch(
+                    "tools.enableSecurityScan",
+                    json!({ "tools": { "enable_security_scan": next, "enableSecurityScan": null } }),
+                ) {
+                    self.config
+                        .tools
+                        .get_or_insert_default()
+                        .enable_security_scan = Some(next);
+                    self.status_message = Some(format!(
+                        "Updated tools.enableSecurityScan: {} (new session)",
+                        bool_label(next)
+                    ));
+                }
+            }
+            SettingsUiEntry::EnableSubagent => {
+                let next = !self
+                    .config
+                    .tools
+                    .as_ref()
+                    .and_then(|tools| tools.enable_subagent)
+                    .unwrap_or(false);
+                if self.persist_project_settings_patch(
+                    "tools.enableSubagent",
+                    json!({ "tools": { "enable_subagent": next, "enableSubagent": null } }),
+                ) {
+                    self.config.tools.get_or_insert_default().enable_subagent = Some(next);
+                    self.status_message = Some(format!(
+                        "Updated tools.enableSubagent: {} (new session)",
+                        bool_label(next)
+                    ));
+                }
+            }
             SettingsUiEntry::DefaultPermissive => {
                 let next = !self.effective_default_permissive();
                 if self.persist_project_settings_patch(
@@ -1107,6 +1182,19 @@ impl PiApp {
         let keep_recent = self.config.compaction_keep_recent_tokens();
         let steering = self.config.steering_queue_mode();
         let follow_up = self.config.follow_up_queue_mode();
+        let tool_settings = self.config.tools.as_ref();
+        let enable_eval = tool_settings
+            .and_then(|tools| tools.enable_eval)
+            .unwrap_or(false);
+        let enable_github = tool_settings
+            .and_then(|tools| tools.enable_github)
+            .unwrap_or(false);
+        let enable_security_scan = tool_settings
+            .and_then(|tools| tools.enable_security_scan)
+            .unwrap_or(false);
+        let enable_subagent = tool_settings
+            .and_then(|tools| tools.enable_subagent)
+            .unwrap_or(false);
         let default_permissive = self.effective_default_permissive();
         let quiet_startup = self.config.quiet_startup.unwrap_or(false);
         let collapse_changelog = self.config.collapse_changelog.unwrap_or(false);
@@ -1132,6 +1220,26 @@ impl PiApp {
         );
         let _ = writeln!(output, "  steeringMode: {}", steering.as_str());
         let _ = writeln!(output, "  followUpMode: {}", follow_up.as_str());
+        let _ = writeln!(
+            output,
+            "  tools.enableEval: {} (new session)",
+            bool_label(enable_eval)
+        );
+        let _ = writeln!(
+            output,
+            "  tools.enableGithub: {} (new session)",
+            bool_label(enable_github)
+        );
+        let _ = writeln!(
+            output,
+            "  tools.enableSecurityScan: {} (new session)",
+            bool_label(enable_security_scan)
+        );
+        let _ = writeln!(
+            output,
+            "  tools.enableSubagent: {} (new session)",
+            bool_label(enable_subagent)
+        );
         let _ = writeln!(
             output,
             "  extensionPolicy.defaultPermissive: {}{}",
@@ -1758,6 +1866,7 @@ pub async fn run_interactive(
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
     package_manager: PackageManager,
+    workspace_trust_guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
     cwd: PathBuf,
     runtime_handle: RuntimeHandle,
     workspace: WorkspaceHandle,
@@ -1911,10 +2020,9 @@ pub async fn run_interactive(
         // Keep the actual AgentSession/ExtensionRegion alive until async
         // shutdown finishes, even after the terminal program drops PiApp.
         shutdown_owner = Arc::clone(&app.agent);
-        // `/reload` must reuse the exact startup trust decision. Rebuilding a
-        // default PackageManager here would silently re-enable project package
-        // resolution in an untrusted workspace.
-        app.set_reload_package_manager(package_manager);
+        // Retain the actual launch admission so `/reload` cannot resolve
+        // changed project packages under a stale trust decision.
+        app.set_reload_package_manager(package_manager, workspace_trust_guard);
         app.ask_tool = ask_tool;
         // The live multi-root handle must reach the app (bd-cv653.3.12) —
         // without it /add-dir, @-file scope, and autocomplete run on a
@@ -2973,6 +3081,8 @@ pub struct PiApp {
     /// `PiApp::new` construction starts fail-closed until its host installs an
     /// explicitly trusted manager.
     package_manager: PackageManager,
+    /// Admission for project configuration reread by the retained resolver.
+    workspace_trust_guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
     cwd: PathBuf,
     model_entry: ModelEntry,
     model_entry_shared: Arc<StdMutex<ModelEntry>>,
@@ -3128,8 +3238,16 @@ impl PiApp {
     ///
     /// Keeping this as one explicit seam prevents reload from reconstructing a
     /// resolver whose default trust differs from the decision made at startup.
-    pub(crate) fn set_reload_package_manager(&mut self, package_manager: PackageManager) {
-        self.package_manager = package_manager;
+    pub(crate) fn set_reload_package_manager(
+        &mut self,
+        package_manager: PackageManager,
+        workspace_trust_guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
+    ) {
+        self.package_manager = match &workspace_trust_guard {
+            Some(guard) => package_manager.with_project_trust(guard.trusted()),
+            None => package_manager,
+        };
+        self.workspace_trust_guard = workspace_trust_guard;
     }
 
     /// Attach the session workspace root handle (bd-cv653.3.12). Installed
@@ -3498,6 +3616,7 @@ impl PiApp {
             resources,
             resource_cli,
             package_manager: PackageManager::new(cwd.clone()).with_project_trust(false),
+            workspace_trust_guard: None,
             cwd,
             model_entry,
             model_entry_shared: model_entry_shared.clone(),
