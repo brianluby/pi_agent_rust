@@ -2,6 +2,7 @@
 mod tests {
     use super::extensions_integration_tests::PiAiCaptureProvider;
     use super::*;
+    use crate::agent_cx::AgentCx;
     use crate::auth::AuthCredential;
     use crate::provider::{InputType, Model, ModelCost};
     use asupersync::runtime::RuntimeBuilder;
@@ -12,6 +13,19 @@ mod tests {
     use std::path::Path;
     use std::pin::Pin;
     use std::sync::{Arc as StdArc, Mutex as StdTestMutex};
+
+    fn assistant_text_content(content: &[ContentBlock]) -> String {
+        let mut text = String::new();
+        for block in content {
+            if let ContentBlock::Text(part) = block {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&part.text);
+            }
+        }
+        text
+    }
 
     fn user_message(text: &str) -> Message {
         Message::User(UserMessage {
@@ -201,6 +215,7 @@ mod tests {
                     total: self.provider_reported_total.unwrap_or(0.0),
                     ..crate::model::Cost::default()
                 },
+                billing: None,
             };
             Ok(Box::pin(futures::stream::iter([Ok(StreamEvent::Done {
                 reason: StopReason::Stop,
@@ -306,11 +321,12 @@ mod tests {
             assert_eq!(session.agent.config.max_time, Some(Duration::from_secs(60)));
             assert!(!session.stage_pending_job_follow_up().await);
 
-            let captured = calls.lock().expect("captured provider context");
-            assert_eq!(captured.len(), 1, "exactly one wake request");
-            assert_eq!(captured[0].messages.len(), 1);
-            assert_user_text(&captured[0].messages[0], "owned background result");
-            drop(captured);
+            {
+                let captured = calls.lock().expect("captured provider context");
+                assert_eq!(captured.len(), 1, "exactly one wake request");
+                assert_eq!(captured[0].messages.len(), 1);
+                assert_user_text(&captured[0].messages[0], "owned background result");
+            }
             let cx = AgentCx::for_current_or_request();
             let saved = saved.lock(cx.cx()).await.expect("saved transcript");
             let messages = saved.to_messages_for_current_path();
@@ -368,7 +384,9 @@ mod tests {
                 Err(Error::Aborted)
             ));
             let expired = PrewalkRunBudget {
-                started: Instant::now() - Duration::from_secs(2),
+                started: Instant::now()
+                    .checked_sub(Duration::from_secs(2))
+                    .expect("the clock origin is over 2 s ago"),
                 max_time: Some(Duration::from_secs(1)),
                 iterations: 3,
                 pause_continuations: 0,
@@ -433,7 +451,9 @@ mod tests {
     #[test]
     fn idle_job_wake_deadline_clamps_the_original_prewalk_clock() {
         let wake_started = Instant::now();
-        let prewalk_started = wake_started - Duration::from_secs(20);
+        let prewalk_started = wake_started
+            .checked_sub(Duration::from_secs(20))
+            .expect("the clock origin is over 20 s ago");
         for (original_cap, expected_cap) in [(Some(60), 30), (Some(25), 25), (None, 30)] {
             let original_cap = original_cap.map(Duration::from_secs);
             let mut session = idle_wake_session_with_prewalk(
@@ -474,7 +494,9 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
         runtime.block_on(async {
             let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let started = Instant::now() - Duration::from_secs(20);
+            let started = Instant::now()
+                .checked_sub(Duration::from_secs(20))
+                .expect("the clock origin is over 20 s ago");
             let mut session = idle_wake_session_with_prewalk(
                 Arc::new(StallAfterToolTurnProvider {
                     calls: Arc::clone(&calls),
@@ -6920,7 +6942,7 @@ mod tests {
                 .expect("provider admission");
 
             agent_session
-                .apply_compaction_result(result, on_event, provider_admission, None, None)
+                .apply_compaction_result(result, on_event, provider_admission, None, None, None)
                 .await
                 .expect("apply compaction result");
 
@@ -7029,6 +7051,7 @@ mod tests {
                     provider_admission,
                     None,
                     None,
+                    None,
                 ),
             )
             .await
@@ -7111,7 +7134,7 @@ mod tests {
                 .expect("provider admission");
 
             let err = agent_session
-                .apply_compaction_result(result, on_event, provider_admission, None, None)
+                .apply_compaction_result(result, on_event, provider_admission, None, None, None)
                 .await
                 .expect_err("blocked persistence must fail");
             assert!(
@@ -11084,11 +11107,12 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
             let streaming = Arc::clone(&session.extensions_is_streaming);
             let events = Arc::new(StdMutex::new(Vec::new()));
             let captured = Arc::clone(&events);
-            let mut turn = Box::pin(
-                session.run_text("check the fixture".to_string(), move |event| {
-                    captured.lock().expect("events").push(event)
-                }),
-            );
+            let mut turn = Box::pin(session.run_text(
+                "check the fixture".to_string(),
+                move |event| {
+                    captured.lock().expect("events").push(event);
+                },
+            ));
             let reached_review = futures::future::poll_fn(|cx| {
                 assert!(std::future::Future::poll(turn.as_mut(), cx).is_pending());
                 if advisor.observed_durable_completion.load(Ordering::SeqCst) {

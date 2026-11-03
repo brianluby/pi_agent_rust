@@ -64,7 +64,7 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BUSY_TIMEOUT_MS: u64 = 30_000;
 // fsqlite 0.4.10 uses this floor for connection admission and prepare refresh,
 // independently of a connection's current PRAGMA busy_timeout setting.
-const ENGINE_BOOTSTRAP_WAIT: Duration = Duration::from_millis(30_000);
+const ENGINE_BOOTSTRAP_WAIT: Duration = Duration::from_secs(30);
 const CANCEL_GRACE: Duration = Duration::from_millis(250);
 static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
@@ -360,18 +360,17 @@ impl SqliteRuntime {
             if db.extension_id != owner {
                 return Err("SQLite database belongs to another extension".into());
             }
-            if let Some(path) = &db.path {
-                if let Err(error) =
+            if let Some(path) = &db.path
+                && let Err(error) =
                     authorize_database(path, owner.as_deref(), modules, policy, db.readonly)
-                {
-                    // Once authority or the namespace changes, do not leave
-                    // an engine handle that could later flush through it.
-                    if let Some(worker) = self.worker.as_mut() {
-                        let _ = worker.call(Command::Retire { id });
-                    }
-                    self.databases.remove(&id);
-                    return Err(error.into());
+            {
+                // Once authority or the namespace changes, do not leave
+                // an engine handle that could later flush through it.
+                if let Some(worker) = self.worker.as_mut() {
+                    let _ = worker.call(Command::Retire { id });
                 }
+                self.databases.remove(&id);
+                return Err(error.into());
             }
         }
 
@@ -1157,7 +1156,7 @@ struct Worker {
 impl Worker {
     fn start() -> Result<Self> {
         ACTIVE_WORKERS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_WORKERS).then_some(active + 1)
             })
             .map_err(|_| "SQLite process worker limit reached")?;

@@ -25,8 +25,8 @@ fn task_sources_are_explicit_and_cannot_forge_snapshot_metadata() {
     let file = json!({"agent":"task", "taskFile":"local://instructions"});
     for valid in [
         file.clone(),
-        json!({"tasks":[file.clone(), {"agent":"task", "task":"inline"}]}),
-        json!({"chain":[file.clone()]}),
+        json!({"tasks":[file, {"agent":"task", "task":"inline"}]}),
+        json!({"chain":[file]}),
     ] {
         validate_request(&valid).expect("supported request");
     }
@@ -70,7 +70,7 @@ fn snapshot_preserves_original_utf8_bytes_and_is_not_reread() {
     let mut task = task(path.to_str().expect("path"));
     prepare(&tool, std::iter::once(&mut task), deadline()).expect("snapshot");
     assert_eq!(task.task, original);
-    let digest = format!("{:x}", Sha256::digest(original.as_bytes()));
+    let digest = crate::package_manager::hex_encode(&Sha256::digest(original.as_bytes()));
     assert_eq!(task.task_file_sha256.as_deref(), Some(digest.as_str()));
     std::fs::write(&path, "changed after admission").expect("replace source");
     prepare(&tool, std::iter::once(&mut task), deadline()).expect("retain snapshot");
@@ -155,13 +155,18 @@ fn symlink_escapes_unreadable_files_and_fifos_are_rejected() {
 
     let unreadable = root.path().join("unreadable.md");
     std::fs::write(&unreadable, "private").expect("unreadable source");
-    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0)).expect("mode");
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o0)).expect("mode");
     let mut denied = task(unreadable.to_str().expect("path"));
     assert!(prepare(&tool, std::iter::once(&mut denied), deadline()).is_err());
     std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).expect("mode");
 
     let fifo = root.path().join("fifo.md");
-    rustix::fs::mkfifo(&fifo, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR).expect("fifo");
+    rustix::fs::mkfifoat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )
+    .expect("fifo");
     let mut special = task(fifo.to_str().expect("path"));
     assert!(prepare(&tool, std::iter::once(&mut special), deadline()).is_err());
 }

@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; with the `wasm-host` feature, proving `Send` for the
+// extension-loading futures exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! Unit tests for the `node:child_process` shim (bd-1h06).
 //!
 //! Tests verify spawn/exec API surface, option validation, kill semantics,
@@ -895,7 +900,7 @@ fn exec_file_accepts_callback_only() {
 }
 
 /// This test is also a portable subprocess fixture. Selecting it alone with
-/// PIJS_STDIO_TEST_PEER set produces genuine newline-delimited responses.
+/// `PIJS_STDIO_TEST_PEER` set produces genuine newline-delimited responses.
 #[test]
 fn persistent_stdio_peer() {
     use sha2::Digest as _;
@@ -931,7 +936,7 @@ fn persistent_stdio_peer() {
                 .expect("large tool input");
             serde_json::json!({
                 "bytes": text.len(), "characters": text.chars().count(),
-                "sha256": format!("{:x}", sha2::Sha256::digest(text.as_bytes())),
+                "sha256": pi::package_manager::hex_encode(&sha2::Sha256::digest(text.as_bytes())),
             })
         } else {
             serde_json::json!({"method": request["method"], "text": request["params"]["text"]})
@@ -1130,7 +1135,7 @@ fn loaded_extension_exchanges_persistent_stdio_frames_and_closes_after_eof() {
             result["large"],
             serde_json::json!({
                 "bytes": large_text.len(), "characters": large_text.chars().count(),
-                "sha256": format!("{:x}", sha2::Sha256::digest(large_text.as_bytes())),
+                "sha256": pi::package_manager::hex_encode(&sha2::Sha256::digest(large_text.as_bytes())),
             }),
             "large UTF-8 frames must reach the peer without truncation or interleaving"
         );

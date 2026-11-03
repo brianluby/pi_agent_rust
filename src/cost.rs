@@ -27,7 +27,7 @@ static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn next_attempt_id() -> Result<u64> {
     NEXT_ATTEMPT
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .map_err(|_| Error::session("model cost attempt identities exhausted"))
 }
 
@@ -1336,6 +1336,9 @@ fn load_session_ledgers(
         }
     }
     for account in &closed {
+        // A closed counter is final: any difference from the covered total,
+        // however small, is an error, so the exact comparison is intended.
+        #[allow(clippy::float_cmp)]
         if let Some(writer) = journal.writers.get(account)
             && (writer.own_total > covered[account]
                 || (writer.closed && writer.own_total != covered[account]))

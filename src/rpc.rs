@@ -7481,9 +7481,9 @@ async fn run_prompt_with_retry_owned(
                 }
             };
             let provider = guard.agent.provider().name().to_string();
-            if !guard
+            if guard
                 .recovery_api_key_override(&provider, options.cli_api_key.as_deref())
-                .is_some_and(|key| !key.trim().is_empty())
+                .is_none_or(|key| key.trim().is_empty())
                 && let Some(key) = guard.agent.stream_options().api_key.clone()
             {
                 quota_credential = Some((provider, key));
@@ -14648,7 +14648,7 @@ mod retry_tests {
             );
             let options = rpc_fork_test_options(&runtime_handle, temp.path().join("auth.json"));
             let (in_tx, in_rx) = mpsc::channel(4);
-            let (out_tx, out_rx) = std::sync::mpsc::sync_channel(32);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(32);
             let client = async {
                 in_tx
                     .send(
@@ -18179,6 +18179,8 @@ mod tests {
     }
 
     #[test]
+    // The cost-cap error carries the exact configured values, so `==` is intended.
+    #[allow(clippy::float_cmp)]
     fn rpc_manual_compaction_commits_its_bill_and_refreshes_credentials_before_acknowledging() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))

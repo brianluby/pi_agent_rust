@@ -1,3 +1,7 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; with the `wasm-host` feature, proving `Send` for the
+// extension-loading futures exceeds the default 128.
+#![recursion_limit = "256"]
 #![allow(clippy::redundant_clone)]
 //! Unit tests: tool/command/event wiring (bd-1u6).
 //!
@@ -962,7 +966,7 @@ fn tool_result_transforms_preserve_current_output_across_realms_and_event_bus() 
     for (owner, source) in [
         (
             "redactor",
-            r#"
+            r"
             export default function init(pi) {
                 const seen = [];
                 const capture = (phase, event) => seen.push(JSON.parse(JSON.stringify({phase, event})));
@@ -990,11 +994,11 @@ fn tool_result_transforms_preserve_current_output_across_realms_and_event_bus() 
                 });
                 pi.registerCommand('redactor-observations', { handler:async () => seen });
             }
-        "#,
+        ",
         ),
         (
             "observer",
-            r#"
+            r"
             export default function init(pi) {
                 const seen = [];
                 const capture = (phase, event) => seen.push(JSON.parse(JSON.stringify({phase, event})));
@@ -1009,12 +1013,11 @@ fn tool_result_transforms_preserve_current_output_across_realms_and_event_bus() 
                 });
                 pi.registerCommand('observer-observations', { handler:async () => seen });
             }
-        "#,
+        ",
         ),
     ] {
         // Each index entry gets its own extension owner and QuickJS realm.
-        let entry =
-            harness.create_file(&format!("extensions/{owner}/index.mjs"), source.as_bytes());
+        let entry = harness.create_file(format!("extensions/{owner}/index.mjs"), source.as_bytes());
         specs.push(JsExtensionLoadSpec::from_entry_path(&entry).expect("load spec"));
     }
     let manager = ExtensionManager::new();

@@ -516,16 +516,16 @@ impl OpenAIProvider {
                 ));
             }
         }
-        if self.audio_input {
-            if body.get("modalities").is_some_and(|modalities| {
+        if self.audio_input
+            && body.get("modalities").is_some_and(|modalities| {
                 modalities
                     .as_array()
                     .is_none_or(|values| values.len() != 1 || values[0].as_str() != Some("text"))
-            }) {
-                return Err(Error::validation(
-                    "Native OpenAI audio input requires text-only output modalities",
-                ));
-            }
+            })
+        {
+            return Err(Error::validation(
+                "Native OpenAI audio input requires text-only output modalities",
+            ));
         }
         Ok(budget.blocks > 0)
     }
@@ -3050,7 +3050,7 @@ mod tests {
             match (usage.billing(true).unwrap(), reported) {
                 (BillingUsage::Unavailable { .. }, None) => {}
                 (BillingUsage::ReportedTotal { total }, Some(expected)) => {
-                    assert_eq!(total, expected)
+                    assert_eq!(total, expected);
                 }
                 other => panic!("unexpected accounting evidence: {other:?}"),
             }
@@ -3076,12 +3076,12 @@ mod tests {
                                 "model" => body["model"] = json!("unpriced-replacement"),
                                 "format" => {
                                     body["messages"][0]["content"][0]["input_audio"]["format"] =
-                                        json!("flac")
+                                        json!("flac");
                                 }
                                 "output" => body["modalities"] = json!(["audio"]),
                                 "data" => {
                                     body["messages"][0]["content"][0]["input_audio"]["data"] =
-                                        json!("not base64!")
+                                        json!("not base64!");
                                 }
                                 "usage" => body["stream_options"]["include_usage"] = json!(false),
                                 _ => unreachable!(),

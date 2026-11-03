@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; with the `wasm-host` feature, proving `Send` for the
+// extension-loading futures exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! E2E: TypeScript extension loading through swc transpilation + `QuickJS` (bd-1e1b).
 //!
 //! Validates that the Rust `QuickJS` runtime can:
@@ -875,7 +880,7 @@ export default function init(pi: any): void {
 
 /// Reproduces the package, storage and SQLite initialization sequence used by
 /// context-mode 1.0.169 (build/adapters/base.js, build/db-base.js and
-/// build/session/db.js). This is a real database across two cold PiJS realms;
+/// build/session/db.js). This is a real database across two cold `PiJS` realms;
 /// no hostcall interceptor or database stub participates in this test.
 #[test]
 fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
@@ -896,7 +901,7 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
     }"#,
     )
     .unwrap();
-    std::fs::write(package.join("build/db.js"), r#"
+    std::fs::write(package.join("build/db.js"), r"
         import { createRequire } from 'node:module';
         import { Database as ESMDatabase } from 'bun:sqlite';
         const require = createRequire(import.meta.url);
@@ -925,8 +930,8 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
             });
             return { db, write };
         }
-    "#).unwrap();
-    std::fs::write(&entry, r#"
+    ").unwrap();
+    std::fs::write(&entry, r"
         import { mkdirSync } from 'node:fs';
         import { createHash } from 'node:crypto';
         import { homedir } from 'node:os';
@@ -964,7 +969,7 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
             });
             pi.registerCommand('ctx-storage-close', { handler: async () => { db.close(); return { display: 'closed' }; } });
         }
-    "#).unwrap();
+    ").unwrap();
 
     let load = |session: Arc<asupersync::sync::Mutex<Session>>| {
         let manager = ExtensionManager::new();
@@ -1048,7 +1053,10 @@ fn npm_context_mode_storage_and_sqlite_initialize_then_survive_reload() {
     assert!(!initial["sessionId"].as_str().unwrap().starts_with("pi-"));
     common::run_async(async move {
         let cx = pi::agent_cx::AgentCx::for_request();
-        let mut session = shared.lock(cx.cx()).await.expect("session lock");
+        // Owned guard: run_async needs a Send future, and save() awaits with the lock held.
+        let mut session = asupersync::sync::OwnedMutexGuard::lock(shared, cx.cx())
+            .await
+            .expect("session lock");
         session.set_name("Durable context-mode session");
         session.save().await.expect("first native session save");
     });
@@ -1144,7 +1152,7 @@ fn npm_invalid_state_namespace_does_not_block_unrelated_extension_loading() {
         (
             "broken-state",
             "broken.js",
-            r#"
+            r"
             import { readFileSync } from 'node:fs';
             import { homedir } from 'node:os';
             import { join } from 'node:path';
@@ -1154,12 +1162,12 @@ fn npm_invalid_state_namespace_does_not_block_unrelated_extension_loading() {
                 catch (_) { denied = true; }
                 pi.registerCommand('broken-state-check', { handler: async () => ({ display: denied ? 'denied' : 'escaped' }) });
             }
-        "#,
+        ",
         ),
         (
             "healthy-state",
             "healthy.js",
-            r#"
+            r"
             import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
             import { homedir } from 'node:os';
             import { join } from 'node:path';
@@ -1172,7 +1180,7 @@ fn npm_invalid_state_namespace_does_not_block_unrelated_extension_loading() {
                 catch (_) { peerDenied = true; }
                 pi.registerCommand('healthy-state-check', { handler: async () => ({ display: peerDenied ? readFileSync(join(root, 'state.txt'), 'utf8') : 'escaped' }) });
             }
-        "#,
+        ",
         ),
     ] {
         let package = base.join("npm/node_modules").join(package_name);
@@ -1267,7 +1275,7 @@ fn npm_peer_without_env_cannot_access_owner_state_under_configured_workspace_hom
     let owner_entry = owner_package.join("owner.js");
     std::fs::write(
         &owner_entry,
-        r#"
+        r"
         import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
         import { homedir } from 'node:os';
         import { join } from 'node:path';
@@ -1281,7 +1289,7 @@ fn npm_peer_without_env_cannot_access_owner_state_under_configured_workspace_hom
                 handler: async () => ({ display: readFileSync(path, 'utf8') }),
             });
         }
-        "#,
+        ",
     )
     .unwrap();
     let state_json = serde_json::to_string(&state_path).unwrap();
@@ -1290,7 +1298,7 @@ fn npm_peer_without_env_cannot_access_owner_state_under_configured_workspace_hom
     std::fs::write(
         &peer_entry,
         format!(
-            r#"
+            r"
         import {{ readFileSync, writeFileSync }} from 'node:fs';
         export default function(pi) {{
             const state = {state_json};
@@ -1321,7 +1329,7 @@ fn npm_peer_without_env_cannot_access_owner_state_under_configured_workspace_hom
                 homeHidden: process.env.HOME === undefined && pi.env.get('HOME') === undefined,
             }}) }}) }});
         }}
-        "#
+        "
         ),
     )
     .unwrap();
@@ -1424,11 +1432,11 @@ fn context_mode_driver_selection_and_encoded_module_paths_load_without_stubs() {
     let cwd = harness.temp_dir().to_path_buf();
     let prefix = "extensions/context # % λ";
     harness.create_file(
-        &format!("{prefix}/package.json"),
+        format!("{prefix}/package.json"),
         br#"{"name":"context-mode-loader-fixture","type":"module","pi":{"extensions":["./entry.mjs"]}}"#,
     );
     harness.create_file(
-        &format!("{prefix}/driver.mjs"),
+        format!("{prefix}/driver.mjs"),
         br"
 import { createRequire } from 'node:module';
 export function openDatabase() {
@@ -1442,19 +1450,19 @@ export function openDatabase() {
 ",
     );
     let factory = harness.create_file(
-        &format!("{prefix}/factory.cjs"),
+        format!("{prefix}/factory.cjs"),
         br"
 const { basename } = require('node:path');
 module.exports = value => ({ value, filename: __filename, directory: __dirname, basename: basename(__filename) });
 ",
     );
-    harness.create_file(&format!("{prefix}/value.cjs"), b"module.exports = 41;\n");
+    harness.create_file(format!("{prefix}/value.cjs"), b"module.exports = 41;\n");
     harness.create_file(
-        &format!("{prefix}/side-effect.cjs"),
+        format!("{prefix}/side-effect.cjs"),
         b"const path = require ('node:path'); globalThis.loaderSideEffect = path.basename('/fixture/loaded');\n",
     );
     harness.create_file(
-        &format!("{prefix}/consumer.cjs"),
+        format!("{prefix}/consumer.cjs"),
         br"
 require('./side-effect.cjs');
 const createValue = require('./factory.cjs');
@@ -1462,13 +1470,13 @@ const value = require('./value.cjs');
 module.exports = createValue(value);
 ",
     );
-    harness.create_file(&format!("{prefix}/prices.json"), br#"{"price":3}"#);
+    harness.create_file(format!("{prefix}/prices.json"), br#"{"price":3}"#);
     harness.create_file(
-        &format!("{prefix}/helper #%.mjs"),
+        format!("{prefix}/helper #%.mjs"),
         b"export const count = 7;\n",
     );
     let entry = harness.create_file(
-        &format!("{prefix}/entry.mjs"),
+        format!("{prefix}/entry.mjs"),
         br"
 import { openDatabase } from './driver.mjs';
 import importedValue from './consumer.cjs';
@@ -1551,7 +1559,7 @@ export default async function (pi) {
     );
 }
 
-const CONTEXT_MODE_WORKTREE_EXTENSION: &str = r#"
+const CONTEXT_MODE_WORKTREE_EXTENSION: &str = r"
 import { createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { mkdirSync, readFileSync, realpathSync } from 'node:fs';
@@ -1634,7 +1642,7 @@ export default function(pi) {
         return { display: JSON.stringify({ ...snapshot, child: JSON.parse(line.slice(18)) }) };
     } });
 }
-"#;
+";
 
 fn context_mode_project_hash(path: &std::path::Path) -> String {
     use sha2::Digest as _;
@@ -1645,7 +1653,7 @@ fn context_mode_project_hash(path: &std::path::Path) -> String {
     } else {
         normalized.to_string()
     };
-    format!("{:x}", sha2::Sha256::digest(canonical.as_bytes()))[..16].to_string()
+    pi::package_manager::hex_encode(&sha2::Sha256::digest(canonical.as_bytes()))[..16].to_string()
 }
 
 /// Selected alone by the real process bridge; no Node or npm installation is

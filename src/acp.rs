@@ -1291,16 +1291,15 @@ async fn run(
                             continue;
                         };
 
-                        let session_config = match session_state.lock(&cx).await {
-                            Ok(state) => Arc::clone(&state.config),
-                            Err(_) => {
-                                let _ = out_tx.send(json_rpc_error(
-                                    id,
-                                    INTERNAL_ERROR,
-                                    "Session settings are unavailable",
-                                ));
-                                continue;
-                            }
+                        let session_config = if let Ok(state) = session_state.lock(&cx).await {
+                            Arc::clone(&state.config)
+                        } else {
+                            let _ = out_tx.send(json_rpc_error(
+                                id,
+                                INTERNAL_ERROR,
+                                "Session settings are unavailable",
+                            ));
+                            continue;
                         };
                         let message_content = match content::extract_prompt_content(
                             prompt_blocks,
@@ -1423,18 +1422,17 @@ async fn run(
                             }
                             continue;
                         };
-                        let session_config = match session_state.lock(&cx).await {
-                            Ok(state) => Arc::clone(&state.config),
-                            Err(_) => {
-                                if request.id.is_some() {
-                                    let _ = out_tx.send(json_rpc_error(
-                                        id,
-                                        INTERNAL_ERROR,
-                                        "Session settings are unavailable",
-                                    ));
-                                }
-                                continue;
+                        let session_config = if let Ok(state) = session_state.lock(&cx).await {
+                            Arc::clone(&state.config)
+                        } else {
+                            if request.id.is_some() {
+                                let _ = out_tx.send(json_rpc_error(
+                                    id,
+                                    INTERNAL_ERROR,
+                                    "Session settings are unavailable",
+                                ));
                             }
+                            continue;
                         };
                         match steering::Input::parse(
                             &request.params,
@@ -4688,8 +4686,7 @@ mod tests {
         };
         let error = launch
             .selection_cli()
-            .err()
-            .expect("missing explicit selection must be rejected")
+            .expect_err("missing explicit selection must be rejected")
             .to_string();
         assert!(
             error.contains("no_implicit_tools requires an explicit tools selection or no_tools"),
@@ -4885,15 +4882,11 @@ mod tests {
 
         trust_acp_settings(&cwd, &source.global_dir);
         let (_, admitted) = handle_session_new(&params, &options, None).expect("trusted workspace");
-        let error = probe(&admitted)
-            .err()
-            .expect("trusted duplicates are parsed");
+        let error = probe(&admitted).expect_err("trusted duplicates are parsed");
         assert!(error.to_string().contains("PI_AGENT_DEFINITION_DUPLICATE"));
         std::fs::write(agents.join("first.md"), format!("{definition}Changed\n"))
             .expect("mutate admitted project role");
-        let error = probe(&admitted)
-            .err()
-            .expect("retained session must recheck its admission");
+        let error = probe(&admitted).expect_err("retained session must recheck its admission");
         assert!(
             error
                 .to_string()
@@ -4945,7 +4938,7 @@ mod tests {
         let cwd = root.path().join("target");
         let params = json!({ "cwd": cwd, "mcpServers": [] });
         let audio = json!({ "type": "audio", "mimeType": "audio/wav", "data": "AQID" });
-        let steering_params = json!({ "prompt": [audio.clone()] });
+        let steering_params = json!({ "prompt": [audio] });
         for (name, setting) in [
             ("eval", "enableEval"),
             ("github", "enableGithub"),

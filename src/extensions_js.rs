@@ -19982,8 +19982,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let windows_environment = uses_windows_environment(&self.config.env);
         let process_platform =
             configured_environment_value(&self.config.env, "PI_PLATFORM", windows_environment)
-                .map(str::to_string)
-                .unwrap_or_else(|| std::env::consts::OS.to_string());
+                .map_or_else(|| std::env::consts::OS.to_string(), str::to_string);
         let env = self.config.env.clone();
         let deny_env = self.config.deny_env;
         let repair_mode = self.config.repair_mode;
@@ -29454,7 +29453,7 @@ const path = require('path');
 
     #[test]
     fn extract_static_require_specifiers_respects_nested_lexical_bindings() {
-        let source = r#"
+        let source = r"
 import { createRequire } from 'node:module';
 export function loadDatabase() {
     const require = createRequire(import.meta.url);
@@ -29471,7 +29470,7 @@ const arrow = (require) => require('arrow-local');
 const fs = require /* whitespace must not hide a free call */ ('node:fs');
 function freeCall() { return require('node:path'); }
 const escaped = require('node:\u006f\u0073');
-"#;
+";
         assert_eq!(
             extract_static_require_specifiers(source),
             vec!["node:fs", "node:path", "node:os"]
@@ -29480,14 +29479,14 @@ const escaped = require('node:\u006f\u0073');
 
     #[test]
     fn maybe_cjs_to_esm_preserves_lazy_create_require_driver_selection() {
-        let source = r#"
+        let source = r"
 import { createRequire } from 'node:module';
 export function loadDatabase() {
     const require = createRequire(import.meta.url);
     if (globalThis.Bun) return require(['bun', 'sqlite'].join(':')).Database;
     return require('better-sqlite3');
 }
-"#;
+";
         assert_eq!(maybe_cjs_to_esm(source), source);
     }
 
@@ -29838,7 +29837,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 .expect("create runtime");
             runtime
                 .eval(
-                    r#"
+                    r"
                     globalThis.timerResults = [];
                     globalThis.keptTimer = setTimeout(function(value) {
                         timerResults.push([value, this === keptTimer]);
@@ -29874,7 +29873,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                     } finally {
                         [WeakMap.prototype.get, WeakMap.prototype.set, WeakMap.prototype.has] = saved;
                     }
-                    "#,
+                    ",
                 )
                 .await
                 .expect("create and clear timer handles");
@@ -31295,7 +31294,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 RepairMode::Off,
                 &roots
             ),
-            Some(module.clone())
+            Some(module)
         );
         let outside_url = url::Url::from_file_path(&outside).unwrap();
         assert!(
@@ -33937,7 +33936,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             runtime
                 .eval(&privileged_test_script(
                     &runtime,
-                    r#"
+                    r"
                     globalThis.seen = [];
                     globalThis.done = false;
                     globalThis.original = {
@@ -33993,7 +33992,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                         );
                         globalThis.done = true;
                     })();
-                    "#,
+                    ",
                 ))
                 .await
                 .expect("eval");
@@ -34055,7 +34054,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             runtime
                 .eval(&privileged_test_script(
                     &runtime,
-                    r#"
+                    r"
                     globalThis.done = false;
                     __pi_begin_extension(__pi_test_secret, 'ext.noop', { name: 'ext.noop' });
                     pi.on('tool_result', (event) => {
@@ -34080,7 +34079,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                         globalThis.wasUndefined = result === undefined;
                         globalThis.done = true;
                     })();
-                    "#,
+                    ",
                 ))
                 .await
                 .expect("eval");

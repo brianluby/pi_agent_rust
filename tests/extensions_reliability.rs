@@ -1,3 +1,8 @@
+// Integration tests are separate crates, so src/lib.rs's `recursion_limit`
+// does not reach here; with the `wasm-host` feature, proving `Send` for the
+// extension-loading futures exceeds the default 128.
+#![recursion_limit = "256"]
+
 //! Reliability and failure-mode tests for the extension runtime (bd-2km5).
 //!
 //! Tests cover:
@@ -1435,7 +1440,7 @@ fn idle_timer_and_child_callbacks_progress_without_an_external_pump() {
     let executable = serde_json::to_string(&std::env::current_exe().expect("test executable"))
         .expect("serialize executable");
     let source = format!(
-        r#"
+        r"
         import {{ existsSync, mkdirSync, writeFileSync, renameSync }} from 'node:fs';
         import {{ homedir }} from 'node:os';
         import {{ dirname, join }} from 'node:path';
@@ -1475,7 +1480,7 @@ fn idle_timer_and_child_callbacks_progress_without_an_external_pump() {
                 }} catch (error) {{ persist({{ error: String(error) }}); }}
             }}, 10);
         }}
-        "#
+        "
     );
     let spec = idle_npm_package(&harness, "idle-stdio-fixture", &source);
     let manager = load_idle_packages(
@@ -1588,7 +1593,7 @@ fn idle_pending_hostcall_preserves_peer_progress_and_shutdown_cancels_once() {
     let blocker = idle_npm_package(
         &harness,
         "idle-blocker-fixture",
-        r#"
+        r"
         import { existsSync } from 'node:fs';
         import { dirname, join } from 'node:path';
         import { fileURLToPath } from 'node:url';
@@ -1600,12 +1605,12 @@ fn idle_pending_hostcall_preserves_peer_progress_and_shutdown_cancels_once() {
                 pi.tool('idle_pending', {}).catch(() => {});
             }, 10);
         }
-        "#,
+        ",
     );
     let peer = idle_npm_package(
         &harness,
         "idle-peer-fixture",
-        r#"
+        r"
         import { existsSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
         import { homedir } from 'node:os';
         import { dirname, join } from 'node:path';
@@ -1627,7 +1632,7 @@ fn idle_pending_hostcall_preserves_peer_progress_and_shutdown_cancels_once() {
                 handler: async () => ({ display: String(ticks) }),
             });
         }
-        "#,
+        ",
     );
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let entries = Arc::new(AtomicUsize::new(0));
@@ -1701,7 +1706,7 @@ fn idle_pending_call_lives_until_the_last_public_runtime_handle_is_dropped() {
     let spec = idle_npm_package(
         &harness,
         "idle-lifetime-fixture",
-        r#"
+        r"
         import { existsSync } from 'node:fs';
         import { dirname, join } from 'node:path';
         import { fileURLToPath } from 'node:url';
@@ -1713,7 +1718,7 @@ fn idle_pending_call_lives_until_the_last_public_runtime_handle_is_dropped() {
                 pi.tool('idle_pending', {}).catch(() => {});
             }, 10);
         }
-        "#,
+        ",
     );
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let entries = Arc::new(AtomicUsize::new(0));

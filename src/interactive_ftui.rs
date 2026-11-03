@@ -2388,7 +2388,7 @@ async fn reload_driver_resources(
     catalog.extension_commands = extension_commands;
     let update = reloaded.map_or_else(
         || PiMsg::AutocompleteCatalog(catalog.clone()),
-        |resources| PiMsg::ResourcesReloaded {
+        |resources| PiMsg::ResourcesReloadedWithCatalog {
             resources,
             catalog: catalog.clone(),
         },
@@ -3484,7 +3484,7 @@ impl PiFtuiModel {
                 msg,
                 PiMsg::AutocompleteRefresh
                     | PiMsg::AutocompleteCatalog(_)
-                    | PiMsg::ResourcesReloaded { .. }
+                    | PiMsg::ResourcesReloadedWithCatalog { .. }
                     | PiMsg::LoginPending { .. }
                     | PiMsg::SystemNote(_)
                     | PiMsg::ToolStart { .. }
@@ -3844,7 +3844,7 @@ impl PiFtuiModel {
                 self.autocomplete.provider.set_catalog(catalog);
                 self.autocomplete.close();
             }
-            PiMsg::ResourcesReloaded { resources, catalog } => {
+            PiMsg::ResourcesReloadedWithCatalog { resources, catalog } => {
                 self.steer_resources = Some(*resources);
                 self.extension_commands
                     .clone_from(&catalog.extension_commands);
@@ -5278,7 +5278,7 @@ impl PiFtuiModel {
                 match ServiceTierCommand::parse(cmd_args) {
                     Some(request) => self.send_command(UiCommand::Fast(request)),
                     None => {
-                        self.push_entry(EntryRole::Error, String::from(ServiceTierCommand::USAGE))
+                        self.push_entry(EntryRole::Error, String::from(ServiceTierCommand::USAGE));
                     }
                 }
                 return true;
@@ -8185,7 +8185,11 @@ pub struct TurnControlState {
 }
 
 impl TurnControlState {
-    fn publish(&mut self, control: crate::session_control::SessionControlHandle) {
+    /// Publishes a prompt turn's control, as the live UI's driver does at the start of each turn.
+    ///
+    /// Public only so integration tests can drive the live-UI path; not public API.
+    #[doc(hidden)]
+    pub fn publish(&mut self, control: crate::session_control::SessionControlHandle) {
         // Scoped goal events may still be crossing their subscription when
         // the next ordinary prompt starts. They no longer own this display.
         self.last_goal = None;
@@ -8194,6 +8198,14 @@ impl TurnControlState {
         } else {
             self.current = Some(control);
         }
+    }
+
+    /// Clears the published control when its turn ends, as the live UI's driver does.
+    ///
+    /// Public only so integration tests can drive the live-UI path; not public API.
+    #[doc(hidden)]
+    pub fn retire(&mut self) {
+        self.current = None;
     }
 
     fn close(&mut self) -> Option<goal_control::Invocation> {
@@ -8642,14 +8654,13 @@ async fn run_controlled_turn_with_pending(
     // Other failures may have delivered the first input and must not replay it.
     if matches!(&result, Err(crate::error::Error::Validation(message))
         if message.starts_with("[SESSION_CONTROL_CANCELLED] turn cancelled before execution;"))
+        && let Some(source) = initial_source
     {
-        if let Some(source) = initial_source {
-            leftover.insert(0, source);
-            handle
-                .session_mut()
-                .agent
-                .set_magic_keyword_scan_override(None);
-        }
+        leftover.insert(0, source);
+        handle
+            .session_mut()
+            .agent
+            .set_magic_keyword_scan_override(None);
     }
     // The SDK result is the durability boundary. A successful cap must stop
     // the outer continuation loop just like an abort or terminal failure.
@@ -13602,7 +13613,7 @@ mod tests {
                             "clipboard-owner",
                             "input",
                             serde_json::json!({"title": "Reply"}),
-                        ))))
+                        ))));
                     }
                     "picker" => sim.send(PiFtuiMsg::Agent(PiMsg::MessagePicker {
                         fork: false,
@@ -13626,7 +13637,7 @@ mod tests {
                     }
                     _ => {
                         sim.model_mut().mcp_auth_request =
-                            Some(McpAuthRequest::new(String::from("current")))
+                            Some(McpAuthRequest::new(String::from("current")));
                     }
                 }
                 sim.inject_event(Event::Tick);
@@ -13639,7 +13650,7 @@ mod tests {
                         accepts_empty_input: false,
                     })),
                     "ask" | "extension" | "picker" => {
-                        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()))
+                        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
                     }
                     "custom" => send_ui_effect(
                         &mut sim,
@@ -27331,7 +27342,7 @@ mod tests {
         assert!(
             !messages
                 .iter()
-                .any(|message| matches!(message, PiMsg::ResourcesReloaded { .. }))
+                .any(|message| matches!(message, PiMsg::ResourcesReloadedWithCatalog { .. }))
         );
         assert!(messages.iter().any(|message| {
             matches!(message, PiMsg::AutocompleteCatalog(updated)
@@ -27394,7 +27405,7 @@ mod tests {
             Some("Triage issue #12")
         );
         assert!(catalog.prompt_templates.iter().any(|t| t.name == "triage"));
-        let Ok(update @ PiMsg::ResourcesReloaded { .. }) = rx.try_recv() else {
+        let Ok(update @ PiMsg::ResourcesReloadedWithCatalog { .. }) = rx.try_recv() else {
             panic!("the refreshed bodies and catalog go to the UI together");
         };
         let (_agent_tx, ui_rx) = mpsc::channel();

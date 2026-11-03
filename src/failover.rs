@@ -2621,7 +2621,11 @@ mod tests {
             assert_eq!(until.duration_since(now), Duration::from_secs(seconds));
             assert_eq!(ring.current_key(now), Some("sibling"));
             assert_eq!(
-                ring.current_key(until - Duration::from_nanos(1)),
+                ring.current_key(
+                    until
+                        .checked_sub(Duration::from_nanos(1))
+                        .expect("the deadline is after the clock origin")
+                ),
                 Some("sibling")
             );
             assert_eq!(ring.current_key(until), Some("primary"));
@@ -2710,7 +2714,7 @@ mod tests {
         let _ = ring.report_rate_limited("primary", start, Duration::MAX, Duration::MAX);
         let _ = ring.report_rate_limited("primary", start, Duration::MAX, Duration::MAX);
         assert_eq!(
-            ring.current_key(start + Duration::from_secs(86_400)),
+            ring.current_key(start + Duration::from_hours(24)),
             Some("sibling")
         );
         assert!(ring.report_success("primary", start + Duration::from_secs(1)));

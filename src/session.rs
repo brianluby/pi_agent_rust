@@ -12672,7 +12672,7 @@ mod tests {
     fn reserved_path_rejects_identity_drift_without_creating_storage() {
         let temp = tempfile::tempdir().expect("tempdir");
         let sessions_root = temp.path().join("sessions");
-        let mut session = Session::create_with_dir(Some(sessions_root.clone()));
+        let mut session = Session::create_with_dir(Some(sessions_root));
         session
             .reserve_persistence_path()
             .expect("reserve filename");
@@ -12685,10 +12685,11 @@ mod tests {
             match changed {
                 "id" => changed_session.header.id = "different-identity".to_string(),
                 "cwd" => {
-                    changed_session.header.cwd = temp.path().join("other cwd").display().to_string()
+                    changed_session.header.cwd =
+                        temp.path().join("other cwd").display().to_string();
                 }
                 "session_dir" => {
-                    changed_session.session_dir = Some(temp.path().join("other sessions"))
+                    changed_session.session_dir = Some(temp.path().join("other sessions"));
                 }
                 _ => unreachable!(),
             }

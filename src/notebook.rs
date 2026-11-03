@@ -11,10 +11,10 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 
-pub(crate) const MAX_NOTEBOOK_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_NOTEBOOK_BYTES: usize = 10 * 1024 * 1024;
 const MAX_CELLS: usize = 10_000;
 
-pub(crate) fn is_notebook_path(path: &Path) -> bool {
+pub fn is_notebook_path(path: &Path) -> bool {
     path.extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("ipynb"))
 }
@@ -115,7 +115,7 @@ fn parse_editable(text: &str, display: &str) -> Result<Vec<EditedCell>> {
                 return Err(invalid(display, "notebook exceeds the 10000-cell limit"));
             }
             let original_index = index
-                .map(|index| index.parse::<usize>())
+                .map(str::parse::<usize>)
                 .transpose()
                 .map_err(|_| invalid(display, "cell index is too large"))?;
             cells.push(EditedCell {
@@ -146,7 +146,7 @@ fn parse_editable(text: &str, display: &str) -> Result<Vec<EditedCell>> {
     Ok(cells)
 }
 
-pub(crate) struct Notebook {
+pub struct Notebook {
     document: Value,
     display: String,
 }

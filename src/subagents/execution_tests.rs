@@ -83,7 +83,7 @@ fn file_tasks_reach_real_child_stdin_beyond_argv_limits_with_source_provenance()
     );
     assert_eq!(
         result(&output)["taskFileSha256"],
-        format!("{:x}", Sha256::digest(text.as_bytes()))
+        crate::package_manager::hex_encode(&Sha256::digest(text.as_bytes()))
     );
     assert_eq!(result(&output)["task"], source.to_string_lossy().as_ref());
     let visible = crate::agent_hub::registry()
@@ -106,11 +106,11 @@ fn invalid_later_file_tasks_launch_no_valid_prefix_in_any_delegation_mode() {
         .unwrap();
     for input in [
         later.clone(),
-        json!({"tasks":[first.clone(), later.clone()], "concurrency":1}),
-        json!({"chain":[first.clone(), later.clone()]}),
+        json!({"tasks":[first, later], "concurrency":1}),
+        json!({"chain":[first, later]}),
         json!({"workflow":[
-            {"id":"first", "call":first.clone()},
-            {"id":"later", "needs":["first"], "call":later.clone()}
+            {"id":"first", "call":first},
+            {"id":"later", "needs":["first"], "call":later}
         ]}),
     ] {
         assert!(
@@ -162,7 +162,7 @@ fn queued_chain_file_snapshots_keep_original_bytes_and_render_previous_results()
         std::fs::read_to_string(root.path().join("instructions-used")).unwrap(),
         "Task: Review accepted."
     );
-    let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let digest = crate::package_manager::hex_encode(&Sha256::digest(text.as_bytes()));
     assert_eq!(
         results[1].task_file_sha256.as_deref(),
         Some(digest.as_str())
@@ -205,7 +205,7 @@ fn oversized_raw_and_typed_file_chain_expansion_fails_before_that_child_launches
         assert_eq!(records[1]["taskFile"], source.to_string_lossy().as_ref());
         assert_eq!(
             records[1]["taskFileSha256"],
-            format!("{:x}", Sha256::digest(instructions.as_bytes()))
+            crate::package_manager::hex_encode(&Sha256::digest(instructions.as_bytes()))
         );
         assert_eq!(
             std::fs::read_to_string(root.path().join("launches")).expect("real launches"),
@@ -245,7 +245,7 @@ fn workflow_file_instructions_keep_typed_predecessor_data_and_source_digest() {
     );
     assert_eq!(
         output.details.as_ref().unwrap()["nodes"][1]["result"]["taskFileSha256"],
-        format!("{:x}", Sha256::digest(text.as_bytes()))
+        crate::package_manager::hex_encode(&Sha256::digest(text.as_bytes()))
     );
 }
 
@@ -301,7 +301,7 @@ fn task_file_snapshot_survives_schema_retry_and_explicit_hub_revival() {
     assert_eq!(results.len(), 1);
     assert!(!results[0].is_error, "{:?}", results[0]);
     assert_eq!(results[0].schema_retries, Some(1));
-    let digest = format!("{:x}", Sha256::digest(original.as_bytes()));
+    let digest = crate::package_manager::hex_encode(&Sha256::digest(original.as_bytes()));
     assert_eq!(
         results[0].task_file_sha256.as_deref(),
         Some(digest.as_str())
@@ -394,11 +394,11 @@ fn task_role_provenance_is_carried_in_all_modes_without_model_id_inference() {
         json!({"agent":"worker", "task":"explicit work", "model":"selection-local/selection-fast"});
     for input in [
         role.clone(),
-        json!({"tasks":[role.clone(), explicit.clone()], "concurrency":1}),
-        json!({"chain":[role.clone(), explicit.clone()]}),
+        json!({"tasks":[role, explicit], "concurrency":1}),
+        json!({"chain":[role, explicit]}),
         json!({"workflow":[
-            {"id":"role", "call":role.clone()},
-            {"id":"explicit", "needs":["role"], "call":explicit.clone()}
+            {"id":"role", "call":role},
+            {"id":"explicit", "needs":["role"], "call":explicit}
         ]}),
     ] {
         let (_dir, tool) = fixture(&record_fallback_script(&emit(&[ended("complete", "stop")])));
@@ -496,11 +496,11 @@ fn explicit_models_override_definition_role_and_parent_in_every_one_shot_mode() 
     let second = json!({"agent":"worker", "task":"review {previous}", "model":"selection-local/selection-careful:high"});
     for input in [
         first.clone(),
-        json!({"tasks":[first.clone(), second.clone()], "concurrency":1}),
-        json!({"chain":[first.clone(), second.clone()]}),
+        json!({"tasks":[first, second], "concurrency":1}),
+        json!({"chain":[first, second]}),
         json!({"workflow":[
-            {"id":"inspect", "call":first.clone()},
-            {"id":"review", "needs":["inspect"], "call":second.clone()}
+            {"id":"inspect", "call":first},
+            {"id":"review", "needs":["inspect"], "call":second}
         ]}),
     ] {
         let (_dir, tool) = fixture(&record_model_script(&emit(&[ended("complete", "stop")])));
