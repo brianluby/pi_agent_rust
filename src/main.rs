@@ -3427,11 +3427,7 @@ async fn run(
         )
         .map_err(anyhow::Error::new)?;
         agent_session.agent.set_provider(provider);
-        agent_session.agent.set_keyword_max_thinking_level(
-            selection
-                .model_entry
-                .clamp_thinking_level(pi::model::ThinkingLevel::Max),
-        );
+        agent_session.agent.set_keyword_model(&selection.model_entry);
         agent_session
             .agent
             .set_tool_call_dialect(selection.model_entry.tool_call_dialect());
@@ -3852,6 +3848,7 @@ async fn handle_subcommand(
         }
         cli::Commands::Review {
             target,
+            focus,
             offline,
             fail_on,
             format,
@@ -3861,7 +3858,8 @@ async fn handle_subcommand(
         } => {
             handle_review(
                 cwd,
-                target.as_deref(),
+                &target,
+                focus.as_deref(),
                 fail_on.as_deref(),
                 &format,
                 confidence_threshold,
@@ -6543,11 +6541,12 @@ async fn handle_self_update(version: Option<&str>, check: bool) -> Result<()> {
     Ok(())
 }
 
-/// `pi review [TARGET]` (bd-cv653.3.11): prioritized code review with ship verdict.
+/// `pi review [CHECKOUT] [TARGET] [FOCUS]`: prioritized code review with ship verdict.
 #[allow(clippy::too_many_arguments)]
 async fn handle_review(
     cwd: &Path,
-    target: Option<&str>,
+    target: &[String],
+    focus: Option<&str>,
     fail_on: Option<&str>,
     format: &str,
     confidence_threshold: f64,
@@ -6557,6 +6556,10 @@ async fn handle_review(
     project_trusted: bool,
     cli: &mut cli::Cli,
 ) -> Result<()> {
+    let mut request = pi::review::ReviewRequest::parse(cwd, target)?;
+    if let Some(focus) = focus {
+        request.append_focus(focus)?;
+    }
     // An unparseable --fail-on must not silently disable the gate (CI would
     // pass with P0 findings present).
     let fail_severity = match fail_on {
@@ -6568,7 +6571,8 @@ async fn handle_review(
         })?),
     };
     let options = pi::review::ReviewOptions {
-        target: target.map(ToString::to_string),
+        target: request.target,
+        focus: request.focus,
         fail_on: fail_severity,
         confidence_threshold,
         format: format.to_string(),
@@ -6578,10 +6582,12 @@ async fn handle_review(
     options.validate()?;
 
     let report = if offline {
-        pi::review::CodeReviewer::review(cwd, &options)?
+        pi::review::CodeReviewer::review(&request.cwd, &options)?
     } else {
+        // Keep the invoking project's model, trust and privacy policy. Selecting
+        // another checkout authorizes a diff read, not its Pi configuration.
         let client = review_model_client(cli, cwd, project_trusted).await?;
-        client.review(cwd, &options, None).await?
+        client.review(&request.cwd, &options, None).await?
     };
 
     match format {
@@ -12406,6 +12412,264 @@ mod tests {
             seen.contains("somebody else's error"),
             "errors elsewhere went quiet, which is a regression: {seen:?}"
         );
+    }
+
+    #[test]
+    fn supported_media_activation_settings_load_without_warnings() {
+        for key in ["enable_media", "enableMedia"] {
+            for enabled in [false, true] {
+                let temp = TempDir::new().expect("temporary settings roots");
+                let global_dir = temp.path().join("global");
+                let cwd = temp.path().join("project");
+                std::fs::create_dir_all(&global_dir).expect("global settings directory");
+                std::fs::create_dir_all(&cwd).expect("project directory");
+                std::fs::write(
+                    global_dir.join("settings.json"),
+                    json!({"media": {(key): enabled}}).to_string(),
+                )
+                .expect("write media activation setting");
+
+                let seen = logged_under(default_log_filter_for(None), || {
+                    let config = Config::load_with_roots(None, &global_dir, &cwd)
+                        .expect("load supported media activation setting");
+                    let tools = ToolRegistry::new(&[], &cwd, Some(&config));
+                    for name in ["inspect_image", "generate_image", "tts"] {
+                        assert_eq!(
+                            tools.get(name).is_some(),
+                            enabled,
+                            "{key}={enabled} must select {name}"
+                        );
+                    }
+                    assert!(
+                        tools.get("read_media").is_none(),
+                        "aggregate media activation must leave read_media independent"
+                    );
+                });
+
+                assert!(
+                    seen.is_empty(),
+                    "supported setting {key}={enabled} emitted a warning: {seen:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ignored_media_settings_name_the_file_and_key_without_activating_tools() {
+        for project_setting in [false, true] {
+            let temp = TempDir::new().expect("temporary settings roots");
+            let global_dir = temp.path().join("global");
+            let cwd = temp.path().join("project");
+            std::fs::create_dir_all(&global_dir).expect("global settings directory");
+            std::fs::create_dir_all(cwd.join(".pi")).expect("project settings directory");
+            let settings_path = if project_setting {
+                cwd.join(".pi/settings.json")
+            } else {
+                global_dir.join("settings.json")
+            };
+            std::fs::write(
+                &settings_path,
+                r#"{"media":{"enableMedai":true,"output_dir":"generated"}}"#,
+            )
+            .expect("write unsupported media settings");
+
+            let seen = logged_under(default_log_filter_for(None), || {
+                let config = Config::load_with_roots(None, &global_dir, &cwd)
+                    .expect("unknown settings warn without preventing startup");
+                let tools = ToolRegistry::new(&[], &cwd, Some(&config));
+                for name in ["inspect_image", "generate_image", "tts", "read_media"] {
+                    assert!(
+                        tools.get(name).is_none(),
+                        "ignored settings must not activate {name}"
+                    );
+                }
+            });
+
+            for key in ["media.enableMedai", "media.output_dir"] {
+                assert!(seen.contains(key), "missing diagnostic for {key}: {seen:?}");
+            }
+            let file = settings_path.display().to_string();
+            let quoted_file = format!("{file:?}");
+            assert!(
+                seen.contains(file.as_str()) || seen.contains(quoted_file.as_str()),
+                "diagnostic must identify the settings file: {seen:?}"
+            );
+            assert!(
+                seen.contains("Unrecognised setting; it is being ignored"),
+                "diagnostic must explain that activation was ignored: {seen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_tool_load_mode_values_load_without_warnings() {
+        use pi::xdev::LoadMode;
+
+        for key in ["load_mode", "loadMode"] {
+            for (mode, expected) in [
+                ("  EsSeNtIaL  ", LoadMode::Essential),
+                ("\tDISCOVERABLE\n", LoadMode::Discoverable),
+                (" OFF ", LoadMode::Off),
+            ] {
+                let temp = TempDir::new().expect("temporary settings roots");
+                let global_dir = temp.path().join("global");
+                let cwd = temp.path().join("project");
+                std::fs::create_dir_all(&global_dir).expect("global settings directory");
+                std::fs::create_dir_all(&cwd).expect("project directory");
+                std::fs::write(
+                    global_dir.join("settings.json"),
+                    json!({
+                        "media": {"enable_tts": true},
+                        "tools": {(key): {
+                            "tts": mode,
+                            "my_extension_tool": mode,
+                            "mcp__fixture__query": mode
+                        }}
+                    })
+                    .to_string(),
+                )
+                .expect("write supported tool load modes");
+
+                let seen = logged_under(default_log_filter_for(None), || {
+                    let config = Config::load_with_roots(None, &global_dir, &cwd)
+                        .expect("load supported tool load modes");
+                    for name in ["tts", "my_extension_tool", "mcp__fixture__query"] {
+                        assert_eq!(
+                            pi::xdev::configured_tier(name, Some(&config)),
+                            Some(expected),
+                            "{key}.{name}={mode:?}"
+                        );
+                    }
+                    let tools = ToolRegistry::new(&[], &cwd, Some(&config));
+                    assert_eq!(
+                        tools.get("tts").is_some(),
+                        expected != LoadMode::Off,
+                        "{key}.tts={mode:?} must govern implicit activation"
+                    );
+                    let explicit = ToolRegistry::new(&["tts"], &cwd, Some(&config));
+                    assert!(
+                        explicit.get("tts").is_some(),
+                        "a load mode must not veto an explicitly selected tool"
+                    );
+                });
+
+                assert!(
+                    seen.is_empty(),
+                    "supported modes or user-defined tool names warned: {seen:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn invalid_tool_load_modes_warn_without_changing_fallback_or_project_trust() {
+        for key in ["load_mode", "loadMode"] {
+            for mode in ["disabled", "discoverble", ""] {
+                for (project_setting, project_trusted) in
+                    [(false, false), (false, true), (true, true), (true, false)]
+                {
+                    let temp = TempDir::new().expect("temporary settings roots");
+                    let global_dir = temp.path().join("global");
+                    let cwd = temp.path().join("project");
+                    std::fs::create_dir_all(&global_dir).expect("global settings directory");
+                    std::fs::create_dir_all(cwd.join(".pi")).expect("project settings directory");
+                    let global_path = global_dir.join("settings.json");
+                    let settings_path = if project_setting {
+                        // A project override replaces the same global map entry,
+                        // including when its value cannot be interpreted.
+                        let global_key = if key == "loadMode" {
+                            "load_mode"
+                        } else {
+                            "loadMode"
+                        };
+                        std::fs::write(
+                            &global_path,
+                            json!({
+                                "media": {"enable_tts": true},
+                                "tools": {(global_key): {"tts": " OFF "}}
+                            })
+                            .to_string(),
+                        )
+                        .expect("write global TTS activation and load mode");
+                        cwd.join(".pi/settings.json")
+                    } else {
+                        global_path
+                    };
+                    std::fs::write(
+                        &settings_path,
+                        json!({
+                            "media": {"enable_tts": true},
+                            "tools": {(key): {"tts": mode}}
+                        })
+                        .to_string(),
+                    )
+                    .expect("write invalid tool load mode");
+
+                    let should_warn = !project_setting || project_trusted;
+                    let seen = logged_under(default_log_filter_for(None), || {
+                        // Startup loads settings repeatedly. One invalid value
+                        // should produce one warning, while leaving it intact
+                        // for the existing merge and runtime fallback rules.
+                        for _ in 0..2 {
+                            let config = Config::load_with_roots_and_project_trust(
+                                None,
+                                &global_dir,
+                                &cwd,
+                                project_trusted,
+                            )
+                            .expect("invalid strings warn without preventing startup");
+                            assert_eq!(
+                                pi::xdev::configured_tier("tts", Some(&config)),
+                                if should_warn {
+                                    None
+                                } else {
+                                    Some(pi::xdev::LoadMode::Off)
+                                }
+                            );
+                            let tools = ToolRegistry::new(&[], &cwd, Some(&config));
+                            assert_eq!(
+                                tools.get("tts").is_some(),
+                                should_warn,
+                                "an invalid mode keeps enabled TTS available; an unread project must retain global off"
+                            );
+                        }
+                    });
+
+                    if should_warn {
+                        let setting = format!("tools.{key}.tts");
+                        assert!(
+                            seen.contains(setting.as_str()),
+                            "missing setting path: {seen:?}"
+                        );
+                        let file = settings_path.display().to_string();
+                        let quoted_file = format!("{file:?}");
+                        assert!(
+                            seen.contains(file.as_str()) || seen.contains(quoted_file.as_str()),
+                            "diagnostic must identify the settings file: {seen:?}"
+                        );
+                        assert_eq!(
+                            seen.matches("Invalid tool load mode").count(),
+                            1,
+                            "repeated config loads must not repeat the warning: {seen:?}"
+                        );
+                        assert!(seen.contains(mode), "missing rejected value: {seen:?}");
+                        assert!(
+                            seen.contains("essential, discoverable, or off")
+                                && seen.contains("being ignored")
+                                && seen
+                                    .contains("normal tool selection and default load modes apply"),
+                            "diagnostic must explain accepted values and fallback: {seen:?}"
+                        );
+                    } else {
+                        assert!(
+                            seen.is_empty(),
+                            "untrusted project settings must not be read or diagnosed: {seen:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

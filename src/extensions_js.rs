@@ -50,8 +50,8 @@ use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, path::Path, path::PathBuf};
 use swc_common::{FileName, GLOBALS, Globals, Mark, SourceMap, sync::Lrc};
 use swc_ecma_ast::{Module as SwcModule, Pass, Program as SwcProgram};
@@ -61,6 +61,7 @@ use swc_ecma_transforms_base::resolver;
 use swc_ecma_transforms_typescript::strip;
 
 mod executable;
+mod intl;
 mod process_session;
 mod sqlite;
 #[path = "extensions_js_storage.rs"]
@@ -4752,6 +4753,34 @@ impl InterruptBudget {
     }
 }
 
+struct JsExecutionFence {
+    cancelled: Arc<AtomicBool>,
+    deadline: Instant,
+    interrupted: Rc<std::cell::Cell<bool>>,
+}
+
+/// Bound synchronous guest execution as well as asynchronous invocation waits. The
+/// caller's drop flag is atomic because cancellation originates on another
+/// thread while QuickJS may be executing an otherwise unbounded loop.
+#[must_use = "the JS execution fence ends when the guard is dropped"]
+pub(crate) struct JsExecutionFenceGuard {
+    active: Rc<RefCell<Option<JsExecutionFence>>>,
+    previous: Option<JsExecutionFence>,
+    interrupted: Rc<std::cell::Cell<bool>>,
+}
+
+impl JsExecutionFenceGuard {
+    pub(crate) fn was_interrupted(&self) -> bool {
+        self.interrupted.get()
+    }
+}
+
+impl Drop for JsExecutionFenceGuard {
+    fn drop(&mut self) {
+        self.active.replace(self.previous.take());
+    }
+}
+
 #[must_use = "the Session-action origin scope ends when the guard is dropped"]
 pub(crate) struct SessionActionOriginGuard {
     active_origin: Rc<RefCell<Option<SessionActionOrigin>>>,
@@ -5333,10 +5362,12 @@ fn path_is_in_workspace_or_registered_extension_root(
     workspace_root: &Path,
     module_state: &Rc<RefCell<PiJsModuleState>>,
 ) -> bool {
+    if module_state.borrow().persistent_storage.is_registered(path) {
+        return true;
+    }
     let checked_path = crate::extensions::safe_canonicalize(path);
     checked_path.starts_with(workspace_root)
         || path_is_in_registered_extension_root(&checked_path, module_state)
-        || module_state.borrow().persistent_storage.is_registered(path)
         || module_state
             .borrow()
             .persistent_storage
@@ -5382,18 +5413,22 @@ fn path_is_allowed_extension_fs_path(
     module_state: &Rc<RefCell<PiJsModuleState>>,
     fallback_roots: &Arc<std::sync::Mutex<Vec<PathBuf>>>,
 ) -> bool {
-    let checked_path = crate::extensions::safe_canonicalize(path);
-    if module_state.borrow().persistent_storage.is_registered(path)
-        || module_state
-            .borrow()
-            .persistent_storage
-            .is_registered(&checked_path)
-    {
-        return module_state
-            .borrow()
-            .persistent_storage
-            .allows(path, extension_id, "read");
+    // Resolve registered data first: validation of raw Windows components must
+    // precede canonicalization, including direct calls to the native guards.
+    match persistent_storage_path(path, extension_id, module_state) {
+        Err(_) => return false,
+        Ok(Some(granted)) => {
+            let checked = crate::extensions::safe_canonicalize(&granted);
+            return (!path_is_in_registered_extension_root(&checked, module_state)
+                || path_is_in_owned_extension_root(&checked, extension_id, module_state))
+                && module_state
+                    .borrow()
+                    .persistent_storage
+                    .allows(path, extension_id, "read");
+        }
+        Ok(None) => {}
     }
+    let checked_path = crate::extensions::safe_canonicalize(path);
     let path = checked_path.as_path();
     let in_owned_root =
         path_is_in_allowed_extension_root(path, extension_id, module_state, fallback_roots);
@@ -13067,6 +13102,12 @@ const __pi_vfs = (() => {
       return { bytes: toBytes(content, "base64"), error: "" };
     } catch (error) {
       const message = String((error && error.message) ? error.message : error);
+      // Protected host data never falls back to the VFS or missing-config
+      // defaults after a permission, link, or I/O failure. Only native ENOENT
+      // means that an authorized configuration file is absent.
+      if (isPersistentPath(resolved) && (!error || error.code !== "ENOENT")) {
+        throw error;
+      }
       // A standalone realm may use an unrestricted virtual overlay, but host
       // reads remain confined. Treat a denied host probe as an absent overlay
       // entry so create/write operations can proceed entirely in the VFS.
@@ -13089,6 +13130,9 @@ const __pi_vfs = (() => {
       return JSON.parse(globalThis.__pi_host_stat_sync(toHostPath(resolved), !!followSymlinks));
     } catch (error) {
       const message = String((error && error.message) ? error.message : error);
+      if (isPersistentPath(resolved) && (!error || error.code !== "ENOENT")) {
+        throw error;
+      }
       // Standalone harness realms have no extension identity. Their virtual
       // reads and writes intentionally bypass extension policy, so a denied
       // host metadata probe means only that no host overlay is visible. An
@@ -13362,12 +13406,8 @@ const __pi_vfs = (() => {
     const isDir = !persistent && state.dirs.has(normalized);
     let bytes = persistent ? undefined : state.files.get(normalized);
     let hostStat = null;
-    if (!isDir && bytes === undefined && !isCurrentExtensionTempPath(normalized) && typeof globalThis.__pi_host_stat_sync === "function") {
-      try {
-        hostStat = JSON.parse(globalThis.__pi_host_stat_sync(toHostPath(normalized), !!followSymlinks));
-      } catch (e) {
-        /* not on host FS */
-      }
+    if (!isDir && bytes === undefined) {
+      hostStat = readHostStat(normalized, followSymlinks) ?? null;
     }
     const hostKind = hostStat && typeof hostStat.kind === "string" ? hostStat.kind : "";
     const isHostDir = hostKind === "dir";
@@ -13376,7 +13416,11 @@ const __pi_vfs = (() => {
     const isHostOther = hostKind === "other";
     const isFile = bytes !== undefined || isHostFile;
     if (!isDir && !isHostDir && !isFile && !isHostSymlink && !isHostOther) {
-      throw new Error(`ENOENT: no such file or directory, stat '${String(path ?? "")}'`);
+      const error = new Error(`ENOENT: no such file or directory, stat '${String(path ?? "")}'`);
+      error.code = "ENOENT";
+      error.syscall = "stat";
+      error.path = String(path ?? "");
+      throw error;
     }
     const hostSize =
       hostStat && typeof hostStat.size === "number" && Number.isFinite(hostStat.size)
@@ -13563,7 +13607,11 @@ export function readFileSync(path, encoding) {
   }
   if (bytes === undefined) {
     const detail = hostError ? ` (host: ${hostError})` : "";
-    throw new Error(`ENOENT: no such file or directory, open '${String(path ?? "")}'${detail}`);
+    const error = new Error(`ENOENT: no such file or directory, open '${String(path ?? "")}'${detail}`);
+    error.code = "ENOENT";
+    error.syscall = "open";
+    error.path = String(path ?? "");
+    throw error;
   }
   return __pi_vfs.decodeBytes(bytes, encoding);
 }
@@ -18322,6 +18370,7 @@ pub struct PiJsRuntime<C: SchedulerClock = WallClock> {
     peak_memory_used_bytes: Arc<AtomicU64>,
     tick_counter: Arc<AtomicU64>,
     interrupt_budget: Rc<InterruptBudget>,
+    execution_fence: Rc<RefCell<Option<JsExecutionFence>>>,
     config: PiJsRuntimeConfig,
     /// Additional filesystem roots that `readFileSync` may access (e.g.
     /// extension directories).  Populated lazily as extensions are loaded.
@@ -18360,6 +18409,7 @@ struct JsRuntimeRegistrySnapshot {
     message_renderers: u64,
     mcp_servers: u64,
     pending_tasks: u64,
+    tool_invocations: u64,
     pending_hostcalls: u64,
     pending_timers: u64,
     timer_handles: u64,
@@ -18392,6 +18442,7 @@ pub struct PiJsRealmScrubReport {
     pub rust_pending_hostcall_queue: u64,
     pub rust_scheduler_pending: bool,
     pub pending_tasks_before: u64,
+    pub tool_invocations_before: u64,
     pub pending_hostcalls_before: u64,
     pub pending_timers_before: u64,
     pub residual_entries_after: u64,
@@ -18560,10 +18611,21 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         }
 
         let interrupt_budget = Rc::new(InterruptBudget::new(config.limits.interrupt_budget));
-        if config.limits.interrupt_budget.is_some() {
+        let execution_fence: Rc<RefCell<Option<JsExecutionFence>>> = Rc::new(RefCell::new(None));
+        {
             let budget = Rc::clone(&interrupt_budget);
+            let fence = Rc::clone(&execution_fence);
             runtime
-                .set_interrupt_handler(Some(Box::new(move || budget.on_interrupt())))
+                .set_interrupt_handler(Some(Box::new(move || {
+                    fence.borrow().as_ref().is_some_and(|active| {
+                        let stop = active.cancelled.load(AtomicOrdering::Acquire)
+                            || Instant::now() >= active.deadline;
+                        if stop {
+                            active.interrupted.set(true);
+                        }
+                        stop
+                    }) || budget.on_interrupt()
+                })))
                 .await;
         }
 
@@ -18658,6 +18720,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             peak_memory_used_bytes,
             tick_counter,
             interrupt_budget,
+            execution_fence,
             config,
             allowed_read_roots: Arc::new(std::sync::Mutex::new(Vec::new())),
             repair_events,
@@ -18799,6 +18862,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             })?;
 
         report.pending_tasks_before = reset_payload.before.pending_tasks;
+        report.tool_invocations_before = reset_payload.before.tool_invocations;
         report.pending_hostcalls_before = reset_payload.before.pending_hostcalls;
         report.pending_timers_before = reset_payload
             .before
@@ -18815,6 +18879,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             + reset_payload.after.message_renderers
             + reset_payload.after.mcp_servers
             + reset_payload.after.pending_tasks
+            + reset_payload.after.tool_invocations
             + reset_payload.after.pending_hostcalls
             + reset_payload.after.pending_timers
             + reset_payload.after.timer_handles
@@ -18888,6 +18953,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         report.module_cache_limit_bytes = cache_limit_bytes;
 
         if report.pending_tasks_before > 0
+            || report.tool_invocations_before > 0
             || report.pending_hostcalls_before > 0
             || report.pending_timers_before > 0
         {
@@ -19378,6 +19444,24 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         }
     }
 
+    pub(crate) fn enter_execution_fence(
+        &self,
+        cancelled: Arc<AtomicBool>,
+        deadline: Instant,
+    ) -> JsExecutionFenceGuard {
+        let interrupted = Rc::new(std::cell::Cell::new(false));
+        let previous = self.execution_fence.replace(Some(JsExecutionFence {
+            cancelled,
+            deadline,
+            interrupted: Rc::clone(&interrupted),
+        }));
+        JsExecutionFenceGuard {
+            active: Rc::clone(&self.execution_fence),
+            previous,
+            interrupted,
+        }
+    }
+
     /// Return the trusted origin captured when a hostcall was created.
     pub(crate) fn session_action_origin_for_hostcall(
         &self,
@@ -19854,6 +19938,26 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             .map_err(|error| Error::extension(format!("Invalid persistent storage grant: {error}")))
     }
 
+    /// Grant read-only access to one host configuration file. Its parent is a
+    /// protected namespace, not a directory read grant or a module search root.
+    /// Missing files remain missing; registration never creates host paths.
+    pub fn add_configuration_read_file(&self, file: PathBuf, extension_id: &str) -> Result<()> {
+        if self
+            .owner_extension_id
+            .as_deref()
+            .is_some_and(|owner| owner != extension_id)
+        {
+            return Err(Error::extension(
+                "Configuration owner does not match runtime owner",
+            ));
+        }
+        self.module_state
+            .borrow_mut()
+            .persistent_storage
+            .register_configuration_file(file, extension_id)
+            .map_err(|error| Error::extension(format!("Invalid configuration read grant: {error}")))
+    }
+
     pub(crate) fn register_foreign_persistent_storage_root(
         &self,
         root: PathBuf,
@@ -20012,6 +20116,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 let global = ctx.globals();
 
                 storage::install(&ctx, &module_state, &process_cwd)?;
+                intl::install(&ctx)?;
                 sqlite::install(
                     &ctx,
                     Rc::clone(&self.sqlite_state),
@@ -20940,9 +21045,6 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             } else {
                                 workspace_root.join(requested)
                             };
-                            let checked_path =
-                                crate::extensions::safe_canonicalize(&requested_abs);
-
                             let allowed = path_is_allowed_extension_fs_path(
                                 &requested_abs,
                                 &workspace_root,
@@ -20950,6 +21052,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 &module_state,
                                 &allowed_read_roots,
                             );
+                            let checked_path = if allowed {
+                                crate::extensions::safe_canonicalize(&requested_abs)
+                            } else {
+                                requested_abs.clone()
+                            };
                             log_host_fs_decision(
                                 "read",
                                 allowed,
@@ -20965,9 +21072,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             if allowed {
                                 Ok(())
                             } else {
-                                Err(rquickjs::Error::new_loading_message(
+                                Err(storage::filesystem_error(
+                                    &ctx,
                                     &path,
-                                    "host read denied: path outside extension root".to_string(),
+                                    "open",
+                                    &std::io::Error::new(
+                                        std::io::ErrorKind::PermissionDenied,
+                                        "host read denied: path outside extension root",
+                                    ),
                                 ))
                             }
                         }
@@ -21001,22 +21113,22 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             } else {
                                 workspace_root.join(requested)
                             };
-                            let checked_path =
-                                crate::extensions::safe_canonicalize(&requested_abs);
-
                             let storage = &module_state.borrow().persistent_storage;
-                            let allowed = if storage.is_registered(&requested_abs)
-                                || storage.is_registered(&checked_path)
-                            {
-                                storage.allows(&requested_abs, extension_id.as_deref(), "write")
-                            } else {
-                                path_is_allowed_extension_fs_path(
+                            let allowed = match storage.resolve(&requested_abs, extension_id.as_deref()) {
+                                Err(_) => false,
+                                Ok(Some(_)) => storage.allows(&requested_abs, extension_id.as_deref(), "write"),
+                                Ok(None) => path_is_allowed_extension_fs_path(
                                     &requested_abs,
                                     &workspace_root,
                                     extension_id.as_deref(),
                                     &module_state,
                                     &allowed_read_roots,
-                                )
+                                ),
+                            };
+                            let checked_path = if allowed {
+                                crate::extensions::safe_canonicalize(&requested_abs)
+                            } else {
+                                requested_abs.clone()
                             };
                             log_host_fs_decision(
                                 "write",
@@ -21067,9 +21179,6 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             } else {
                                 workspace_root.join(requested)
                             };
-                            let checked_path =
-                                crate::extensions::safe_canonicalize(&requested_abs);
-
                             let allowed = path_is_allowed_extension_fs_path(
                                 &requested_abs,
                                 &workspace_root,
@@ -21077,6 +21186,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 &module_state,
                                 &allowed_read_roots,
                             );
+                            let checked_path = if allowed {
+                                crate::extensions::safe_canonicalize(&requested_abs)
+                            } else {
+                                requested_abs.clone()
+                            };
                             log_host_fs_decision(
                                 "stat",
                                 allowed,
@@ -21096,16 +21210,18 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 ));
                             }
 
-                            let metadata = if follow_symlinks {
+                            let configuration = storage::configuration_metadata(
+                                &requested_abs, extension_id.as_deref(), &module_state,
+                            ).map_err(|error| storage::filesystem_error(&ctx, &path, "stat", &error))?;
+                            let metadata = if let Some((_, metadata)) = configuration {
+                                Ok(metadata)
+                            } else if follow_symlinks {
                                 std::fs::metadata(&requested_abs)
                             } else {
                                 std::fs::symlink_metadata(&requested_abs)
                             }
                             .map_err(|err| {
-                                rquickjs::Error::new_loading_message(
-                                    &path,
-                                    format!("host stat: {err}"),
-                                )
+                                storage::filesystem_error(&ctx, &path, "stat", &err)
                             })?;
 
                             let file_type = metadata.file_type();
@@ -21148,6 +21264,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             if !allowed(&requested) {
                                 return Err(rquickjs::Error::new_loading_message(&path, "host realpath denied: path outside extension root"));
                             }
+                            if let Some((canonical, _)) = storage::configuration_metadata(
+                                &requested, extension_id.as_deref(), &module_state,
+                            ).map_err(|error| storage::filesystem_error(&ctx, &path, "realpath", &error))? {
+                                return Ok(canonical.to_string_lossy().into_owned());
+                            }
                             let canonical = std::fs::canonicalize(&requested)
                                 .map(crate::extensions::strip_unc_prefix)
                                 .map_err(|error| rquickjs::Error::new_loading_message(&path, format!("host realpath: {error}")))?;
@@ -21180,9 +21301,6 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             } else {
                                 workspace_root.join(requested)
                             };
-                            let checked_path =
-                                crate::extensions::safe_canonicalize(&requested_abs);
-
                             let allowed = path_is_allowed_extension_fs_path(
                                 &requested_abs,
                                 &workspace_root,
@@ -21195,6 +21313,16 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 return Err(rquickjs::Error::new_loading_message(
                                     &path,
                                     "host readdir denied: path outside extension root".to_string(),
+                                ));
+                            }
+                            let checked_path = crate::extensions::safe_canonicalize(&requested_abs);
+
+                            if storage::configuration_metadata(
+                                &requested_abs, extension_id.as_deref(), &module_state,
+                            ).map_err(|error| storage::filesystem_error(&ctx, &path, "scandir", &error))?.is_some() {
+                                return Err(storage::filesystem_error(
+                                    &ctx, &path, "scandir",
+                                    &std::io::Error::new(std::io::ErrorKind::NotADirectory, "configuration is a file"),
                                 ));
                             }
 
@@ -21290,9 +21418,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 &requested_abs,
                                 extension_id.as_deref(),
                                 &module_state,
-                            ).map_err(|error| rquickjs::Error::new_loading_message(
-                                &path, format!("persistent storage read: {error}"),
-                            ))? {
+                            ).map_err(|error| storage::filesystem_error(&ctx, &path, "open", &error))? {
                                 return Ok(BASE64_STANDARD.encode(bytes));
                             }
 
@@ -22131,20 +22257,82 @@ if (typeof globalThis.Intl === 'undefined') {
         resolvedOptions() { return { ...this._opts, locale: this._locale }; }
     }
 
-    class Segmenter {
-        constructor(locale, opts) {
-            this._locale = locale || 'en';
-            this._opts = opts || {};
+    // Locale-independent extended grapheme boundaries come from the host's
+    // Unicode implementation. Keep the original JS string here: its indices
+    // and slices use UTF-16, including any unpaired surrogate code units.
+    const __graphemeBoundaries = globalThis.__pi_intl_grapheme_boundaries;
+    const __segmenters = new WeakSet();
+    const __segmentStates = new WeakMap();
+
+    function __segmentState(receiver) {
+        const state = __segmentStates.get(receiver);
+        if (!state) throw new TypeError('Incompatible Segments receiver');
+        return state;
+    }
+
+    function __segmentRecord(state, index) {
+        const start = state.boundaries[index];
+        return {
+            segment: state.input.slice(start, state.boundaries[index + 1]),
+            index: start,
+            input: state.input,
+        };
+    }
+
+    class Segments {
+        constructor(input, boundaries) {
+            __segmentStates.set(this, { input, boundaries });
         }
-        segment(str) {
-            const s = String(str ?? '');
-            const segments = [];
-            // Approximate grapheme segmentation: split by codepoints
-            for (const ch of s) {
-                segments.push({ segment: ch, index: segments.length, input: s });
+
+        [Symbol.iterator]() {
+            const state = __segmentState(this);
+            // Each traversal owns its cursor and creates fresh records. Do
+            // not iterate this Segments object from inside its own iterator.
+            return (function*() {
+                for (let index = 0; index + 1 < state.boundaries.length; index++) {
+                    yield __segmentRecord(state, index);
+                }
+            })();
+        }
+
+        containing(index) {
+            const state = __segmentState(this);
+            const number = +index;
+            const position = Number.isNaN(number) ? 0 : Math.trunc(number);
+            if (position < 0 || position >= state.input.length) return undefined;
+            let low = 0;
+            let high = state.boundaries.length - 1;
+            while (low + 1 < high) {
+                const middle = Math.floor((low + high) / 2);
+                if (state.boundaries[middle] <= position) low = middle;
+                else high = middle;
             }
-            segments[Symbol.iterator] = function*() { for (const seg of segments) yield seg; };
-            return segments;
+            return __segmentRecord(state, low);
+        }
+    }
+
+    class Segmenter {
+        constructor(_locale, opts) {
+            if (opts === null) throw new TypeError('Intl.Segmenter options must not be null');
+            const requested = opts === undefined ? undefined : opts.granularity;
+            const granularity = requested === undefined ? 'grapheme' : `${requested}`;
+            if (granularity !== 'grapheme') {
+                throw new RangeError('PiJS Intl.Segmenter supports only grapheme granularity');
+            }
+            __segmenters.add(this);
+        }
+
+        segment(value) {
+            if (!__segmenters.has(this)) throw new TypeError('Incompatible Intl.Segmenter receiver');
+            const input = `${value}`;
+            // Rust strings require valid Unicode. Replacement is only for
+            // classifying boundaries; each unpaired surrogate still occupies
+            // one UTF-16 unit, and returned text always slices the original.
+            const boundaryInput = input.replace(
+                /[\uD800-\uDBFF][\uDC00-\uDFFF]|[\uD800-\uDFFF]/g,
+                units => units.length === 2 ? units : '\uFFFD',
+            );
+            return new Segments(input, __graphemeBoundaries(boundaryInput));
         }
     }
 
@@ -22354,6 +22542,7 @@ function __pi_runtime_registry_snapshot() {
         messageRenderers: __pi_map_size_primordial(__pi_message_renderer_index),
         mcpServers: __pi_map_size_primordial(__pi_mcp_server_index),
         pendingTasks: __pi_map_size_primordial(__pi_tasks),
+        toolInvocations: __pi_tool_invocation_runtime.count(),
         pendingHostcalls: __pi_map_size_primordial(__pi_pending_hostcalls),
         pendingTimers: __pi_map_size_primordial(__pi_timer_callbacks),
         timerHandles: __pi_timer_runtime.count(),
@@ -22379,6 +22568,7 @@ function __pi_runtime_registry_snapshot() {
 function __pi_reset_extension_runtime_state(bridge_secret) {
     const before = __pi_runtime_registry_snapshot();
 
+    __pi_tool_invocation_runtime.reset();
     for (const server of __pi_virtual_http_server_values(__pi_virtual_http_servers)) {
         __pi_virtual_http_close(server);
     }
@@ -22458,6 +22648,7 @@ function __pi_reset_extension_runtime_state(bridge_secret) {
         after.messageRenderers === 0 &&
         after.mcpServers === 0 &&
         after.pendingTasks === 0 &&
+        after.toolInvocations === 0 &&
         after.pendingHostcalls === 0 &&
         after.pendingTimers === 0 &&
         after.timerHandles === 0 &&
@@ -24043,6 +24234,28 @@ function __pi_make_extension_ctx(ctx_payload) {
     const modelCatalog =
         ctx_payload && Array.isArray(ctx_payload.models) ? ctx_payload.models : [];
 
+    // A native request snapshot, independent of the cached session entries.
+    // Copy only public numeric fields before handlers can mutate the payload.
+    // No previous-event fallback: missing data must not revive another model
+    // or session's usage. Each getter returns an independent value.
+    let contextUsage;
+    const usage = ctx_payload && ctx_payload.contextUsage;
+    if (usage && typeof usage === 'object' && !Array.isArray(usage)) {
+        const window = usage.contextWindow;
+        const tokens = usage.tokens;
+        if (
+            Number.isSafeInteger(window) && window > 0 &&
+            (tokens === null || (Number.isSafeInteger(tokens) && tokens >= 0))
+        ) {
+            contextUsage = {
+                tokens,
+                contextWindow: window,
+                // Percent means 0..100, not a fraction. Do not clamp overflow.
+                percent: tokens === null ? null : (tokens / window) * 100,
+            };
+        }
+    }
+
     const sessionManager = {
         getEntries: () => entries,
         getBranch: () => branch,
@@ -24059,6 +24272,7 @@ function __pi_make_extension_ctx(ctx_payload) {
         sessionManager: sessionManager,
         model: model,
         getSystemPrompt: () => __pi_current_system_prompt,
+        getContextUsage: () => contextUsage === undefined ? undefined : { ...contextUsage },
         modelRegistry: {
             // Synchronous catalog lookup (upstream ModelRegistry.find parity,
             // gh #167 / bd-t9n21). Consumers call it without await (e.g.
@@ -24557,7 +24771,9 @@ function __pi_validate_tool_input(schema, input) {
     }
 }
 
-async function __pi_execute_tool(tool_name, tool_call_id, input, ctx_payload) {
+async function __pi_execute_tool(
+    tool_name, tool_call_id, input, ctx_payload, invocation_token, native_update
+) {
     const name = String(tool_name || '').trim();
     const record = __pi_tool_index.get(name);
     if (!record) {
@@ -24566,10 +24782,27 @@ async function __pi_execute_tool(tool_name, tool_call_id, input, ctx_payload) {
 
     __pi_validate_tool_input(record.spec && record.spec.parameters, input);
 
-    const ctx = __pi_make_extension_ctx(ctx_payload);
-    return __pi_with_extension_async(record.extensionId, () =>
-        record.execute(tool_call_id, input, undefined, undefined, ctx)
-    );
+    return __pi_with_extension_async(record.extensionId, async () => {
+        const invocation = __pi_tool_invocation_runtime.start(
+            invocation_token, record.extensionId, native_update
+        );
+        try {
+            const ctx = __pi_make_extension_ctx(ctx_payload);
+            return await record.execute(
+                tool_call_id, input, invocation.signal, invocation.onUpdate, ctx
+            );
+        } finally {
+            __pi_tool_invocation_runtime.finish(invocation_token, invocation);
+        }
+    });
+}
+
+function __pi_cancel_tool_invocation(invocation_token) {
+    return __pi_tool_invocation_runtime.cancel(invocation_token);
+}
+
+function __pi_finish_tool_invocation(invocation_token) {
+    return __pi_tool_invocation_runtime.finish(invocation_token);
 }
 
 async function __pi_execute_command(command_name, args, ctx_payload) {
@@ -27785,6 +28018,104 @@ if (typeof globalThis.fetch !== 'function') {
     globalThis.__pi_fetch_for_node_http = (input, init) => __pi_fetch(input, init, true);
 }
 
+// Tool invocation lifetime is separate from extension ownership. In particular,
+// a timer or persistent subprocess owned by the same extension is not implicitly
+// cancelled with a tool. Consumers use the supplied signal to stop their work.
+// Capture controller and collection intrinsics only after the fetch/abort
+// polyfills exist, before any extension can replace their public methods.
+const __pi_tool_invocation_runtime = (() => {
+    const active = new Map();
+    const getActive = Function.call.bind(Map.prototype.get);
+    const setActive = Function.call.bind(Map.prototype.set);
+    const deleteActive = Function.call.bind(Map.prototype.delete);
+    const forEachActive = Function.call.bind(Map.prototype.forEach);
+    const Controller = globalThis.AbortController;
+    const abort = Function.call.bind(Controller.prototype.abort);
+    const stringify = JSON.stringify;
+    const isArray = Array.isArray;
+    const createObject = Object.create;
+    const maxUpdateUnits = 1024 * 1024;
+
+    function ownsActive(token, state) {
+        return state.active && getActive(active, token) === state &&
+            __pi_get_current_extension_id() === state.owner;
+    }
+
+    function start(token, owner, sink) {
+        if (typeof token !== 'string' || token.length === 0 || token.length > 200) {
+            throw new TypeError('Tool invocation requires a host-assigned token');
+        }
+        if (getActive(active, token)) {
+            throw new Error('Tool invocation token is already active');
+        }
+        if (sink !== undefined && sink !== null && typeof sink !== 'function') {
+            throw new TypeError('Invalid native tool update callback');
+        }
+        const controller = new Controller();
+        const state = {
+            owner, controller, signal: controller.signal,
+            active: true, sink: typeof sink === 'function' ? sink : null,
+            onUpdate: undefined,
+        };
+        if (state.sink) {
+            state.onUpdate = (update) => {
+                if (!ownsActive(token, state) || !state.sink) return;
+                try {
+                    if (!update || typeof update !== 'object' || isArray(update)) return;
+                    const content = update.content;
+                    if (!isArray(content)) return;
+                    const details = update.details;
+                    const snapshot = createObject(null);
+                    snapshot.content = content;
+                    snapshot.details = details === undefined ? null : details;
+                    const encoded = stringify(snapshot);
+                    if (typeof encoded !== 'string' || encoded.length > maxUpdateUnits) return;
+                    // Getters/toJSON may run guest code during serialization.
+                    // Recheck lifetime and owner before crossing the boundary.
+                    if (ownsActive(token, state) && state.sink) state.sink(encoded);
+                } catch (_) {
+                    // Invalid or oversized progress is advisory. The native
+                    // sink independently validates bytes, shape and lifetime.
+                }
+            };
+        }
+        setActive(active, token, state);
+        return state;
+    }
+
+    function cancel(token) {
+        const state = getActive(active, token);
+        if (!state || !state.active) return false;
+        // Abort listeners must not be able to publish another progress update,
+        // and a retained callback must not retain the native mailbox after close.
+        state.active = false;
+        state.sink = null;
+        __pi_with_extension_sync(state.owner, () => abort(state.controller));
+        return true;
+    }
+
+    function finish(token, expected) {
+        const state = getActive(active, token);
+        if (!state || (expected !== undefined && state !== expected)) return false;
+        state.active = false;
+        state.sink = null;
+        deleteActive(active, token);
+        return true;
+    }
+
+    return Object.freeze({
+        start, cancel, finish,
+        count: () => __pi_map_size_primordial(active),
+        reset() {
+            forEachActive(active, (_state, token) => {
+                try { cancel(token); } catch (_) {}
+                finally { finish(token); }
+            });
+            __pi_map_clear_primordial(active);
+        },
+    });
+})();
+
 const __pi_export_privileged = (name, fn, forwardSecret = false) => {
     Object.defineProperty(globalThis, name, {
         value: (secret, ...args) => {
@@ -27824,6 +28155,8 @@ for (const [name, fn] of Object.entries({
     __pi_register_mcp_server_for_extension,
     __pi_load_extension,
     __pi_execute_tool,
+    __pi_cancel_tool_invocation,
+    __pi_finish_tool_invocation,
     __pi_execute_command,
     __pi_execute_shortcut,
     __pi_provider_stream_simple_start,
@@ -27998,16 +28331,34 @@ mod tests {
     /// accounted for by d9999a5f (+363, footer/header factories), 27e9d778
     /// (+1_177, environment/executable facade), and 70110103 (+5_689,
     /// context transforms and timer lifecycle): 245_152 -> 247_754 bytes.
+    ///
+    /// Grapheme rendering for gh #279 adds 2_688 bridge bytes: 247_754 ->
+    /// 250_442. The native boundary callback replaces recursive iteration
+    /// and code-point splitting; published-renderer regressions cover the
+    /// deliberate source change. The filesystem module is trimmed before
+    /// this receipt: pre-config main already contained 64_141 bytes, and
+    /// 7684b1a adds 470 for typed configuration errors, yielding 64_611.
+    /// Other pre-existing module receipt drift is not re-pinned here.
+    ///
+    /// Request-scoped context usage for gh #279 adds 1_070 bytes to the
+    /// second bridge literal: 250_442 -> 251_512. It projects host usage
+    /// into a synchronous getter without caching it across dispatches.
+    /// Published compression and native snapshot regressions cover this edit.
+    ///
+    /// Invocation-scoped tool progress and cancellation add 5_172 bytes:
+    /// 251_512 -> 256_684 (+144 inventory/reset, +635 tool dispatch,
+    /// +4_393 private lifetime controls). The pinned real-subagent source
+    /// diagnostic and native lifecycle regressions cover these edits.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            247_754,
-            "29f10a474b23f3cda3ec56ce1f74781f2918cef375dd27ba5effa6a5b5b343ed",
+            256_684,
+            "2f2004075b71ba724fcda8d3be81183324eb27e34cc35027e8b9013bcfe92096",
         ),
         (
             "node:fs",
-            57_930,
-            "9180ce100adb7cf8e951b1f4d2e712a6ae3b72bd2720f9ad65e7eb1d5250cdb0",
+            64_611,
+            "00009b3d960524a1c9d37f6fd8e2a014d29520a06fa3b1283f607db8dc068151",
         ),
         (
             "@mariozechner/pi-ai",
@@ -28224,6 +28575,70 @@ mod tests {
             );
             clock.set(next_deadline);
         }
+    }
+
+    #[test]
+    fn extension_context_usage_is_a_fresh_request_snapshot() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    __pi_begin_extension(__pi_test_secret, "ext.usage", {name: "ext.usage"});
+                    globalThis.usageProbe = { captures: [] };
+                    pi.on("context", (_event, ctx) => {
+                        const value = ctx.getContextUsage();
+                        globalThis.usageProbe.captures.push(value === undefined ? "unknown" : value);
+                        if (value !== undefined) {
+                            value.tokens = -1;
+                            value.contextWindow = 1;
+                            globalThis.usageProbe.captures.push(ctx.getContextUsage());
+                        }
+                    });
+                    __pi_end_extension(__pi_test_secret);
+                    const dispatch = (payload) => __pi_dispatch_extension_event(
+                        __pi_test_secret, "context", {messages: [], contextUsage: {tokens: 99}}, payload
+                    );
+                    dispatch({contextUsage: {tokens: 60000, contextWindow: 200000, percent: 999, secret: "hidden"}})
+                        .then(() => dispatch({contextUsage: {tokens: null, contextWindow: 100000}}))
+                        .then(() => dispatch({contextUsage: {tokens: 150, contextWindow: 100}}))
+                        .then(() => dispatch({contextUsage: {tokens: 1, contextWindow: 0}}))
+                        .then(() => dispatch({contextUsage: {tokens: -1, contextWindow: 100}}))
+                        .then(() => dispatch({contextUsage: {tokens: "1", contextWindow: 100}}))
+                        .then(() => dispatch({sessionState: {sessionId: "other-session"}}))
+                        .then(() => dispatch({}))
+                        .catch((error) => { globalThis.usageProbe.error = String(error); })
+                        .finally(() => { globalThis.usageProbe.done = true; });
+                    "#,
+                ))
+                .await
+                .expect("dispatch context usage snapshots");
+            drain_until_idle(&runtime, &clock).await;
+            let probe = get_global_json(&runtime, "usageProbe").await;
+            assert_eq!(probe["done"], json!(true), "{probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "{probe}");
+            let captures = probe["captures"].as_array().expect("usage captures");
+            assert_eq!(captures.len(), 11);
+            assert_eq!(
+                captures[1],
+                json!({"tokens": 60000, "contextWindow": 200000, "percent": 30})
+            );
+            assert_eq!(
+                captures[3],
+                json!({"tokens": null, "contextWindow": 100000, "percent": null})
+            );
+            assert_eq!(
+                captures[5],
+                json!({"tokens": 150, "contextWindow": 100, "percent": 150})
+            );
+            for value in &captures[6..] {
+                assert_eq!(value, "unknown");
+            }
+        });
     }
 
     // ── gh #167 extension-API parity: ctx.model / getSystemPrompt /

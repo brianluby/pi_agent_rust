@@ -80,7 +80,77 @@ A relative override is resolved against Pi's launch directory and keeps that
 location when a session requests a different workspace. The startup skills
 block is omitted for a different or untrusted workspace.
 
+## Magic keywords
+
+Standalone lowercase words in **user-authored prose** can change how Pi handles
+a turn. Code spans, fenced or indented code, HTML/XML, paths, identifiers, and
+function-call spellings such as `chillax()` do not activate them. Generated
+attachment content, extension messages, and BTW injections are not new authored
+keyword requests. The original visible user message is preserved.
+
+| Word | Native behavior |
+| --- | --- |
+| `ultrathink` | Temporarily use the selected model's highest supported thinking tier for this turn. |
+| `chillax` | Add a brief-reasoning instruction. On supported adaptive Anthropic models, lower an enabled pinned thinking level to the lowest supported tier and keep that setting until changed. |
+| `orchestrate` | Add the parallel delegation and verification instruction for this turn. |
+| `workflowz` | Add the deterministic multi-agent workflow instruction for this turn. |
+| `jevify` | When `eval` is available, add a bulk-classification instruction using native `judgeBatch()` / `judge_batch()` with bounded batches and explicit coverage/error accounting. |
+
+For example, write `chillax, check this small fix` or `jevify this list of
+changes against the agreed rubric`. `jevify` does not enable eval, choose an
+unconfigured model, or expand a request or cost budget. Configure the native
+`judge_model` or a trusted model role as described by the eval tool.
+
+`chillax` wins over `ultrathink` within the same logical turn, including steering
+messages delivered before the next provider request. It never turns thinking on
+or raises the pinned effort. Numeric lowering is restricted to the
+`anthropic-messages` transport with verified adaptive thinking support; the
+catalog's `forceAdaptiveThinking` and disabled thinking tiers are respected.
+Unknown or inverted custom effort mappings are not guessed. Other models still
+receive the brief-reasoning instruction. Native Pi does not currently have OMP's
+automatic thinking classifier.
+
+The lowered effort is recorded in session history and survives resume. A later
+explicit thinking selection changes it normally. Hidden instructions remain
+turn-local: a follow-up starts a new instruction scope, and the next ordinary
+turn does not inherit a previous keyword's notice. Native notices currently
+append to the turn's system prompt, so there is no guarantee that injecting a
+notice mid-turn preserves a provider's prompt-cache prefix.
+
+All keyword switches default to enabled. Set the following in global or trusted
+project settings:
+
+```json
+{
+  "keywords": {
+    "enabled": true,
+    "ultrathink": true,
+    "chillax": true,
+    "orchestrate": true,
+    "workflowz": true,
+    "jevify": true
+  }
+}
+```
+
+Set `keywords.enabled` to `false` to disable all effects, including custom
+keywords, or disable individual words. These fields merge independently across
+settings scopes. OMP's `magicKeywords` object name (also `magic_keywords`) and
+its `workflow` setting for `workflowz` are accepted aliases; use one spelling
+per field in a file. Activations are recorded as `magic_keyword` session entries;
+actual pinned reductions also record a thinking-level change.
+
 ## Supported settings (snake_case JSON keys)
+
+### Language servers (LSP)
+
+Pi includes definitions for rust-analyzer, TypeScript Language Server, Pyright,
+gopls, and clangd. Install the server executable yourself; the defaults select
+and launch it lazily for matching source files. A settings entry is only needed
+to override a default or add another server.
+
+See [language-server setup and configuration](lsp-configuration.md) for the
+installation table, automatic detection behavior, and `lsp.servers` examples.
 
 ### Optional tools
 
@@ -170,6 +240,44 @@ that exclusion. Explicit names do not enable a separate backend: the memory
 bank still requires `memory.backend` to be `"local"` or `"cass"`. The generated
 `xdev` dispatcher still requires discoverable tools and is disabled by
 `loadMode.xdev: "off"`.
+
+Load-mode values ignore surrounding whitespace and letter case. Any other
+string, such as `"disabled"` or `"discoverble"`, produces a startup warning
+naming the settings file, dotted entry, and rejected value. The invalid value
+is ignored and normal selection/default exposure applies: `"disabled"` does
+not turn a tool off. Use `"off"` to exclude it from implicit activation.
+Extension and MCP tool names are accepted as map keys. These rules also apply
+when tools register after startup, an extension reloads, or an MCP server
+refreshes its catalog. Use the published MCP name, such as
+`mcp__docs__search`, rather than the server's unqualified `search` name.
+
+New extension and MCP tool names default to `essential`. Replacements preserve
+the existing exposure unless configured. Setting one to `discoverable` hides
+its schema and makes its current
+description and arguments available through `xdev`; setting it to `off`
+excludes it from lookup, schemas, and discovery. An extension's
+`setActiveTools` cannot reactivate a tool excluded by `off`. For example:
+
+```json
+{
+  "tools": {
+    "loadMode": {
+      "my_extension_tool": "discoverable",
+      "mcp__docs__search": "discoverable",
+      "mcp__docs__delete": "off"
+    }
+  }
+}
+```
+
+These settings do not load an extension, connect an MCP server, or grant
+permission to execute its tools. The existing admission and authorization
+checks still apply. A late discoverable tool can supply the generated `xdev`
+dispatcher, including alongside an explicit built-in selection such as
+`--tools read`. `--no-tools` and `loadMode.xdev: "off"` suppress that generated
+dispatcher; choose `essential` for mounted tools that should remain directly
+visible in those cases. Catalog refresh updates discovery together with the
+active tools, so shelved or removed tools no longer appear in `xdev list`.
 
 `subagent` remains activatable with `enableSubagent: true`: its built-in
 off-by-default tier is not an explicit `loadMode.subagent: "off"` setting.
@@ -728,13 +836,72 @@ They remain outside project recall, reflection, and startup memory.
 
 ### Media (multimodal perception & speech)
 
-- `media.enable_media` (bool): Default `false`. When `true`, activates `inspect_image`, `generate_image`, and `tts`.
-- `media.tts_provider` (string): Default `"elevenlabs"`. Supported: `"openai"`, `"elevenlabs"`, `"system"`.
-- `media.tts_voice` (string): Voice identifier (e.g. `"alloy"`, `"rachel"`).
-- `media.image_gen_provider` (string): Default `"gemini"`. Supported: `"gemini"`, `"dall-e-3"`.
-- `media.output_dir` (string): Destination folder for generated media artifacts.
+| Setting | camelCase alias | Effect |
+| --- | --- | --- |
+| `media.enable_media` | `media.enableMedia` | Default activation for `inspect_image`, `generate_image`, and `tts` |
+| `media.enable_inspect_image` | `media.enableInspectImage` | Override activation of `inspect_image` |
+| `media.enable_generate_image` | `media.enableGenerateImage` | Override activation of `generate_image` |
+| `media.enable_tts` | `media.enableTts` | Override activation of `tts` |
+
+All four switches accept JSON booleans. Each individual switch, including an
+explicit `false`, takes precedence over the aggregate setting. If neither is
+set, the tool remains disabled. `read_media` has its own independent switch.
+For example, this enables image inspection and generation without speech:
+
+```json
+{
+  "media": {
+    "enableMedia": true,
+    "enableTts": false
+  }
+}
+```
+
+Global and trusted project settings first merge field by field, with project
+values overriding the same global field regardless of spelling. Missing and
+`null` values inherit. Individual switches then override the merged aggregate,
+even when the individual value was inherited: a global `enable_tts: false`
+survives a project `enable_media: true`, and a global `enable_tts: true`
+survives a project `enable_media: false`. Set the project's individual switch
+to change that choice.
+
+Untrusted project settings remain excluded. `--no-tools` and an explicit empty
+tool selection still disable built-ins. Explicitly naming a media tool retains
+its existing override behavior. Ordinary nonempty `--tools` selections retain
+automatic media additions; restricted child-agent and SDK tool allowlists
+exclude unlisted tools. Implicit activation respects
+`tools.loadMode.<name>: "off"`. Execution retains its existing approval
+requirements. See [Optional tools](#optional-tools).
+
+Use one spelling per field in each file; supplying both is a duplicate-field
+error. Strings such as `"true"` are invalid. Unknown media settings with non-null values
+produce a startup warning naming the file and dotted setting and explaining
+that it is ignored. An explicit `RUST_LOG` filter retains control over log
+visibility.
+
+- `media.vision_provider` / `media.visionProvider` (string): Default `"gemini"`. Supported: `"openai"`, `"anthropic"`, `"gemini"`.
+- `media.vision_model` / `media.visionModel` (string): Default inspection model; otherwise chosen for the selected provider.
+- `media.tts_provider` / `media.ttsProvider` (string): Default `"openai"`. Supported: `"openai"`, `"xai"`.
+- `media.tts_voice` / `media.ttsVoice` (string): Provider voice identifier; defaults to `"alloy"` for OpenAI or `"eve"` for xAI.
+- `media.image_gen_provider` / `media.imageGenProvider` (string): Default `"openai"`. Supported: `"openai"`, `"gemini"`, `"xai"`.
+- `media.image_gen_model` / `media.imageGenModel` (string): Default generation model; otherwise chosen for the selected provider.
 - `media.enable_read_media` / `media.enableReadMedia` (bool): Default `false`. When `true`, activates `read_media`, which attaches a local video/audio file (mp4, webm, mov, mp3, wav, m4a, ogg, flac) as a native media block. Gemini-family models consume audio/video natively. OpenAI Chat Completions models declaring audio input and separate audio pricing consume WAV/MP3 natively and return text; `openai/gpt-audio-1.5` includes that configuration. Unsupported media produces `[media omitted: <name>, <mime>, <size>]`. See [native audio model configuration](models.md#native-audio-with-openai-chat-completions).
 - `media.max_bytes` / `media.maxBytes` (integer): Default `5242880` (5 MiB). Hard cap on one `read_media` file in bytes; larger files are rejected with an error naming the cap. Session media can be stored in sidecars and is restored for subsequent provider requests until compaction, so keep this small. Provider-specific per-request transport bounds also apply.
+
+For provider, model, and voice choices, explicit tool-call arguments win over
+settings, followed by the corresponding `PI_VISION_*`, `PI_IMAGE_GEN_*`, or
+`PI_TTS_*` environment fallback and then the built-in default.
+
+`media.output_dir` is not supported. Use the `output_path` argument of
+`generate_image` or `tts` to choose a new destination within the workspace.
+Without it, artifacts use `images/generated_<id>.<extension>` or
+`audio/speech_<id>.<extension>`. Existing files are not overwritten. Activating
+a tool does not supply the provider credentials needed to execute it. Native
+media tools use API-key credentials from the owning session's `auth.json`,
+after any configured provider key pool and singular environment variables.
+Only the requested provider's API key is resolved; chat-session OAuth tokens
+and chat-only CLI/SDK key overrides are not forwarded. See
+[media authentication](tools/media_tools.md#activation-and-credentials).
 
 ### Computer (desktop automation)
 

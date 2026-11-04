@@ -111,6 +111,7 @@ pub struct Config {
     /// Secrets vault settings (bd-cv653.7.9).
     pub secrets: Option<crate::secrets::SecretsSettings>,
     /// Magic-keyword settings (bd-cv653.3.6).
+    #[serde(alias = "magicKeywords", alias = "magic_keywords")]
     pub keywords: Option<crate::magic_keywords::KeywordSettings>,
     /// Advisor settings (bd-cv653.3.3).
     pub advisor: Option<AdvisorSettings>,
@@ -261,6 +262,11 @@ pub struct Config {
     // Extension tool hook behavior
     #[serde(alias = "failClosedHooks")]
     pub fail_closed_hooks: Option<bool>,
+
+    /// Shared deadline for awaited `before_agent_start` readiness hooks.
+    /// Resolved from trusted host settings, never from extension metadata.
+    #[serde(alias = "extensionStartupTimeoutMs")]
+    pub extension_startup_timeout_ms: Option<u64>,
 
     /// Auto-compaction mode (bd-cv653.3.18): "summary" (default) |
     /// "shake-first" | "aggressive".
@@ -942,6 +948,7 @@ impl Config {
             ))
         })?;
         warn_unrecognised_setting_keys(path, &content);
+        warn_invalid_tool_load_modes(path, &content);
         Ok(config)
     }
 
@@ -1165,6 +1172,9 @@ impl Config {
             themes: other.themes.or(base.themes),
             enable_skill_commands: other.enable_skill_commands.or(base.enable_skill_commands),
             fail_closed_hooks: other.fail_closed_hooks.or(base.fail_closed_hooks),
+            extension_startup_timeout_ms: other
+                .extension_startup_timeout_ms
+                .or(base.extension_startup_timeout_ms),
             compaction_mode: other.compaction_mode.or(base.compaction_mode),
             turn_recovery: other.turn_recovery.or(base.turn_recovery),
 
@@ -1180,6 +1190,16 @@ impl Config {
     }
 
     // === Accessor methods with defaults ===
+
+    /// Await extension readiness for at most 120 seconds by default. A host
+    /// override is bounded to 1..=300_000 milliseconds; other event deadlines
+    /// and explicit runtime API timeout arguments remain independent.
+    #[must_use]
+    pub fn extension_startup_timeout_ms(&self) -> u64 {
+        self.extension_startup_timeout_ms
+            .unwrap_or(crate::extensions::EXTENSION_STARTUP_EVENT_TIMEOUT_MS)
+            .clamp(1, 300_000)
+    }
 
     /// Keep print mode alive for owned background work only when opted in.
     #[must_use]
@@ -1936,6 +1956,42 @@ fn warn_unrecognised_setting_keys(path: &Path, content: &str) {
     }
 }
 
+/// Validate mode values without restricting extension or MCP tool names.
+/// Use the runtime parser so whitespace and case normalization cannot drift.
+fn warn_invalid_tool_load_modes(path: &Path, content: &str) {
+    let Ok(value) = serde_json::from_str::<Value>(content) else {
+        return;
+    };
+    let Some(tools) = value.get("tools") else {
+        return;
+    };
+
+    let file = path.display().to_string();
+    for key in ["load_mode", "loadMode"] {
+        let Some(modes) = tools.get(key).and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, value) in modes {
+            let Some(mode) = value.as_str() else {
+                continue; // Wrong types are already rejected by Config deserialization.
+            };
+            if crate::xdev::LoadMode::from_name(mode).is_some() {
+                continue;
+            }
+            let setting = format!("tools.{key}.{name}");
+            if first_report_of(&file, &setting) {
+                tracing::warn!(
+                    target: USER_DIAGNOSTIC_TARGET,
+                    setting,
+                    file = file.as_str(),
+                    value = mode,
+                    "Invalid tool load mode; expected essential, discoverable, or off. This value is being ignored; normal tool selection and default load modes apply"
+                );
+            }
+        }
+    }
+}
+
 /// Settings keys this build does not recognise, as dotted paths.
 ///
 /// `Config` is `#[serde(default)]` with no `deny_unknown_fields`, so an
@@ -2226,9 +2282,12 @@ fn merge_keywords(
 ) -> Option<crate::magic_keywords::KeywordSettings> {
     match (base, other) {
         (Some(base), Some(other)) => Some(crate::magic_keywords::KeywordSettings {
+            enabled: other.enabled.or(base.enabled),
             ultrathink: other.ultrathink.or(base.ultrathink),
+            chillax: other.chillax.or(base.chillax),
             orchestrate: other.orchestrate.or(base.orchestrate),
             workflowz: other.workflowz.or(base.workflowz),
+            jevify: other.jevify.or(base.jevify),
             extra: other.extra.or(base.extra),
         }),
         (None, Some(other)) => Some(other),
@@ -2289,13 +2348,15 @@ fn merge_memory(
     }
 }
 
-/// Merge media trio settings field-wise (bd-cv653.2.7).
+/// Merge media settings field-wise before resolving individual activation
+/// overrides against the aggregate default.
 fn merge_media(
     base: Option<crate::media_tools::MediaSettings>,
     other: Option<crate::media_tools::MediaSettings>,
 ) -> Option<crate::media_tools::MediaSettings> {
     match (base, other) {
         (Some(base), Some(other)) => Some(crate::media_tools::MediaSettings {
+            enable_media: other.enable_media.or(base.enable_media),
             enable_inspect_image: other.enable_inspect_image.or(base.enable_inspect_image),
             enable_generate_image: other.enable_generate_image.or(base.enable_generate_image),
             enable_tts: other.enable_tts.or(base.enable_tts),
@@ -2738,6 +2799,74 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
+
+    #[test]
+    fn extension_startup_timeout_is_bounded_and_recognizes_settings_spellings() {
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(Config::default().extension_startup_timeout_ms(), 120_000);
+        let camel: Config = serde_json::from_str(r#"{"extensionStartupTimeoutMs":75000}"#)
+            .expect("camelCase startup setting");
+        let snake: Config = serde_json::from_str(r#"{"extension_startup_timeout_ms":90000}"#)
+            .expect("snake_case startup setting");
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(camel.extension_startup_timeout_ms(), 75_000);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(snake.extension_startup_timeout_ms(), 90_000);
+        let merged = Config::merge(camel, snake);
+        let inherited = Config::merge(merged, Config::default());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(inherited.extension_startup_timeout_ms(), 90_000);
+        let zero = Config {
+            extension_startup_timeout_ms: Some(0),
+            ..Config::default()
+        };
+        let oversized = Config {
+            extension_startup_timeout_ms: Some(u64::MAX),
+            ..Config::default()
+        };
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(zero.extension_startup_timeout_ms(), 1);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(oversized.extension_startup_timeout_ms(), 300_000);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(unrecognised_setting_keys(r#"{"extensionStartupTimeoutMs":75000}"#).is_empty());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(unrecognised_setting_keys(r#"{"extension_startup_timeout_ms":90000}"#).is_empty());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(serde_json::from_str::<Config>(r#"{"extensionStartupTimeoutMs":-1}"#).is_err());
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert!(serde_json::from_str::<Config>(r#"{"extensionStartupTimeoutMs":1.5}"#).is_err());
+    }
+
+    #[test]
+    fn extension_startup_timeout_uses_only_admitted_settings_sources() {
+        let temp = TempDir::new().expect("fixture directory");
+        let cwd = temp.path().join("workspace");
+        let global = temp.path().join("global");
+        let override_path = temp.path().join("explicit-settings.json");
+        write_file(
+            &global.join("settings.json"),
+            r#"{"extensionStartupTimeoutMs":20000}"#,
+        );
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{"extensionStartupTimeoutMs":240000}"#,
+        );
+        write_file(&override_path, r#"{"extensionStartupTimeoutMs":45000}"#);
+        let trusted = Config::load_with_roots_and_project_trust(None, &global, &cwd, true)
+            .expect("trusted project config");
+        let untrusted = Config::load_with_roots_and_project_trust(None, &global, &cwd, false)
+            .expect("global config without project trust");
+        let explicit =
+            Config::load_with_roots_and_project_trust(Some(&override_path), &global, &cwd, false)
+                .expect("explicit user config path");
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(trusted.extension_startup_timeout_ms(), 240_000);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(untrusted.extension_startup_timeout_ms(), 20_000);
+        // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+        assert_eq!(explicit.extension_startup_timeout_ms(), 45_000);
+    }
 
     #[test]
     fn prewalk_selectors_merge_independently_without_enabling_the_workflow()
@@ -3232,6 +3361,253 @@ mod tests {
         }
     }
 
+    const MEDIA_TOOL_SETTINGS: [(&str, &str, &str); 3] = [
+        (
+            "inspect_image",
+            "enableInspectImage",
+            "enable_inspect_image",
+        ),
+        (
+            "generate_image",
+            "enableGenerateImage",
+            "enable_generate_image",
+        ),
+        ("tts", "enableTts", "enable_tts"),
+    ];
+
+    fn assert_media_tool_selection(config: &Config, cwd: &std::path::Path, expected: &[&str]) {
+        let registry = crate::tools::ToolRegistry::new(&["read"], cwd, Some(config));
+        for name in ["inspect_image", "generate_image", "tts", "read_media"] {
+            assert_eq!(
+                registry.get(name).is_some(),
+                expected.contains(&name),
+                "media tool {name}, expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_aggregate_aliases_and_individual_switches_select_tools() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let path = global_dir.join("settings.json");
+        let names = ["inspect_image", "generate_image", "tts"];
+        for aggregate_key in ["enable_media", "enableMedia"] {
+            for value in [json!(true), json!(false), Value::Null] {
+                let content = json!({"media": {(aggregate_key): value}}).to_string();
+                assert!(unrecognised_setting_keys(&content).is_empty());
+                write_file(&path, &content);
+                let config = Config::load_with_roots(None, &global_dir, &cwd)
+                    .expect("load aggregate media activation");
+                assert_media_tool_selection(
+                    &config,
+                    &cwd,
+                    if value == json!(true) { &names } else { &[] },
+                );
+            }
+            for (name, camel, snake) in MEDIA_TOOL_SETTINGS {
+                for individual_key in [camel, snake] {
+                    for aggregate in [false, true] {
+                        let individual = !aggregate;
+                        let content = json!({"media": {
+                            (aggregate_key): aggregate,
+                            (individual_key): individual
+                        }})
+                        .to_string();
+                        assert!(unrecognised_setting_keys(&content).is_empty());
+                        write_file(&path, &content);
+                        let config = Config::load_with_roots(None, &global_dir, &cwd)
+                            .expect("load individual media override");
+                        let expected: Vec<&str> = names
+                            .iter()
+                            .copied()
+                            .filter(|candidate| (*candidate == name) == individual)
+                            .collect();
+                        assert_media_tool_selection(&config, &cwd, &expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn media_aggregate_merges_across_aliases_and_respects_project_trust() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let global_path = global_dir.join("settings.json");
+        let project_path = cwd.join(".pi/settings.json");
+        let names = ["inspect_image", "generate_image", "tts"];
+        for global_key in ["enable_media", "enableMedia"] {
+            for project_key in ["enable_media", "enableMedia"] {
+                for global_enabled in [false, true] {
+                    write_file(
+                        &global_path,
+                        &json!({"media": {(global_key): global_enabled}}).to_string(),
+                    );
+                    write_file(
+                        &project_path,
+                        &json!({"media": {(project_key): !global_enabled}}).to_string(),
+                    );
+                    for trusted in [false, true] {
+                        let config = Config::load_with_roots_and_project_trust(
+                            None,
+                            &global_dir,
+                            &cwd,
+                            trusted,
+                        )
+                        .expect("load media settings with project trust");
+                        let enabled = global_enabled != trusted;
+                        assert_eq!(
+                            config.media.as_ref().expect("media settings").enable_media,
+                            Some(enabled)
+                        );
+                        assert_media_tool_selection(
+                            &config,
+                            &cwd,
+                            if enabled { &names } else { &[] },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn media_individual_choices_survive_aggregate_overrides_in_another_scope() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let global_path = global_dir.join("settings.json");
+        let project_path = cwd.join(".pi/settings.json");
+        let names = ["inspect_image", "generate_image", "tts"];
+        for (name, camel, snake) in MEDIA_TOOL_SETTINGS {
+            for (global_key, project_key) in [(camel, snake), (snake, camel)] {
+                for individual in [false, true] {
+                    write_file(
+                        &global_path,
+                        &json!({"media": {
+                            (global_key): individual,
+                            "enableMedia": individual,
+                            "visionProvider": "gemini"
+                        }})
+                        .to_string(),
+                    );
+                    write_file(
+                        &project_path,
+                        &json!({"media": {"enable_media": !individual}}).to_string(),
+                    );
+                    let config = Config::load_with_roots(None, &global_dir, &cwd)
+                        .expect("inherit explicit individual choice");
+                    let expected: Vec<&str> = names
+                        .iter()
+                        .copied()
+                        .filter(|candidate| (*candidate == name) == individual)
+                        .collect();
+                    assert_media_tool_selection(&config, &cwd, &expected);
+                    assert_eq!(
+                        config
+                            .media
+                            .as_ref()
+                            .and_then(|m| m.vision_provider.as_deref()),
+                        Some("gemini")
+                    );
+
+                    write_file(
+                        &project_path,
+                        &json!({"media": {
+                            "enable_media": !individual,
+                            (project_key): !individual
+                        }})
+                        .to_string(),
+                    );
+                    let overridden = Config::load_with_roots(None, &global_dir, &cwd)
+                        .expect("project overrides the same individual field");
+                    assert_media_tool_selection(
+                        &overridden,
+                        &cwd,
+                        if individual { &[] } else { &names },
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn media_unset_fields_inherit_without_expanding_the_aggregate() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{"media":{"enableMedia":true,"enableTts":false,"enableReadMedia":true,"ttsVoice":"alloy"}}"#,
+        );
+        for project in [
+            r"{}",
+            r#"{"media":{}}"#,
+            r#"{"media":{"enable_media":null,"enable_tts":null,"enable_read_media":null,"tts_voice":null}}"#,
+        ] {
+            write_file(&cwd.join(".pi/settings.json"), project);
+            let config = Config::load_with_roots(None, &global_dir, &cwd)
+                .expect("inherit unset media fields");
+            let media = config.media.as_ref().expect("merged media settings");
+            assert_eq!(media.enable_media, Some(true));
+            assert_eq!(media.enable_inspect_image, None);
+            assert_eq!(media.enable_generate_image, None);
+            assert_eq!(media.enable_tts, Some(false));
+            assert_eq!(media.enable_read_media, Some(true));
+            assert_eq!(media.tts_voice.as_deref(), Some("alloy"));
+            assert_media_tool_selection(
+                &config,
+                &cwd,
+                &["inspect_image", "generate_image", "read_media"],
+            );
+        }
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{"media":{"enable_media":false}}"#,
+        );
+        let config = Config::load_with_roots(None, &global_dir, &cwd)
+            .expect("disable aggregate independently of read_media");
+        assert_media_tool_selection(&config, &cwd, &["read_media"]);
+    }
+
+    #[test]
+    fn invalid_media_aggregate_values_and_duplicate_aliases_name_the_settings_file() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let path = global_dir.join("settings.json");
+        for key in ["enable_media", "enableMedia"] {
+            for value in [json!("true"), json!(1), json!([]), json!({})] {
+                write_file(&path, &json!({"media": {(key): value}}).to_string());
+                let error = Config::load_with_roots(None, &global_dir, &cwd)
+                    .expect_err("aggregate activation must be a JSON boolean");
+                assert!(
+                    error
+                        .to_string()
+                        .contains(path.to_str().expect("UTF-8 path"))
+                );
+                assert!(error.to_string().contains("boolean"), "{error}");
+            }
+        }
+        for content in [
+            r#"{"media":{"enable_media":true,"enableMedia":true}}"#,
+            r#"{"media":{"enableMedia":false,"enable_media":true}}"#,
+        ] {
+            write_file(&path, content);
+            let error = Config::load_with_roots(None, &global_dir, &cwd)
+                .expect_err("duplicate spellings must not silently pick a value");
+            assert!(
+                error
+                    .to_string()
+                    .contains(path.to_str().expect("UTF-8 path"))
+            );
+            assert!(error.to_string().contains("duplicate field"), "{error}");
+        }
+    }
+
     #[test]
     fn optional_tool_defaults_and_global_setting_aliases() {
         let temp = TempDir::new().expect("create tempdir");
@@ -3599,23 +3975,29 @@ mod tests {
             &global_dir.join("settings.json"),
             r#"{
                 "keywords": {
+                    "enabled": true,
                     "ultrathink": true,
+                    "chillax": false,
                     "orchestrate": false,
                     "workflowz": false,
+                    "jevify": true,
                     "extra": [{"word": "deepdive", "directive": "go deep"}]
                 }
             }"#,
         );
         write_file(
             &cwd.join(".pi/settings.json"),
-            r#"{"keywords":{"ultrathink":false}}"#,
+            r#"{"magicKeywords":{"ultrathink":false,"jevify":false}}"#,
         );
 
         let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load config");
         let keywords = config.keywords.expect("merged keyword settings");
+        assert_eq!(keywords.enabled, Some(true));
         assert_eq!(keywords.ultrathink, Some(false));
+        assert_eq!(keywords.chillax, Some(false));
         assert_eq!(keywords.orchestrate, Some(false));
         assert_eq!(keywords.workflowz, Some(false));
+        assert_eq!(keywords.jevify, Some(false));
         let extra = keywords.extra.expect("inherited custom keywords");
         assert_eq!(extra.len(), 1);
         assert_eq!(extra[0].word, "deepdive");
@@ -3639,6 +4021,23 @@ mod tests {
                 .is_some_and(|extra| extra.is_empty()),
             "an explicit higher-precedence empty list must clear inherited custom words"
         );
+    }
+
+    #[test]
+    fn keyword_global_and_workflow_aliases_merge_without_resetting_other_flags() {
+        let base: Config = serde_json::from_str(
+            r#"{"keywords":{"enabled":true,"workflowz":true,"chillax":false}}"#,
+        )
+        .expect("base config");
+        let other: Config = serde_json::from_str(
+            r#"{"magic_keywords":{"enabled":false,"workflow":false,"jevify":true}}"#,
+        )
+        .expect("other config");
+        let keywords = Config::merge(base, other).keywords.expect("keywords");
+        assert_eq!(keywords.enabled, Some(false));
+        assert_eq!(keywords.workflowz, Some(false));
+        assert_eq!(keywords.chillax, Some(false));
+        assert_eq!(keywords.jevify, Some(true));
     }
 
     #[test]

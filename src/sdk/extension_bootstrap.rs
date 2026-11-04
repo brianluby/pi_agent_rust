@@ -190,11 +190,7 @@ async fn finish_selection_inner(
     // installation of provider/options, stored identity and both registries.
     ensure_startup_active(&cx)?;
     session.agent.set_provider(provider);
-    session.agent.set_keyword_max_thinking_level(
-        selection
-            .model_entry
-            .clamp_thinking_level(crate::model::ThinkingLevel::Max),
-    );
+    session.agent.set_keyword_model(&selection.model_entry);
     session
         .agent
         .set_tool_call_dialect(selection.model_entry.tool_call_dialect());
@@ -219,6 +215,11 @@ async fn finish_selection_inner(
         } else {
             window
         });
+    } else {
+        // Provider replacement clears usage metadata. Preserve the embedder's
+        // explicit window and reinstall it for this provider's request snapshots.
+        let window = session.compaction_settings().context_window_tokens;
+        session.agent.set_context_window_tokens(Some(window));
     }
     app::update_session_for_selection(&mut stored, &selection, &candidate_registry);
     drop(stored);

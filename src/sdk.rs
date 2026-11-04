@@ -4397,6 +4397,9 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     // whatever was configured. Extensions enabled below copy these modes.
     agent_session.set_queue_modes(config.steering_queue_mode(), config.follow_up_queue_mode());
     agent_session.set_api_key_override(options.api_key.clone());
+    // Native tools invoked by extension startup use the same scoped auth as
+    // later turns. Final model selection may refresh it again below.
+    agent_session.set_auth_storage(auth.clone());
     agent_session.set_memory_settings(config.memory.as_ref());
     agent_session.advisor = options.advisor.as_ref().map(|options| {
         options
@@ -7288,6 +7291,1034 @@ mod tests {
         }
     }
 
+    fn assert_session_media_tools(handle: &AgentSessionHandle, expected: &[&str]) {
+        let registry = handle.session().agent.shared_tools().snapshot();
+        let discoverable = registry.discoverable_index();
+        for name in ["inspect_image", "generate_image", "tts", "read_media"] {
+            let enabled = expected.contains(&name);
+            assert_eq!(
+                handle.has_tool(name),
+                enabled,
+                "{name}, expected={expected:?}"
+            );
+            if !enabled {
+                assert!(
+                    !discoverable.iter().any(|(candidate, _)| candidate == name),
+                    "disabled {name} must not enter discovery"
+                );
+            }
+        }
+    }
+
+    fn isolated_media_auth_test(name: &str, openai_pool: Option<&str>) -> bool {
+        const CHILD: &str = "PI_SDK_MEDIA_AUTH_TEST_CHILD";
+        if env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        // Native adapters must not borrow credentials or mock settings from
+        // the test runner. Isolate those variables without mutating the
+        // environment of other libtest threads. Own and bound the child too:
+        // an HTTP/runtime regression must not stall the whole test binary.
+        let _guard = crate::jobs::process_test_guard();
+        let directory = tempdir().expect("media auth subprocess logs");
+        let log_path = directory.path().join("output.log");
+        let log = std::fs::File::create(&log_path).expect("media auth subprocess log");
+        let owner = crate::agent_cx::AgentCx::for_request();
+        let mut command = owner
+            .process()
+            .command(env::current_exe().expect("test executable"));
+        command
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, name)
+            .env("NO_PROXY", "127.0.0.1,localhost,::1")
+            .env("no_proxy", "127.0.0.1,localhost,::1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone().expect("clone log handle")))
+            .stderr(Stdio::from(log));
+        for variable in [
+            "OPENAI_API_KEY",
+            "OPENAI_API_KEYS",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_API_KEYS",
+            "GOOGLE_API_KEY",
+            "GOOGLE_API_KEYS",
+            "GEMINI_API_KEY",
+            "GEMINI_API_KEYS",
+            "XAI_API_KEY",
+            "XAI_API_KEYS",
+            "PI_MEDIA_MOCK",
+            "PI_TEST_MODE",
+            "PI_CONFIG_PATH",
+            "PI_VISION_PROVIDER",
+            "PI_VISION_MODEL",
+            "PI_IMAGE_GEN_PROVIDER",
+            "PI_IMAGE_GEN_MODEL",
+            "PI_TTS_PROVIDER",
+            "PI_TTS_VOICE",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            command.env_remove(variable);
+        }
+        if let Some(keys) = openai_pool {
+            command.env("OPENAI_API_KEYS", keys);
+        }
+        let mut child = command.spawn().expect("isolated SDK media auth fixture");
+        drop(command);
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("observe media auth fixture") {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                child
+                    .kill()
+                    .expect("terminate timed-out media auth fixture");
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = std::fs::read_to_string(&log_path).expect("read media auth fixture log");
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "SDK media auth fixture failed or timed out: {status:?}\n{output}"
+        );
+        assert!(output.contains("1 passed"), "fixture did not run: {output}");
+        true
+    }
+
+    struct NativeMediaAuthFactory {
+        name: &'static str,
+        endpoint: String,
+    }
+
+    impl ToolFactory for NativeMediaAuthFactory {
+        fn create_tool_registry(
+            &self,
+            enabled: &[&str],
+            cwd: &Path,
+            config: &Config,
+        ) -> ToolRegistry {
+            let mut registry = default_tool_registry(enabled, cwd, config);
+            assert!(registry.get(self.name).is_some(), "media tool is enabled");
+            // Override only the transport destination and mock switch. The
+            // normal SDK startup must supply auth.json through the registry;
+            // passing a key here would conceal the missing integration.
+            let tool: Box<dyn Tool> = match self.name {
+                "inspect_image" => Box::new(
+                    crate::media_tools::InspectImageTool::new(cwd)
+                        .with_base_url(&self.endpoint)
+                        .with_mock(false),
+                ),
+                "generate_image" => Box::new(
+                    crate::media_tools::GenerateImageTool::new(cwd)
+                        .with_base_url(&self.endpoint)
+                        .with_mock(false),
+                ),
+                "tts" => Box::new(
+                    crate::media_tools::TtsTool::new(cwd)
+                        .with_base_url(&self.endpoint)
+                        .with_mock(false),
+                ),
+                _ => panic!("unknown media fixture tool"),
+            };
+            registry.extend([tool]);
+            registry
+        }
+    }
+
+    const MEDIA_CHAT_KEY: &str = "sdk-chat-key-not-a-media-credential";
+
+    fn media_auth_fixture(name: &str) -> (tempfile::TempDir, SessionOptions, PathBuf) {
+        let (directory, mut options) =
+            guarded_settings_fixture(true, r#"{"media":{"enableMedia":true}}"#, "{}");
+        options.enabled_tools = Some(vec![name.to_string()]);
+        options.api_key = Some(MEDIA_CHAT_KEY.to_string());
+        let auth_path = options
+            .workspace_trust_guard
+            .as_ref()
+            .expect("fixture admission")
+            .global_dir()
+            .join("auth.json");
+        (directory, options, auth_path)
+    }
+
+    fn media_audio_fixture() -> Vec<u8> {
+        // PCM WAV with two real samples, rather than a header-only mock.
+        vec![
+            0x52, 0x49, 0x46, 0x46, 0x28, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45, 0x66, 0x6d,
+            0x74, 0x20, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x44, 0xac, 0x00, 0x00,
+            0x88, 0x58, 0x01, 0x00, 0x02, 0x00, 0x10, 0x00, 0x64, 0x61, 0x74, 0x61, 0x04, 0x00,
+            0x00, 0x00, 0x34, 0x12, 0xcd, 0xab,
+        ]
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sdk_native_media_uses_provider_scoped_saved_api_keys() {
+        use base64::Engine as _;
+
+        if isolated_media_auth_test(
+            "sdk::tests::sdk_native_media_uses_provider_scoped_saved_api_keys",
+            None,
+        ) {
+            return;
+        }
+        let encoded_png = concat!(
+            "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8z8DAwMDA",
+            "xMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg=="
+        );
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(encoded_png)
+            .expect("PNG fixture");
+        let audio = media_audio_fixture();
+        for (name, provider, expected_header) in [
+            (
+                "inspect_image",
+                "anthropic",
+                "x-api-key: sdk-media-anthropic",
+            ),
+            (
+                "generate_image",
+                "gemini",
+                "x-goog-api-key: sdk-media-google",
+            ),
+            ("tts", "xai", "authorization: Bearer sdk-media-xai"),
+        ] {
+            let (_directory, mut options, auth_path) = media_auth_fixture(name);
+            let cwd = options
+                .working_directory
+                .clone()
+                .expect("fixture workspace");
+            let mut auth = AuthStorage::empty_at(auth_path);
+            for (provider, key) in [
+                ("openai", "sdk-media-openai"),
+                ("anthropic", "sdk-media-anthropic"),
+                ("google", "sdk-media-google"),
+                ("xai", "sdk-media-xai"),
+            ] {
+                auth.set(
+                    provider,
+                    crate::auth::AuthCredential::ApiKey {
+                        key: key.to_string(),
+                    },
+                );
+            }
+            auth.save().expect("persist media API keys");
+            std::fs::write(cwd.join("input.png"), &png).expect("vision input");
+            let (content_type, response, arguments) = match name {
+                "inspect_image" => (
+                    "application/json",
+                    serde_json::to_vec(&serde_json::json!({
+                        "stop_reason":"end_turn",
+                        "content":[{"type":"text","text":"The fixture image is red."}]
+                    }))
+                    .unwrap(),
+                    serde_json::json!({"path":"input.png","provider":provider,"timeout_ms":5000}),
+                ),
+                "generate_image" => (
+                    "application/json",
+                    serde_json::to_vec(&serde_json::json!({
+                        "candidates":[{"finishReason":"STOP","content":{"parts":[
+                            {"inlineData":{"mimeType":"image/png","data":encoded_png}}
+                        ]}}]
+                    }))
+                    .unwrap(),
+                    serde_json::json!({
+                        "prompt":"Draw a red square","provider":provider,
+                        "output_path":"generated.png","timeout_ms":5000
+                    }),
+                ),
+                "tts" => (
+                    "audio/wav",
+                    audio.clone(),
+                    serde_json::json!({
+                        "text":"Speak this fixture","provider":provider,
+                        "output_path":"spoken.wav","timeout_ms":5000
+                    }),
+                ),
+                _ => unreachable!(),
+            };
+            let (endpoint, peer) = crate::media_tools::test_peer(200, content_type, response);
+            options.tool_factory = Some(Arc::new(NativeMediaAuthFactory { name, endpoint }));
+            let handle = run_async(create_agent_session(options)).expect("start native media SDK");
+            assert_eq!(
+                handle.session().agent.stream_options().api_key.as_deref(),
+                Some(MEDIA_CHAT_KEY)
+            );
+            let registry = handle.session().agent.shared_tools().snapshot();
+            let output = run_async(registry.get(name).expect("started media tool").execute(
+                "saved-media-auth",
+                arguments,
+                None,
+            ))
+            .expect("saved media API key authorizes the native request");
+            assert!(!output.is_error);
+            assert_eq!(output.details.as_ref().unwrap()["mock"], false);
+            assert_eq!(output.details.as_ref().unwrap()["provider"], provider);
+            match name {
+                "inspect_image" => assert!(
+                    matches!(&output.content[0], ContentBlock::Text(text) if text.text == "The fixture image is red.")
+                ),
+                "generate_image" => {
+                    assert_eq!(std::fs::read(cwd.join("generated.png")).unwrap(), png);
+                }
+                "tts" => assert_eq!(std::fs::read(cwd.join("spoken.wav")).unwrap(), audio),
+                _ => unreachable!(),
+            }
+            let request = peer.join().expect("native media HTTP peer");
+            assert!(
+                request
+                    .headers
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case(expected_header)),
+                "the request must use the selected media provider's saved key"
+            );
+            assert!(!request.headers.contains(MEDIA_CHAT_KEY));
+            assert!(!request.body.to_string().contains(MEDIA_CHAT_KEY));
+            assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sdk_retained_media_tool_observes_auth_replacement_and_logout() {
+        if isolated_media_auth_test(
+            "sdk::tests::sdk_retained_media_tool_observes_auth_replacement_and_logout",
+            None,
+        ) {
+            return;
+        }
+        let (_directory, mut options, auth_path) = media_auth_fixture("tts");
+        let cwd = options
+            .working_directory
+            .clone()
+            .expect("fixture workspace");
+        let mut auth = AuthStorage::empty_at(auth_path.clone());
+        auth.set(
+            "openai",
+            crate::auth::AuthCredential::ApiKey {
+                key: "sdk-media-before-login".to_string(),
+            },
+        );
+        auth.save().expect("initial saved API key");
+        let audio = media_audio_fixture();
+        let (endpoint, peer) = crate::media_tools::test_peer_responses(vec![
+            (200, "audio/wav", audio.clone()),
+            (200, "audio/wav", audio.clone()),
+        ]);
+        options.tool_factory = Some(Arc::new(NativeMediaAuthFactory {
+            name: "tts",
+            endpoint,
+        }));
+        let mut handle =
+            run_async(create_agent_session(options)).expect("native media SDK session");
+        let registry = handle.session().agent.shared_tools().snapshot();
+        let retained_tool = registry.get("tts").expect("retain original native tool");
+        for (index, filename) in ["before.wav", "after.wav"].into_iter().enumerate() {
+            if index == 1 {
+                auth.set(
+                    "openai",
+                    crate::auth::AuthCredential::ApiKey {
+                        key: "sdk-media-after-login".to_string(),
+                    },
+                );
+                auth.save().expect("persist changed API key");
+                handle.adopt_auth_storage(
+                    AuthStorage::load(auth_path.clone()).expect("reload changed credentials"),
+                );
+            }
+            let output = run_async(retained_tool.execute(
+                "retained-media-auth",
+                serde_json::json!({
+                    "text":"Speak with the current API key","provider":"openai",
+                    "output_path":filename,"timeout_ms":5000
+                }),
+                None,
+            ))
+            .expect("retained tool resolves the current session credential");
+            assert!(!output.is_error);
+            assert_eq!(std::fs::read(cwd.join(filename)).unwrap(), audio);
+        }
+        let requests = peer.join().expect("successive native media requests");
+        assert_eq!(requests.len(), 2);
+        for (request, key) in requests
+            .iter()
+            .zip(["sdk-media-before-login", "sdk-media-after-login"])
+        {
+            assert!(request.headers.lines().any(|line| {
+                line.eq_ignore_ascii_case(&format!("authorization: Bearer {key}"))
+            }));
+            assert!(!request.headers.contains(MEDIA_CHAT_KEY));
+        }
+
+        assert!(auth.remove("openai"));
+        for (oauth_only, filename) in [(false, "logged-out.wav"), (true, "oauth-only.wav")] {
+            if oauth_only {
+                auth.set(
+                    "openai",
+                    serde_json::from_value(serde_json::json!({
+                        "type":"oauth","access":"sdk-chat-oauth-not-a-media-key",
+                        "refresh":"unused-refresh-token","expires":i64::MAX
+                    }))
+                    .expect("chat OAuth credential"),
+                );
+            }
+            auth.save().expect("persist logout or chat-only OAuth");
+            handle.adopt_auth_storage(
+                AuthStorage::load(auth_path.clone()).expect("reload credentials after logout"),
+            );
+            assert_eq!(
+                handle.session().agent.stream_options().api_key.as_deref(),
+                Some(MEDIA_CHAT_KEY),
+                "the explicit chat credential remains available but is not a media credential"
+            );
+            let error = run_async(retained_tool.execute(
+                "media-auth-denied",
+                serde_json::json!({
+                    "text":"Must not use chat credentials","provider":"openai",
+                    "output_path":filename,"timeout_ms":5000
+                }),
+                None,
+            ))
+            .expect_err("removed API keys and chat OAuth must not authorize media");
+            assert!(
+                error.to_string().contains("missing API key"),
+                "must refuse before reaching the closed HTTP peer: {error}"
+            );
+            assert!(!error.to_string().contains(MEDIA_CHAT_KEY));
+            assert!(!error.to_string().contains("sdk-chat-oauth-not-a-media-key"));
+            assert!(
+                !cwd.join(filename).exists(),
+                "denied requests write no artifact"
+            );
+        }
+        assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sdk_native_media_pool_429s_do_not_retry_or_escape_exhaustion() {
+        const POOL: &str = "sdk-media-pool-first,sdk-media-pool-second";
+        const SAVED_KEY: &str = "sdk-media-saved-fallback";
+        if isolated_media_auth_test(
+            "sdk::tests::sdk_native_media_pool_429s_do_not_retry_or_escape_exhaustion",
+            Some(POOL),
+        ) {
+            return;
+        }
+        let (_directory, mut options, auth_path) = media_auth_fixture("tts");
+        let cwd = options
+            .working_directory
+            .clone()
+            .expect("fixture workspace");
+        let mut auth = AuthStorage::empty_at(auth_path);
+        auth.set(
+            "openai",
+            crate::auth::AuthCredential::ApiKey {
+                key: SAVED_KEY.to_string(),
+            },
+        );
+        auth.save().expect("persist fallback API key");
+        let (endpoint, peer) = crate::media_tools::test_peer_responses(vec![
+            (
+                429,
+                "application/json",
+                br#"{"error":{"message":"first-explicit-call-rate-limited"}}"#.to_vec(),
+            ),
+            (
+                429,
+                "application/json",
+                br#"{"error":{"message":"second-explicit-call-rate-limited"}}"#.to_vec(),
+            ),
+        ]);
+        options.tool_factory = Some(Arc::new(NativeMediaAuthFactory {
+            name: "tts",
+            endpoint,
+        }));
+        let handle =
+            run_async(create_agent_session(options)).expect("native media SDK session");
+        assert_eq!(
+            handle.session().agent.stream_options().api_key.as_deref(),
+            Some(MEDIA_CHAT_KEY)
+        );
+        let registry = handle.session().agent.shared_tools().snapshot();
+        let retained_tool = registry.get("tts").expect("retain original native tool");
+        for (filename, response_marker) in [
+            ("first-limited.wav", "first-explicit-call-rate-limited"),
+            ("second-limited.wav", "second-explicit-call-rate-limited"),
+        ] {
+            let error = run_async(retained_tool.execute(
+                response_marker,
+                serde_json::json!({
+                    "text":"Speak once per explicit invocation","provider":"openai",
+                    "output_path":filename,"timeout_ms":5000
+                }),
+                None,
+            ))
+            .expect_err("a media 429 must return without replaying the request");
+            let message = error.to_string();
+            assert!(message.contains("HTTP 429"), "{message}");
+            assert!(
+                message.contains(response_marker),
+                "each explicit call must consume exactly its own response: {message}"
+            );
+            assert!(
+                !cwd.join(filename).exists(),
+                "failed requests write no artifact"
+            );
+        }
+        let requests = peer.join().expect("two explicit native media requests");
+        assert_eq!(requests.len(), 2);
+        // Pool affinity may select either key first. Each key must appear
+        // exactly once; a 429 rotates only the next explicit invocation.
+        for key in POOL.split(',') {
+            let expected = format!("authorization: Bearer {key}");
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request
+                        .headers
+                        .lines()
+                        .any(|line| line.eq_ignore_ascii_case(&expected)))
+                    .count(),
+                1,
+                "each pool credential must authorize exactly one request"
+            );
+        }
+        for request in &requests {
+            for forbidden in [SAVED_KEY, MEDIA_CHAT_KEY] {
+                assert!(!request.headers.contains(forbidden));
+                assert!(!request.body.to_string().contains(forbidden));
+            }
+        }
+        let error = run_async(retained_tool.execute(
+            "exhausted-media-pool",
+            serde_json::json!({
+                "text":"Must not escape the exhausted pool","provider":"openai",
+                "output_path":"pool-exhausted.wav","timeout_ms":5000
+            }),
+            None,
+        ))
+        .expect_err("an exhausted pool must refuse before another HTTP request");
+        let message = error.to_string();
+        assert!(
+            message.contains(crate::auth::CREDENTIAL_POOL_EXHAUSTED),
+            "must refuse before reaching the closed HTTP peer: {message}"
+        );
+        for secret in POOL.split(',').chain([SAVED_KEY, MEDIA_CHAT_KEY]) {
+            assert!(!message.contains(secret));
+        }
+        assert!(!cwd.join("pool-exhausted.wav").exists());
+        assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+    }
+
+    #[cfg(unix)]
+    struct MediaCommandCleanup {
+        root_pid_path: PathBuf,
+        armed: bool,
+    }
+
+    #[cfg(unix)]
+    impl Drop for MediaCommandCleanup {
+        fn drop(&mut self) {
+            if self.armed
+                && let Ok(text) = std::fs::read_to_string(&self.root_pid_path)
+                && let Ok(pid) = text.trim().parse::<u32>()
+                && pid > 1
+            {
+                // A failed regression must not leave its fixture waiting for
+                // release. Successful assertions disarm this fallback first.
+                crate::tools::kill_process_group_tree(Some(pid));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn media_command_fixture() -> (tempfile::TempDir, SessionOptions, std::net::TcpListener) {
+        let (directory, mut options, auth_path) = media_auth_fixture("tts");
+        let cwd = options
+            .working_directory
+            .as_ref()
+            .expect("fixture workspace");
+        std::fs::write(
+            cwd.join("credential-helper.sh"),
+            r#"#!/bin/sh
+printf '%s\n' "$$" > credential-root.pid
+sh -c '
+  printf "%s\n" "$$" > credential-child.pid
+  printf ready > credential-ready
+  while [ ! -f credential-release ]; do sleep 0.01; done
+  printf completed > credential-completed
+' &
+wait
+printf sdk-owned-command-key
+"#,
+        )
+        .expect("write gated credential helper");
+        let mut auth = AuthStorage::empty_at(auth_path);
+        auth.set(
+            "openai",
+            crate::auth::AuthCredential::ApiKey {
+                key: "$CMD:exec sh credential-helper.sh".to_string(),
+            },
+        );
+        auth.save().expect("save command-backed media key");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        options.tool_factory = Some(Arc::new(NativeMediaAuthFactory {
+            name: "tts",
+            endpoint: format!("http://{}/v1/", listener.local_addr().unwrap()),
+        }));
+        (directory, options, listener)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_media_command_marker(owner: &crate::agent_cx::AgentCx, path: &Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "credential helper never became ready"
+            );
+            owner.time().sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn media_while_pending<F, T>(
+        call: std::pin::Pin<&mut F>,
+        observer: impl std::future::Future<Output = T>,
+        stage: &str,
+    ) -> T
+    where
+        F: std::future::Future<Output = Result<ToolOutput>> + ?Sized,
+    {
+        match futures::future::select(call, Box::pin(observer)).await {
+            futures::future::Either::Left((result, _)) => {
+                panic!("media request settled before {stage}: {result:?}");
+            }
+            futures::future::Either::Right((value, _)) => value,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_media_command_retired(owner: &crate::agent_cx::AgentCx, cwd: &Path) {
+        let read_pid = |name: &str| {
+            std::fs::read_to_string(cwd.join(name))
+                .expect("credential fixture PID")
+                .trim()
+                .parse::<u32>()
+                .expect("positive fixture PID")
+        };
+        let root = rustix::process::Pid::from_raw(
+            i32::try_from(read_pid("credential-root.pid")).expect("root PID fits i32"),
+        )
+        .expect("nonzero root PID");
+        assert!(
+            rustix::process::test_kill_process(root).is_err(),
+            "credential helper root must be reaped before the call settles"
+        );
+        let child = sysinfo::Pid::from_u32(read_pid("credential-child.pid"));
+        let mut processes = sysinfo::System::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            processes.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[child]), true);
+            if processes.process(child).is_none_or(|process| {
+                matches!(
+                    process.status(),
+                    sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead
+                )
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "credential descendant is still running"
+            );
+            owner.time().sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sdk_media_command_cancellation_and_drop_stop_owned_helpers_without_http() {
+        if isolated_media_auth_test(
+            "sdk::tests::sdk_media_command_cancellation_and_drop_stop_owned_helpers_without_http",
+            None,
+        ) {
+            return;
+        }
+        for cancel in [true, false] {
+            let (_directory, options, listener) = media_command_fixture();
+            let cwd = options
+                .working_directory
+                .clone()
+                .expect("fixture workspace");
+            let mut cleanup = MediaCommandCleanup {
+                root_pid_path: cwd.join("credential-root.pid"),
+                armed: true,
+            };
+            let runtime = RuntimeBuilder::current_thread()
+                .with_reactor(create_reactor().expect("reactor"))
+                .build()
+                .expect("current-thread runtime");
+            let invocation = crate::agent_cx::AgentCx::from_cx(
+                runtime.request_cx_with_budget(asupersync::Budget::new()),
+            );
+            runtime.block_on(Box::pin(async {
+                let observer = crate::agent_cx::AgentCx::for_current_or_request();
+                let handle = create_agent_session(options)
+                    .await
+                    .expect("native media SDK session");
+                let registry = handle.session().agent.shared_tools().snapshot();
+                let retained_tool = registry.get("tts").expect("retained native TTS tool");
+                let mut call = Box::pin(invocation.with_current(retained_tool.execute(
+                    "owned-media-command",
+                    serde_json::json!({
+                        "text":"Do not send this request","provider":"openai",
+                        "output_path":"cancelled.wav","timeout_ms":30000
+                    }),
+                    None,
+                )));
+                media_while_pending(
+                    call.as_mut(),
+                    wait_for_media_command_marker(&observer, &cwd.join("credential-ready")),
+                    "the helper readiness marker",
+                )
+                .await;
+                // This timer runs on the same current-thread runtime while the
+                // helper waits for a file only this test can create.
+                media_while_pending(
+                    call.as_mut(),
+                    observer.time().sleep(Duration::from_millis(20)),
+                    "current-thread timer progress",
+                )
+                .await;
+                if cancel {
+                    invocation.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("cancel media helper"),
+                    );
+                    let result = match futures::future::select(
+                        call.as_mut(),
+                        Box::pin(observer.time().sleep(Duration::from_secs(2))),
+                    )
+                    .await
+                    {
+                        futures::future::Either::Left((result, _)) => result,
+                        futures::future::Either::Right(_) => {
+                            panic!("media helper ignored owner cancellation")
+                        }
+                    };
+                    let error =
+                        result.expect_err("cancelled credential preparation cannot send HTTP");
+                    assert!(
+                        matches!(&error, Error::Aborted)
+                            || error.to_string().to_ascii_lowercase().contains("cancel"),
+                        "expected cancellation, got {error}"
+                    );
+                }
+                drop(call);
+                assert_media_command_retired(&observer, &cwd).await;
+                std::fs::write(cwd.join("credential-release"), "release")
+                    .expect("release any leaked descendant");
+                observer.time().sleep(Duration::from_millis(100)).await;
+                assert!(
+                    !cwd.join("credential-completed").exists(),
+                    "a cancelled/dropped helper must not finish after release"
+                );
+                assert!(
+                    matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+                );
+                assert!(!cwd.join("cancelled.wav").exists());
+                cleanup.armed = false;
+                assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+            }));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sdk_media_command_preparation_shares_the_http_deadline() {
+        if isolated_media_auth_test(
+            "sdk::tests::sdk_media_command_preparation_shares_the_http_deadline",
+            None,
+        ) {
+            return;
+        }
+        let (_directory, options, listener) = media_command_fixture();
+        let cwd = options
+            .working_directory
+            .clone()
+            .expect("fixture workspace");
+        let mut cleanup = MediaCommandCleanup {
+            root_pid_path: cwd.join("credential-root.pid"),
+            armed: true,
+        };
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("reactor"))
+            .build()
+            .expect("current-thread runtime");
+        let invocation = crate::agent_cx::AgentCx::from_cx(
+            runtime.request_cx_with_budget(asupersync::Budget::new()),
+        );
+        runtime.block_on(Box::pin(async {
+            let observer = crate::agent_cx::AgentCx::for_current_or_request();
+            let handle = create_agent_session(options)
+                .await
+                .expect("native media SDK session");
+            let registry = handle.session().agent.shared_tools().snapshot();
+            let retained_tool = registry.get("tts").expect("retained native TTS tool");
+            let mut call = Box::pin(invocation.with_current(retained_tool.execute(
+                "media-command-deadline",
+                serde_json::json!({
+                    "text":"Bound credential preparation and HTTP together","provider":"openai",
+                    "output_path":"deadline.wav","timeout_ms":4000
+                }),
+                None,
+            )));
+            media_while_pending(
+                call.as_mut(),
+                wait_for_media_command_marker(&observer, &cwd.join("credential-ready")),
+                "the helper readiness marker",
+            )
+            .await;
+            let helper_ready = std::time::Instant::now();
+            media_while_pending(
+                call.as_mut(),
+                observer.time().sleep(Duration::from_secs(2)),
+                "credential preparation consuming part of the request deadline",
+            )
+            .await;
+            std::fs::write(cwd.join("credential-release"), "release")
+                .expect("release successful credential helper");
+            let connection = media_while_pending(
+                call.as_mut(),
+                async {
+                    loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                observer.time().sleep(Duration::from_millis(10)).await;
+                            }
+                            Err(error) => panic!("accept native media HTTP request: {error}"),
+                        }
+                    }
+                },
+                "HTTP connection after successful credential preparation",
+            )
+            .await;
+            // Keep the real connection open without replying. A fresh four-second
+            // HTTP allowance would exceed this guard after the two-second helper.
+            // Measure after helper startup so output preflight is outside the oracle.
+            let guard = Duration::from_secs(5).saturating_sub(helper_ready.elapsed());
+            let result = match futures::future::select(
+                call.as_mut(),
+                Box::pin(observer.time().sleep(guard)),
+            )
+            .await
+            {
+                futures::future::Either::Left((result, _)) => result,
+                futures::future::Either::Right(_) => {
+                    panic!("HTTP received a fresh timeout after credential preparation")
+                }
+            };
+            let error = result.expect_err("the shared media deadline must expire");
+            let message = error.to_string().to_ascii_lowercase();
+            assert!(
+                message.contains("timed out") || message.contains("timeout"),
+                "{error}"
+            );
+            drop(call);
+            drop(connection);
+            assert_media_command_retired(&observer, &cwd).await;
+            assert!(cwd.join("credential-completed").exists());
+            assert!(!cwd.join("deadline.wav").exists());
+            cleanup.armed = false;
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+        }));
+    }
+
+    #[test]
+    fn sdk_media_aggregate_aliases_respect_global_project_merge_and_trust() {
+        for (global_key, project_key) in [
+            ("enable_media", "enableMedia"),
+            ("enableMedia", "enable_media"),
+        ] {
+            for global_enabled in [false, true] {
+                for trusted in [false, true] {
+                    let global = serde_json::json!({
+                        "media": { (global_key): global_enabled }
+                    })
+                    .to_string();
+                    let project = serde_json::json!({
+                        "media": { (project_key): !global_enabled }
+                    })
+                    .to_string();
+                    let (_tmp, options) = guarded_settings_fixture(trusted, &global, &project);
+                    let handle = run_async(create_agent_session(options))
+                        .expect("start session with admitted media settings");
+                    let enabled = if trusted {
+                        !global_enabled
+                    } else {
+                        global_enabled
+                    };
+                    let expected: &[&str] = if enabled {
+                        &["inspect_image", "generate_image", "tts"]
+                    } else {
+                        &[]
+                    };
+                    assert_session_media_tools(&handle, expected);
+                    assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sdk_media_individual_overrides_are_applied_after_layer_merging() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                r#"{"media":{"enable_media":true,"enable_tts":false}}"#,
+                r#"{"media":{"enableMedia":true,"enableInspectImage":false}}"#,
+                &["generate_image"],
+            ),
+            (
+                r#"{"media":{"enableMedia":true,"enableGenerateImage":false}}"#,
+                r#"{"media":{"enable_media":true,"enable_tts":false}}"#,
+                &["inspect_image"],
+            ),
+            (
+                r#"{"media":{"enableMedia":false,"enableInspectImage":true}}"#,
+                r#"{"media":{"enable_media":false,"enable_generate_image":true}}"#,
+                &["inspect_image", "generate_image"],
+            ),
+            (
+                r#"{"media":{"enable_media":true,"enable_tts":false}}"#,
+                r#"{"media":{"enableTts":true,"enableReadMedia":true}}"#,
+                &["inspect_image", "generate_image", "tts", "read_media"],
+            ),
+        ];
+        for &(global, project, expected) in cases {
+            let (_tmp, options) = guarded_settings_fixture(true, global, project);
+            let handle = run_async(create_agent_session(options))
+                .expect("start session with merged media settings");
+            assert_session_media_tools(&handle, expected);
+            assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+        }
+    }
+
+    #[test]
+    fn sdk_media_aggregate_preserves_explicit_and_strict_tool_selections() {
+        let cases: &[(bool, Option<&[&str]>, &[&str])] = &[
+            (
+                false,
+                Some(&["read"]),
+                &["inspect_image", "generate_image", "tts"],
+            ),
+            (true, Some(&["read"]), &[]),
+            (true, Some(&["read", "inspect_image"]), &["inspect_image"]),
+            (true, None, &[]),
+        ];
+        for &(strict, selected, expected) in cases {
+            let (_tmp, mut options) =
+                guarded_settings_fixture(true, r#"{"media":{"enableMedia":true}}"#, "{}");
+            options.tool_factory =
+                strict.then(|| Arc::new(ExplicitBuiltinTools) as Arc<dyn ToolFactory>);
+            options.enabled_tools =
+                selected.map(|names| names.iter().map(|name| (*name).to_string()).collect());
+            let handle = run_async(create_agent_session(options))
+                .expect("start session with a selected tool list");
+            assert_session_media_tools(&handle, expected);
+            if let Some(selected) = selected {
+                for name in selected {
+                    assert!(handle.has_tool(name), "explicit {name}");
+                }
+            }
+            assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+        }
+    }
+
+    #[test]
+    fn sdk_media_aggregate_cannot_restore_disabled_builtins() {
+        for strict in [false, true] {
+            for selected in [Vec::new(), vec![String::new()], vec![" , ".to_string()]] {
+                let (_tmp, mut options) = guarded_settings_fixture(
+                    true,
+                    r#"{"media":{"enable_media":true,"enable_read_media":true}}"#,
+                    "{}",
+                );
+                options.tool_factory =
+                    strict.then(|| Arc::new(ExplicitBuiltinTools) as Arc<dyn ToolFactory>);
+                options.enabled_tools = Some(selected);
+                let handle = run_async(create_agent_session(options))
+                    .expect("start session with builtins disabled");
+                assert_session_media_tools(&handle, &[]);
+                let registry = handle.session().agent.shared_tools().snapshot();
+                assert!(registry.tools().is_empty());
+                assert!(registry.discoverable_index().is_empty());
+                assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+            }
+        }
+    }
+
+    #[test]
+    fn sdk_media_load_modes_and_explicit_names_keep_their_precedence() {
+        let cases: &[(&str, Option<&[&str]>, &[&str])] = &[
+            (
+                r#"{
+                    "media":{"enableMedia":true},
+                    "tools":{"loadMode":{
+                        "inspect_image":"off","generate_image":"off","tts":"off"
+                    }}
+                }"#,
+                None,
+                &[],
+            ),
+            (
+                r#"{
+                    "media":{"enable_media":true},
+                    "tools":{"load_mode":{
+                        "inspect_image":"off","generate_image":"off","tts":"off"
+                    }}
+                }"#,
+                Some(&["tts"]),
+                &["tts"],
+            ),
+            (
+                r#"{
+                    "media":{
+                        "enableMedia":false,"enableInspectImage":false,
+                        "enableGenerateImage":false,"enableTts":false
+                    },
+                    "tools":{"loadMode":{
+                        "inspect_image":"off","generate_image":"off","tts":"off"
+                    }}
+                }"#,
+                Some(&["inspect_image", "generate_image", "tts"]),
+                &["inspect_image", "generate_image", "tts"],
+            ),
+        ];
+        for &(global, selected, expected) in cases {
+            let (_tmp, mut options) = guarded_settings_fixture(true, global, "{}");
+            options.enabled_tools =
+                selected.map(|names| names.iter().map(|name| (*name).to_string()).collect());
+            let handle = run_async(create_agent_session(options))
+                .expect("start session with media exposure settings");
+            assert_session_media_tools(&handle, expected);
+            assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+        }
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn sdk_builtin_ceiling_survives_settings_driven_registry_construction() {
@@ -7396,13 +8427,6 @@ mod tests {
     }
 
     fn guarded_optional_tool_fixture(trusted: bool) -> (tempfile::TempDir, SessionOptions) {
-        use crate::workspace_trust::{TRUST_STORE_FILE, TrustInputs, WorkspaceTrustGuard, establish};
-
-        let tmp = tempdir().expect("tempdir");
-        let cwd = tmp.path().join("workspace");
-        let global_dir = tmp.path().join("global");
-        std::fs::create_dir_all(cwd.join(".pi/extensions")).expect("project resources");
-        std::fs::create_dir_all(&global_dir).expect("global directory");
         let settings = |enabled| {
             serde_json::json!({
                 "tools": {
@@ -7414,10 +8438,25 @@ mod tests {
             })
             .to_string()
         };
-        std::fs::write(global_dir.join("settings.json"), settings(false))
-            .expect("global optional tools disabled");
-        std::fs::write(cwd.join(".pi/settings.json"), settings(true))
-            .expect("project optional tools enabled");
+        guarded_settings_fixture(trusted, &settings(false), &settings(true))
+    }
+
+    fn guarded_settings_fixture(
+        trusted: bool,
+        global_settings: &str,
+        project_settings: &str,
+    ) -> (tempfile::TempDir, SessionOptions) {
+        use crate::workspace_trust::{
+            TRUST_STORE_FILE, TrustInputs, WorkspaceTrustGuard, establish,
+        };
+
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let global_dir = tmp.path().join("global");
+        std::fs::create_dir_all(cwd.join(".pi/extensions")).expect("project resources");
+        std::fs::create_dir_all(&global_dir).expect("global directory");
+        std::fs::write(global_dir.join("settings.json"), global_settings).expect("global settings");
+        std::fs::write(cwd.join(".pi/settings.json"), project_settings).expect("project settings");
         std::fs::write(
             cwd.join(".pi/extensions/trust_guard.js"),
             "export default function init() {}\n",
@@ -10182,6 +11221,285 @@ export default function init(pi) {
             let shutdown = handle.shutdown_owned_resources().await;
             assert!(shutdown.completed_cleanly()); // ubs:ignore[rust.panic.assert-macros] -- Regression oracle.
         });
+    }
+
+    const SDK_DYNAMIC_TOOL_NAMES: [&str; 5] = [
+        "sdk_dynamic_default",
+        "sdk_dynamic_discoverable",
+        "sdk_dynamic_essential",
+        "sdk_dynamic_off",
+        "sdk_dynamic_project",
+    ];
+
+    fn sdk_dynamic_tool_text(output: &ToolOutput) -> &str {
+        let [ContentBlock::Text(text)] = output.content.as_slice() else {
+            panic!("expected one text result, got {output:?}");
+        };
+        &text.text
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_sdk_dynamic_tool_exposure(
+        handle: &mut AgentSessionHandle,
+        expected_registry: &[&str],
+        expected_schema: &[&str],
+        expected_discovery: &[&str],
+        explicit_builtins: Option<&[&str]>,
+    ) {
+        let sorted = |mut names: Vec<String>| {
+            names.sort_unstable();
+            names
+        };
+        let expected = |names: &[&str]| sorted(names.iter().map(ToString::to_string).collect());
+        let registry = handle.session().agent.shared_tools().snapshot();
+        assert_eq!(
+            sorted(
+                registry
+                    .tools()
+                    .iter()
+                    .map(|tool| tool.name())
+                    .filter(|name| name.starts_with("sdk_dynamic_"))
+                    .map(str::to_string)
+                    .collect()
+            ),
+            expected(expected_registry),
+            "the live registry must obey both configured modes and extension activation"
+        );
+        // This is the same filtered context used for the next provider request.
+        // Reading it also primes the cache before the next setActiveTools swap.
+        let context = handle.session_mut().agent.request_context_json();
+        assert_eq!(
+            sorted(
+                context["tools"]
+                    .as_array()
+                    .expect("provider tool schemas")
+                    .iter()
+                    .filter_map(|tool| tool["name"].as_str())
+                    .filter(|name| name.starts_with("sdk_dynamic_"))
+                    .map(str::to_string)
+                    .collect()
+            ),
+            expected(expected_schema),
+            "essential and unconfigured extension tools belong in the provider schema"
+        );
+        assert_eq!(
+            sorted(
+                registry
+                    .discoverable_index()
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .filter(|name| name.starts_with("sdk_dynamic_"))
+                    .collect()
+            ),
+            expected(expected_discovery)
+        );
+        if let Some(names) = explicit_builtins {
+            assert_eq!(
+                sorted(
+                    registry
+                        .tools()
+                        .iter()
+                        .filter(|tool| {
+                            tool.origin() == crate::tools::ToolOrigin::BuiltIn
+                                && tool.name() != "xdev"
+                        })
+                        .map(|tool| tool.name().to_string())
+                        .collect()
+                ),
+                expected(names),
+                "extension changes cannot expand the explicit built-in selection"
+            );
+        }
+        if let Some(xdev) = registry.get("xdev") {
+            let list = xdev
+                .execute("dynamic-list", serde_json::json!({"action":"list"}), None)
+                .await
+                .expect("list currently discoverable tools");
+            assert!(!list.is_error);
+            for name in SDK_DYNAMIC_TOOL_NAMES {
+                let discoverable = expected_discovery.contains(&name);
+                assert_eq!(
+                    sdk_dynamic_tool_text(&list)
+                        .lines()
+                        .any(|line| line.starts_with(&format!("- {name}: "))),
+                    discoverable,
+                    "xdev list must reflect the current registration of {name}"
+                );
+                let description = xdev
+                    .execute(
+                        "dynamic-describe",
+                        serde_json::json!({"action":"describe","name":name}),
+                        None,
+                    )
+                    .await
+                    .expect("describe current discoverable tool");
+                assert_eq!(description.is_error, !discoverable, "xdev describe {name}");
+                if discoverable {
+                    let definition: Value =
+                        serde_json::from_str(sdk_dynamic_tool_text(&description))
+                            .expect("xdev description JSON");
+                    assert_eq!(definition["name"], name);
+                    assert_eq!(
+                        definition["description"],
+                        format!("{name} fixture description")
+                    );
+                    assert_eq!(
+                        definition["parameters"]["properties"]["value"]["type"],
+                        "string"
+                    );
+                    assert_eq!(definition["tier"], "discoverable");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn sdk_extension_load_modes_survive_startup_and_active_tool_changes() {
+        let cases: &[(&str, bool, Option<&[&str]>, bool)] = &[
+            ("loadMode", true, Some(&["read"]), false),
+            ("load_mode", false, None, false),
+            ("loadMode", true, Some(&[]), false),
+            ("load_mode", true, Some(&["read"]), true),
+        ];
+        for &(setting, trusted, explicit_builtins, xdev_off) in cases {
+            let mut modes = serde_json::json!({
+                "sdk_dynamic_off":"off",
+                "sdk_dynamic_essential":"essential",
+                "sdk_dynamic_discoverable":"discoverable",
+                "sdk_dynamic_project":"essential"
+            });
+            if xdev_off {
+                modes["xdev"] = serde_json::json!("off");
+            }
+            let global = serde_json::json!({"tools":{(setting):modes}}).to_string();
+            let project_setting = if setting == "loadMode" {
+                "load_mode"
+            } else {
+                "loadMode"
+            };
+            let project = serde_json::json!({
+                "tools":{(project_setting):{"sdk_dynamic_project":"off"}}
+            })
+            .to_string();
+            let (directory, mut options) = guarded_settings_fixture(trusted, &global, &project);
+            // An explicit external extension does not alter the project resource
+            // bytes whose trust was captured by guarded_settings_fixture.
+            let extension_path = directory.path().join("dynamic-load-modes.mjs");
+            std::fs::write(
+                &extension_path,
+                r#"export default function init(pi) {
+  for (const name of [
+    "sdk_dynamic_default", "sdk_dynamic_discoverable", "sdk_dynamic_essential",
+    "sdk_dynamic_off", "sdk_dynamic_project"
+  ]) {
+    pi.registerTool({
+      name, label: name, description: name + " fixture description",
+      parameters: {type: "object", properties: {value: {type: "string"}}},
+      execute: async (_callId, input) => ({
+        content: [{type: "text", text: name + ":" + input.value}], isError: false
+      })
+    });
+  }
+  pi.registerCommand("sdk-dynamic-active", {
+    description: "Change extension tool activation",
+    handler: async (args) => {
+      await pi.events("setActiveTools", {tools: JSON.parse(args)});
+      return {display: "updated"};
+    }
+  });
+}
+"#,
+            )
+            .expect("write explicit extension fixture");
+            options.enabled_tools =
+                explicit_builtins.map(|names| names.iter().map(ToString::to_string).collect());
+            if explicit_builtins.is_some() {
+                options.tool_factory = Some(Arc::new(ExplicitBuiltinTools));
+            }
+            options.extension_paths = vec![extension_path];
+            options.extension_policy = Some("safe".to_string());
+            options.persist_extension_permissions = false;
+            let dispatcher_allowed =
+                !xdev_off && explicit_builtins.is_none_or(|names| !names.is_empty());
+            let mut schema = vec!["sdk_dynamic_default", "sdk_dynamic_essential"];
+            if !trusted {
+                schema.push("sdk_dynamic_project");
+            }
+            let mut registered = schema.clone();
+            registered.push("sdk_dynamic_discoverable");
+            run_async(async {
+                let mut handle = create_agent_session(options)
+                    .await
+                    .expect("start extension SDK session");
+                let manager = handle
+                    .extension_manager()
+                    .expect("loaded extension manager")
+                    .clone();
+                assert_eq!(handle.has_tool("xdev"), dispatcher_allowed);
+                assert_sdk_dynamic_tool_exposure(
+                    &mut handle,
+                    &registered,
+                    &schema,
+                    &["sdk_dynamic_discoverable"],
+                    explicit_builtins,
+                )
+                .await;
+                {
+                    let registry = handle.session().agent.shared_tools().snapshot();
+                    let output = registry
+                        .get("sdk_dynamic_essential")
+                        .expect("essential extension tool")
+                        .execute(
+                            "dynamic-execute",
+                            serde_json::json!({"value":"ready"}),
+                            None,
+                        )
+                        .await
+                        .expect("execute essential extension tool");
+                    assert!(!output.is_error);
+                    assert_eq!(
+                        sdk_dynamic_tool_text(&output),
+                        "sdk_dynamic_essential:ready"
+                    );
+                }
+                let narrowed = serde_json::json!([
+                    "sdk_dynamic_default",
+                    "sdk_dynamic_essential",
+                    "sdk_dynamic_off"
+                ])
+                .to_string();
+                let result = manager
+                    .execute_command("sdk-dynamic-active", &narrowed, 5000)
+                    .await
+                    .expect("shelve discoverable extension tool");
+                assert_eq!(result["display"], "updated");
+                assert_sdk_dynamic_tool_exposure(
+                    &mut handle,
+                    &["sdk_dynamic_default", "sdk_dynamic_essential"],
+                    &["sdk_dynamic_default", "sdk_dynamic_essential"],
+                    &[],
+                    explicit_builtins,
+                )
+                .await;
+                let restored =
+                    serde_json::to_string(&SDK_DYNAMIC_TOOL_NAMES).expect("requested tools");
+                manager
+                    .execute_command("sdk-dynamic-active", &restored, 5000)
+                    .await
+                    .expect("restore admitted extension tools");
+                assert_eq!(handle.has_tool("xdev"), dispatcher_allowed);
+                assert_sdk_dynamic_tool_exposure(
+                    &mut handle,
+                    &registered,
+                    &schema,
+                    &["sdk_dynamic_discoverable"],
+                    explicit_builtins,
+                )
+                .await;
+                assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+            });
+        }
     }
 
     #[test]

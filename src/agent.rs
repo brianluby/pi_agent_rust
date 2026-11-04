@@ -26,9 +26,9 @@ use crate::extension_events::{
 };
 use crate::extension_tools::ExtensionToolCatalog;
 use crate::extensions::{
-    EXTENSION_EVENT_TIMEOUT_MS, ExtensionAiCompletionRequest, ExtensionCompactionOptions,
-    ExtensionDeliverAs, ExtensionEventName, ExtensionHostActions, ExtensionLoadSpec,
-    ExtensionManager, ExtensionPolicy, ExtensionRegion, ExtensionRuntimeHandle,
+    EXTENSION_EVENT_TIMEOUT_MS, EXTENSION_STARTUP_EVENT_TIMEOUT_MS, ExtensionAiCompletionRequest,
+    ExtensionCompactionOptions, ExtensionDeliverAs, ExtensionEventName, ExtensionHostActions,
+    ExtensionLoadSpec, ExtensionManager, ExtensionPolicy, ExtensionRegion, ExtensionRuntimeHandle,
     ExtensionSendMessage, ExtensionSendUserMessage, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
     NativeRustExtensionLoadSpec, NativeRustExtensionRuntimeHandle, RepairPolicyMode,
     SessionActionOrigin, SessionActionOriginSource, resolve_extension_load_spec,
@@ -2047,6 +2047,10 @@ pub struct Agent {
     /// provider swap resets this until the owning session installs its window.
     snapcompact_text_tokens: u32,
 
+    /// Active model window supplied by the owning session or SDK embedder.
+    /// Bare providers carry no window metadata, so unknown stays explicit.
+    context_window_tokens: Option<u32>,
+
     /// Optional extension manager for tool/event hooks.
     extensions: Option<ExtensionManager>,
 
@@ -2159,6 +2163,23 @@ pub struct Agent {
     /// a raw unsupported `Max` request.
     keyword_max_thinking_level: crate::model::ThinkingLevel,
 
+    /// Catalog-verified adaptive effort target; absent for unknown providers
+    /// and transports whose thinking mode cannot be safely lowered in place.
+    keyword_chillax_thinking_level: Option<crate::model::ThinkingLevel>,
+    /// Baselines whose wire effort is known. Bare Agent callers may supply
+    /// an unclamped level, so a numeric ordering alone is insufficient.
+    keyword_chillax_levels: Vec<crate::model::ThinkingLevel>,
+    /// Baseline and reductions belong to the running settings guard. The
+    /// pinned reduction survives that guard, while temporary ultrathink and
+    /// hidden notices do not. A new logical follow-up resets precedence.
+    keyword_turn_baseline: Option<crate::model::ThinkingLevel>,
+    keyword_pinned_thinking: Option<crate::model::ThinkingLevel>,
+    keyword_turn_chillax: bool,
+    /// A reduction awaiting session persistence, including one re-applied
+    /// after a retry switches to a different model. The activation ledger is
+    /// intentionally not duplicated on retry.
+    keyword_thinking_change: Option<crate::model::ThinkingLevel>,
+
     /// Session-scoped secrets vault (bd-cv653.7.9): placeholder map lives in
     /// memory and dies with the session — never persisted raw.
     secrets_vault: crate::secrets::SecretVault,
@@ -2180,6 +2201,9 @@ impl<'a> AgentTurnSettingsGuard<'a> {
     fn new(agent: &'a mut Agent) -> Self {
         let thinking_level = agent.config.stream_options.thinking_level;
         let system_prompt = agent.config.system_prompt.clone();
+        agent.keyword_turn_baseline = thinking_level;
+        agent.keyword_pinned_thinking = None;
+        agent.keyword_turn_chillax = false;
         Self {
             agent,
             thinking_level,
@@ -2190,7 +2214,13 @@ impl<'a> AgentTurnSettingsGuard<'a> {
 
 impl Drop for AgentTurnSettingsGuard<'_> {
     fn drop(&mut self) {
-        self.agent.config.stream_options.thinking_level = self.thinking_level;
+        self.agent.config.stream_options.thinking_level = self
+            .agent
+            .keyword_pinned_thinking
+            .take()
+            .or(self.thinking_level);
+        self.agent.keyword_turn_baseline = None;
+        self.agent.keyword_turn_chillax = false;
         self.agent.config.system_prompt = self.system_prompt.take();
     }
 }
@@ -2299,6 +2329,7 @@ impl Agent {
             tools,
             config,
             snapcompact_text_tokens: crate::compaction_snap::DEFAULT_SOURCE_TEXT_TOKENS,
+            context_window_tokens: None,
             extensions: None,
             extension_tool_catalog: ExtensionToolCatalog::new(json!({})),
             messages: Vec::new(),
@@ -2336,6 +2367,12 @@ impl Agent {
             retry_keyword_activations: Vec::new(),
             magic_keyword_scan_override: None,
             keyword_max_thinking_level,
+            keyword_chillax_thinking_level: None,
+            keyword_chillax_levels: Vec::new(),
+            keyword_turn_baseline: None,
+            keyword_pinned_thinking: None,
+            keyword_turn_chillax: false,
+            keyword_thinking_change: None,
             secrets_vault: crate::secrets::SecretVault::default(),
             compaction_privacy_state,
         }
@@ -2444,6 +2481,10 @@ impl Agent {
         self.prewalk = None;
         self.prewalk_budget = None;
         self.take_prewalk_evidence();
+        self.keyword_ledger.clear();
+        self.retry_keyword_activations.clear();
+        self.keyword_thinking_change = None;
+        self.magic_keyword_scan_override = None;
     }
 
     /// The destination armed for this live session, never restored from disk.
@@ -2788,9 +2829,23 @@ impl Agent {
         // carry capabilities from the previous model. Registry-aware switch
         // paths immediately install the target model's thinking and image caps.
         self.keyword_max_thinking_level = crate::model::ThinkingLevel::Off;
+        self.keyword_chillax_thinking_level = None;
+        self.keyword_chillax_levels.clear();
+        self.keyword_thinking_change = None;
         self.tool_call_dialect = crate::dialects::Dialect::Native;
         self.config.model_accepts_images = false;
         self.snapcompact_text_tokens = crate::compaction_snap::DEFAULT_SOURCE_TEXT_TOKENS;
+        self.context_window_tokens = None;
+    }
+
+    /// Set the active model's context window for extension usage snapshots.
+    /// A zero or absent window reports unknown usage. Provider replacement
+    /// clears this metadata; catalog-aware callers must install the new window.
+    pub const fn set_context_window_tokens(&mut self, context_window_tokens: Option<u32>) {
+        self.context_window_tokens = match context_window_tokens {
+            Some(window) if window > 0 => Some(window),
+            _ => None,
+        };
     }
 
     #[must_use]
@@ -2837,8 +2892,32 @@ impl Agent {
     }
 
     /// Set the model-clamped target used when a turn contains `ultrathink`.
-    pub const fn set_keyword_max_thinking_level(&mut self, level: crate::model::ThinkingLevel) {
+    pub fn set_keyword_max_thinking_level(&mut self, level: crate::model::ThinkingLevel) {
         self.keyword_max_thinking_level = level;
+        self.keyword_chillax_thinking_level = None;
+        self.keyword_chillax_levels.clear();
+    }
+
+    /// Install both keyword effort bounds from the selected model. Provider
+    /// replacement clears them first, including across failover and prewalk.
+    pub fn set_keyword_model(&mut self, entry: &ModelEntry) {
+        self.keyword_max_thinking_level =
+            entry.clamp_thinking_level(crate::model::ThinkingLevel::Max);
+        self.keyword_chillax_thinking_level = entry.chillax_thinking_level();
+        self.keyword_chillax_levels = if self.keyword_chillax_thinking_level.is_some() {
+            entry.available_thinking_levels()
+        } else {
+            Vec::new()
+        };
+    }
+
+    /// An explicit operator effort selection supersedes retained effort
+    /// keywords from an incomplete turn. Call only after admitting that
+    /// selection; automatic retry/failover retains its original keywords.
+    pub fn clear_retry_keyword_effort(&mut self) {
+        self.retry_keyword_activations
+            .retain(|hit| !matches!(hit.action.as_str(), "chillax" | "ultrathink"));
+        self.keyword_thinking_change = None;
     }
 
     /// Override the prose scanned for magic keywords on the next non-resume
@@ -3085,6 +3164,7 @@ impl Agent {
             self.config.model_accepts_images && !self.config.block_images,
             Some(self.snapcompact_text_tokens),
             self.provider.name(),
+            self.provider.model_id(),
         )
     }
 
@@ -3095,12 +3175,14 @@ impl Agent {
         let accepts_images = self.config.model_accepts_images && !self.config.block_images;
         let text_budget = self.snapcompact_text_tokens;
         let provider = self.provider.name().to_string();
+        let model_id = self.provider.model_id().to_string();
         let mut context = self.build_context();
         crate::compaction_snap::project_for_model(
             context.messages.to_mut(),
             accepts_images,
             Some(text_budget),
             &provider,
+            &model_id,
         );
         let tools: Vec<serde_json::Value> = context
             .tools
@@ -3867,10 +3949,8 @@ impl Agent {
         }
     }
 
-    /// The main agent loop. Magic keywords (bd-cv653.3.6) mutate the
-    /// thinking level and system prompt for *this turn only*; snapshot and
-    /// restore them here so a single `ultrathink` does not pin every later
-    /// turn at max thinking and directives do not accrete forever.
+    /// The main agent loop. Keyword notices and `ultrathink` are turn-local;
+    /// `chillax` may lower the pinned effort until the user changes it.
     async fn run_loop(
         &mut self,
         prompts: Vec<Message>,
@@ -3918,12 +3998,34 @@ impl Agent {
         result
     }
 
-    fn apply_magic_keyword_effects(&mut self, hits: &[crate::magic_keywords::KeywordActivation]) {
-        let keyword_max_thinking_level = self.keyword_max_thinking_level;
-        for hit in hits {
-            if hit.action == "ultrathink" {
-                self.stream_options_mut().thinking_level = Some(keyword_max_thinking_level);
+    fn apply_magic_keyword_effects(
+        &mut self,
+        hits: &mut [crate::magic_keywords::KeywordActivation],
+    ) {
+        self.keyword_turn_chillax |= hits.iter().any(|hit| hit.action == "chillax");
+        if self.keyword_turn_chillax {
+            // Compare with the pinned baseline, not a preceding temporary
+            // ultrathink. In particular, `ultrathink chillax` with thinking
+            // off must not enable it. Delivery order cannot reverse precedence.
+            let baseline = self.keyword_pinned_thinking.or(self.keyword_turn_baseline);
+            let lowered = baseline
+                .filter(|level| self.keyword_chillax_levels.contains(level))
+                .zip(self.keyword_chillax_thinking_level)
+                .and_then(|(current, minimum)| {
+                    (current != crate::model::ThinkingLevel::Off
+                        && minimum.default_budget() < current.default_budget())
+                    .then_some(minimum)
+                });
+            if let Some(level) = lowered {
+                self.keyword_pinned_thinking = Some(level);
+                self.keyword_thinking_change = Some(level);
+                if let Some(hit) = hits.iter_mut().find(|hit| hit.action == "chillax") {
+                    hit.thinking_level = Some(level);
+                }
             }
+            self.config.stream_options.thinking_level = lowered.or(baseline);
+        } else if hits.iter().any(|hit| hit.action == "ultrathink") {
+            self.config.stream_options.thinking_level = Some(self.keyword_max_thinking_level);
         }
         let directives =
             crate::magic_keywords::directives_for(hits, self.config.keyword_settings.as_ref());
@@ -3995,16 +4097,20 @@ impl Agent {
         scan_text: &str,
         turn_keyword_words: &mut std::collections::HashSet<String>,
     ) {
-        let hits: Vec<_> =
+        let mut hits: Vec<_> =
             crate::magic_keywords::detect(scan_text, self.config.keyword_settings.as_ref())
                 .into_iter()
+                // The classification instruction must not promise a helper
+                // that this session cannot call. Re-check on delivery so an
+                // optional-tool change while input is queued takes effect.
+                .filter(|hit| hit.action != "jevify" || self.has_tool("eval"))
                 .filter(|hit| turn_keyword_words.insert(hit.word.clone()))
                 .collect();
         if hits.is_empty() {
             return;
         }
 
-        self.apply_magic_keyword_effects(&hits);
+        self.apply_magic_keyword_effects(&mut hits);
         self.retry_keyword_activations.extend(hits.iter().cloned());
         self.keyword_ledger.extend(hits);
     }
@@ -4038,9 +4144,15 @@ impl Agent {
         let turn_baseline_system_prompt = self.config.system_prompt.clone();
 
         if prompts.is_empty() && !self.retry_keyword_activations.is_empty() {
-            let retry_hits = self.retry_keyword_activations.clone();
+            let mut retry_hits = self.retry_keyword_activations.clone();
             turn_keyword_words.extend(retry_hits.iter().map(|hit| hit.word.clone()));
-            self.apply_magic_keyword_effects(&retry_hits);
+            // A retry/failover may have changed model capabilities or the
+            // enabled tool set. Reapply behavior, never a stale numeric cap.
+            retry_hits.retain(|hit| hit.action != "jevify" || self.has_tool("eval"));
+            for hit in &mut retry_hits {
+                hit.thinking_level = None;
+            }
+            self.apply_magic_keyword_effects(&mut retry_hits);
         }
 
         // A resumed follow-up must fetch and validate the owning surface before
@@ -4077,9 +4189,8 @@ impl Agent {
         for prompt in prompts {
             // Magic keywords (bd-cv653.3.6): pre-send prose scan of the user
             // message. ultrathink raises the turn's thinking level to the
-            // active model's pre-clamped maximum; orchestrate/workflowz/custom words
-            // append their directive to the system prompt (appended, never
-            // inserted, so provider prompt caches stay valid).
+            // active model's pre-clamped maximum; chillax may lower a pinned
+            // adaptive effort; the other effects append turn-local notices.
             if matches!(prompt, Message::User(_))
                 && let Some(source) = keyword_scan_override.take()
             {
@@ -4189,11 +4300,15 @@ impl Agent {
                     // caller's baseline before scanning their keywords so
                     // steering-only effort and directives cannot leak across
                     // the boundary.
-                    self.config.stream_options.thinking_level = turn_baseline_thinking;
+                    self.config.stream_options.thinking_level =
+                        self.keyword_pinned_thinking.or(turn_baseline_thinking);
+                    self.keyword_turn_baseline = self.config.stream_options.thinking_level;
+                    self.keyword_turn_chillax = false;
                     self.config
                         .system_prompt
                         .clone_from(&turn_baseline_system_prompt);
                     turn_keyword_words.clear();
+                    self.retry_keyword_activations.clear();
                     pending_messages = current_follow_up;
                 }
 
@@ -4799,14 +4914,21 @@ impl Agent {
         let Some(extensions) = &self.extensions else {
             return None;
         };
+        // Do not count the request or serialize its messages when no extension
+        // consumes context. Observation events keep their existing cheap path.
+        if !extensions.has_hook_for("context") {
+            return None;
+        }
 
         let payload = json!({ "messages": messages });
-        let response = extensions
-            .dispatch_event_with_response(
-                ExtensionEventName::Context,
-                Some(payload),
-                EXTENSION_EVENT_TIMEOUT_MS,
+        let usage = self.context_window_tokens.and_then(|window| {
+            crate::extensions::ExtensionContextUsage::from_tokens(
+                self.estimate_message_context_tokens(messages),
+                window,
             )
+        });
+        let response = extensions
+            .dispatch_context_with_usage(payload, usage, EXTENSION_EVENT_TIMEOUT_MS)
             .await
             .ok()?;
 
@@ -5232,6 +5354,7 @@ impl Agent {
             self.config.model_accepts_images && !self.config.block_images,
             Some(self.snapcompact_text_tokens),
             self.provider.name(),
+            self.provider.model_id(),
         );
 
         if checkpoint_cx.checkpoint().is_err()
@@ -7590,6 +7713,9 @@ pub struct AgentSession {
     /// Extension lifecycle region — ensures the JS runtime thread is shut
     /// down when the session ends.
     pub extensions: Option<ExtensionRegion>,
+    /// Host-configured shared deadline for awaited before-agent readiness.
+    /// Bound once when extensions are enabled, including pre-warmed runtimes.
+    extension_startup_timeout_ms: u64,
     /// MCP client registry serving this session, when MCP is enabled. Turn
     /// runners that own the session (RPC loop, classic TUI) use it to pick up
     /// servers extensions register after startup (`registerMcpServer`).
@@ -7611,6 +7737,8 @@ pub struct AgentSession {
     compaction_worker: CompactionWorkerState,
     model_registry: Option<ModelRegistry>,
     auth_storage: Option<AuthStorage>,
+    /// Distinguishes this owner from sessions reusing the same registry snapshots.
+    media_auth_owner: Arc<()>,
     api_key_override: Option<String>,
     /// A CLI/API override belongs to the provider selected when it was set.
     /// Role switches must not forward that secret to a different provider.
@@ -10679,9 +10807,10 @@ mod extensions_integration_tests {
                 export default function(pi) {
                     let generation = 0;
                     pi.on('before_agent_start', async () => {
-                        // Match context-mode's awaited tools/list registration,
-                        // including a real actor timer before tools are known.
-                        await new Promise(resolve => setTimeout(resolve, 1));
+                        // Cold readiness exceeds the ordinary five-second
+                        // hook budget, as a healthy MCP handshake can. Later
+                        // turns reuse initialization and register promptly.
+                        await new Promise(resolve => setTimeout(resolve, generation === 0 ? 5100 : 1));
                         const current = ++generation;
                         pi.registerTool({
                             name: 'ctx_search',
@@ -15287,6 +15416,56 @@ mod abort_tests {
         }
     }
 
+    struct StartupAbortTool {
+        abort: AbortHandle,
+        return_after_abort: bool,
+        entered: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for StartupAbortTool {
+        fn name(&self) -> &'static str {
+            "read"
+        }
+
+        fn label(&self) -> &'static str {
+            "Startup cancellation fixture"
+        }
+
+        fn description(&self) -> &'static str {
+            "Cancels the caller during an extension readiness hostcall"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+
+        fn effects(&self) -> ToolEffects {
+            ToolEffects::read()
+        }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _input: serde_json::Value,
+            _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> crate::error::Result<ToolOutput> {
+            let _drop_guard = BlockedToolDropGuard(Arc::clone(&self.dropped));
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            self.abort.abort();
+            if self.return_after_abort {
+                Ok(ToolOutput {
+                    content: Vec::new(),
+                    details: None,
+                    is_error: false,
+                })
+            } else {
+                futures::future::pending().await
+            }
+        }
+    }
+
     struct AbortAfterReadsTool {
         completed: Arc<AtomicUsize>,
         ready: Arc<Notify>,
@@ -15644,6 +15823,221 @@ mod abort_tests {
             assert_eq!(message.stop_reason, StopReason::Aborted);
             assert_eq!(calls.load(Ordering::SeqCst), 0);
         });
+    }
+
+    enum StartupAbortPrompt {
+        Text,
+        Content,
+        Custom,
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn cancelled_startup_never_reaches_provider(
+        prompt: StartupAbortPrompt,
+        pre_warmed: bool,
+        return_after_abort: bool,
+    ) {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let temp = tempfile::TempDir::new().expect("fixture directory");
+            let entry = temp.path().join("startup.js");
+            std::fs::write(
+                &entry,
+                r#"export default function(pi) {
+                    pi.on('before_agent_start', async () => {
+                        await pi.tool('read', {});
+                        return { systemPrompt: 'late readiness prompt' };
+                    });
+                }"#,
+            )
+            .expect("extension fixture");
+            let (abort_handle, abort_signal) = AbortHandle::new();
+            let entered = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let tools = ToolRegistry::from_tools(vec![Box::new(StartupAbortTool {
+                abort: abort_handle,
+                return_after_abort,
+                entered: Arc::clone(&entered),
+                dropped: Arc::clone(&dropped),
+            })]);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(CountingProvider {
+                calls: Arc::clone(&calls),
+            });
+            let agent = Agent::new(
+                provider,
+                tools,
+                AgentConfig {
+                    system_prompt: Some("base-system".to_string()),
+                    ..AgentConfig::default()
+                },
+            );
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            let mut policy = ExtensionPolicy::default();
+            policy.default_caps.push("tool".to_string());
+            let pre_warmed = if pre_warmed {
+                let manager = ExtensionManager::new();
+                manager.set_cwd(temp.path().display().to_string());
+                let tools = agent_session.agent.shared_tools();
+                let runtime = JsExtensionRuntimeHandle::start_with_policy(
+                    PiJsRuntimeConfig {
+                        cwd: temp.path().display().to_string(),
+                        disk_cache_dir: None,
+                        ..PiJsRuntimeConfig::default()
+                    },
+                    tools.clone(),
+                    manager.clone(),
+                    policy.clone(),
+                )
+                .await
+                .expect("pre-warmed native runtime");
+                Some(PreWarmedExtensionRuntime {
+                    manager,
+                    runtime: ExtensionRuntimeHandle::Js(runtime),
+                    tools,
+                })
+            } else {
+                None
+            };
+            let config = crate::config::Config {
+                extension_startup_timeout_ms: Some(75_000),
+                ..crate::config::Config::default()
+            };
+            agent_session
+                .enable_extensions_with_policy(
+                    &[],
+                    temp.path(),
+                    Some(&config),
+                    &[entry],
+                    Some(policy),
+                    Some(RepairPolicyMode::Off),
+                    pre_warmed,
+                    ExtensionHostConfiguration::default(),
+                )
+                .await
+                .expect("load readiness extension");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(agent_session.extension_startup_timeout_ms, 75_000);
+            let manager = agent_session
+                .extensions
+                .as_ref()
+                .expect("extensions")
+                .manager()
+                .clone();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let previous_entries = session
+                .lock(cx.cx())
+                .await
+                .expect("session lock")
+                .entries
+                .len();
+            let run = async {
+                match prompt {
+                    StartupAbortPrompt::Text => {
+                        agent_session
+                            .run_text_with_abort("hello".to_string(), Some(abort_signal), |_| {})
+                            .await
+                    }
+                    StartupAbortPrompt::Content => {
+                        agent_session
+                            .run_with_content_with_abort(
+                                vec![ContentBlock::Text(TextContent::new("hello"))],
+                                Some(abort_signal),
+                                |_| {},
+                            )
+                            .await
+                    }
+                    StartupAbortPrompt::Custom => {
+                        agent_session
+                            .run_custom_message_with_abort(
+                                Message::Custom(CustomMessage {
+                                    custom_type: "startup-note".to_string(),
+                                    content: "hello".to_string(),
+                                    display: true,
+                                    details: None,
+                                    timestamp: 0,
+                                }),
+                                Some(abort_signal),
+                                |_| {},
+                            )
+                            .await
+                    }
+                }
+            };
+            let result = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                run,
+            )
+            .await
+            .expect("caller cancellation must not wait for the 75-second startup budget");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(matches!(result, Err(Error::Aborted)));
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(entered.load(Ordering::SeqCst), 1);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(agent_session.agent.messages().is_empty());
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(
+                session
+                    .lock(cx.cx())
+                    .await
+                    .expect("session lock")
+                    .entries
+                    .len(),
+                previous_entries
+            );
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert_eq!(agent_session.agent.system_prompt(), Some("base-system"));
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(!agent_session.extensions_turn_active.load(Ordering::SeqCst));
+            let handle = manager.js_runtime().expect("native JS runtime");
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(5),
+                handle.get_registered_tools(),
+            )
+            .await
+            .expect("cancelled owner must release the actor")
+            .expect("actor barrier");
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "cancelled initialization must release its hostcall"
+            );
+            // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
+            assert!(manager.shutdown(Duration::from_secs(5)).await);
+        });
+    }
+
+    #[test]
+    fn text_startup_cancellation_drops_pending_hostcall_before_provider_admission() {
+        cancelled_startup_never_reaches_provider(StartupAbortPrompt::Text, false, false);
+    }
+
+    #[test]
+    fn content_startup_cancellation_drops_pending_hostcall_before_provider_admission() {
+        cancelled_startup_never_reaches_provider(StartupAbortPrompt::Content, false, false);
+    }
+
+    #[test]
+    fn custom_message_startup_cancellation_drops_pending_hostcall_before_provider_admission() {
+        cancelled_startup_never_reaches_provider(StartupAbortPrompt::Custom, false, false);
+    }
+
+    #[test]
+    fn prewarmed_startup_cancellation_wins_when_hostcall_returns_after_abort() {
+        cancelled_startup_never_reaches_provider(StartupAbortPrompt::Text, true, true);
     }
 
     #[test]
@@ -17269,10 +17663,18 @@ impl AgentSession {
         save_enabled: bool,
         compaction_settings: ResolvedCompactionSettings,
     ) -> Self {
+        agent.set_context_window_tokens(Some(compaction_settings.context_window_tokens));
         agent.snapcompact_text_tokens = compaction_settings
             .context_window_tokens
             .saturating_sub(compaction_settings.reserve_tokens)
             / 2;
+        // Claim before any auth is installed: an unauthenticated second owner
+        // must not inherit credentials already held by a shared registry.
+        let media_auth_owner = Arc::new(());
+        agent
+            .tools
+            .snapshot()
+            .claim_media_auth_owner(&media_auth_owner);
         // The job scope is shared by every snapshot of the registry, so
         // binding through the current one binds the live registry.
         agent
@@ -17293,6 +17695,7 @@ impl AgentSession {
             save_enabled,
             input_source: InputSource::Interactive,
             extensions: None,
+            extension_startup_timeout_ms: EXTENSION_STARTUP_EVENT_TIMEOUT_MS,
             mcp_manager: None,
             extensions_is_streaming: Arc::new(AtomicBool::new(false)),
             extensions_is_compacting: Arc::new(AtomicBool::new(false)),
@@ -17309,6 +17712,7 @@ impl AgentSession {
             compaction_worker: CompactionWorkerState::new(CompactionQuota::default()),
             model_registry: None,
             auth_storage: None,
+            media_auth_owner,
             api_key_override: None,
             api_key_override_provider: None,
             recovery_cli_api_key: None,
@@ -17398,12 +17802,12 @@ impl AgentSession {
     pub fn set_model_registry(&mut self, registry: ModelRegistry) {
         let provider = self.agent.provider();
         let entry = registry.find(provider.name(), provider.model_id());
-        let keyword_max = entry
-            .as_ref()
-            .map_or(self.agent.keyword_max_thinking_level, |entry| {
-                entry.clamp_thinking_level(crate::model::ThinkingLevel::Max)
-            });
-        self.agent.set_keyword_max_thinking_level(keyword_max);
+        if let Some(entry) = &entry {
+            self.agent.set_keyword_model(entry);
+        } else {
+            self.agent.keyword_chillax_thinking_level = None;
+            self.agent.keyword_chillax_levels.clear();
+        }
         self.agent.set_tool_call_dialect(entry.as_ref().map_or_else(
             || self.agent.tool_call_dialect(),
             ModelEntry::tool_call_dialect,
@@ -17422,6 +17826,10 @@ impl AgentSession {
     }
 
     pub fn set_auth_storage(&mut self, auth: AuthStorage) {
+        self.agent
+            .shared_tools()
+            .snapshot()
+            .set_media_auth_storage(&self.media_auth_owner, auth.clone());
         self.auth_storage = Some(auth);
         self.refresh_extension_compaction_models();
     }
@@ -17744,6 +18152,8 @@ impl AgentSession {
 
     pub const fn set_compaction_context_window(&mut self, context_window_tokens: u32) {
         self.compaction_settings.context_window_tokens = context_window_tokens;
+        self.agent
+            .set_context_window_tokens(Some(context_window_tokens));
         self.agent.snapcompact_text_tokens =
             context_window_tokens.saturating_sub(self.compaction_settings.reserve_tokens) / 2;
     }
@@ -17889,9 +18299,7 @@ impl AgentSession {
         }
 
         if let Some(entry) = entry {
-            self.agent.set_keyword_max_thinking_level(
-                entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
-            );
+            self.agent.set_keyword_model(&entry);
             self.agent.set_tool_call_dialect(entry.tool_call_dialect());
             self.agent.set_model_accepts_images(
                 entry
@@ -18360,6 +18768,7 @@ impl AgentSession {
         }
         *session = candidate;
         self.agent.stream_options_mut().thinking_level = Some(effective_level);
+        self.agent.clear_retry_keyword_effort();
         self.agent.disarm_prewalk();
         self.refresh_extension_completion_host_state();
         if changed {
@@ -18520,6 +18929,13 @@ impl AgentSession {
         *session = candidate;
         drop(session);
         self.install_prepared_model_selection(prepared);
+        if !runtime_model_changed
+            && parsed_session_thinking.is_some_and(|level| level != current_thinking)
+        {
+            // A frontend may have changed the durable selection while the
+            // Agent was locked. Honor it before resuming a retained turn.
+            self.agent.clear_retry_keyword_effort();
+        }
         if runtime_model_changed && let Some(policy) = &mut self.child_fallback_policy {
             policy.use_default_role();
         }
@@ -19040,9 +19456,7 @@ impl AgentSession {
         target_thinking: crate::model::ThinkingLevel,
     ) {
         self.agent.set_provider(provider_impl);
-        self.agent.set_keyword_max_thinking_level(
-            entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
-        );
+        self.agent.set_keyword_model(entry);
         self.agent.set_tool_call_dialect(entry.tool_call_dialect());
         self.agent.set_model_accepts_images(
             entry
@@ -19394,9 +19808,7 @@ impl AgentSession {
         *inner = candidate;
         self.agent.replace_messages(restored_messages);
         self.agent.set_provider(Arc::clone(&request.provider));
-        self.agent.set_keyword_max_thinking_level(
-            entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
-        );
+        self.agent.set_keyword_model(entry);
         self.agent.set_tool_call_dialect(entry.tool_call_dialect());
         self.agent.set_model_accepts_images(
             entry
@@ -19882,7 +20294,12 @@ impl AgentSession {
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            let prep = compaction::prepare_compaction(&entries, self.compaction_settings.clone());
+            let prep = compaction::prepare_compaction_for_model(
+                &entries,
+                self.compaction_settings.clone(),
+                &origin_provider_id,
+                &origin_model_id,
+            );
             let origin = CompactionOrigin {
                 session_id: session.header.id.clone(),
                 provider_id: origin_provider_id,
@@ -20105,7 +20522,13 @@ impl AgentSession {
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            compaction::prepare_compaction(&entries, self.compaction_settings.clone())
+            let provider = self.agent.provider();
+            compaction::prepare_compaction_for_model(
+                &entries,
+                self.compaction_settings.clone(),
+                provider.name(),
+                provider.model_id(),
+            )
         };
 
         let Some(prep) = preparation else {
@@ -20735,6 +21158,10 @@ impl AgentSession {
         pre_warmed: Option<PreWarmedExtensionRuntime>,
         host: ExtensionHostConfiguration,
     ) -> Result<()> {
+        let extension_startup_timeout_ms = config.map_or(
+            EXTENSION_STARTUP_EVENT_TIMEOUT_MS,
+            crate::config::Config::extension_startup_timeout_ms,
+        );
         let mut js_specs: Vec<JsExtensionLoadSpec> = Vec::new();
         let mut native_specs: Vec<NativeRustExtensionLoadSpec> = Vec::new();
         #[cfg(feature = "wasm-host")]
@@ -21111,6 +21538,7 @@ impl AgentSession {
         self.agent.extension_tool_catalog = catalog;
         self.agent.extensions = Some(manager.clone());
         self.extensions = Some(ExtensionRegion::new(manager));
+        self.extension_startup_timeout_ms = extension_startup_timeout_ms;
         self.refresh_extension_compaction_models();
         Ok(())
     }
@@ -21429,8 +21857,9 @@ impl AgentSession {
                     &text,
                     &images,
                     base_system_prompt.as_deref().unwrap_or(""),
+                    abort.as_ref(),
                 )
-                .await;
+                .await?;
             *turn_system_prompt = system_prompt.or(base_system_prompt);
             let prompt_scope = SessionTurnPromptGuard::new(self, turn_system_prompt.clone());
             prompt_scope.session.agent.magic_keyword_scan_override = keyword_scan_override;
@@ -21518,8 +21947,9 @@ impl AgentSession {
                     &text,
                     &images,
                     base_system_prompt.as_deref().unwrap_or(""),
+                    abort.as_ref(),
                 )
-                .await;
+                .await?;
             *turn_system_prompt = system_prompt.or(base_system_prompt);
             let prompt_scope = SessionTurnPromptGuard::new(self, turn_system_prompt.clone());
             prompt_scope.session.agent.magic_keyword_scan_override = keyword_scan_override;
@@ -21610,13 +22040,26 @@ impl AgentSession {
         prompt: &str,
         images: &[ImageContent],
         system_prompt: &str,
-    ) -> BeforeAgentStartOutcome {
+        abort: Option<&AbortSignal>,
+    ) -> Result<BeforeAgentStartOutcome> {
         let Some(region) = &self.extensions else {
-            return BeforeAgentStartOutcome {
+            return Ok(BeforeAgentStartOutcome {
                 messages: Vec::new(),
                 system_prompt: None,
-            };
+            });
         };
+        if !region
+            .manager()
+            .has_hook_for(ExtensionEventName::BeforeAgentStart.as_str())
+        {
+            return Ok(BeforeAgentStartOutcome {
+                messages: Vec::new(),
+                system_prompt: None,
+            });
+        }
+        if abort.is_some_and(AbortSignal::is_aborted) {
+            return Err(Error::Aborted);
+        }
 
         let images_value = serde_json::to_value(images).unwrap_or(Value::Null);
         let payload = json!({
@@ -21625,23 +22068,42 @@ impl AgentSession {
             "systemPrompt": system_prompt,
         });
 
-        let response = region
-            .manager()
-            .dispatch_event_with_response(
-                ExtensionEventName::BeforeAgentStart,
-                Some(payload),
-                EXTENSION_EVENT_TIMEOUT_MS,
-            )
-            .await;
+        let response = region.manager().dispatch_event_with_response(
+            ExtensionEventName::BeforeAgentStart,
+            Some(payload),
+            self.extension_startup_timeout_ms,
+        );
+        let response = if let Some(abort) = abort {
+            let cancelled = abort.wait();
+            futures::pin_mut!(response, cancelled);
+            match futures::future::select(cancelled, response).await {
+                // Dropping the event future signals the native actor out of
+                // band, so pending or CPU-bound initialization is quarantined.
+                futures::future::Either::Left(_) => return Err(Error::Aborted),
+                futures::future::Either::Right((result, _)) => {
+                    // Cancellation wins when readiness and abort become ready
+                    // together. No provider request may use the late response.
+                    if abort.is_aborted() {
+                        return Err(Error::Aborted);
+                    }
+                    result
+                }
+            }
+        } else {
+            response.await
+        };
 
         match response {
-            Ok(value) => apply_before_agent_start_response(value, Utc::now().timestamp_millis()),
+            Ok(value) => Ok(apply_before_agent_start_response(
+                value,
+                Utc::now().timestamp_millis(),
+            )),
             Err(err) => {
                 tracing::warn!("before_agent_start extension hook failed (fail-open): {err}");
-                BeforeAgentStartOutcome {
+                Ok(BeforeAgentStartOutcome {
                     messages: Vec::new(),
                     system_prompt: None,
-                }
+                })
             }
         }
     }
@@ -22041,8 +22503,13 @@ impl AgentSession {
             messages: custom_messages,
             system_prompt,
         } = self
-            .dispatch_before_agent_start("", &[], base_system_prompt.as_deref().unwrap_or(""))
-            .await;
+            .dispatch_before_agent_start(
+                "",
+                &[],
+                base_system_prompt.as_deref().unwrap_or(""),
+                abort.as_ref(),
+            )
+            .await?;
         let prompt_scope = SessionTurnPromptGuard::new(self, system_prompt.or(base_system_prompt));
         prompt_scope
             .session
@@ -22703,6 +23170,9 @@ impl AgentSession {
             self.agent.authored_queue_delivery_indices.clear();
             append_dialect_repair_telemetry(&mut session, &repairs);
             crate::magic_keywords::append_session_telemetry(&mut session, &activations);
+            if let Some(level) = self.agent.keyword_thinking_change.take() {
+                crate::magic_keywords::persist_thinking_change(&mut session, level);
+            }
             if let Some(message) = incomplete_assistant
                 && !(run_failed && is_synthetic_empty_error_assistant(&message))
             {

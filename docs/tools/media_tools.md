@@ -25,15 +25,37 @@ Configure the existing opt-in flags in the application's settings:
 }
 ```
 
-Include the desired tools in the selected tool list, for example:
+`enableMedia` (alias `enable_media`) enables inspection, generation, and speech
+by default; individual flags override it, including an explicit `false`.
+`read_media` remains independent. See [settings precedence](../settings.md#media-multimodal-perception--speech).
+
+Explicit CLI selection can also enable the desired tools, for example:
 
 ```sh
 pi --tools read,write,edit,bash,inspect_image,generate_image,tts,read_media
 ```
 
-Native media requests use the selected provider's API key. They do not borrow
-chat-session OAuth credentials or switch providers merely because another
-provider has a key.
+Native media requests use the selected provider's API key. Tools inside an
+AgentSession use that session's auth store, including API-key entries saved in
+its `auth.json`. Provider aliases and mixed-case stored provider names follow
+the normal auth resolver. Media adapters resolve credentials only when the
+selected provider is invoked; binding media tools does not execute stored key
+sources. Login/logout changes apply to subsequent invocations through the
+existing tool instances.
+
+The precedence is an explicit tool-builder key, a configured provider API-key
+pool, a singular environment key, then a stored `type: "api_key"` credential.
+Stored `$ENV:` and bounded `$CMD:` / `$COMMAND:` sources retain the session's
+captured working directory. Command sources run under the invoking operation's
+process capability. Their output is collected asynchronously, with separate
+64 KiB stdout and 16 KiB stderr limits and a ten-second ceiling that also fits
+inside the operation's remaining `timeout_ms`. Cancellation, timeout, output
+overflow, or dropping the invocation stops and reaps the owned helper rather
+than leaving it to finish in a detached task. Helper failures do not include
+the command text or captured output. Stored OAuth, bearer, AWS, and service credentials
+are not admitted as media API keys. A chat-session `--api-key` or SDK
+`SessionOptions.api_key` is not forwarded to media endpoints; configure the
+chosen media provider's credentials separately.
 
 | Provider | Credential environment variables | Native media operations |
 |---|---|---|
@@ -43,7 +65,21 @@ provider has a key.
 | `xai` (`x-ai` alias) | `XAI_API_KEY` | Generation/editing, speech |
 
 SDK callers can supply `with_api_key(Some(key))`; an explicit empty key fails
-instead of falling back to the environment. `with_client` retains the caller's
+instead of falling back to saved or environment keys. Standalone tools that
+are not attached to an AgentSession retain explicit-key/environment lookup.
+A session's configured plural pool (for example `OPENAI_API_KEYS`) takes
+precedence over the singular variables above. When all keys are cooling, the
+call reports `[CREDENTIAL_POOL_EXHAUSTED]` without falling through to a saved
+key. A media HTTP 429 records cooldown for the next invocation; the adapter
+never automatically retries a potentially billable request.
+
+Custom SDK factories must create a fresh tool registry for each AgentSession.
+Shallow registry copies share native tool instances; assigning that scope to
+two sessions refuses implicit media authentication instead of exchanging their
+saved credentials. A custom wrapper around a native adapter should forward
+`Tool::bind_media_auth_scope` and `Tool::bind_cost_scope` to the wrapped tool.
+
+`with_client` retains the caller's
 HTTP/VCR configuration. The endpoints can be overridden using `with_base_url`
 or `PI_MEDIA_OPENAI_BASE_URL`, `PI_MEDIA_ANTHROPIC_BASE_URL`,
 `PI_MEDIA_GEMINI_BASE_URL`, and `PI_MEDIA_XAI_BASE_URL`. An override receives the
@@ -64,6 +100,23 @@ arguments still take precedence, followed by these configured defaults and then
 the environment variables documented above. Invalid configured selections fail
 through the same adapter validation as explicit arguments instead of being
 silently ignored.
+
+### Spend admission
+
+Native inspection, generation, and speech requests consult the session's shared
+cost budget before credential helpers run and again immediately before HTTP
+dispatch. Requests are refused when known spend reaches `--max-cost` /
+`session.maxCost`, or when the account is quarantined because its spend cannot
+be established. An explicit media API key does not bypass this check. Each
+invocation retains the account it started with; a retained tool uses the
+current account on its next invocation.
+
+The adapters do not yet add their own inspection, image, or speech charges to
+the session ledger. They enforce admission against spend already recorded by
+the rest of the session, so `--warn-cost` and `--max-cost` totals do not include
+media charges and do not cap cumulative media spending. No media USD price is
+inferred from token counts or image/audio sizes. An admitted request is never
+automatically replayed.
 
 ## Image inspection
 
@@ -354,15 +407,25 @@ its prompts, image references, or speech text can leave the machine and incur
 provider charges. These adapters do not establish filesystem sandboxing or add
 a new approval system.
 
-`timeout_ms` bounds the complete network request, including response-body
-consumption, not local file preprocessing. Defaults are 120 seconds for vision
-and speech, 180 seconds for images; the maximum is 300 seconds. Cancellation
-stops further transport polling and drops the request. It cannot reverse work
-or charges already accepted by a provider. Requests are not automatically
-retried.
+`timeout_ms` starts before credential lookup and covers command-based key
+preparation plus the complete network request, including response-body
+consumption. Preparing a key does not grant a fresh network timeout. Local
+input preprocessing after credential lookup consumes the same elapsed budget,
+but blocking filesystem calls cannot be interrupted mid-call. Output
+publication is checked for cancellation separately. Defaults are 120 seconds
+for vision and speech, 180 seconds for images; the maximum is 300 seconds.
+Cancellation stops the owned credential helper or further transport polling
+and drops the request. Process cleanup uses synchronous OS kill/reap operations,
+so this is not a hard real-time guarantee. Cancellation cannot reverse work or
+charges already accepted by a provider. Requests are not automatically retried.
 
-Artifacts are staged beside their destination, synced, and published with
-no-clobber persistence. Existing files and symlinks at the destination are
+Artifact destinations are prepared before credential helpers or provider calls.
+The same prepared target is retained until publication, including when an
+automatic filename receives its extension from the provider's actual format.
+On Unix, this preserves the pinned workspace descriptor across the request;
+replacing the workspace before publication is rejected. Artifacts are staged
+beside their destination, synced, and published with no-clobber persistence.
+Existing files and symlinks at the destination are
 rejected, including a destination created concurrently. A failed request does
 not publish a success artifact. Image checks are basic container checks, not a
 full decoder or decompression-bomb guard. No claim of decoded visual or acoustic
@@ -372,17 +435,12 @@ correctness is made merely because a container passes these checks.
 behavior, marked `mock: true`. `with_mock(false)` overrides the environment.
 Speech fixtures support WAV only; they never stand in for a native response.
 
-Twenty regression test functions were added under the media modules, including
-real loopback TCP peers exercising the actual HTTP adapter and provider request
-layouts, malformed/filtered responses, credential redaction, no-clobber writes,
-ordered image references, masks, and one Unix-only path-serialization case.
-These are protocol fixtures, not live-provider validation.
-
-**Validation status of the implementation session:** no Rust compiler or DSR
-runner was available. `dsr quality --tool pi_agent_rust` failed with
-`dsr: command not found`. The Rust tests were authored but not executed, and
-neither a passing build nor live provider success was established. The
-required authoritative check remains:
+Regression cases under the media modules and SDK use real loopback TCP peers
+to exercise the HTTP adapters, provider request layouts, saved credential
+sources, cancellation, spend admission, malformed/filtered responses,
+credential redaction, no-clobber writes, ordered image references, and masks.
+These are protocol fixtures, not live-provider validation. Adding a regression
+does not establish that it passed; the authoritative quality entry point is:
 
 ```sh
 dsr quality --tool pi_agent_rust

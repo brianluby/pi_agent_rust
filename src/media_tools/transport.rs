@@ -1,5 +1,5 @@
 //! Shared transport for native media adapters. No retries, redirects, or mock fallback.
-//! An explicit owner covers connect, response-body consumption, and the request deadline.
+//! An explicit owner covers credential helpers, HTTP, and response-body consumption.
 
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
@@ -8,16 +8,26 @@ use futures::future::{Either, select};
 use serde_json::Value;
 use std::io::Read;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use url::Url;
 
 #[derive(Default)]
 pub(super) struct Transport {
     client: Client,
     base_url: Option<String>,
+    auth: super::MediaAuthScope,
+    cost_scope: crate::cost::CostScope,
 }
 
 impl Transport {
+    pub(super) fn bind_auth_scope(&mut self, scope: super::MediaAuthScope) {
+        self.auth = scope;
+    }
+
+    pub(super) fn bind_cost_scope(&mut self, scope: crate::cost::CostScope) {
+        self.cost_scope = scope;
+    }
+
     pub(super) fn with_client(mut self, client: Client) -> Self {
         self.client = client;
         self
@@ -28,16 +38,33 @@ impl Transport {
         self
     }
 
-    pub(super) fn api(
+    /// Refuse native work before output preflight touches the filesystem.
+    /// `api` still captures and checks the invocation account before helpers;
+    /// this early check must not replace either request admission boundary.
+    pub(super) fn check_admission(&self, tool: &str) -> Result<()> {
+        check_owner(tool, &AgentCx::for_current_or_request())?;
+        if let Some(budget) = self.cost_scope.current() {
+            budget.admit()?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn api(
         &self,
         tool: &'static str,
         provider: &'static str,
         explicit_key: Option<&str>,
         timeout: Duration,
     ) -> Result<Api<'_>> {
-        let key = resolve_key(tool, provider, explicit_key, |name| {
-            std::env::var(name).ok()
-        })?;
+        let started = Instant::now();
+        let owner = AgentCx::for_current_or_request();
+        check_owner(tool, &owner)?;
+        // Capture the invocation's account before resolving a command-backed
+        // credential. A later session switch must not move this call's authority.
+        let cost_budget = self.cost_scope.current();
+        if let Some(budget) = &cost_budget {
+            budget.admit()?;
+        }
         let (default_url, env_name) = match provider {
             "openai" => ("https://api.openai.com/v1/", "PI_MEDIA_OPENAI_BASE_URL"),
             "anthropic" => (
@@ -59,15 +86,45 @@ impl Transport {
                 .or(env_url.as_deref())
                 .unwrap_or(default_url),
         )?;
-        let owner = AgentCx::for_current_or_request();
+        let auth = if explicit_key.is_some() {
+            None
+        } else {
+            self.auth
+                .snapshot()
+                .map_err(|message| Error::tool(tool, message))?
+        };
+        let track_rate_limits = explicit_key.is_none() && auth.is_some();
+        let key = if explicit_key.is_some() {
+            // Even an empty explicit key is authoritative: never replace a
+            // caller's deliberate denial with a saved or ambient credential.
+            resolve_key(tool, provider, explicit_key, |name| {
+                std::env::var(name).ok()
+            })?
+        } else if let Some(auth) = &auth {
+            auth.resolve_media_api_key_status_async(
+                provider,
+                &owner,
+                remaining_timeout(tool, started, timeout)?,
+            )
+                .await?
+                .into_result(provider)
+                .map_err(|error| Error::tool(tool, error.to_string()))?
+                .ok_or_else(|| missing_key(tool, provider))?
+        } else {
+            resolve_key(tool, provider, None, |name| std::env::var(name).ok())?
+        };
         check_owner(tool, &owner)?;
+        remaining_timeout(tool, started, timeout)?;
         Ok(Api {
             transport: self,
             tool,
             provider,
             key,
+            track_rate_limits,
+            cost_budget,
             base,
             owner,
+            started,
             timeout,
         })
     }
@@ -78,8 +135,11 @@ pub(super) struct Api<'a> {
     tool: &'static str,
     provider: &'static str,
     key: String,
+    track_rate_limits: bool,
+    cost_budget: Option<crate::cost::CostBudget>,
     base: Url,
     pub(super) owner: AgentCx,
+    started: Instant,
     timeout: Duration,
 }
 
@@ -112,6 +172,8 @@ impl Api<'_> {
     // Keep the bounded HTTP exchange inside its shared cancellation/deadline race.
     #[allow(clippy::too_many_lines)]
     pub(super) async fn post(&self, path: &str, payload: &Value, limit: usize) -> Result<Response> {
+        check_owner(self.tool, &self.owner)?;
+        remaining_timeout(self.tool, self.started, self.timeout)?;
         // Paths are built by adapters, never accepted as model-facing arguments.
         let url = self
             .base
@@ -128,7 +190,7 @@ impl Api<'_> {
             let client = self.owner.http().bind(&self.transport.client);
             let request = client
                 .post(url.as_str())
-                .timeout(self.timeout)
+                .timeout(remaining_timeout(self.tool, self.started, self.timeout)?)
                 .json(payload)?;
             let request = match self.provider {
                 "gemini" => request.try_header("x-goog-api-key", &self.key),
@@ -138,6 +200,13 @@ impl Api<'_> {
                 _ => request.try_header("Authorization", format!("Bearer {}", self.key)),
             }
             .map_err(|_| Error::tool(self.tool, "invalid media authentication header"))?;
+            // Sibling work may exhaust or quarantine the captured account
+            // while credentials and input payloads are being prepared.
+            if let Some(budget) = &self.cost_budget {
+                budget.admit()?;
+            }
+            remaining_timeout(self.tool, self.started, self.timeout)?;
+            let started_at = std::time::Instant::now();
             let response = request.send().await.map_err(|error| {
                 Error::tool(
                     self.tool,
@@ -150,6 +219,11 @@ impl Api<'_> {
             })?;
             let status = response.status();
             if !(200..300).contains(&status) {
+                if status == 429 && self.track_rate_limits {
+                    // Record backoff for the next invocation; never replay a
+                    // potentially billable generation or synthesis request.
+                    crate::auth::report_provider_rate_limit(self.provider, &self.key);
+                }
                 let detail = response.text_limited(16 * 1024).await.map_or_else(
                     |_| "error body unavailable or too large".to_string(),
                     |body| self.scrub(&body, 2048),
@@ -183,11 +257,20 @@ impl Api<'_> {
                 )
             })?;
             check_owner(self.tool, &self.owner)?;
+            if self.started.elapsed() >= self.timeout {
+                return Err(Error::tool(
+                    self.tool,
+                    "media request timed out; the provider may already have processed it",
+                ));
+            }
             if bytes.is_empty() {
                 return Err(Error::tool(
                     self.tool,
                     "provider returned an empty response",
                 ));
+            }
+            if self.track_rate_limits {
+                crate::auth::report_provider_success(self.provider, &self.key, started_at);
             }
             Ok(Response {
                 bytes,
@@ -201,7 +284,11 @@ impl Api<'_> {
         };
         let watchdog = async {
             match select(
-                Box::pin(self.owner.time().sleep(self.timeout)),
+                Box::pin(
+                    self.owner
+                        .time()
+                        .sleep(self.timeout.saturating_sub(self.started.elapsed())),
+                ),
                 Box::pin(cancelled),
             )
             .await
@@ -222,6 +309,18 @@ impl Api<'_> {
             }
         }
     }
+}
+
+fn remaining_timeout(tool: &str, started: Instant, timeout: Duration) -> Result<Duration> {
+    timeout
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| {
+            Error::tool(
+                tool,
+                "media operation timed out before dispatch; no provider request was sent",
+            )
+        })
 }
 
 pub(super) fn check_owner(tool: &str, owner: &AgentCx) -> Result<()> {
@@ -283,13 +382,7 @@ fn resolve_key(
     explicit: Option<&str>,
     mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<String> {
-    let vars: &[&str] = match provider {
-        "openai" => &["OPENAI_API_KEY"],
-        "anthropic" => &["ANTHROPIC_API_KEY"],
-        "gemini" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-        "xai" => &["XAI_API_KEY"],
-        _ => &[],
-    };
+    let vars = key_environment_variables(provider);
     // An explicit empty key is a deliberate denial, not permission to fall back.
     let key = explicit.map_or_else(
         || {
@@ -300,20 +393,32 @@ fn resolve_key(
     );
     key.map(|key| key.trim().to_string())
         .filter(|key| !key.is_empty())
-        .ok_or_else(|| {
-            let purpose = match tool {
-                "inspect_image" => "vision provider",
-                "generate_image" => "image generation provider",
-                _ => "TTS synthesis provider",
-            };
-            Error::tool(
-                tool,
-                format!(
-                    "missing API key for {purpose} {provider} (set {})",
-                    vars.join(" or ")
-                ),
-            )
-        })
+        .ok_or_else(|| missing_key(tool, provider))
+}
+
+fn key_environment_variables(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "openai" => &["OPENAI_API_KEY"],
+        "anthropic" => &["ANTHROPIC_API_KEY"],
+        "gemini" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "xai" => &["XAI_API_KEY"],
+        _ => &[],
+    }
+}
+
+fn missing_key(tool: &str, provider: &str) -> Error {
+    let purpose = match tool {
+        "inspect_image" => "vision provider",
+        "generate_image" => "image generation provider",
+        _ => "TTS synthesis provider",
+    };
+    Error::tool(
+        tool,
+        format!(
+            "missing API key for {purpose} {provider} (save a provider API key in the session's auth.json or set {}; media tools do not use OAuth or subscription credentials)",
+            key_environment_variables(provider).join(" or ")
+        ),
+    )
 }
 
 pub(super) fn optional<'a>(args: &'a Value, tool: &str, field: &str) -> Result<Option<&'a str>> {
@@ -464,88 +569,114 @@ pub(super) mod tests {
     // A real TCP peer with a canned protocol response, not a replacement client.
     // Both accept and I/O are bounded so a failed assertion cannot hang the suite.
     pub fn peer(status: u16, content_type: &str, body: Vec<u8>) -> (String, JoinHandle<Captured>) {
+        let (endpoint, listener) = peer_listener();
+        let content_type = content_type.to_string();
+        let worker = thread::spawn(move || exchange(&listener, status, &content_type, &body));
+        (endpoint, worker)
+    }
+
+    pub fn peer_responses(
+        responses: Vec<(u16, &str, Vec<u8>)>,
+    ) -> (String, JoinHandle<Vec<Captured>>) {
+        let (endpoint, listener) = peer_listener();
+        let responses = responses
+            .into_iter()
+            .map(|(status, content_type, body)| (status, content_type.to_string(), body))
+            .collect::<Vec<_>>();
+        let worker = thread::spawn(move || {
+            responses
+                .into_iter()
+                .map(|(status, content_type, body)| {
+                    exchange(&listener, status, &content_type, &body)
+                })
+                .collect()
+        });
+        (endpoint, worker)
+    }
+
+    fn peer_listener() -> (String, TcpListener) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
         let endpoint = format!("http://{}/v1/", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
-        let content_type = content_type.to_string();
-        let worker = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut socket = loop {
-                match listener.accept() {
-                    Ok((socket, _)) => break socket,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "adapter never connected");
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => panic!("accept: {error}"),
+        (endpoint, listener)
+    }
+
+    fn exchange(listener: &TcpListener, status: u16, content_type: &str, body: &[u8]) -> Captured {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "adapter never connected");
+                    thread::sleep(Duration::from_millis(5));
                 }
-            };
-            // 250ms is the POLLING interval; `deadline` is the budget for the
-            // whole exchange. A read timeout means "nothing yet", not "fail":
-            // macOS reports one as EAGAIN/WouldBlock, so panicking on it fails
-            // the test whenever the client has merely not been scheduled, which
-            // is common under a parallel suite (bd-eg6ng).
-            socket
-                .set_read_timeout(Some(Duration::from_millis(250)))
-                .unwrap();
-            socket
-                .set_write_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            let read_patiently = |socket: &mut std::net::TcpStream, chunk: &mut [u8]| loop {
-                match socket.read(chunk) {
-                    Ok(n) => return n,
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
-                    {
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "fixture timed out waiting for the request"
-                        );
-                    }
-                    // ubs:ignore an unexpected socket error in a fixture is an assertion failure
-                    Err(error) => panic!("fixture read failed: {error}"),
-                }
-            };
-            let mut request = Vec::new();
-            let header_end = loop {
-                let mut chunk = [0; 4096];
-                let n = read_patiently(&mut socket, &mut chunk);
-                assert!(n > 0, "request ended before headers");
-                request.extend_from_slice(&chunk[..n]);
-                assert!(request.len() < 2 * 1024 * 1024);
-                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                    break end + 4;
-                }
-            };
-            let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
-            let length: usize = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse().unwrap())
-                })
-                .expect("content-length");
-            assert!(length < 2 * 1024 * 1024);
-            while request.len() - header_end < length {
-                let mut chunk = [0; 4096];
-                let n = read_patiently(&mut socket, &mut chunk);
-                assert!(n > 0, "request ended before body");
-                request.extend_from_slice(&chunk[..n]);
+                Err(error) => panic!("accept: {error}"),
             }
-            let captured = Captured {
-                headers,
-                body: serde_json::from_slice(&request[header_end..header_end + length]).unwrap(),
-            };
-            write!(socket, "HTTP/1.1 {status} Response\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-            socket.write_all(&body).unwrap();
-            captured
-        });
-        (endpoint, worker)
+        };
+        // 250ms is the POLLING interval; `deadline` is the budget for the
+        // whole exchange. A read timeout means "nothing yet", not "fail":
+        // macOS reports one as EAGAIN/WouldBlock, so panicking on it fails
+        // the test whenever the client has merely not been scheduled, which
+        // is common under a parallel suite (bd-eg6ng).
+        socket
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let read_patiently = |socket: &mut std::net::TcpStream, chunk: &mut [u8]| loop {
+            match socket.read(chunk) {
+                Ok(n) => return n,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "fixture timed out waiting for the request"
+                    );
+                }
+                // ubs:ignore an unexpected socket error in a fixture is an assertion failure
+                Err(error) => panic!("fixture read failed: {error}"),
+            }
+        };
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0; 4096];
+            let n = read_patiently(&mut socket, &mut chunk);
+            assert!(n > 0, "request ended before headers");
+            request.extend_from_slice(&chunk[..n]);
+            assert!(request.len() < 2 * 1024 * 1024);
+            if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+        let length: usize = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().unwrap())
+            })
+            .expect("content-length");
+        assert!(length < 2 * 1024 * 1024);
+        while request.len() - header_end < length {
+            let mut chunk = [0; 4096];
+            let n = read_patiently(&mut socket, &mut chunk);
+            assert!(n > 0, "request ended before body");
+            request.extend_from_slice(&chunk[..n]);
+        }
+        let captured = Captured {
+            headers,
+            body: serde_json::from_slice(&request[header_end..header_end + length]).unwrap(),
+        };
+        write!(socket, "HTTP/1.1 {status} Response\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+        socket.write_all(body).unwrap();
+        captured
     }
 
     #[test]
@@ -569,6 +700,226 @@ pub(super) mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_media_tools_obey_the_live_registry_spend_scope() {
+        use crate::cost::CostBudget;
+        use crate::media_tools::{GenerateImageTool, InspectImageTool, TtsTool};
+        use crate::tools::{Tool, ToolRegistry};
+        use base64::Engine as _;
+
+        for name in ["inspect_image", "generate_image", "tts"] {
+            let directory = tempfile::tempdir().expect("media workspace");
+            let png = super::super::MIN_VALID_PNG;
+            std::fs::write(directory.path().join("input.png"), png).unwrap();
+            let (mime, response, arguments) = match name {
+                "inspect_image" => (
+                    "application/json",
+                    serde_json::to_vec(&serde_json::json!({"choices":[{
+                        "finish_reason":"stop", "message":{"content":"A fixture image."}
+                    }]}))
+                    .unwrap(),
+                    serde_json::json!({"path":"input.png", "provider":"openai",
+                        "model":"gpt-4.1-mini", "timeout_ms":2000}),
+                ),
+                "generate_image" => (
+                    "application/json",
+                    serde_json::to_vec(&serde_json::json!({"data":[{
+                        "b64_json":base64::engine::general_purpose::STANDARD.encode(png)
+                    }]}))
+                    .unwrap(),
+                    serde_json::json!({"prompt":"Draw a square", "provider":"openai",
+                        "model":"gpt-image-1.5", "output_path":"output.png", "timeout_ms":2000}),
+                ),
+                _ => {
+                    let mut audio = super::super::MIN_VALID_WAV.to_vec();
+                    audio[4..8].copy_from_slice(&40_u32.to_le_bytes());
+                    audio[40..44].copy_from_slice(&4_u32.to_le_bytes());
+                    audio.extend_from_slice(&[0x34, 0x12, 0xcd, 0xab]);
+                    (
+                        "audio/wav",
+                        audio,
+                        serde_json::json!({"text":"Hello", "provider":"openai",
+                            "voice":"alloy", "output_path":"output.wav", "timeout_ms":2000}),
+                    )
+                }
+            };
+            let (endpoint, worker) = peer(200, mime, response);
+            let native: Box<dyn Tool> = match name {
+                "inspect_image" => Box::new(
+                    InspectImageTool::new(directory.path())
+                        .with_mock(false)
+                        .with_api_key(Some("media-cost-key".to_string()))
+                        .with_base_url(endpoint),
+                ),
+                "generate_image" => Box::new(
+                    GenerateImageTool::new(directory.path())
+                        .with_mock(false)
+                        .with_api_key(Some("media-cost-key".to_string()))
+                        .with_base_url(endpoint),
+                ),
+                _ => Box::new(
+                    TtsTool::new(directory.path())
+                        .with_mock(false)
+                        .with_api_key(Some("media-cost-key".to_string()))
+                        .with_base_url(endpoint),
+                ),
+            };
+            let registry = ToolRegistry::from_tools(vec![native]);
+            let tool = registry.get(name).expect("native adapter");
+            let scope = registry.cost_scope();
+            scope.set(Some(CostBudget::new(None, Some(1.0), 1.0).unwrap()));
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let refused = runtime.block_on(tool.execute("refused", arguments.clone(), None));
+            assert!(
+                matches!(refused, Err(Error::CostCap { .. })),
+                "{name}: {refused:?}"
+            );
+
+            let available = CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            scope.set(Some(available.clone()));
+            let output = runtime
+                .block_on(tool.execute("admitted", arguments.clone(), None))
+                .expect("the retained native tool must observe the replacement scope");
+            assert!(!output.is_error);
+            assert!(
+                available.spent().abs() < f64::EPSILON,
+                "media responses must not invent USD charges"
+            );
+            available.record(1.0).unwrap();
+            let refused = runtime.block_on(tool.execute("spent", arguments, None));
+            assert!(
+                matches!(refused, Err(Error::CostCap { .. })),
+                "{name}: {refused:?}"
+            );
+            let captured = worker.join().expect("one admitted native request");
+            assert!(captured.headers.contains("Bearer media-cost-key"));
+        }
+    }
+
+    #[test]
+    fn media_request_rechecks_its_captured_account_without_migrating_to_a_new_scope() {
+        use crate::cost::{CostBudget, CostScope};
+
+        for quarantine in [false, true] {
+            let original = CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            let replacement = CostBudget::new(None, Some(1.0), 0.0).unwrap();
+            let scope = CostScope::default();
+            scope.set(Some(original.clone()));
+            let (endpoint, listener) = peer_listener();
+            let mut transport = Transport::default().with_base_url(endpoint);
+            transport.bind_cost_scope(scope.clone());
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let api = transport
+                    .api(
+                        "tts",
+                        "openai",
+                        Some("captured-key"),
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .expect("initial account permits preparation");
+                scope.set(Some(replacement));
+                if quarantine {
+                    assert!(original.record(f64::NAN).is_err());
+                } else {
+                    original.record(1.0).unwrap();
+                }
+                let error = api
+                    .post("audio/speech", &serde_json::json!({}), 1024)
+                    .await
+                    .err()
+                    .expect("captured account must be checked immediately before HTTP");
+                if quarantine {
+                    assert!(matches!(error, Error::Session(ref message)
+                        if message.contains("model cost accounting unavailable")));
+                } else {
+                    assert!(matches!(error, Error::CostCap { .. }));
+                }
+                assert!(matches!(listener.accept(), Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock));
+
+                let api = transport
+                    .api(
+                        "tts",
+                        "openai",
+                        Some("replacement-key"),
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .expect("next invocation captures the healthy replacement account");
+                scope.set(Some(CostBudget::new(None, Some(1.0), 1.0).unwrap()));
+                let worker =
+                    thread::spawn(move || exchange(&listener, 200, "application/json", b"{}"));
+                let response = api
+                    .post("audio/speech", &serde_json::json!({}), 1024)
+                    .await
+                    .expect("a later scope change must not migrate an admitted invocation");
+                assert_eq!(response.bytes, b"{}");
+                let captured = worker.join().unwrap();
+                assert!(captured.headers.contains("Bearer replacement-key"));
+                assert!(matches!(
+                    transport
+                        .api("tts", "openai", Some("next-key"), Duration::from_secs(2))
+                        .await,
+                    Err(Error::CostCap { .. })
+                ));
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exhausted_and_quarantined_media_budgets_refuse_before_stored_key_commands() {
+        use crate::auth::{AuthCredential, AuthStorage};
+        use crate::cost::{CostBudget, CostScope};
+
+        let directory = tempfile::tempdir().expect("command workspace");
+        let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+        auth.set(
+            "openai",
+            AuthCredential::ApiKey {
+                key: "$CMD:printf invoked > credential-invoked; printf command-key".to_string(),
+            },
+        );
+        auth.set_command_working_directory(directory.path())
+            .unwrap();
+        let auth_scope = super::super::MediaAuthScope::default();
+        auth_scope.set(&std::sync::Arc::new(()), auth);
+        let scope = CostScope::default();
+        let mut transport =
+            Transport::default().with_base_url("http://127.0.0.1:1/v1/".to_string());
+        transport.bind_auth_scope(auth_scope);
+        transport.bind_cost_scope(scope.clone());
+        let owner = AgentCx::for_testing_with_io();
+        futures::executor::block_on(owner.with_current(async {
+            for quarantine in [false, true] {
+                let budget = CostBudget::new(None, Some(1.0), 1.0).unwrap();
+                if quarantine {
+                    assert!(budget.record(f64::NAN).is_err());
+                }
+                scope.set(Some(budget));
+                let error = transport
+                    .api("tts", "openai", None, Duration::from_secs(1))
+                    .await
+                    .err()
+                    .expect("refuse before stored credential resolution");
+                if quarantine {
+                    assert!(matches!(error, Error::Session(ref message)
+                        if message.contains("model cost accounting unavailable")));
+                } else {
+                    assert!(matches!(error, Error::CostCap { .. }));
+                }
+                assert!(!directory.path().join("credential-invoked").exists());
+            }
+        }));
     }
 
     #[test]

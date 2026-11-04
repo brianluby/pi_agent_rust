@@ -515,6 +515,83 @@ wrappers do not retain their own actor's application lifetime through the
 shared registry; explicitly retained public runtime handles keep their normal
 ownership semantics.
 
+### Startup readiness and event cancellation
+
+`before_agent_start` can await external-service readiness and register tools
+before the provider's tool schema is captured. The Agent gives each such
+dispatch a default budget of **120,000 ms**, shared across all its handlers.
+The runtime uses one deadline for queueing and the ordered handlers; moving
+to another owner does not restart it. This applies on every turn that fires
+the event, not only the first turn after opening a session.
+
+Set `extensionStartupTimeoutMs` in an admitted settings source to shorten or
+extend that budget:
+
+```json
+{
+  "extensionStartupTimeoutMs": 120000
+}
+```
+
+The setting accepts an unsigned integer in milliseconds and is clamped to
+`1`–`300000`; the default is `120000`. Existing settings precedence and project
+trust checks apply. It configures the Agent's `before_agent_start` dispatch,
+not every extension event. Ordinary actionable hooks retain their five-second
+default, informational hooks retain their shorter default, and compaction
+keeps its dedicated budget. An explicit SDK or runtime dispatch timeout is
+never enlarged by the startup default or this setting.
+
+The same setting applies when extensions are prewarmed, and an embedding
+manager's tighter budget still caps the wait. Cancellation in the Agent's
+text, structured-content, and custom prompt paths returns before provider
+invocation or admitting that prompt to conversation history.
+
+This addresses a concrete context-mode startup requirement. Published
+`context-mode@1.0.169` starts its MCP child lazily in `before_agent_start`,
+awaits `initialize` and `tools/list`, and only then registers its tools. Its
+handshake requests each allow 60 seconds, with bounded initialization retries.
+A healthy six-second initialization therefore exceeded the former generic
+five-second event budget. The dedicated startup budget permits that work while
+remaining bounded. It does not promise to accommodate the package's complete
+worst-case retry sequence, which can exceed 120 seconds.
+
+Dropping an admitted event future or reaching its deadline signals the busy
+actor directly. The currently executing extension owner is quarantined so a
+late Promise continuation cannot publish registrations, and retained native
+requests and subprocesses are retired. Other completed owners remain
+available, and handlers which have not started are skipped for that failed
+dispatch. A QuickJS interrupt fence also observes cancellation and deadlines
+during guest CPU loops. Quarantine retires owned resources through the
+existing cleanup paths and retains admission accounting until those resources
+finish. Native synchronous host operations retain their own bounds; a
+JavaScript interrupt cannot preempt Rust inside one of those operations.
+
+Event-batch context creation shares the request's cancellation and deadline.
+Batch cleanup skips already quarantined isolates and gives each remaining
+owner's context deletion its own 100 ms execution budget. A failed or
+over-budget cleanup quarantines that owner while cleanup continues for peers.
+
+The supplementary `scripts/test_published_extension_rendering.mjs` diagnostic
+now also pins and executes the complete published `extension.js` and
+`mcp-bridge.js` modules. With a controlled MCP response and real Linux Node
+timers, discovery and `session_start` spawned no child; the real startup hook
+was still pending with no tools at five seconds, then registered the controlled
+MCP tool after approximately six seconds. The package completed its actual
+`initialize` → `notifications/initialized` → `tools/list` sequence and requested
+`SIGTERM` on shutdown. All 24 checks pass with the current sources: 23 existing
+rendering checks and this readiness case. With
+`--startup-source /path/to/prior/extensions.rs` pointing to the prior
+five-second default, the rendering checks pass and the readiness assertion
+fails.
+
+The timeout constant read from Rust is applied by a fixture observer in that
+diagnostic. Imported dependencies, SQLite, the extension API and child I/O are
+controlled fixtures; no native process is launched. These results establish
+the published hook's readiness requirement, not native configuration loading,
+timeout enforcement, cancellation, quarantine, catalog publication or Windows
+behavior. Native event and settings regressions cover those request boundaries
+and owner isolation, but remain unexecuted here pending the DSR native runner.
+
 ### Context message transforms
 
 Context hooks receive the message array produced by earlier handlers, across
@@ -663,6 +740,289 @@ Writable descriptors,
 symlink creation, recursive directory deletion, and cross-filesystem rename
 are explicitly unsupported within a persistent grant.
 
+### Read-only extension configuration
+
+Configuration is a separate, exact-file capability in the host data registry.
+The host API `PiJsRuntime::add_configuration_read_file` grants one owner a
+read-only file and protects its parent namespace from other owners and ordinary
+workspace fallback. It does not authorize directory listings, neighboring files,
+JavaScript imports, or writes, even when the extension has a `write` capability.
+Registration creates neither the configuration file nor its directories.
+
+The npm loader currently declares this compatibility mapping:
+
+| Admitted package identity | File relative to the owner's home |
+|---|---|
+| `@zhushanwen/pi-context-engineering` | `.pi/agent/extensions/context-engineering/config.json` |
+
+The identity comes from the existing admitted package provenance: installed
+`node_modules` layout, manifest name, and declared `pi.extensions` entry must
+agree. Aliases are explicit host policy; arbitrary scopes and `pi-` prefixes
+are never stripped to infer ownership. Guest package fields and changes to
+`process.env` cannot add grants. Each path is resolved once in its owner's
+runtime configuration, and all realms receive its protected boundary before
+factories run. A collision with a different extension's code directory rejects
+the proposed load before executing factories.
+
+Configuration reads, stat, and realpath use the same pinned, no-follow file
+handles and link checks as persistent data. Windows case aliases must identify
+the actual granted file; case folding alone cannot authorize a distinct sibling
+in a case-sensitive directory. Read-only configuration never satisfies SQLite's
+write-authority requirement. Context-mode's existing writable
+`~/.pi/context-mode` namespace remains separate.
+
+An authorized absent configuration is reported with `error.code === "ENOENT"`.
+Permission, unsafe-link, and I/O failures remain errors and cannot silently
+become missing-file defaults. This matters for the published
+`@zhushanwen/pi-context-engineering@0.2.0`, which reads configuration during
+initialization and again on `session_start`, and checks `error.code` to select
+its defaults.
+
+#### Issue #279 verification scope (2026-11-04)
+
+The supplementary diagnostic in
+`scripts/test_published_extension_config.mjs` pins the published
+`@zhushanwen/pi-context-engineering@0.2.0` source files and evaluates its actual
+configuration loader and factory with the embedded PiJS JavaScript filesystem
+facade. All 13 checks passed under Linux Node 24.22.1, both with POSIX paths and
+with Windows path/platform projection. The same diagnostic against the prior
+facade passed 6 checks and failed 7. Native host callbacks are fixtures in this
+diagnostic: these results do not verify Rust authorization, QuickJS execution,
+or a native Windows filesystem.
+
+An independent Linux Node reference exercise of the unmodified
+`context-mode@1.0.169` package completed initialization, session events,
+compaction state, shutdown, and a cold-process SQLite reopen with the same
+session identity. Its actual MCP server registered 11 tools and completed an
+index/search round trip while the other package's configuration remained
+readable and unchanged. This establishes the published package behavior to
+exercise in PiJS; it is not evidence of a complete PiJS lifecycle.
+
+Native regressions in `tests/extensions_fs_shim.rs` and
+`tests/e2e_ts_extension_loading.rs` cover the exact reported configuration
+layout, owner/provenance checks, missing files, policy denial, peer isolation,
+read-only access, traversal, links, Windows aliases/junctions, and coexistence
+with the existing context-mode SQLite/session reload fixture. The authoring
+environment has no configured RCH worker or native Windows runner, so those
+Rust tests have not been executed here. The unchanged DSR quality recipe
+remains the required native validation path; published-package PiJS startup,
+reload, MCP behavior, and Windows lifecycle remain unverified until that
+runner evidence is available.
+
+### Context usage for compression hooks
+
+`ctx.getContextUsage()` is synchronous and returns a fresh
+`{ tokens, contextWindow, percent }` snapshot when the host supplies usage.
+The native agent supplies it to each `context` dispatch, before extensions
+transform the request. It estimates the actual message list using the active
+model's token counter, archive projection, and image policy. Hidden history,
+sibling branches, and cumulative provider billing totals are not counted.
+System-prompt and tool-schema overhead are not included in this estimate.
+
+The snapshot belongs to that request; it never enters the cached session
+context or a JavaScript global mirror. A later request gets a new estimate
+even when the extension registry has not changed. Provider replacement clears
+the old window until the owning session installs the new model metadata.
+Standalone `Agent` embedders can supply that metadata through
+`set_context_window_tokens`. A missing or zero window yields `undefined`.
+Other events, commands, and minimal tool contexts currently return `undefined`
+because they have no authoritative request snapshot. An explicitly supplied
+snapshot with unknown tokens returns `tokens: null` and `percent: null`.
+
+Only the three public numeric fields are exposed. The getter copies them and
+calculates percent from tokens/window, so mutating one returned object cannot
+change subsequent reads. Percent uses percentage points: 60,000 tokens in a
+200,000-token window is `30`. Values over `100` remain visible as overflow.
+
+This restores a critical path in the published
+`@zhushanwen/pi-context-engineering@0.2.0`: its `context` handler calls
+`getContextUsage()` unconditionally inside a catch block. The previously absent
+method caused the handler to return `{}`, silently skipping all compression
+after configuration loaded successfully. The published-package diagnostic also
+exercises actual budget compression, recall, statistics, command toggles, and
+session reset with the verbatim PiJS context builder.
+
+Version `0.2.0` has a separate threshold-units defect: its emergency compression
+compares `contextUsage.percent` directly with the default `emergencyThreshold`
+of `0.9`. For a 90% threshold with the percentage API, configure that value as
+`90`; the host does not change percentage units to compensate. This package
+limitation is distinct from the missing-method failure.
+
+The supplementary diagnostic runs under Node with controlled native callbacks;
+all 20 checks pass with POSIX paths and Windows path/platform projection. The
+same expanded diagnostic against the source before the usage fix passes the
+original 13 checks and fails all seven new checks. It does not execute Rust,
+QuickJS, or native Windows. Native request-path and
+snapshot regressions cover fresh usage, window changes, unknown metadata,
+post-compaction inputs, and isolation from later events. They require the DSR
+native runner before their results can be claimed as executed verification.
+
+### Tool progress and cancellation
+
+JavaScript extension tools receive the standard argument order:
+
+```typescript
+execute(toolCallId, input, signal, onUpdate, ctx)
+```
+
+`signal` is a fresh `AbortSignal` for that invocation. `onUpdate`, when the
+native caller supplies an observer, forwards `{ content, details }` snapshots
+through the existing `ToolUpdate` and `ToolExecutionUpdate` path used by the
+terminal interfaces and RPC. The final tool result stays separate. Native
+descriptor tools keep their existing immediate-result behavior.
+
+Progress belongs to a host-generated private invocation token, independently
+of the public tool-call ID. Owner checks and secret-protected lifecycle controls
+prevent guest code from selecting another invocation's destination. The host
+validates each snapshot and caps its serialized UTF-8 size at 1,000,000 bytes.
+One replaceable pending snapshot bounds the buffer: slow observers see the most
+recent state rather than an unbounded backlog. Native observers run in the
+awaiting caller, outside the JavaScript actor. Invalid progress is ignored;
+updates after completion or cancellation are suppressed, and retained guest
+callbacks release their native destination when the invocation closes.
+
+Dropping an admitted tool future, including agent cancellation, sets an atomic
+flag observed by the busy actor. It does not enqueue a cancellation request
+behind the work being cancelled. Active tool waits poll a bounded collection
+of retained native hostcalls, allowing a pending operation and a later operation
+needed to release it to make progress. Existing capability checks, native
+resource guards, session provenance, and per-extension routing remain in force.
+When the runtime's safety envelope vetoes interleaving, new admission falls to
+one retained hostcall. Previously admitted work continues to be polled without
+being dropped, and further requests wait for the conservative limit.
+
+Cancellation and the existing tool deadline close progress before dispatching
+abort listeners. The runtime gives cooperative JavaScript cleanup a 100 ms
+budget. A tool that remains unresolved is quarantined with its own isolate's
+resources; other extension isolates remain available. A QuickJS interrupt
+fence also checks cancellation and the deadline during guest CPU loops. An
+interrupted isolate is quarantined even if an async function converts the
+interruption into a rejected promise. Native synchronous host operations retain
+their own timeout behavior; the JavaScript interrupt hook cannot preempt Rust
+while it is inside one of those operations.
+
+Cancellation is cooperative for resources: pass the signal to `fetch`, or use
+an abort listener to stop a child process. The host does not infer ownership of
+all background work from its timing and does not cancel every resource owned
+by an extension that completes its abort handling. Hostcalls have extension and
+session provenance, but not automatic task-local attribution across every
+Promise continuation. A tool that settles while abandoning unrelated-looking
+background work therefore does not cause that work to be cancelled implicitly.
+
+#### FTUI live previews
+
+FTUI displays an extension tool's text progress in its existing pending card.
+Each accepted snapshot replaces the previous preview, including a shorter or
+empty snapshot, and changes the card's render revision when its visible detail
+changes. Progress leaves the card pending until the tool finishes.
+
+The FTUI forwarder owns an operation scope tied to the displayed session.
+Each tracked invocation gets a private presentation identity and a replaceable
+mailbox. Public tool-call IDs remain opaque lookup keys; only displayed names,
+summaries, and output are terminal-sanitized. The UI checks both operation
+identity and session ownership before accepting a card or its progress.
+Completion, operation retirement, and conversation reset close the relevant
+mailboxes, so retained callbacks and queued messages cannot revive their
+progress in a later operation.
+
+Progress tracking admits at most **128 active tools** and remembers at most
+**1,024 distinct call IDs per operation**. Call IDs and tool names used by that
+tracker are limited to **4,096 bytes** each. Reused IDs, oversized keys, and
+capacity exhaustion suppress live progress for the affected invocation while
+preserving the existing lifecycle and terminal-result path.
+
+Each mailbox keeps only its latest bounded text preview: up to **200 lines**,
+with up to **300 Unicode characters per line**, plus truncation markers. The
+preview is built directly from borrowed text blocks. Images and arbitrary
+`details` objects are not copied into this presentation channel. Progress
+updates enqueue no notifications or result payloads; ordered lifecycle messages
+establish and finish the card. FTUI polls active mailboxes on its existing
+**120 ms spinner heartbeat**, so updates between polls coalesce. This is a poll
+cadence, not a guarantee that every intermediate snapshot appears on screen.
+If terminal suspension or an external editor consumes and parks a tick,
+returning terminal ownership rearms that heartbeat without adding another
+chain when a timer is already pending.
+
+The terminal result closes progress before its final preview is delivered and
+replaces any partial text. A final result without text clears the partial
+preview. Manual shell cards keep their existing behavior: a `BashResult` can
+fold output into the card before a `ToolEnd` without a replacement preview.
+The classic terminal and RPC retain their existing update consumers. Interim
+`out://` replies become assistant prose only after successful completion;
+provisional updates do not publish those replies.
+
+These are generic text previews. Full JavaScript `renderCall` and
+`renderResult` callbacks, custom tool components, and rich `details` rendering
+remain unsupported in the FTUI tool-card path. Presentation buffering does
+not change the tool result supplied to the model or persisted in the session.
+
+#### Verification
+
+The supplementary `scripts/pijs_tool_lifecycle_probe.mjs` diagnostic pins the
+unchanged repository subagent example and runs the actual PiJS JavaScript
+registration, dispatch, signal, and lifetime code in Node. Its **16 checks
+pass**; the pre-lifecycle bridge at `152c13d` fails all 16. The real example
+emits a shorter replacement snapshot in single mode, detached aggregate
+snapshots in parallel mode, and a parallel terminal summary distinct from its
+last progress message. It also invokes its child `SIGTERM` handler on abort.
+Child processes, native sinks, and other host facilities are controlled
+fixtures: this verifies JavaScript behavior at the bridge sink, not native
+child termination, actor cancellation, FTUI delivery, or Windows. The bridge
+at `c15db1a`, before the FTUI delivery change, also passes these 16 checks;
+the source diagnostic does not establish the native UI fix.
+
+Native regressions cover wrapper progress delivery, caller abandonment,
+deadlines, late callbacks, mailbox bounds, hostcall scheduling, and isolation
+after unresponsive tools. FTUI regressions cover bounded preview transport,
+pending-card updates, replacement and final-output handling, and operation
+and session isolation. They require the DSR native runner before their results
+can be claimed as executed verification; native FTUI and Windows behavior
+remain unexecuted here. The published
+`context-mode@1.0.169` tool callback ignores Pi's signal and progress callback;
+these host features alone do not establish cancellation or streamed progress
+for that package.
+The existing owner-scoped configuration, persistent-storage, SQLite, session
+identity, and grapheme mechanisms are independent of invocation lifetime.
+
+### Grapheme segmentation for extension rendering
+
+PiJS supports locale-independent extended grapheme segmentation through
+`new Intl.Segmenter(undefined, { granularity: "grapheme" })`; the default
+granularity is also `grapheme`. The pure native helper uses the already-locked
+`unicode-segmentation` 1.13.3 Unicode tables and returns UTF-16 boundaries in
+one batch. It does not acquire filesystem, environment, process, or network
+capabilities. JavaScript retains the original input, creates records lazily,
+and gives each iterator its own cursor. `Segments.containing(index)` searches
+the same boundaries, including when the index falls within a surrogate pair.
+Unpaired surrogate code units remain intact in returned text.
+
+This fixes a concrete failure in the published `context-mode@1.0.169` tool
+renderer: the previous iterator recursively invoked itself and overflowed the
+stack on nonempty output. Removing that recursion alone still split flags,
+emoji modifiers, ZWJ families, Hangul Jamo, and Indic clusters during clipping.
+The new boundaries keep those clusters together and report UTF-16 indices
+rather than code-point counts.
+
+This is a focused grapheme implementation, not complete locale-aware Intl
+support. Word and sentence granularities are explicitly rejected with
+`RangeError` instead of silently returning graphemes. Locale negotiation,
+`supportedLocalesOf`, and `resolvedOptions` are not implemented for Segmenter.
+
+The supplementary diagnostic
+`scripts/test_published_extension_rendering.mjs` pins the unmodified published
+renderer and runs it with both Node's native Intl and the actual PiJS JavaScript
+facade in the same invocation. All 23 rendering checks pass with the updated
+facade; the prior facade fails all 23. Cases include ANSI preservation,
+clipping at grapheme boundaries, multiline rendering, independent iterators, UTF-16
+indices, input coercion, and lone surrogates. Node supplies the boundary
+callback in this diagnostic, so this result verifies the JavaScript facade
+and published renderer, not the Rust segmentation implementation or QuickJS.
+
+Native boundary, QuickJS callback, and full PiJS facade regressions are in
+`src/extensions_js/intl.rs`. They remain unexecuted in this environment because
+the required DSR remote Rust runner is unavailable. Native Windows rendering
+and the complete published-package PiJS lifecycle remain unverified.
+
 ---
 
 ## 7. Preflight Analysis
@@ -714,6 +1074,13 @@ The report includes:
 - **Filesystem scope**: Extension/workspace access retains its existing policy.
   Persistent application namespaces are separate, owner-scoped data grants;
   they do not authorize arbitrary HOME access or native addon loading.
+- **Compaction cancellation**: `compact()` / `ctx.compact()` called with a
+  signal that is already aborted rejects with an `AbortError` before any host
+  work starts. An abort that fires
+  while the compaction is running is not propagated: no JavaScript abort
+  handler runs until the compact hostcall returns. The dedicated
+  `session_before_compact` budget (300 seconds) and the provider request
+  timeout bound the call instead.
 
 ### Remaining Failure Buckets (18/223)
 

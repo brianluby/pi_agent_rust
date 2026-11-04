@@ -71,6 +71,14 @@ impl InspectImageTool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for InspectImageTool {
+    fn bind_cost_scope(&mut self, scope: crate::cost::CostScope) {
+        self.transport.bind_cost_scope(scope);
+    }
+
+    fn bind_media_auth_scope(&mut self, scope: super::MediaAuthScope) {
+        self.transport.bind_auth_scope(scope);
+    }
+
     fn name(&self) -> &str {
         NAME
     }
@@ -196,7 +204,8 @@ impl Tool for InspectImageTool {
         )?;
         let api = self
             .transport
-            .api(NAME, provider, self.api_key.as_deref(), timeout)?;
+            .api(NAME, provider, self.api_key.as_deref(), timeout)
+            .await?;
         if matches!(mime, "image/svg+xml" | "image/bmp") {
             return Err(Error::tool(
                 NAME,
