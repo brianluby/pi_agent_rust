@@ -32,7 +32,6 @@ use pi::agent::{
 use pi::app::StartupError;
 use pi::auth::{AuthCredential, AuthStorage};
 use pi::cli;
-use pi::compaction::ResolvedCompactionSettings;
 use pi::config::Config;
 use pi::config::SettingsScope;
 use pi::extension_index::{
@@ -2796,9 +2795,9 @@ async fn run(
             system_prompt: cli.system_prompt.clone(),
             append_system_prompt: cli.append_system_prompt.clone(),
             enabled_tools: ftui_enabled_tools,
-            tool_factory: cli.no_implicit_tools.then(|| {
-                Arc::new(pi::sdk::ExplicitBuiltinTools) as Arc<dyn pi::sdk::ToolFactory>
-            }),
+            tool_factory: cli
+                .no_implicit_tools
+                .then(|| Arc::new(pi::sdk::ExplicitBuiltinTools) as Arc<dyn pi::sdk::ToolFactory>),
             out_default_enabled: true,
             thinking: cli.thinking.as_deref().and_then(|t| t.parse().ok()),
             include_cwd_in_prompt: !cli.hide_cwd_in_prompt,
@@ -3045,14 +3044,8 @@ async fn run(
     };
 
     let session_arc = Arc::new(Mutex::new(session));
-    let compaction_settings = ResolvedCompactionSettings {
-        enabled: config.compaction_enabled(),
-        reserve_tokens: config.compaction_reserve_tokens(),
-        keep_recent_tokens: config.compaction_keep_recent_tokens(),
-        context_window_tokens: context_window_tokens_for_entry(&selection.model_entry),
-        mode: config.compaction_mode(),
-        render_mode: config.compaction_render_mode(),
-    };
+    let compaction_settings =
+        config.resolved_compaction_settings(selection.model_entry.model.context_window);
     let mut agent_session = AgentSession::new(
         // The same registry the pre-warmed extension runtime resolves
         // `pi.tool` hostcalls through (bd-4t6oz).
@@ -3427,7 +3420,9 @@ async fn run(
         )
         .map_err(anyhow::Error::new)?;
         agent_session.agent.set_provider(provider);
-        agent_session.agent.set_keyword_model(&selection.model_entry);
+        agent_session
+            .agent
+            .set_keyword_model(&selection.model_entry);
         agent_session
             .agent
             .set_tool_call_dialect(selection.model_entry.tool_call_dialect());
@@ -11813,6 +11808,7 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use clap::Parser as _;
+    use pi::compaction::ResolvedCompactionSettings;
     use serde_json::json;
     use tempfile::TempDir;
 

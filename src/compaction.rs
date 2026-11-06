@@ -115,6 +115,48 @@ pub enum AutoCompactionMode {
     Aggressive,
 }
 
+/// One preference in an explicit automatic compaction fallback order.
+/// Methods operate on the same prepared source and return one candidate;
+/// the session owner installs only the selected candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutoCompactionMethod {
+    /// Reserved for a provider-native replay path. Until native session
+    /// installation can preserve that replay window, this is unavailable.
+    Remote,
+    /// Retain conversation text and replace bulky tool results with stubs.
+    Shake,
+    /// Produce a portable text summary with the active provider.
+    Soft,
+}
+
+impl AutoCompactionMethod {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Remote => "remote",
+            Self::Shake => "shake",
+            Self::Soft => "soft",
+        }
+    }
+}
+
+/// An explicit order is bounded and cannot repeat a paid summary request.
+pub(crate) fn validate_compaction_method_order(methods: &[AutoCompactionMethod]) -> Result<()> {
+    if methods.is_empty() || methods.len() > 3 {
+        return Err(Error::validation(
+            "compaction methodOrder must contain between one and three distinct methods",
+        ));
+    }
+    for (index, method) in methods.iter().enumerate() {
+        if methods[..index].contains(method) {
+            return Err(Error::validation(
+                "compaction methodOrder must not contain duplicate methods",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Render mode for compaction output (bd-cv653.7.6).
 ///
 /// Supports plain text summary (default) or text summary plus deterministic
@@ -150,16 +192,57 @@ pub struct ResolvedCompactionSettings {
     pub context_window_tokens: u32,
     pub reserve_tokens: u32,
     pub keep_recent_tokens: u32,
+    /// Optional earlier trigger; the model's reserved headroom still applies.
+    pub threshold_tokens: Option<u32>,
+    /// Optional earlier trigger as a percentage of the active model's window.
+    pub threshold_percent: Option<f64>,
+    /// Explicit bounded automatic fallback policy. `None` retains `mode`.
+    pub method_order: Option<Vec<AutoCompactionMethod>>,
     pub mode: AutoCompactionMode,
     /// Snapcompact rendering policy (bd-cv653.7.6).
     pub render_mode: CompactionRenderMode,
 }
 
+/// Effective reading of a compaction candidate by the next provider request.
+/// The session owner supplies this snapshot rather than inferring capabilities
+/// from a provider or model name. Text budgets affect the outbound archive
+/// reading only; the complete screened source remains durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionReader {
+    pub accepts_images: bool,
+    pub source_text_budget: Option<u32>,
+}
+
 impl ResolvedCompactionSettings {
+    /// Recompute the automatic trigger against the active model's capacity.
+    /// Explicit thresholds may compact earlier, but never consume reserved
+    /// response headroom. Invalid direct SDK values leave the safe default.
+    #[must_use]
+    pub fn trigger_tokens(&self) -> u64 {
+        self.trigger_tokens_for_window(self.context_window_tokens)
+    }
+
+    fn trigger_tokens_for_window(&self, context_window: u32) -> u64 {
+        let mut trigger = u64::from(context_window.saturating_sub(self.reserve_tokens));
+        if let Some(tokens) = self.threshold_tokens.filter(|tokens| *tokens > 0) {
+            trigger = trigger.min(u64::from(tokens));
+        }
+        if let Some(percent) = self
+            .threshold_percent
+            .filter(|percent| percent.is_finite() && *percent > 0.0 && *percent <= 100.0)
+        {
+            // The finite percentage and u32 window bound the result to u32.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let tokens = (f64::from(context_window) * percent / 100.0).floor() as u64;
+            trigger = trigger.min(tokens);
+        }
+        trigger
+    }
+
     /// Apply the mode's settings adjustments (aggressive halves keep-recent).
     #[must_use]
     pub const fn with_mode_applied(mut self) -> Self {
-        if matches!(self.mode, AutoCompactionMode::Aggressive) {
+        if self.method_order.is_none() && matches!(self.mode, AutoCompactionMode::Aggressive) {
             self.keep_recent_tokens /= 2;
         }
         self
@@ -184,6 +267,9 @@ impl Default for ResolvedCompactionSettings {
             reserve_tokens: 10_240,
             // 10% of context window
             keep_recent_tokens: 12_800,
+            threshold_tokens: None,
+            threshold_percent: None,
+            method_order: None,
             mode: AutoCompactionMode::default(),
             render_mode: CompactionRenderMode::default(),
         }
@@ -196,8 +282,8 @@ impl Default for ResolvedCompactionSettings {
 pub struct CompactionDetails {
     pub read_files: Vec<String>,
     pub modified_files: Vec<String>,
-    /// Compaction mode that produced this entry ("shake" or "handoff"); absent for the
-    /// default LLM-summary mode (bd-cv653.3.18).
+    /// Compaction mode that produced this entry ("shake", "soft" or "handoff");
+    /// absent for the legacy default LLM-summary mode (bd-cv653.3.18).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
 }
@@ -222,6 +308,10 @@ pub struct CompactionPreparation {
     pub turn_prefix_messages: Vec<SessionMessage>,
     pub is_split_turn: bool,
     pub tokens_before: u64,
+    /// Estimated provider-visible size of the actual retained tail. A safe
+    /// cut can retain more than `keep_recent_tokens`; that budget is not a
+    /// substitute for this count when selecting an automatic method.
+    pub retained_tokens: Option<u64>,
     pub previous_summary: Option<String>,
     pub file_ops: FileOperations,
     pub settings: ResolvedCompactionSettings,
@@ -1227,6 +1317,9 @@ pub fn compaction_preparation_to_value(prep: &CompactionPreparation) -> Value {
     obj.insert("turnPrefixMessages".to_string(), turn_prefix_messages);
     obj.insert("isSplitTurn".to_string(), Value::Bool(prep.is_split_turn));
     obj.insert("tokensBefore".to_string(), Value::from(prep.tokens_before));
+    if let Some(retained_tokens) = prep.retained_tokens {
+        obj.insert("retainedTokens".to_string(), Value::from(retained_tokens));
+    }
     if let Some(previous_summary) = &prep.previous_summary {
         obj.insert(
             "previousSummary".to_string(),
@@ -1273,6 +1366,39 @@ fn compaction_settings_to_value(settings: &ResolvedCompactionSettings) -> Value 
         "keepRecentTokens".to_string(),
         Value::from(settings.keep_recent_tokens),
     );
+    if let Some(tokens) = settings.threshold_tokens.filter(|tokens| *tokens > 0) {
+        obj.insert("thresholdTokens".to_string(), Value::from(tokens));
+    }
+    if let Some(percent) = settings
+        .threshold_percent
+        .filter(|percent| percent.is_finite() && *percent > 0.0 && *percent <= 100.0)
+    {
+        obj.insert("thresholdPercent".to_string(), Value::from(percent));
+    }
+    if let Some(methods) = &settings.method_order {
+        obj.insert(
+            "methodOrder".to_string(),
+            Value::Array(
+                methods
+                    .iter()
+                    .map(|method| Value::String(method.as_str().to_string()))
+                    .collect(),
+            ),
+        );
+    }
+    if settings.mode != AutoCompactionMode::Summary {
+        obj.insert(
+            "autoMode".to_string(),
+            Value::String(
+                match settings.mode {
+                    AutoCompactionMode::Summary => "summary",
+                    AutoCompactionMode::ShakeFirst => "shake-first",
+                    AutoCompactionMode::Aggressive => "aggressive",
+                }
+                .to_string(),
+            ),
+        );
+    }
     obj.insert(
         "renderMode".to_string(),
         Value::String(
@@ -1401,9 +1527,70 @@ fn compaction_settings_from_value(value: &Value) -> Result<ResolvedCompactionSet
             "compaction preparation: `settings.enabled` must be a boolean".to_string(),
         )
     })?;
+    let threshold_tokens = match preparation_field(obj, "thresholdTokens", "threshold_tokens") {
+        None | Some(Value::Null) => None,
+        Some(_) => {
+            let tokens = preparation_settings_u32(obj, "thresholdTokens", "threshold_tokens")?;
+            if tokens == 0 {
+                return Err(Error::validation(
+                    "compaction preparation: `settings.thresholdTokens` must be positive",
+                ));
+            }
+            Some(tokens)
+        }
+    };
+    let threshold_percent = match preparation_field(obj, "thresholdPercent", "threshold_percent") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_f64()
+                .filter(|percent| percent.is_finite() && *percent > 0.0 && *percent <= 100.0)
+                .ok_or_else(|| {
+                    Error::validation(
+                        "compaction preparation: `settings.thresholdPercent` must be greater than 0 and at most 100",
+                    )
+                })?,
+        ),
+    };
+    let method_order = match preparation_field(obj, "methodOrder", "method_order") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let methods = value
+                .as_array()
+                .filter(|methods| methods.len() <= 3)
+                .ok_or_else(|| {
+                    Error::validation(
+                        "compaction preparation: `settings.methodOrder` must be an array of at most three methods",
+                    )
+                })?;
+            let methods = methods
+                .iter()
+                .map(|method| {
+                    serde_json::from_value::<AutoCompactionMethod>(method.clone()).map_err(|_| {
+                        Error::validation(
+                            "compaction preparation: `settings.methodOrder` supports remote, shake and soft",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            validate_compaction_method_order(&methods)?;
+            Some(methods)
+        }
+    };
+    let mode = match preparation_field(obj, "autoMode", "auto_mode") {
+        None | Some(Value::Null) => AutoCompactionMode::default(),
+        Some(value) => {
+            serde_json::from_value::<AutoCompactionMode>(value.clone()).map_err(|_| {
+                Error::validation("compaction preparation: `settings.autoMode` is invalid")
+            })?
+        }
+    };
     Ok(ResolvedCompactionSettings {
         enabled,
-        mode: AutoCompactionMode::default(),
+        threshold_tokens,
+        threshold_percent,
+        method_order,
+        mode,
         render_mode: match obj.get("renderMode") {
             None => CompactionRenderMode::default(),
             Some(value) => value
@@ -1449,6 +1636,10 @@ pub fn compaction_preparation_from_value(value: &Value) -> Result<CompactionPrep
         preparation_messages(obj, "turnPrefixMessages", "turn_prefix_messages")?;
     let is_split_turn = preparation_bool(obj, "isSplitTurn", "is_split_turn")?;
     let tokens_before = preparation_u64(obj, "tokensBefore", "tokens_before")?;
+    let retained_tokens = match preparation_field(obj, "retainedTokens", "retained_tokens") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(preparation_u64(obj, "retainedTokens", "retained_tokens")?),
+    };
 
     // The serializer omits `previousSummary` when absent, so a missing key or
     // an explicit null both mean "no previous summary"; any other non-string
@@ -1480,6 +1671,7 @@ pub fn compaction_preparation_from_value(value: &Value) -> Result<CompactionPrep
         turn_prefix_messages,
         is_split_turn,
         tokens_before,
+        retained_tokens,
         previous_summary,
         file_ops,
         settings,
@@ -1672,6 +1864,13 @@ fn estimate_context_tokens_for_model(
     };
     let mut last_usage: Option<(&Usage, usize)> = None;
     for (idx, msg) in messages.iter().enumerate().rev() {
+        if matches!(msg, SessionMessage::CompactionSummary { .. }) {
+            // The retained tail precedes this record in session order, but
+            // its usage measured a request before the history was replaced.
+            // Until a newer request succeeds, count the whole live context
+            // instead of triggering another compaction with stale usage.
+            break;
+        }
         if let Some(usage) = get_assistant_usage(msg) {
             // Usage describes the request made to its original model. After a
             // switch it cannot anchor the new reader's context, even when both
@@ -1800,9 +1999,7 @@ pub fn estimate_model_context_tokens_for_model(
     let estimate = |messages: &[Message]| {
         messages
             .iter()
-            .cloned()
-            .map(SessionMessage::from)
-            .map(|message| estimate_tokens_with_table(&message, table))
+            .map(|message| estimate_model_message_with_table(message, table))
             .fold(0u64, u64::saturating_add)
     };
     if accepts_images
@@ -1831,9 +2028,7 @@ fn should_compact(
     if !settings.enabled {
         return false;
     }
-    let reserve = u64::from(settings.reserve_tokens);
-    let window = u64::from(context_window);
-    context_tokens >= window.saturating_sub(reserve)
+    context_tokens >= settings.trigger_tokens_for_window(context_window)
 }
 
 /// Accumulate one content block's countable text into `text`, or add its
@@ -1934,6 +2129,44 @@ fn estimate_tokens_with_table(
         | SessionMessage::CompactionSummary { summary, .. } => text.push_str(summary),
     }
 
+    flat_tokens.saturating_add(crate::token_count::active_counter().count(&text, table))
+}
+
+/// Count borrowed provider messages without cloning their image/media payloads.
+/// All roles share the selected reader's table, and historical assistant usage
+/// is deliberately ignored when evaluating a replacement context.
+fn estimate_model_message_with_table(
+    message: &Message,
+    table: crate::token_count::TokenTable,
+) -> u64 {
+    let mut text = String::new();
+    let mut flat_tokens = 0;
+    match message {
+        Message::User(user) => match &user.content {
+            UserContent::Text(value) => text.push_str(value),
+            UserContent::Blocks(blocks) => {
+                for block in blocks {
+                    accumulate_block_estimate(block, &mut text, &mut flat_tokens);
+                }
+            }
+        },
+        Message::Assistant(assistant) => {
+            for block in &assistant.content {
+                accumulate_block_estimate(block, &mut text, &mut flat_tokens);
+            }
+        }
+        Message::ToolResult(result) => {
+            for block in &result.content {
+                accumulate_block_estimate(block, &mut text, &mut flat_tokens);
+            }
+        }
+        Message::Custom(custom) => {
+            text.push_str(&custom.content);
+            if let Some(source) = crate::compaction_snap::source_for_custom(custom) {
+                text.push_str(source);
+            }
+        }
+    }
     flat_tokens.saturating_add(crate::token_count::active_counter().count(&text, table))
 }
 
@@ -2646,11 +2879,29 @@ pub fn prepare_compaction_for_model(
 /// below that threshold. Never summarize the current authored user or its tool
 /// tail: native image/audio/video blocks cannot survive a text-only summary.
 /// Empty history and turns without an older safe prefix remain no-ops.
+#[cfg(test)]
 pub(crate) fn prepare_overflow_compaction(
     path_entries: &[SessionEntry],
     settings: ResolvedCompactionSettings,
 ) -> Option<CompactionPreparation> {
     prepare_compaction_impl(path_entries, settings, true, false, None)
+}
+
+/// Overflow preparation using the active reader's counter for its retained
+/// tail, so explicit fallback policy does not reuse a former model's estimate.
+pub(crate) fn prepare_overflow_compaction_for_model(
+    path_entries: &[SessionEntry],
+    settings: ResolvedCompactionSettings,
+    provider: &str,
+    model_id: &str,
+) -> Option<CompactionPreparation> {
+    prepare_compaction_impl(
+        path_entries,
+        settings,
+        true,
+        false,
+        Some((provider, model_id)),
+    )
 }
 
 /// Manual `/compact` and `/shake` ignore the automatic threshold and the
@@ -2663,6 +2914,8 @@ pub(crate) fn prepare_manual_compaction(
     mut settings: ResolvedCompactionSettings,
 ) -> Option<CompactionPreparation> {
     settings.enabled = true;
+    settings.method_order = None;
+    settings.mode = AutoCompactionMode::Summary;
     prepare_compaction_impl(path_entries, settings, true, false, None)
 }
 
@@ -2675,6 +2928,7 @@ pub(crate) fn prepare_handoff_compaction(
     mut settings: ResolvedCompactionSettings,
 ) -> Option<CompactionPreparation> {
     settings.enabled = true;
+    settings.method_order = None;
     settings.mode = AutoCompactionMode::Summary;
     settings.render_mode = CompactionRenderMode::Text;
     prepare_compaction_impl(path_entries, settings, true, true, None)
@@ -2828,6 +3082,21 @@ fn prepare_compaction_impl(
 
     let first_kept_entry = &path_entries[cut_point.first_kept_entry_index];
     let first_kept_entry_id = first_kept_entry.base_id()?.clone();
+    let table =
+        model.map(|(provider, model_id)| crate::token_count::table_for_model(provider, model_id));
+    let retained_tokens = path_entries[cut_point.first_kept_entry_index..boundary_end]
+        .iter()
+        .filter(|entry| !entry_is_compaction_boundary(entry))
+        .filter_map(message_from_entry)
+        .filter_map(|message| session_message_to_model(&message))
+        .map(SessionMessage::from)
+        .map(|message| {
+            table.map_or_else(
+                || estimate_tokens(&message),
+                |table| estimate_tokens_with_table(&message, table),
+            )
+        })
+        .fold(0u64, u64::saturating_add);
 
     let history_end = if cut_point.is_split_turn {
         cut_point.turn_start_index?
@@ -2931,6 +3200,7 @@ fn prepare_compaction_impl(
         turn_prefix_messages,
         is_split_turn: cut_point.is_split_turn,
         tokens_before,
+        retained_tokens: Some(retained_tokens),
         previous_summary,
         file_ops,
         settings,
@@ -2969,6 +3239,7 @@ pub async fn summarize_entries(
         turn_prefix_messages: Vec::new(),
         is_split_turn: false,
         tokens_before: 0,
+        retained_tokens: Some(0),
         previous_summary: None,
         file_ops: FileOperations::default(),
         settings,
@@ -2981,6 +3252,7 @@ pub async fn summarize_entries(
         custom_instructions.as_deref(),
         &prompts,
         &mut privacy,
+        true,
     )?;
     let mut summary =
         generate_llm_summary(&preparation.settings, provider, stream_options, requests).await?;
@@ -3007,6 +3279,7 @@ fn prepare_summary_requests(
     custom_instructions: Option<&str>,
     prompts: &SummaryPrompts,
     privacy: &mut CompactionPrivacy,
+    include_archive: bool,
 ) -> Result<PreparedSummaryRequests> {
     let split = preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty();
     let mut requests = PreparedSummaryRequests {
@@ -3021,19 +3294,9 @@ fn prepare_summary_requests(
         }),
         turn_prefix: split
             .then(|| turn_prefix_prompt_text(&preparation.turn_prefix_messages, prompts)),
-        snap_transcript: matches!(
-            preparation.settings.render_mode,
-            CompactionRenderMode::SnapCompact
-        )
-        .then(|| {
-            let messages = preparation
-                .messages_to_summarize
-                .iter()
-                .chain(&preparation.turn_prefix_messages)
-                .filter_map(session_message_to_model)
-                .collect::<Vec<_>>();
-            serialize_conversation(&messages)
-        }),
+        snap_transcript: include_archive
+            .then(|| snap_transcript(preparation))
+            .flatten(),
     };
     let mut fields = SummaryFields::default();
     fields.text(&mut requests.system)?;
@@ -3049,6 +3312,40 @@ fn prepare_summary_requests(
     }
     fields.screen(privacy)?;
     Ok(requests)
+}
+
+fn snap_transcript(preparation: &CompactionPreparation) -> Option<String> {
+    (preparation.settings.render_mode == CompactionRenderMode::SnapCompact).then(|| {
+        let messages = preparation
+            .messages_to_summarize
+            .iter()
+            .chain(&preparation.turn_prefix_messages)
+            .filter_map(session_message_to_model)
+            .collect::<Vec<_>>();
+        serialize_conversation(&messages)
+    })
+}
+
+/// Render only a complete admitted source. The caller screens this transcript
+/// before entering here; all fallback methods share the resulting archive.
+fn render_snap_payload(transcript: String) -> Option<crate::compaction_snap::SnapPayload> {
+    if transcript.len() > crate::compaction_snap::MAX_SOURCE_TEXT_BYTES {
+        tracing::warn!(
+            target: "snapcompact",
+            reason_code = "snapcompact_source_text_limit",
+            "Archive source exceeds its retention budget; retaining the compaction summary"
+        );
+        return None;
+    }
+    let frames = crate::compaction_snap::render_frames(&transcript);
+    tracing::info!(
+        target: "snapcompact",
+        frame_count = frames.len(),
+        source_chars = transcript.chars().count(),
+        reason_code = "snapcompact_archive_generated",
+        "Retained compacted source with its available visual reading"
+    );
+    Some(crate::compaction_snap::SnapPayload::new(frames).with_source_text(transcript))
 }
 
 /// Provider failures and empty replies remain eligible for local fallback.
@@ -3094,13 +3391,16 @@ async fn generate_llm_summary(
 fn finish_compaction(
     preparation: &CompactionPreparation,
     mut summary: String,
-    screened_snap_transcript: Option<String>,
+    mut screened_snap_transcript: Option<String>,
     privacy: &mut CompactionPrivacy,
 ) -> Result<CompactionResult> {
     let (read_files, modified_files) = compute_file_lists(&preparation.file_ops);
     summary.push_str(&format_file_operations(&read_files, &modified_files));
     let mut fields = SummaryFields::default();
     fields.text(&mut summary)?;
+    if let Some(transcript) = screened_snap_transcript.as_mut() {
+        fields.text(transcript)?;
+    }
     fields.screen(privacy)?;
     let details = CompactionDetails {
         read_files,
@@ -3112,25 +3412,7 @@ fn finish_compaction(
         preparation.settings.render_mode,
         CompactionRenderMode::SnapCompact
     ) {
-        screened_snap_transcript.and_then(|transcript| {
-            if transcript.len() > crate::compaction_snap::MAX_SOURCE_TEXT_BYTES {
-                tracing::warn!(
-                    target: "snapcompact",
-                    reason_code = "snapcompact_source_text_limit",
-                    "Archive source exceeds its retention budget; retaining the compaction summary"
-                );
-                return None;
-            }
-            let frames = crate::compaction_snap::render_frames(&transcript);
-            tracing::info!(
-                target: "snapcompact",
-                frame_count = frames.len(),
-                source_chars = transcript.chars().count(),
-                reason_code = "snapcompact_archive_generated",
-                "Retained compacted source with its available visual reading"
-            );
-            Some(crate::compaction_snap::SnapPayload::new(frames).with_source_text(transcript))
-        })
+        screened_snap_transcript.and_then(render_snap_payload)
     } else {
         None
     };
@@ -3171,6 +3453,7 @@ pub(crate) async fn compact_handoff(
         instructions.as_deref(),
         &prompts,
         &mut privacy,
+        true,
     )?;
     if requests.turn_prefix.is_some() {
         return Err(Error::validation(
@@ -3239,6 +3522,7 @@ pub async fn compact(
         custom_instructions.as_deref(),
         &prompts,
         &mut privacy,
+        true,
     )?;
     let snap_transcript = requests.snap_transcript.take();
     let summary = match generate_llm_summary(
@@ -3488,18 +3772,31 @@ pub const fn estimate_text_tokens(text: &str) -> u64 {
     (text.len() / CHARS_PER_TOKEN_ESTIMATE) as u64
 }
 
-/// Mode-aware automatic compaction (bd-cv653.3.18).
+/// Policy-aware automatic compaction.
 ///
-/// `shake-first` takes the instant no-LLM shortcut when it reclaims enough;
-/// everything else (and an insufficient shake) runs the standard LLM summary
-/// with its local fallback.
+/// An explicit order selects one usable candidate from the original source.
+/// Without it, the legacy `shake-first` shortcut and LLM summary fallback
+/// retain their existing behavior.
 pub async fn compact_auto(
     preparation: CompactionPreparation,
     provider: Arc<dyn Provider>,
     stream_options: &StreamOptions,
     custom_instructions: Option<&str>,
     privacy: &CompactionPrivacy,
+    reader: CompactionReader,
 ) -> Result<CompactionResult> {
+    if let Some(method_order) = preparation.settings.method_order.clone() {
+        return compact_ordered_auto(
+            preparation,
+            &method_order,
+            provider,
+            stream_options,
+            custom_instructions,
+            privacy,
+            reader,
+        )
+        .await;
+    }
     if matches!(preparation.settings.mode, AutoCompactionMode::ShakeFirst) {
         let projection = shake_projection(&preparation);
         if !shake_first_needs_summary(projection, &preparation.settings) {
@@ -3519,6 +3816,235 @@ pub async fn compact_auto(
         privacy,
     )
     .await
+}
+
+async fn compact_ordered_auto(
+    mut preparation: CompactionPreparation,
+    methods: &[AutoCompactionMethod],
+    provider: Arc<dyn Provider>,
+    stream_options: &StreamOptions,
+    custom_instructions: Option<&str>,
+    privacy: &CompactionPrivacy,
+    reader: CompactionReader,
+) -> Result<CompactionResult> {
+    validate_compaction_method_order(methods)?;
+    let retained_tokens = preparation.retained_tokens.ok_or_else(|| {
+        Error::validation(
+            "Explicit compaction methodOrder requires retainedTokens from native preparation",
+        )
+    })?;
+    let mut privacy = privacy.clone();
+    let mut instructions = custom_instructions.map(str::to_string);
+    // A local method must not turn a privacy refusal into permission to
+    // replace history. Every candidate reads this same screened source.
+    let prompts = privacy.screen(&mut preparation, &mut instructions)?;
+    // Build the reader's archive projection once. Rejected methods change only
+    // the text summary; they do not re-render or clone the encoded frames.
+    let mut projection = CompactionSummaryProjection::new(
+        prepare_ordered_archive(&preparation, methods, &mut privacy)?,
+        reader,
+        provider.name(),
+        provider.model_id(),
+    )?;
+    let mut last_failure = None;
+    for method in methods {
+        let outcome = match method {
+            AutoCompactionMethod::Remote => {
+                last_failure = Some(Error::validation(
+                    "Automatic remote compaction is unavailable: native replay installation is not supported",
+                ));
+                continue;
+            }
+            AutoCompactionMethod::Shake => {
+                let summary = build_shake_summary(&preparation);
+                finish_compaction(&preparation, summary, None, &mut privacy)
+            }
+            AutoCompactionMethod::Soft => {
+                let requests = prepare_summary_requests(
+                    &preparation,
+                    instructions.as_deref(),
+                    &prompts,
+                    &mut privacy,
+                    false,
+                )?;
+                // Explicit methods own the fallback decision. The emergency
+                // local truncation used by legacy `compact` must not replace
+                // an unavailable configured method behind the caller's back.
+                generate_llm_summary(
+                    &preparation.settings,
+                    Arc::clone(&provider),
+                    stream_options,
+                    requests,
+                )
+                .await
+                .and_then(|summary| finish_compaction(&preparation, summary, None, &mut privacy))
+            }
+        };
+        let mut result = match outcome {
+            Ok(result) => result,
+            Err(error) if summary_fallback_allowed(&error) => {
+                last_failure = Some(error);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let projected_tokens = projection.tokens(&result.summary, retained_tokens, &mut privacy)?;
+        if projected_tokens < preparation.tokens_before
+            && projected_tokens < preparation.settings.trigger_tokens()
+        {
+            result.details.mode = Some(method.as_str().to_string());
+            result.snap_payload = projection.payload.take();
+            return Ok(result);
+        }
+        last_failure = Some(Error::session(format!(
+            "Automatic {} compaction reclaimed insufficient context: projected {projected_tokens} tokens, previous {}, trigger {}",
+            method.as_str(),
+            preparation.tokens_before,
+            preparation.settings.trigger_tokens(),
+        )));
+    }
+    Err(last_failure.unwrap_or_else(|| {
+        Error::validation("No configured automatic compaction method is available")
+    }))
+}
+
+fn prepare_ordered_archive(
+    preparation: &CompactionPreparation,
+    methods: &[AutoCompactionMethod],
+    privacy: &mut CompactionPrivacy,
+) -> Result<Option<crate::compaction_snap::SnapPayload>> {
+    if methods
+        .iter()
+        .all(|method| *method == AutoCompactionMethod::Remote)
+    {
+        return Ok(None);
+    }
+    let mut transcript = snap_transcript(preparation);
+    if let Some(transcript) = transcript.as_mut() {
+        let mut fields = SummaryFields::default();
+        fields.text(transcript)?;
+        fields.screen(privacy)?;
+    }
+    Ok(transcript.and_then(render_snap_payload))
+}
+
+/// One actual provider-visible summary/archive message. Archive projection is
+/// shared by the bounded fallback sequence; only its summary text is replaced.
+struct CompactionSummaryProjection<'a> {
+    payload: Option<crate::compaction_snap::SnapPayload>,
+    message: Message,
+    source_reading: String,
+    table: crate::token_count::TokenTable,
+    reader: CompactionReader,
+    provider: &'a str,
+    model_id: &'a str,
+}
+
+impl<'a> CompactionSummaryProjection<'a> {
+    fn new(
+        payload: Option<crate::compaction_snap::SnapPayload>,
+        reader: CompactionReader,
+        provider: &'a str,
+        model_id: &'a str,
+    ) -> Result<Self> {
+        let empty_summary = format!(
+            "{}{}",
+            crate::compaction_snap::COMPACTION_SUMMARY_PREFIX,
+            crate::compaction_snap::COMPACTION_SUMMARY_SUFFIX,
+        );
+        let message = session_message_to_model(&SessionMessage::CompactionSummary {
+            summary: String::new(),
+            tokens_before: 0,
+        })
+        .ok_or_else(|| Error::session("Compaction summary has no model message"))?;
+        let mut messages = [crate::compaction_snap::attach_frames(
+            message,
+            payload.as_ref(),
+        )];
+        crate::compaction_snap::project_for_model(
+            &mut messages,
+            reader.accepts_images,
+            reader.source_text_budget,
+            provider,
+            model_id,
+        );
+        let [mut message] = messages;
+        let text = std::mem::take(Self::summary_text(&mut message)?);
+        let source_reading = text
+            .strip_prefix(&empty_summary)
+            .ok_or_else(|| Error::session("Compaction projection changed its summary envelope"))?
+            .to_string();
+        Ok(Self {
+            payload,
+            message,
+            source_reading,
+            table: crate::token_count::table_for_model(provider, model_id),
+            reader,
+            provider,
+            model_id,
+        })
+    }
+
+    fn summary_text(message: &mut Message) -> Result<&mut String> {
+        if let Message::User(user) = message {
+            match &mut user.content {
+                UserContent::Text(text) => return Ok(text),
+                UserContent::Blocks(blocks) => {
+                    if let Some(ContentBlock::Text(text)) = blocks.first_mut() {
+                        return Ok(&mut text.text);
+                    }
+                }
+            }
+        }
+        Err(Error::session(
+            "Compaction projection has no summary message",
+        ))
+    }
+
+    fn tokens(
+        &mut self,
+        summary: &str,
+        retained_tokens: u64,
+        privacy: &mut CompactionPrivacy,
+    ) -> Result<u64> {
+        self.refresh_archive(privacy)?;
+        let text = Self::summary_text(&mut self.message)?;
+        text.clear();
+        text.push_str(crate::compaction_snap::COMPACTION_SUMMARY_PREFIX);
+        text.push_str(summary);
+        text.push_str(crate::compaction_snap::COMPACTION_SUMMARY_SUFFIX);
+        text.push_str(&self.source_reading);
+        Ok(retained_tokens
+            .saturating_add(estimate_model_message_with_table(&self.message, self.table)))
+    }
+
+    fn refresh_archive(&mut self, privacy: &mut CompactionPrivacy) -> Result<()> {
+        // A summary can reveal an assignment for a value that appeared only
+        // as a bare echo in the source. Refresh only when screening discovers
+        // a new redaction; ordinary fallback does not re-render the archive.
+        let changed = if let Some(source) = self
+            .payload
+            .as_mut()
+            .and_then(|payload| payload.source_text.as_mut())
+        {
+            let previous = source.clone();
+            let mut fields = SummaryFields::default();
+            fields.text(source)?;
+            fields.screen(privacy)?;
+            *source != previous
+        } else {
+            false
+        };
+        if changed {
+            let payload = self
+                .payload
+                .take()
+                .and_then(|payload| payload.source_text)
+                .and_then(render_snap_payload);
+            *self = Self::new(payload, self.reader, self.provider, self.model_id)?;
+        }
+        Ok(())
+    }
 }
 
 /// Estimate what the compacted span would shrink to under a shake.
@@ -4392,6 +4918,124 @@ mod tests {
         assert!(should_compact(90_001, 100_000, &settings));
     }
 
+    #[test]
+    fn explicit_thresholds_keep_reserved_headroom_and_track_the_active_window() {
+        let mut settings = ResolvedCompactionSettings {
+            context_window_tokens: 100_000,
+            reserve_tokens: 10_000,
+            threshold_tokens: Some(60_000),
+            threshold_percent: Some(50.0),
+            ..Default::default()
+        };
+        assert_eq!(settings.trigger_tokens(), 50_000);
+        assert!(!should_compact(49_999, 100_000, &settings));
+        assert!(should_compact(50_000, 100_000, &settings));
+        settings.threshold_tokens = Some(40_000);
+        assert_eq!(settings.trigger_tokens(), 40_000);
+        settings.threshold_tokens = Some(120_000);
+        settings.threshold_percent = Some(100.0);
+        assert_eq!(settings.trigger_tokens(), 90_000);
+
+        settings.threshold_tokens = None;
+        settings.threshold_percent = Some(37.5);
+        settings.reserve_tokens = 0;
+        settings.context_window_tokens = 101;
+        assert_eq!(settings.trigger_tokens(), 37);
+        settings.context_window_tokens = 201;
+        assert_eq!(settings.trigger_tokens(), 75);
+        settings.reserve_tokens = 202;
+        assert_eq!(settings.trigger_tokens(), 0);
+
+        settings.reserve_tokens = 0;
+        settings.threshold_tokens = Some(0);
+        for percent in [0.0, -1.0, 100.1, f64::NAN, f64::INFINITY] {
+            settings.threshold_percent = Some(percent);
+            assert_eq!(settings.trigger_tokens(), 201);
+        }
+        settings.threshold_tokens = Some(1);
+        settings.enabled = false;
+        assert!(!should_compact(1_000_000, 201, &settings));
+    }
+
+    #[test]
+    fn explicit_thresholds_drive_preparation_and_shake_escalation() {
+        let entries = vec![
+            user_entry("old-user", "Earlier work to preserve."),
+            assistant_entry("old-answer", "The earlier task is complete.", 800, 100),
+            user_entry("current-user", "Continue the work."),
+        ];
+        let mut settings = ResolvedCompactionSettings {
+            context_window_tokens: 100_000,
+            reserve_tokens: 10_000,
+            keep_recent_tokens: 1,
+            ..Default::default()
+        };
+        assert!(prepare_compaction(&entries, settings.clone()).is_none());
+        settings.threshold_tokens = Some(500);
+        let prep = prepare_compaction(&entries, settings.clone()).expect("earlier trigger");
+        assert_eq!(prep.settings.context_window_tokens, 100_000);
+        assert_eq!(prep.settings.reserve_tokens, 10_000);
+        let projection = ShakeProjection {
+            tokens_before: prep.tokens_before,
+            projected_tokens: 500,
+        };
+        assert!(shake_first_needs_summary(projection, &settings));
+        settings.threshold_tokens = None;
+        assert!(!shake_first_needs_summary(projection, &settings));
+
+        settings.threshold_percent = Some(0.5);
+        assert!(prepare_compaction(&entries, settings.clone()).is_some());
+        settings.context_window_tokens = 1_000_000;
+        assert!(prepare_compaction(&entries, settings.clone()).is_none());
+        settings.enabled = false;
+        assert!(prepare_manual_compaction(&entries, settings).is_some());
+    }
+
+    #[test]
+    fn ordered_preparation_counts_the_whole_retained_turn_and_manual_ignores_auto_policy() {
+        let entries = vec![
+            user_entry("old-user", &distinct_words(2_000)),
+            assistant_entry("old-answer", "The earlier task is complete.", 0, 0),
+            user_entry("current-user", &distinct_words(400)),
+        ];
+        let settings = ResolvedCompactionSettings {
+            context_window_tokens: 10_000,
+            reserve_tokens: 1_000,
+            keep_recent_tokens: 100,
+            threshold_tokens: Some(500),
+            method_order: Some(vec![
+                AutoCompactionMethod::Shake,
+                AutoCompactionMethod::Soft,
+            ]),
+            mode: AutoCompactionMode::Aggressive,
+            ..Default::default()
+        };
+        let prep = prepare_compaction_for_model(&entries, settings.clone(), "openai", "gpt-4o")
+            .expect("threshold preparation");
+        assert_eq!(prep.first_kept_entry_id, "current-user");
+        assert_eq!(prep.settings.keep_recent_tokens, 100);
+        let current_turn =
+            [
+                session_message_to_model(&message_from_entry(&entries[2]).expect("current user"))
+                    .expect("visible current user"),
+            ];
+        let expected_tail =
+            estimate_model_context_tokens_for_model(&current_turn, false, None, "openai", "gpt-4o");
+        assert!(expected_tail > u64::from(settings.keep_recent_tokens));
+        assert_eq!(prep.retained_tokens, Some(expected_tail));
+
+        let mut manual_settings = settings;
+        manual_settings.enabled = false;
+        manual_settings.threshold_tokens = Some(9_000);
+        manual_settings.method_order = Some(vec![AutoCompactionMethod::Remote]);
+        let manual = prepare_manual_compaction(&entries, manual_settings)
+            .expect("manual request bypasses automatic policy");
+        assert_eq!(manual.first_kept_entry_id, "current-user");
+        assert_eq!(manual.settings.keep_recent_tokens, 100);
+        assert_eq!(manual.settings.mode, AutoCompactionMode::Summary);
+        assert!(manual.settings.method_order.is_none());
+    }
+
     // ── estimate_tokens ──────────────────────────────────────────────
 
     #[test]
@@ -4519,6 +5163,75 @@ mod tests {
     }
 
     #[test]
+    fn cached_summary_projection_matches_the_installed_archive_reading() {
+        let source = format!("HEAD café 日本\n{}TAIL", "archived evidence.\n".repeat(30));
+        let payload = render_snap_payload(source).expect("bounded archive");
+        assert!(!payload.frames.is_empty());
+        let provider = "gateway";
+        let model_id = "openai/gpt-4-turbo";
+        for archive in [None, Some(payload)] {
+            for reader in [
+                CompactionReader {
+                    accepts_images: false,
+                    source_text_budget: Some(0),
+                },
+                CompactionReader {
+                    accepts_images: false,
+                    source_text_budget: Some(32),
+                },
+                CompactionReader {
+                    accepts_images: false,
+                    source_text_budget: None,
+                },
+                CompactionReader {
+                    accepts_images: true,
+                    source_text_budget: Some(32),
+                },
+            ] {
+                let mut projection =
+                    CompactionSummaryProjection::new(archive.clone(), reader, provider, model_id)
+                        .expect("reader projection");
+                let mut privacy = CompactionPrivacy::default();
+                for summary in [
+                    "first checkpoint",
+                    "revised checkpoint with café 日本 evidence",
+                ] {
+                    let mut session = crate::session::Session::in_memory();
+                    session.append_message(make_user_text("old source"));
+                    let kept = session.append_message(make_user_text("current request café 日本"));
+                    session.append_message(make_assistant_text("retained response", 900_000, 1000));
+                    let retained_tokens = estimate_model_context_tokens_for_model(
+                        &session.to_messages_for_current_path()[1..],
+                        reader.accepts_images,
+                        reader.source_text_budget,
+                        provider,
+                        model_id,
+                    );
+                    let projected = projection
+                        .tokens(summary, retained_tokens, &mut privacy)
+                        .expect("project candidate");
+                    let details = archive
+                        .as_ref()
+                        .map(|payload| crate::compaction_snap::payload_to_details(None, payload));
+                    session.append_compaction(summary.to_string(), kept, 100_000, details, None);
+                    let installed = estimate_model_context_tokens_for_model(
+                        &session.to_messages_for_current_path(),
+                        reader.accepts_images,
+                        reader.source_text_budget,
+                        provider,
+                        model_id,
+                    );
+                    assert_eq!(projected, installed, "reader={reader:?}, summary={summary}");
+                }
+                assert_eq!(
+                    projection.payload, archive,
+                    "budgeting cannot mutate durable source"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn active_model_usage_is_authoritative_but_switching_discards_the_checkpoint() {
         let mut assistant = make_assistant_text("old answer", 80_000, 2_000);
         if let SessionMessage::Assistant { message } = &mut assistant {
@@ -4578,6 +5291,126 @@ mod tests {
         };
         assert!(prepare_compaction(&entries, settings.clone()).is_some());
         assert!(prepare_compaction_for_model(&entries, settings, "openai", "gpt-4o").is_none());
+    }
+
+    #[test]
+    fn automatic_compaction_ignores_usage_from_the_retained_pre_compaction_tail() {
+        let mut session = crate::session::Session::in_memory();
+        session.append_message(make_user_text(&distinct_words(2_000)));
+        let retained = session.append_message(make_user_text("Keep the parser decisions."));
+        let mut assistant = make_assistant_text("Duplicate IDs are rejected.", 900_000, 100_000);
+        if let SessionMessage::Assistant { message } = &mut assistant {
+            message.provider = "openai".into();
+            message.model = "gpt-4o".into();
+        }
+        session.append_message(assistant);
+        session.append_compaction(
+            "Earlier work is complete.".to_string(),
+            retained,
+            1_000_000,
+            None,
+            None,
+        );
+        session.append_message(make_user_text("Continue with the next task."));
+        let entries = session
+            .entries_for_current_path()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let settings = ResolvedCompactionSettings {
+            context_window_tokens: 128_000,
+            reserve_tokens: 10_000,
+            keep_recent_tokens: 1,
+            ..Default::default()
+        };
+
+        assert!(prepare_compaction(&entries, settings.clone()).is_none());
+        assert!(
+            prepare_compaction_for_model(&entries, settings.clone(), "openai", "gpt-4o").is_none(),
+            "the first prompt after compaction must not reuse the retained assistant's old usage"
+        );
+
+        // Force preparation to inspect its fallback estimate. Every live
+        // message still counts, including the retained tail and summary;
+        // neither the archived source nor its old million-token usage does.
+        let prepared =
+            prepare_overflow_compaction_for_model(&entries, settings, "openai", "gpt-4o")
+                .expect("the retained earlier turn is a safe prefix");
+        let expected: u64 = [
+            "Keep the parser decisions.",
+            "Duplicate IDs are rejected.\n",
+            "Earlier work is complete.",
+            "Continue with the next task.",
+        ]
+        .into_iter()
+        .map(|text| crate::token_count::count_tokens_for_model(text, "openai", "gpt-4o"))
+        .sum();
+        assert_eq!(prepared.tokens_before, expected);
+        assert!(expected < 100);
+    }
+
+    #[test]
+    fn compaction_boundary_keeps_new_usage_authoritative() {
+        let mut old = make_assistant_text("Retained answer.", 900_000, 100_000);
+        let mut fresh = make_assistant_text("A new response.", 80_000, 2_000);
+        for assistant in [&mut old, &mut fresh] {
+            if let SessionMessage::Assistant { message } = assistant {
+                message.provider = "openai".into();
+                message.model = "gpt-4o".into();
+            }
+        }
+        let messages = vec![
+            make_user_text("Retained request."),
+            old,
+            SessionMessage::CompactionSummary {
+                summary: "Earlier work is complete.".into(),
+                tokens_before: 1_000_000,
+            },
+            make_user_text("A new request."),
+            fresh,
+            make_user_text("Continue."),
+        ];
+        let estimate = estimate_context_tokens_for_model(&messages, Some(("openai", "gpt-4o")));
+        assert_eq!(
+            estimate.tokens,
+            82_000 + crate::token_count::count_tokens_for_model("Continue.", "openai", "gpt-4o")
+        );
+        assert_eq!(estimate.last_usage_index, Some(4));
+    }
+
+    #[test]
+    fn unmeasured_or_failed_requests_after_compaction_cannot_revive_old_usage() {
+        for (stop_reason, input) in [
+            (StopReason::Stop, 0),
+            (StopReason::Aborted, 800_000),
+            (StopReason::Error, 800_000),
+        ] {
+            let mut old = make_assistant_text("Retained answer.", 900_000, 100_000);
+            let mut failed = make_assistant_text("Later response.", input, 0);
+            for assistant in [&mut old, &mut failed] {
+                if let SessionMessage::Assistant { message } = assistant {
+                    message.provider = "openai".into();
+                    message.model = "gpt-4o".into();
+                }
+            }
+            if let SessionMessage::Assistant { message } = &mut failed {
+                message.stop_reason = stop_reason;
+            }
+            let messages = vec![
+                make_user_text("Retained request."),
+                old,
+                SessionMessage::CompactionSummary {
+                    summary: String::new(),
+                    tokens_before: 1_000_000,
+                },
+                make_user_text("A new request."),
+                failed,
+                make_user_text("Retry."),
+            ];
+            let estimate = estimate_context_tokens_for_model(&messages, Some(("openai", "gpt-4o")));
+            assert!((1..100).contains(&estimate.tokens));
+            assert_eq!(estimate.last_usage_index, None);
+        }
     }
 
     // ── estimate_entries_context_tokens (tokensAfter heuristic) ──────
@@ -5636,6 +6469,9 @@ mod tests {
             context_window_tokens: 100_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
+            threshold_tokens: None,
+            threshold_percent: None,
+            method_order: None,
             mode: AutoCompactionMode::default(),
             render_mode: CompactionRenderMode::default(),
         };
@@ -5898,6 +6734,9 @@ mod tests {
             context_window_tokens: 1_000_000,
             reserve_tokens: 32_000,
             keep_recent_tokens: u32::try_from(latest_turn_tokens + 1).unwrap(),
+            threshold_tokens: None,
+            threshold_percent: None,
+            method_order: None,
             mode: AutoCompactionMode::Aggressive,
             render_mode: CompactionRenderMode::SnapCompact,
         };
@@ -6008,6 +6847,9 @@ mod tests {
             context_window_tokens: 50_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
+            threshold_tokens: None,
+            threshold_percent: None,
+            method_order: None,
             mode: AutoCompactionMode::ShakeFirst,
             render_mode: CompactionRenderMode::default(),
         };
@@ -6022,6 +6864,10 @@ mod tests {
                 &StreamOptions::default(),
                 None,
                 &CompactionPrivacy::default(),
+                CompactionReader {
+                    accepts_images: false,
+                    source_text_budget: Some(8_192),
+                },
             ))
             .expect("compact_auto");
         assert_eq!(result.details.mode.as_deref(), Some("shake"));
@@ -6035,6 +6881,9 @@ mod tests {
             context_window_tokens: 50_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 12_800,
+            threshold_tokens: None,
+            threshold_percent: None,
+            method_order: None,
             mode: AutoCompactionMode::Aggressive,
             render_mode: CompactionRenderMode::default(),
         };
@@ -6070,6 +6919,9 @@ mod tests {
             context_window_tokens: 50_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
+            threshold_tokens: None,
+            threshold_percent: None,
+            method_order: None,
             mode: AutoCompactionMode::default(),
             render_mode: CompactionRenderMode::default(),
         };
@@ -6113,6 +6965,9 @@ mod tests {
             context_window_tokens: 50_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
+            threshold_tokens: None,
+            threshold_percent: None,
+            method_order: None,
             mode: AutoCompactionMode::default(),
             render_mode: CompactionRenderMode::default(),
         };
@@ -6135,6 +6990,9 @@ mod tests {
             context_window_tokens: 50_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
+            threshold_tokens: None,
+            threshold_percent: None,
+            method_order: None,
             mode: AutoCompactionMode::default(),
             render_mode: CompactionRenderMode::default(),
         };
@@ -6191,6 +7049,9 @@ mod tests {
             context_window_tokens: 100_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
+            threshold_tokens: None,
+            threshold_percent: None,
+            method_order: None,
             mode: AutoCompactionMode::default(),
             render_mode: CompactionRenderMode::default(),
         };
@@ -6235,7 +7096,7 @@ mod tests {
         let mut privacy = CompactionPrivacy::default();
         let prompts = privacy.screen(&mut preparation, &mut None).unwrap();
         let requests =
-            prepare_summary_requests(&preparation, None, &prompts, &mut privacy).unwrap();
+            prepare_summary_requests(&preparation, None, &prompts, &mut privacy, true).unwrap();
         let history = requests.history.expect("summary request");
         assert!(history.contains("previous summary") && history.contains("NEW-FACT"));
         assert!(!history.contains("ARCHIVED-FACT") && !history.contains("SPLIT-TURN-FACT"));
@@ -6332,6 +7193,9 @@ mod tests {
             context_window_tokens: 15,
             reserve_tokens: 0,
             keep_recent_tokens: 100,
+            threshold_tokens: None,
+            threshold_percent: None,
+            method_order: None,
             mode: AutoCompactionMode::default(),
             render_mode: CompactionRenderMode::default(),
         };
@@ -6396,6 +7260,9 @@ mod tests {
             context_window_tokens: 200,
             reserve_tokens: 0,
             keep_recent_tokens: 150,
+            threshold_tokens: None,
+            threshold_percent: None,
+            method_order: None,
             mode: AutoCompactionMode::default(),
             render_mode: CompactionRenderMode::default(),
         };
@@ -6443,6 +7310,7 @@ mod tests {
                 turn_prefix_messages: vec![make_user_text("split turn prefix request")],
                 is_split_turn: true,
                 tokens_before: 4200,
+                retained_tokens: Some(500),
                 previous_summary: Some("## Goal\nShip the scheduler fix".to_string()),
                 file_ops,
                 settings: ResolvedCompactionSettings::default(),
@@ -6467,6 +7335,7 @@ mod tests {
             );
             assert_eq!(parsed.is_split_turn, prep.is_split_turn);
             assert_eq!(parsed.tokens_before, prep.tokens_before);
+            assert_eq!(parsed.retained_tokens, prep.retained_tokens);
             assert_eq!(parsed.previous_summary, prep.previous_summary);
             assert_eq!(parsed.file_ops.read, prep.file_ops.read);
             assert_eq!(parsed.file_ops.written, prep.file_ops.written);
@@ -6480,6 +7349,152 @@ mod tests {
             assert_eq!(
                 parsed.settings.keep_recent_tokens,
                 prep.settings.keep_recent_tokens
+            );
+        }
+
+        #[test]
+        fn ordered_policy_and_retained_tail_survive_extension_round_trips() {
+            let mut prep = make_preparation();
+            let methods = vec![
+                AutoCompactionMethod::Remote,
+                AutoCompactionMethod::Shake,
+                AutoCompactionMethod::Soft,
+            ];
+            prep.settings.method_order = Some(methods.clone());
+            prep.settings.mode = AutoCompactionMode::Aggressive;
+            let value = compaction_preparation_to_value(&prep);
+            let parsed = compaction_preparation_from_value(&value).expect("ordered preparation");
+            assert_eq!(
+                value["settings"]["methodOrder"],
+                json!(["remote", "shake", "soft"])
+            );
+            assert_eq!(parsed.settings.method_order, Some(methods));
+            assert_eq!(parsed.retained_tokens, Some(500));
+            assert_eq!(parsed.settings.mode, AutoCompactionMode::Aggressive);
+            assert_eq!(compaction_preparation_to_value(&parsed), value);
+
+            let mut aliases = value.clone();
+            let object = aliases.as_object_mut().unwrap();
+            let retained = object.remove("retainedTokens").unwrap();
+            object.insert("retained_tokens".to_string(), retained);
+            let settings = aliases["settings"].as_object_mut().unwrap();
+            let methods = settings.remove("methodOrder").unwrap();
+            let mode = settings.remove("autoMode").unwrap();
+            settings.insert("method_order".to_string(), methods);
+            settings.insert("auto_mode".to_string(), mode);
+            assert_eq!(
+                compaction_preparation_to_value(
+                    &compaction_preparation_from_value(&aliases).expect("snake-case policy"),
+                ),
+                value
+            );
+
+            for malformed in [
+                json!([]),
+                json!(["soft", "soft"]),
+                json!(["remote", "shake", "soft", "remote"]),
+                json!(["handoff"]),
+                json!([1]),
+                json!("shake"),
+            ] {
+                let mut invalid = value.clone();
+                invalid["settings"]["methodOrder"] = malformed;
+                assert!(compaction_preparation_from_value(&invalid).is_err());
+            }
+            for malformed in [json!(-1), json!(1.5), json!("500")] {
+                let mut invalid = value.clone();
+                invalid["retainedTokens"] = malformed;
+                assert!(compaction_preparation_from_value(&invalid).is_err());
+            }
+            let mut legacy = compaction_preparation_to_value(&make_preparation());
+            legacy.as_object_mut().unwrap().remove("retainedTokens");
+            let parsed = compaction_preparation_from_value(&legacy).expect("legacy preparation");
+            assert!(parsed.retained_tokens.is_none());
+            assert!(parsed.settings.method_order.is_none());
+            assert_eq!(parsed.settings.mode, AutoCompactionMode::Summary);
+        }
+
+        #[test]
+        fn threshold_policy_round_trips_and_rejects_invalid_extension_values() {
+            let mut prep = make_preparation();
+            prep.settings.threshold_tokens = Some(75_000);
+            prep.settings.threshold_percent = Some(37.5);
+            let value = compaction_preparation_to_value(&prep);
+            let parsed = compaction_preparation_from_value(&value).expect("threshold round trip");
+            assert_eq!(parsed.settings.threshold_tokens, Some(75_000));
+            assert_eq!(parsed.settings.trigger_tokens(), 48_000);
+            assert_eq!(value["settings"]["thresholdPercent"], json!(37.5));
+
+            let mut aliases = value.clone();
+            let settings = aliases["settings"].as_object_mut().unwrap();
+            let tokens = settings.remove("thresholdTokens").unwrap();
+            let percent = settings.remove("thresholdPercent").unwrap();
+            settings.insert("threshold_tokens".into(), tokens);
+            settings.insert("threshold_percent".into(), percent);
+            assert_eq!(
+                compaction_preparation_from_value(&aliases)
+                    .expect("snake-case threshold aliases")
+                    .settings
+                    .trigger_tokens(),
+                48_000
+            );
+
+            for (field, invalid) in [
+                ("thresholdTokens", json!(0)),
+                ("thresholdTokens", json!(-1)),
+                ("thresholdTokens", json!(1.5)),
+                ("thresholdTokens", json!(u64::from(u32::MAX) + 1)),
+                ("thresholdPercent", json!(0)),
+                ("thresholdPercent", json!(-1)),
+                ("thresholdPercent", json!(100.1)),
+                ("thresholdPercent", json!("75%")),
+            ] {
+                let mut malformed = value.clone();
+                malformed["settings"][field] = invalid;
+                assert!(
+                    compaction_preparation_from_value(&malformed).is_err(),
+                    "invalid {field} must not cross the compaction boundary"
+                );
+            }
+
+            // A native SDK setting ignored by the trigger must also be safe
+            // to echo through session_before_compact into the host bridge.
+            for (tokens, percent, expected_trigger) in [
+                (0, 37.5, 48_000),
+                (0, 0.0, 117_760),
+                (75_000, -1.0, 75_000),
+                (75_000, 100.1, 75_000),
+                (75_000, f64::NAN, 75_000),
+                (75_000, f64::INFINITY, 75_000),
+                (75_000, f64::NEG_INFINITY, 75_000),
+            ] {
+                let mut sdk_prep = make_preparation();
+                sdk_prep.settings.threshold_tokens = Some(tokens);
+                sdk_prep.settings.threshold_percent = Some(percent);
+                let encoded = compaction_preparation_to_value(&sdk_prep);
+                let echoed = compaction_preparation_from_value(&encoded)
+                    .expect("ignored SDK thresholds must survive an extension echo");
+                assert_eq!(echoed.settings.trigger_tokens(), expected_trigger);
+                assert_eq!(
+                    echoed.settings.trigger_tokens(),
+                    sdk_prep.settings.trigger_tokens()
+                );
+                assert_eq!(
+                    compaction_preparation_to_value(&echoed)["settings"],
+                    encoded["settings"],
+                    "serialized settings must already omit invalid optional values"
+                );
+            }
+
+            let legacy = compaction_preparation_to_value(&make_preparation());
+            assert!(legacy["settings"].get("thresholdTokens").is_none());
+            assert!(legacy["settings"].get("thresholdPercent").is_none());
+            assert_eq!(
+                compaction_preparation_from_value(&legacy)
+                    .expect("legacy preparation")
+                    .settings
+                    .trigger_tokens(),
+                117_760
             );
         }
 
@@ -6746,6 +7761,7 @@ mod tests {
                 // Past the forced-local threshold (2x the default 128K window)
                 // so provider failures degrade to the deterministic fallback.
                 tokens_before: 600_000,
+                retained_tokens: Some(500),
                 previous_summary: Some("## Goal\nShip the scheduler fix".to_string()),
                 file_ops,
                 settings: ResolvedCompactionSettings::default(),
@@ -6775,66 +7791,126 @@ mod tests {
             run_async(async {
                 for failure in failures {
                     for at_setup in [true, false] {
-                        let provider = Arc::new(RefusingProvider {
-                            failure,
-                            at_setup,
-                            calls: std::sync::atomic::AtomicUsize::new(0),
-                        });
-                        let mut preparation = make_preparation();
-                        preparation.is_split_turn = true;
-                        preparation.turn_prefix_messages = vec![make_user_text("retain this turn")];
-                        let error = compact(
-                            preparation,
-                            provider.clone(),
-                            &StreamOptions::default(),
-                            None,
-                            &CompactionPrivacy::default(),
-                        )
-                        .await
-                        .expect_err("a refusal must not authorize local history replacement");
-                        let expected = failure();
-                        assert_eq!(
-                            std::mem::discriminant(&error),
-                            std::mem::discriminant(&expected)
-                        );
-                        assert_eq!(error.to_string(), expected.to_string());
-                        assert_eq!(
-                            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
-                            1,
-                            "a refused history summary must not dispatch the split-turn summary"
-                        );
+                        for ordered in [false, true] {
+                            let provider = Arc::new(RefusingProvider {
+                                failure,
+                                at_setup,
+                                calls: std::sync::atomic::AtomicUsize::new(0),
+                            });
+                            let mut preparation = make_preparation();
+                            preparation.is_split_turn = true;
+                            preparation.turn_prefix_messages =
+                                vec![make_user_text("retain this turn")];
+                            preparation.settings.method_order = ordered.then(|| {
+                                vec![AutoCompactionMethod::Soft, AutoCompactionMethod::Shake]
+                            });
+                            let error = compact_auto(
+                                preparation,
+                                provider.clone(),
+                                &StreamOptions::default(),
+                                None,
+                                &CompactionPrivacy::default(),
+                                CompactionReader {
+                                    accepts_images: false,
+                                    source_text_budget: Some(8_192),
+                                },
+                            )
+                            .await
+                            .expect_err("a refusal must not authorize local history replacement");
+                            let expected = failure();
+                            assert_eq!(
+                                std::mem::discriminant(&error),
+                                std::mem::discriminant(&expected)
+                            );
+                            assert_eq!(error.to_string(), expected.to_string());
+                            assert_eq!(
+                                provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+                                1,
+                                "a refusal must not dispatch the split summary or next method"
+                            );
+                        }
                     }
                 }
             });
         }
 
         #[test]
-        fn exhausted_real_cost_budget_never_produces_a_local_compaction() {
+        fn ordered_provider_failure_uses_the_next_method_without_hidden_truncation() {
             run_async(async {
-                let budget = crate::cost::CostBudget::new(None, Some(1.0), 1.0).unwrap();
                 let provider = Arc::new(RefusingProvider {
-                    failure: || Error::api("this provider must not be entered"),
+                    failure: || Error::api("temporary summary failure"),
                     at_setup: true,
                     calls: std::sync::atomic::AtomicUsize::new(0),
                 });
-                let guarded = crate::provider::guard_with_cost_budget(provider.clone(), budget);
-                let error = compact(
-                    make_preparation(),
-                    guarded,
+                let mut preparation = make_preparation();
+                preparation.settings.method_order = Some(vec![
+                    AutoCompactionMethod::Remote,
+                    AutoCompactionMethod::Soft,
+                    AutoCompactionMethod::Shake,
+                ]);
+                // This source is beyond the forced-local emergency boundary.
+                // An explicit order must still choose the configured shake.
+                let result = compact_auto(
+                    preparation,
+                    provider.clone(),
                     &StreamOptions::default(),
                     None,
                     &CompactionPrivacy::default(),
+                    CompactionReader {
+                        accepts_images: false,
+                        source_text_budget: Some(8_192),
+                    },
                 )
                 .await
-                .expect_err("a cost refusal must survive the oversized-session failsafe");
-                assert!(matches!(
-                    error,
-                    Error::CostCap {
-                        spent: 1.0,
-                        cap: 1.0
-                    }
-                ));
-                assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                .expect("eligible provider failure advances to shake");
+                assert_eq!(result.details.mode.as_deref(), Some("shake"));
+                assert!(
+                    result
+                        .summary
+                        .contains("Root cause is a race in the scheduler")
+                );
+                assert!(!result.summary.contains("deterministic fallback"));
+                assert_eq!(result.first_kept_entry_id, "entry-9");
+                assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            });
+        }
+
+        #[test]
+        fn exhausted_real_cost_budget_never_produces_a_local_compaction() {
+            run_async(async {
+                for ordered in [false, true] {
+                    let budget = crate::cost::CostBudget::new(None, Some(1.0), 1.0).unwrap();
+                    let provider = Arc::new(RefusingProvider {
+                        failure: || Error::api("this provider must not be entered"),
+                        at_setup: true,
+                        calls: std::sync::atomic::AtomicUsize::new(0),
+                    });
+                    let guarded = crate::provider::guard_with_cost_budget(provider.clone(), budget);
+                    let mut preparation = make_preparation();
+                    preparation.settings.method_order = ordered
+                        .then(|| vec![AutoCompactionMethod::Soft, AutoCompactionMethod::Shake]);
+                    let error = compact_auto(
+                        preparation,
+                        guarded,
+                        &StreamOptions::default(),
+                        None,
+                        &CompactionPrivacy::default(),
+                        CompactionReader {
+                            accepts_images: false,
+                            source_text_budget: Some(8_192),
+                        },
+                    )
+                    .await
+                    .expect_err("a cost refusal must survive every automatic fallback policy");
+                    assert!(matches!(
+                        error,
+                        Error::CostCap {
+                            spent: 1.0,
+                            cap: 1.0
+                        }
+                    ));
+                    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                }
             });
         }
 
@@ -7068,6 +8144,9 @@ mod tests {
                     context_window_tokens: window,
                     reserve_tokens: 16_384,
                     keep_recent_tokens: 20_000,
+                    threshold_tokens: None,
+                    threshold_percent: None,
+                    method_order: None,
                     mode: AutoCompactionMode::default(),
                     render_mode: CompactionRenderMode::default(),
                 };
@@ -7086,6 +8165,9 @@ mod tests {
                     context_window_tokens: window,
                     reserve_tokens: reserve,
                     keep_recent_tokens: 20_000,
+                    threshold_tokens: None,
+                    threshold_percent: None,
+                    method_order: None,
                     mode: AutoCompactionMode::default(),
                     render_mode: CompactionRenderMode::default(),
                 };

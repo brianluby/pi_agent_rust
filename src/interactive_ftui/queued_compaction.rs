@@ -183,12 +183,16 @@ fn restore(request: &QueuedCompaction, text: Vec<String>, agent_tx: &Sender<PiMs
 /// Hold cancellation authority through session admission, installation,
 /// transcript refresh and the resumed native turn. Publication shares the
 /// runtime's shutdown fence; no operation may start after that fence closes.
-struct OperationAbort<'a> {
+pub(super) struct OperationAbort<'a> {
     slot: &'a TurnAbortSlot,
 }
 
 impl<'a> OperationAbort<'a> {
-    fn publish(slot: &'a TurnAbortSlot, controls: &TurnControlSlot, abort: &AbortHandle) -> Self {
+    pub(super) fn publish(
+        slot: &'a TurnAbortSlot,
+        controls: &TurnControlSlot,
+        abort: &AbortHandle,
+    ) -> Self {
         let state = controls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -305,7 +309,7 @@ pub(super) async fn run(
     // A new live input or compaction then sees every older accepted message.
     let mut after = after.into_iter();
     if let Some(input) = after.next() {
-        let (leftover, _) = run_controlled_turn_with_pending(
+        let result = run_controlled_turn_with_pending(
             handle,
             input.content,
             Some(input.text),
@@ -317,6 +321,6 @@ pub(super) async fn run(
         .await;
         // Stops/caps and arrivals at the final boundary are returned intact
         // instead of resetting the completed turn's timer or merging content.
-        restore(&request, leftover, agent_tx);
+        restore(&request, result.into_restore_texts(), agent_tx);
     }
 }

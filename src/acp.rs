@@ -45,7 +45,6 @@ use crate::agent::{
 };
 use crate::agent_cx::AgentCx;
 use crate::auth::AuthStorage;
-use crate::compaction::ResolvedCompactionSettings;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::{AssistantMessageEvent, ContentBlock};
@@ -1301,16 +1300,14 @@ async fn run(
                             ));
                             continue;
                         };
-                        let message_content = match content::extract_prompt_content(
-                            prompt_blocks,
-                            &session_config,
-                        ) {
-                            Ok(content) => content,
-                            Err(err) => {
-                                let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, err));
-                                continue;
-                            }
-                        };
+                        let message_content =
+                            match content::extract_prompt_content(prompt_blocks, &session_config) {
+                                Ok(content) => content,
+                                Err(err) => {
+                                    let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, err));
+                                    continue;
+                                }
+                            };
 
                         // Per spec, only one prompt turn may be active per session.
                         {
@@ -2393,7 +2390,14 @@ fn build_acp_session(
     permission_client: Option<&AcpPermissionClient>,
 ) -> Result<(String, AcpSessionState)> {
     let options = options.for_workspace(&cwd)?;
-    build_acp_session_with_budget(session, save_enabled, cwd, &options, permission_client, None)
+    build_acp_session_with_budget(
+        session,
+        save_enabled,
+        cwd,
+        &options,
+        permission_client,
+        None,
+    )
 }
 
 /// Forks keep their source's live account, including pending requests, while
@@ -2541,28 +2545,20 @@ fn build_acp_session_with_budget(
 
     let agent = crate::agent::Agent::new(provider, tools, agent_config);
     let session_arc = Arc::new(Mutex::new(session));
-    let compaction_settings = ResolvedCompactionSettings {
-        enabled: options.config.compaction_enabled(),
-        reserve_tokens: options.config.compaction_reserve_tokens(),
-        keep_recent_tokens: options.config.compaction_keep_recent_tokens(),
-        mode: options.config.compaction_mode(),
-        render_mode: options.config.compaction_render_mode(),
-        context_window_tokens: if model_entry.model.context_window == 0 {
-            ResolvedCompactionSettings::default().context_window_tokens
-        } else {
-            model_entry.model.context_window
-        },
-    };
+    let compaction_settings = options
+        .config
+        .resolved_compaction_settings(model_entry.model.context_window);
 
     // Wire the model registry and auth storage so the session can switch
     // provider/model at runtime via `session/set_model` (set_provider_model
     // needs the registry to find the target model and resolve its credentials).
-    let mut agent_session = AgentSession::new(agent, session_arc, save_enabled, compaction_settings)
-        .with_runtime_handle(options.runtime_handle.clone())
-        .with_model_registry(registry.clone())
-        .with_auth_storage(auth.clone())
-        .with_api_key_override(cli.api_key.clone())
-        .with_memory_settings(options.config.memory.as_ref());
+    let mut agent_session =
+        AgentSession::new(agent, session_arc, save_enabled, compaction_settings)
+            .with_runtime_handle(options.runtime_handle.clone())
+            .with_model_registry(registry.clone())
+            .with_auth_storage(auth.clone())
+            .with_api_key_override(cli.api_key.clone())
+            .with_memory_settings(options.config.memory.as_ref());
     agent_session.set_child_fallback_policy(cli.subagent_fallback_policy.clone());
     // Keep the exact configured AgentSession for the lifetime of the editor
     // session. The SDK owns one durable recovery driver and its cross-turn
@@ -3520,6 +3516,7 @@ fn classify_tool_kind(tool_name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compaction::ResolvedCompactionSettings;
     use crate::model::{AssistantMessage, StopReason, StreamEvent, TextContent};
     use crate::provider::{InputType, Model, ModelCost};
     use asupersync::runtime::RuntimeBuilder;
@@ -4639,7 +4636,11 @@ mod tests {
         for (args, expected, no_builtins) in [
             (vec!["pi", "--acp"], true, false),
             (vec!["pi", "--acp", "--tools", "read"], false, false),
-            (vec!["pi", "--acp", "--tools", defaults.as_str()], false, false),
+            (
+                vec!["pi", "--acp", "--tools", defaults.as_str()],
+                false,
+                false,
+            ),
             (vec!["pi", "--acp", "--tools", ""], false, true),
             (vec!["pi", "--acp", "--tools", " , "], false, true),
             (vec!["pi", "--acp", "--no-tools"], false, true),
@@ -4673,7 +4674,15 @@ mod tests {
                 assert!(!handle.has_tool(name), "ACP host-only tool {name}");
             }
             if no_builtins {
-                assert!(handle.session().agent.shared_tools().snapshot().tools().is_empty());
+                assert!(
+                    handle
+                        .session()
+                        .agent
+                        .shared_tools()
+                        .snapshot()
+                        .tools()
+                        .is_empty()
+                );
             }
         }
     }
@@ -4720,11 +4729,7 @@ mod tests {
         }))
         .expect("automatic tool settings");
         let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
-        let cases: &[&[&str]] = &[
-            &["read", "grep"],
-            &["read", "browser"],
-            &[],
-        ];
+        let cases: &[&[&str]] = &[&["read", "grep"], &["read", "browser"], &[]];
         for &selected in cases {
             let root = tempfile::tempdir().expect("ACP workspace");
             let selected_arg = selected.join(",");
@@ -4760,13 +4765,18 @@ mod tests {
             for name in selected {
                 assert!(registry.get(name).is_some(), "explicit {name}");
             }
-            assert!(registry.tools().iter().all(|tool| {
-                selected.contains(&tool.name()) || tool.name() == "xdev"
-            }));
+            assert!(
+                registry
+                    .tools()
+                    .iter()
+                    .all(|tool| { selected.contains(&tool.name()) || tool.name() == "xdev" })
+            );
             let discoverable = registry.discoverable_index();
-            assert!(discoverable.iter().all(|(name, _)| {
-                selected.contains(&name.as_str())
-            }));
+            assert!(
+                discoverable
+                    .iter()
+                    .all(|(name, _)| { selected.contains(&name.as_str()) })
+            );
             assert_eq!(registry.get("xdev").is_some(), !discoverable.is_empty());
         }
     }
@@ -4959,7 +4969,8 @@ mod tests {
                     .is_err()
             );
             assert!(
-                steering::Input::parse(&steering_params, Some(json!(7)), &untrusted.config).is_err()
+                steering::Input::parse(&steering_params, Some(json!(7)), &untrusted.config)
+                    .is_err()
             );
             assert!(options.for_workspace(&cwd).unwrap().skills_prompt.is_none());
 
@@ -5114,8 +5125,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("CLAUDE.md"), "acp-claude-md-marker").expect("write");
         let global = tempfile::tempdir().expect("captured global directory");
-        std::fs::write(global.path().join("AGENTS.md"), "acp-captured-global-marker")
-            .expect("write global instructions");
+        std::fs::write(
+            global.path().join("AGENTS.md"),
+            "acp-captured-global-marker",
+        )
+        .expect("write global instructions");
         let tools = ["read", "bash", "edit", "write", "grep", "find", "ls"];
         let cli = AcpLaunchOptions::default()
             .selection_cli()

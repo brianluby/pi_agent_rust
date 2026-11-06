@@ -21,7 +21,8 @@ use crate::auth::AuthStorage;
 #[cfg(test)]
 use crate::compaction::prepare_compaction;
 use crate::compaction::{
-    ResolvedCompactionSettings, compact, compact_auto, compaction_details_to_value,
+    CompactionPreparation, ResolvedCompactionSettings, compact, compact_auto,
+    compaction_details_to_value,
 };
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -15776,12 +15777,6 @@ mod retry_tests {
     }
 }
 
-fn should_auto_compact(tokens_before: u64, context_window: u32, reserve_tokens: u32) -> bool {
-    let reserve = u64::from(reserve_tokens);
-    let window = u64::from(context_window);
-    tokens_before > window.saturating_sub(reserve)
-}
-
 fn emit_auto_compaction_error(
     out_tx: &std::sync::mpsc::SyncSender<String>,
     error_message: impl Into<String>,
@@ -15815,7 +15810,7 @@ async fn maybe_auto_compact(
         return;
     }
     drop(state);
-    let (source, prep, reader) = {
+    let (source, prep, reader, projection) = {
         let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), cx.cx()).await else {
             return;
         };
@@ -15835,41 +15830,35 @@ async fn maybe_auto_compact(
         ) else {
             return;
         };
-        let context_window = entry.model.context_window;
+        let mut settings = options
+            .config
+            .resolved_compaction_settings(entry.model.context_window);
+        // The live RPC auto-compaction toggle gates admission, so it may
+        // enable compaction even when startup settings disabled it.
+        settings.enabled = true;
 
-        let reserve_tokens = options.config.compaction_reserve_tokens();
-        // Carry the configured mode (shake-first/aggressive) and the real
-        // model window: `prepare_compaction` re-checks the threshold against
-        // `context_window_tokens`, so the 128k default would silently disable
-        // auto-compaction for smaller-window models.
-        let settings = ResolvedCompactionSettings {
-            enabled: true,
-            reserve_tokens,
-            keep_recent_tokens: options.config.compaction_keep_recent_tokens(),
-            context_window_tokens: if context_window == 0 {
-                ResolvedCompactionSettings::default().context_window_tokens
-            } else {
-                context_window
-            },
-            mode: options.config.compaction_mode(),
-            render_mode: options.config.compaction_render_mode(),
-        };
-
-        let prepare = |inner_session: &Session| {
+        let prepare = |inner_session: &Session| -> Result<Option<CompactionPreparation>> {
             let path_entries = inner_session
                 .entries_for_current_path()
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            crate::compaction::prepare_compaction_for_model(
+            let mut prep = crate::compaction::prepare_compaction_for_model(
                 &path_entries,
                 settings.clone(),
                 reader.name(),
                 reader.model_id(),
-            )
-            .filter(|prep| should_auto_compact(prep.tokens_before, context_window, reserve_tokens))
+            );
+            if let Some(prep) = prep.as_mut()
+                && prep.settings.method_order.is_some()
+            {
+                guard
+                    .agent
+                    .refresh_compaction_retained_tokens(prep, &path_entries)?;
+            }
+            Ok(prep)
         };
-        let Some(mut prep) = prepare(&inner_session) else {
+        let Ok(Some(mut prep)) = prepare(&inner_session) else {
             return;
         };
         // Keep the ordinary below-threshold path lazy. Only an eligible
@@ -15884,7 +15873,7 @@ async fn maybe_auto_compact(
                 return;
             }
             inner_session.ensure_entry_ids();
-            let Some(hydrated_prep) = prepare(&inner_session) else {
+            let Ok(Some(hydrated_prep)) = prepare(&inner_session) else {
                 return;
             };
             prep = hydrated_prep;
@@ -15892,7 +15881,7 @@ async fn maybe_auto_compact(
         let Ok(source) = SessionEditSnapshot::capture(&inner_session) else {
             return;
         };
-        (source, prep, reader)
+        (source, prep, reader, guard.agent.compaction_reader())
     };
 
     let _ = out_tx.send(agent_event(AgentEvent::AutoCompactionStart {
@@ -15949,7 +15938,10 @@ async fn maybe_auto_compact(
                 return;
             }
         };
-        if current != source || !Arc::ptr_eq(&reader, &guard.agent.provider()) {
+        if current != source
+            || !Arc::ptr_eq(&reader, &guard.agent.provider())
+            || projection != guard.agent.compaction_reader()
+        {
             emit_auto_compaction_error(
                 &out_tx,
                 "Active session changed before auto-compaction provider admission; retry against the current session",
@@ -15962,9 +15954,18 @@ async fn maybe_auto_compact(
     // before installing the result. A shared session ID alone does not bind a
     // summary to its branch, model selection, history, or persistence target.
     let stream_options = guard.agent.stream_options().clone();
-    let provider = guard.agent.provider();
+    let automatic_trigger = prep
+        .settings
+        .method_order
+        .as_ref()
+        .map(|_| prep.settings.trigger_tokens());
+    let provider = if prep.settings.method_order.is_some() {
+        guard.automatic_compaction_provider()
+    } else {
+        guard.agent.provider()
+    };
     let privacy = guard.agent.compaction_privacy();
-    let result = compact_auto(prep, provider, &stream_options, None, &privacy).await;
+    let result = compact_auto(prep, provider, &stream_options, None, &privacy, projection).await;
 
     match result {
         Ok(result) => {
@@ -16028,6 +16029,16 @@ async fn maybe_auto_compact(
                     Some(details_value.clone()),
                     None,
                 );
+                if let Some(trigger) = automatic_trigger
+                    && let Err(error) = guard.validate_automatic_compaction_candidate(
+                        &inner_session,
+                        &candidate,
+                        trigger,
+                    )
+                {
+                    emit_auto_compaction_error(&out_tx, error.to_string());
+                    return;
+                }
                 // The summary request bills the shared account after the
                 // original source was captured. The common transaction saves
                 // that bill with the summary, then projects the accepted saved
@@ -17940,6 +17951,75 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct OrderedCompactionProvider {
+        requests: Arc<Mutex<Vec<Vec<Message>>>>,
+        summary: Option<String>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for OrderedCompactionProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            self.requests
+                .lock()
+                .expect("record compaction request")
+                .push(context.messages.to_vec());
+            let summary = self
+                .summary
+                .as_ref()
+                .ok_or_else(|| Error::api("summary service unavailable"))?;
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(summary.clone()))],
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(crate::model::StreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: summary.clone(),
+                }),
+                Ok(crate::model::StreamEvent::TextEnd {
+                    content_index: 0,
+                    content: summary.clone(),
+                }),
+                Ok(crate::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                }),
+            ])))
+        }
+    }
+
+    #[derive(Debug)]
     struct BilledCompactionProvider {
         observed_keys: Arc<Mutex<Vec<Option<String>>>>,
     }
@@ -19284,6 +19364,7 @@ mod tests {
             reserve_tokens: Some(2),
             keep_recent_tokens: Some(1),
             mode: None,
+            ..Default::default()
         });
         let auth_dir = tempfile::tempdir().expect("tempdir");
         let auth = AuthStorage::load(auth_dir.path().join("auth.json")).expect("auth load");
@@ -22910,6 +22991,7 @@ export default function init(pi) {
                     reserve_tokens: Some(63),
                     keep_recent_tokens: Some(1),
                     mode: None,
+                    ..Default::default()
                 });
                 let cx = AgentCx::for_request();
                 let admission = session // ubs:ignore[rust.ownership.unwrap-expect] -- Match production RPC admission ownership.
@@ -26613,37 +26695,612 @@ export default function init(pi) {
         assert!(delay <= config.retry_max_delay_ms());
     }
 
-    // -----------------------------------------------------------------------
-    // should_auto_compact
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn auto_compact_below_threshold() {
-        // 50k tokens used, 200k window, 40k reserve → threshold = 160k → no compact
-        assert!(!should_auto_compact(50_000, 200_000, 40_000));
+    fn auto_compaction_uses_configured_thresholds_and_rpc_toggle() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(Box::pin(async move {
+            for (case, threshold_tokens, threshold_percent, context_window, expected_compaction) in [
+                ("tokens", Some(80_000), None, 200_000, true),
+                ("percent", None, Some(40.0), 200_000, true),
+                ("earlier token", Some(80_000), Some(60.0), 200_000, true),
+                ("earlier percent", Some(120_000), Some(40.0), 200_000, true),
+                ("percent on larger model", None, Some(40.0), 400_000, false),
+                ("reserve only", None, None, 200_000, false),
+            ] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let mut stored = Session::in_memory();
+                stored.header.provider = Some("test-provider".to_string());
+                stored.header.model_id = Some("test-model".to_string());
+                // End at measured usage so 80k is the exact boundary. Both
+                // configured triggers precede the reserve-only 160k trigger.
+                for (index, tokens) in [40_000, 80_000].into_iter().enumerate() {
+                    stored.append_message(crate::session::SessionMessage::User {
+                        content: UserContent::Text(format!("user turn {index}")),
+                        timestamp: Some(0),
+                    });
+                    stored.append_message(crate::session::SessionMessage::Assistant {
+                        message: AssistantMessage {
+                            content: vec![ContentBlock::Text(TextContent::new(format!(
+                                "assistant turn {index}"
+                            )))],
+                            api: "test-api".to_string(),
+                            provider: "test-provider".to_string(),
+                            model: "test-model".to_string(),
+                            usage: Usage {
+                                total_tokens: tokens,
+                                ..Usage::default()
+                            },
+                            stop_reason: StopReason::Stop,
+                            stop_details: None,
+                            error_message: None,
+                            timestamp: 0,
+                        },
+                    });
+                }
+                let first_kept_entry_id = stored.entries[2]
+                    .base_id()
+                    .expect("second user entry ID")
+                    .clone();
+                let original_messages = stored.to_messages_for_current_path();
+                // Keep the entire second turn under either token-counter
+                // feature; changing the trigger must not change retention.
+                let table = crate::token_count::table_for_model("test-provider", "test-model");
+                let counter = crate::token_count::active_counter();
+                let keep_recent_tokens = u32::try_from(
+                    counter.count("user turn 1", table)
+                        + counter.count("assistant turn 1\n", table),
+                )
+                .expect("small retained turn");
+                assert!(keep_recent_tokens > 0);
+                let agent_session = Arc::new(asupersync::sync::Mutex::new(handoff_agent_session(
+                    stored,
+                    false,
+                    Arc::new(CompactionSummaryProvider),
+                )));
+                let mut options =
+                    build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+                let mut model = dummy_entry("test-model", false);
+                model.model.provider = "test-provider".to_string();
+                model.model.context_window = context_window;
+                options.available_models = vec![model];
+                options.config = serde_json::from_value(json!({
+                    "compaction": {
+                        "enabled": false,
+                        "reserveTokens": 40_000,
+                        "keepRecentTokens": keep_recent_tokens,
+                        "thresholdTokens": threshold_tokens,
+                        "thresholdPercent": threshold_percent
+                    }
+                }))
+                .expect("compaction config");
+                let mut state = RpcSharedState::new(&options.config);
+                assert!(!state.auto_compaction_enabled);
+                // set_auto_compaction updates shared RPC state, not the
+                // startup config. The post-turn caller checks this flag.
+                state.auto_compaction_enabled = true;
+                let shared_state = Arc::new(asupersync::sync::Mutex::new(state));
+                let is_compacting = Arc::new(AtomicBool::new(false));
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel(16);
+                maybe_auto_compact(
+                    Arc::clone(&agent_session),
+                    shared_state,
+                    options,
+                    Arc::clone(&is_compacting),
+                    out_tx,
+                )
+                .await;
+                let events = out_rx
+                    .try_iter()
+                    .map(|line| parse_response(&line))
+                    .collect::<Vec<_>>();
+                assert!(!is_compacting.load(Ordering::SeqCst), "{case}");
+                let cx = AgentCx::for_request();
+                let live = agent_session.lock(&cx).await.expect("live session");
+                let stored = live.session.lock(&cx).await.expect("stored session");
+                if !expected_compaction {
+                    assert!(events.is_empty(), "{case}: {events:?}");
+                    assert_eq!(provider_compaction_count(&stored), 0, "{case}");
+                    assert_eq!(
+                        serde_json::to_value(live.agent.messages()).unwrap(),
+                        serde_json::to_value(&original_messages).unwrap(),
+                        "{case} must leave the context unchanged",
+                    );
+                    continue;
+                }
+                assert_eq!(events.len(), 2, "{case}: {events:?}");
+                assert_eq!(events[0]["type"], "auto_compaction_start", "{case}");
+                assert_eq!(events[1]["type"], "auto_compaction_end", "{case}");
+                assert!(events[1].get("errorMessage").is_none(), "{case}: {events:?}");
+                assert_eq!(events[1]["result"]["tokensBefore"], 80_000, "{case}");
+                assert_eq!(
+                    events[1]["result"]["firstKeptEntryId"],
+                    first_kept_entry_id,
+                    "{case}",
+                );
+                assert_eq!(provider_compaction_count(&stored), 1, "{case}");
+                assert_eq!(live.agent.messages().len(), 3, "{case}");
+                assert_eq!(
+                    serde_json::to_value(&live.agent.messages()[1..]).unwrap(),
+                    serde_json::to_value(&original_messages[2..]).unwrap(),
+                    "{case} must preserve the configured recent turn",
+                );
+                let (live_context, stored_context) =
+                    stored.current_path_comparison_values(live.agent.messages());
+                assert_eq!(live_context, stored_context, "{case}");
+            }
+        }));
     }
 
     #[test]
-    fn auto_compact_above_threshold() {
-        // 170k tokens used, 200k window, 40k reserve → threshold = 160k → compact
-        assert!(should_auto_compact(170_000, 200_000, 40_000));
+    #[allow(clippy::too_many_lines)]
+    fn auto_compaction_ordered_methods_install_only_the_accepted_original_snapshot() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(Box::pin(async move {
+            let prose =
+                "Archived decisions require preserving the reasoning and evidence.\n".repeat(2_000);
+            let summary = Some("causal auto-compaction summary".to_string());
+            for (case, methods, bulky_tool_output, reply, expected_calls, expected_mode) in [
+                (
+                    "unavailable remote then local shake",
+                    vec!["remote", "shake", "soft"],
+                    true,
+                    summary.clone(),
+                    0,
+                    Some("shake"),
+                ),
+                (
+                    "soft precedes available shake",
+                    vec!["soft", "shake"],
+                    true,
+                    summary.clone(),
+                    1,
+                    Some("soft"),
+                ),
+                (
+                    "provider failure advances to shake",
+                    vec!["soft", "shake"],
+                    true,
+                    None,
+                    1,
+                    Some("shake"),
+                ),
+                (
+                    "insufficient shake advances to soft",
+                    vec!["shake", "soft"],
+                    false,
+                    summary,
+                    1,
+                    Some("soft"),
+                ),
+                (
+                    "all candidates retain too much context",
+                    vec!["soft", "shake"],
+                    false,
+                    Some(prose.clone()),
+                    1,
+                    None,
+                ),
+                (
+                    "unavailable remote does not imply soft",
+                    vec!["remote"],
+                    true,
+                    None,
+                    0,
+                    None,
+                ),
+            ] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let mut stored = Session::in_memory();
+                stored.header.provider = Some("test-provider".to_string());
+                stored.header.model_id = Some("test-model".to_string());
+                let source_text = if bulky_tool_output {
+                    "original source fact: preserve the sequence".to_string()
+                } else {
+                    format!("original source fact: preserve the sequence\n{prose}")
+                };
+                stored.append_message(crate::session::SessionMessage::User {
+                    content: UserContent::Text(source_text),
+                    timestamp: Some(0),
+                });
+                stored.append_message(crate::session::SessionMessage::Assistant {
+                    message: AssistantMessage {
+                        content: vec![ContentBlock::ToolCall(ToolCall {
+                            id: "archive-read".to_string(),
+                            name: "read".to_string(),
+                            arguments: json!({"path": "notes.txt"}),
+                            thought_signature: None,
+                        })],
+                        api: "test-api".to_string(),
+                        provider: "test-provider".to_string(),
+                        model: "test-model".to_string(),
+                        usage: Usage::default(),
+                        stop_reason: StopReason::ToolUse,
+                        stop_details: None,
+                        error_message: None,
+                        timestamp: 0,
+                    },
+                });
+                stored.append_message(crate::session::SessionMessage::ToolResult {
+                    tool_call_id: "archive-read".to_string(),
+                    tool_name: "read".to_string(),
+                    content: vec![ContentBlock::Text(TextContent::new(if bulky_tool_output {
+                        "source evidence row\n".repeat(4_000)
+                    } else {
+                        "source evidence row".to_string()
+                    }))],
+                    details: None,
+                    is_error: false,
+                    timestamp: Some(0),
+                });
+                stored.append_message(crate::session::SessionMessage::Assistant {
+                    message: AssistantMessage {
+                        content: vec![ContentBlock::Text(TextContent::new("archive reviewed"))],
+                        api: "test-api".to_string(),
+                        provider: "test-provider".to_string(),
+                        model: "test-model".to_string(),
+                        usage: Usage::default(),
+                        stop_reason: StopReason::Stop,
+                        stop_details: None,
+                        error_message: None,
+                        timestamp: 0,
+                    },
+                });
+                stored.append_message(crate::session::SessionMessage::User {
+                    content: UserContent::Text("retained recent turn".to_string()),
+                    timestamp: Some(0),
+                });
+                stored.append_message(crate::session::SessionMessage::Assistant {
+                    message: AssistantMessage {
+                        content: vec![ContentBlock::Text(TextContent::new("retained answer"))],
+                        api: "test-api".to_string(),
+                        provider: "test-provider".to_string(),
+                        model: "test-model".to_string(),
+                        usage: Usage {
+                            total_tokens: 80_000,
+                            ..Usage::default()
+                        },
+                        stop_reason: StopReason::Stop,
+                        stop_details: None,
+                        error_message: None,
+                        timestamp: 0,
+                    },
+                });
+                let first_kept_entry_id = stored.entries[4]
+                    .base_id()
+                    .expect("retained user entry ID")
+                    .clone();
+                let original_messages = stored.to_messages_for_current_path();
+                let original_entry_count = stored.entries.len();
+                let table = crate::token_count::table_for_model("test-provider", "test-model");
+                let counter = crate::token_count::active_counter();
+                let keep_recent_tokens = u32::try_from(
+                    counter.count("retained recent turn", table)
+                        + counter.count("retained answer\n", table),
+                )
+                .expect("small retained turn");
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let agent_session = Arc::new(asupersync::sync::Mutex::new(handoff_agent_session(
+                    stored,
+                    false,
+                    Arc::new(OrderedCompactionProvider {
+                        requests: Arc::clone(&requests),
+                        summary: reply,
+                    }),
+                )));
+                let mut options =
+                    build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+                let mut model = dummy_entry("test-model", false);
+                model.model.provider = "test-provider".to_string();
+                options.available_models = vec![model];
+                options.config = serde_json::from_value(json!({
+                    "compaction": {
+                        "enabled": true,
+                        "reserveTokens": 40_000,
+                        "keepRecentTokens": keep_recent_tokens,
+                        "thresholdTokens": 2_000,
+                        "methodOrder": methods
+                    }
+                }))
+                .expect("ordered compaction config");
+                let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                    &options.config,
+                )));
+                let cx = AgentCx::for_request();
+                let (source, metrics_before) = {
+                    let live = agent_session.lock(&cx).await.expect("live session");
+                    let stored = live.session.lock(&cx).await.expect("stored session");
+                    (
+                        SessionEditSnapshot::capture(&stored).expect("source snapshot"),
+                        stored.autosave_metrics(),
+                    )
+                };
+                let is_compacting = Arc::new(AtomicBool::new(false));
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel(16);
+                maybe_auto_compact(
+                    Arc::clone(&agent_session),
+                    shared_state,
+                    options,
+                    Arc::clone(&is_compacting),
+                    out_tx,
+                )
+                .await;
+                let events = out_rx
+                    .try_iter()
+                    .map(|line| parse_response(&line))
+                    .collect::<Vec<_>>();
+                assert!(!is_compacting.load(Ordering::SeqCst), "{case}");
+                assert_eq!(events.len(), 2, "{case}: {events:?}");
+                assert_eq!(events[0]["type"], "auto_compaction_start", "{case}");
+                assert_eq!(events[1]["type"], "auto_compaction_end", "{case}");
+                {
+                    let requests = requests.lock().expect("recorded requests");
+                    assert_eq!(requests.len(), expected_calls, "{case}");
+                    for request in requests.iter() {
+                        let text = serde_json::to_string(request).expect("request JSON");
+                        assert!(text.contains("original source fact"), "{case}");
+                        assert!(text.contains("source evidence row"), "{case}");
+                        assert!(
+                            !text.contains("Context Checkpoint (shake)"),
+                            "{case}: a rejected candidate must not replace the summary source",
+                        );
+                    }
+                }
+                let live = agent_session.lock(&cx).await.expect("live session");
+                let stored = live.session.lock(&cx).await.expect("stored session");
+                let metrics_after = stored.autosave_metrics();
+                assert_eq!(
+                    metrics_after.flush_started, metrics_before.flush_started,
+                    "{case}: save-disabled sessions must not flush",
+                );
+                let compaction_count = stored
+                    .entries
+                    .iter()
+                    .filter(|entry| matches!(entry, crate::session::SessionEntry::Compaction(_)))
+                    .count();
+                let Some(expected_mode) = expected_mode else {
+                    assert!(events[1].get("result").is_none(), "{case}: {events:?}");
+                    assert!(events[1]["errorMessage"].is_string(), "{case}: {events:?}");
+                    assert_eq!(compaction_count, 0, "{case}");
+                    assert!(
+                        source == SessionEditSnapshot::capture(&stored).expect("final snapshot"),
+                        "{case}: an exhausted policy must not mutate the session",
+                    );
+                    assert_eq!(
+                        serde_json::to_value(live.agent.messages()).unwrap(),
+                        serde_json::to_value(&original_messages).unwrap(),
+                        "{case}",
+                    );
+                    assert_eq!(
+                        metrics_after.coalesced_mutations, metrics_before.coalesced_mutations,
+                        "{case}",
+                    );
+                    assert_eq!(
+                        metrics_after.pending_mutations, metrics_before.pending_mutations,
+                        "{case}",
+                    );
+                    continue;
+                };
+                assert!(
+                    events[1].get("errorMessage").is_none(),
+                    "{case}: {events:?}"
+                );
+                assert_eq!(
+                    events[1]["result"]["details"]["mode"], expected_mode,
+                    "{case}"
+                );
+                assert_eq!(events[1]["result"]["tokensBefore"], 80_000, "{case}");
+                assert!(
+                    events[1]["result"]["tokensAfter"].as_u64().unwrap() < 2_000,
+                    "{case}",
+                );
+                assert_eq!(
+                    events[1]["result"]["firstKeptEntryId"], first_kept_entry_id,
+                    "{case}",
+                );
+                assert_eq!(compaction_count, 1, "{case}");
+                assert_eq!(stored.entries.len(), original_entry_count + 1, "{case}");
+                assert_eq!(
+                    metrics_after.coalesced_mutations,
+                    metrics_before.coalesced_mutations + 1,
+                    "{case}: attempts must install exactly one compaction mutation",
+                );
+                assert_eq!(
+                    metrics_after.pending_mutations,
+                    metrics_before
+                        .pending_mutations
+                        .saturating_add(1)
+                        .min(metrics_before.max_pending_mutations),
+                    "{case}",
+                );
+                assert_eq!(live.agent.messages().len(), 3, "{case}");
+                assert_eq!(
+                    serde_json::to_value(&live.agent.messages()[1..]).unwrap(),
+                    serde_json::to_value(&original_messages[4..]).unwrap(),
+                    "{case}: retain the complete recent turn, including its original usage",
+                );
+                let (live_context, stored_context) =
+                    stored.current_path_comparison_values(live.agent.messages());
+                assert_eq!(live_context, stored_context, "{case}");
+            }
+        }));
     }
 
     #[test]
-    fn auto_compact_exact_threshold() {
-        // Exactly at threshold → not above → no compact
-        assert!(!should_auto_compact(160_000, 200_000, 40_000));
-    }
-
-    #[test]
-    fn auto_compact_reserve_exceeds_window() {
-        // reserve > window → window - reserve saturates to 0 → any tokens > 0 triggers compact
-        assert!(should_auto_compact(1, 100, 200));
-    }
-
-    #[test]
-    fn auto_compact_zero_tokens() {
-        assert!(!should_auto_compact(0, 200_000, 40_000));
+    #[allow(clippy::too_many_lines)]
+    fn auto_compaction_snapcompact_budgets_the_active_reader_and_reopens_the_archive() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("reactor"))
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            for (vision, blocked, threshold, accepted) in [
+                (true, false, 10_000, true),
+                (false, false, 10_000, true),
+                (true, true, 10_000, true),
+                (true, false, 1_000, false),
+                (false, false, 1_000, false),
+            ] {
+                let directory = tempfile::tempdir().expect("workspace");
+                let archive_source = format!(
+                    "ARCHIVE-READER-PROBE {}",
+                    "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6".repeat(800),
+                );
+                let mut stored = Session::create_with_dir(Some(directory.path().join("sessions")));
+                stored.header.provider = Some("test-provider".to_string());
+                stored.header.model_id = Some("test-model".to_string());
+                stored.append_message(crate::session::SessionMessage::User {
+                    content: UserContent::Text(archive_source),
+                    timestamp: Some(0),
+                });
+                stored.append_message(crate::session::SessionMessage::Assistant {
+                    message: AssistantMessage {
+                        content: vec![ContentBlock::Text(TextContent::new("old answer"))],
+                        provider: "test-provider".to_string(),
+                        model: "test-model".to_string(),
+                        usage: Usage {
+                            total_tokens: 80_000,
+                            ..Usage::default()
+                        },
+                        ..AssistantMessage::default()
+                    },
+                });
+                stored.append_message(crate::session::SessionMessage::User {
+                    content: UserContent::Text("retained recent turn".to_string()),
+                    timestamp: Some(0),
+                });
+                stored.save().await.expect("initial durable session");
+                let path = stored.path.clone().expect("session path");
+                let before = std::fs::read(&path).expect("initial bytes");
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let mut options =
+                    build_test_rpc_options(&handle, directory.path().join("auth.json"));
+                options.config = serde_json::from_value(json!({
+                    "compaction": {
+                        "enabled": true, "mode": "snapcompact", "methodOrder": ["soft"],
+                        "reserveTokens": 8_000, "keepRecentTokens": 1,
+                        "thresholdTokens": threshold
+                    }
+                }))
+                .expect("archive policy");
+                let settings = options.config.resolved_compaction_settings(20_000);
+                let mut model = dummy_entry("test-model", false);
+                model.model.provider = "test-provider".to_string();
+                model.model.context_window = 20_000;
+                // The effective Agent reader, including a local image ban,
+                // remains authoritative even if catalog metadata says vision.
+                model.model.input = vec![InputType::Text, InputType::Image];
+                options.available_models = vec![model];
+                let mut agent = Agent::new(
+                    Arc::new(OrderedCompactionProvider {
+                        requests: Arc::clone(&requests),
+                        summary: Some("short portable checkpoint".to_string()),
+                    }),
+                    ToolRegistry::new(&[], directory.path(), None),
+                    AgentConfig {
+                        model_accepts_images: vision,
+                        block_images: blocked,
+                        ..AgentConfig::default()
+                    },
+                );
+                agent.replace_messages(stored.to_messages_for_current_path());
+                let session = Arc::new(asupersync::sync::Mutex::new(AgentSession::new(
+                    agent,
+                    Arc::new(asupersync::sync::Mutex::new(stored)),
+                    true,
+                    settings,
+                )));
+                let shared = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                    &options.config,
+                )));
+                let compacting = Arc::new(AtomicBool::new(false));
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel(16);
+                maybe_auto_compact(
+                    Arc::clone(&session),
+                    shared,
+                    options,
+                    Arc::clone(&compacting),
+                    out_tx,
+                )
+                .await;
+                let events = out_rx
+                    .try_iter()
+                    .map(|line| parse_response(&line))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    events.len(),
+                    2,
+                    "vision={vision}, blocked={blocked}, threshold={threshold}: {events:?}",
+                );
+                assert!(!compacting.load(Ordering::SeqCst));
+                assert_eq!(requests.lock().expect("requests").len(), 1);
+                if !accepted {
+                    assert!(events[1]["errorMessage"].is_string(), "{events:?}");
+                    assert!(events[1].get("result").is_none());
+                    assert_eq!(std::fs::read(&path).expect("unchanged history"), before);
+                    continue;
+                }
+                assert!(events[1].get("errorMessage").is_none(), "{events:?}");
+                assert!(events[1]["result"]["tokensAfter"].as_u64().unwrap() < threshold);
+                let reopened = Session::open(path.to_str().expect("UTF-8 path"))
+                    .await
+                    .expect("reopen archive");
+                let installed = reopened
+                    .entries_for_current_path()
+                    .into_iter()
+                    .find_map(|entry| {
+                        if let crate::session::SessionEntry::Compaction(entry) = entry {
+                            Some(entry)
+                        } else {
+                            None
+                        }
+                    })
+                    .expect("one durable compaction");
+                let payload =
+                    crate::compaction_snap::frames_from_details(installed.details.as_ref())
+                        .expect("persisted archive");
+                assert!(
+                    payload
+                        .source_text
+                        .as_deref()
+                        .unwrap()
+                        .contains("ARCHIVE-READER-PROBE"),
+                );
+                assert!(!payload.frames.is_empty());
+                let cx = AgentCx::for_request();
+                let mut live = session.lock(&cx).await.expect("live session");
+                let live_tokens = live
+                    .agent
+                    .estimate_message_context_tokens(live.agent.messages());
+                assert_eq!(events[1]["result"]["tokensAfter"], live_tokens);
+                live.agent
+                    .replace_messages(reopened.to_messages_for_current_path());
+                for next_vision in [true, false] {
+                    live.agent.set_model_accepts_images(next_vision);
+                    let request = live.agent.request_context_json();
+                    let wire =
+                        serde_json::to_string(&request["messages"]).expect("request context");
+                    assert_eq!(wire.contains("image/png"), next_vision && !blocked);
+                    assert_eq!(
+                        wire.contains("ARCHIVE-READER-PROBE"),
+                        !next_vision || blocked,
+                    );
+                    assert!(wire.contains("retained recent turn"));
+                    assert!(!wire.contains("pi.snapcompact"));
+                    assert!(!wire.contains("sourceText"));
+                }
+            }
+        }));
     }
 
     #[test]
@@ -26724,6 +27381,7 @@ export default function init(pi) {
                 reserve_tokens: Some(2),
                 keep_recent_tokens: Some(1),
                 mode: None,
+                ..Default::default()
             });
 
             let auth_dir = tempfile::tempdir().expect("tempdir");
@@ -27105,6 +27763,7 @@ export default function init(pi) {
                 reserve_tokens: Some(2),
                 keep_recent_tokens: Some(1),
                 mode: None,
+                ..Default::default()
             });
 
             let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
@@ -27384,6 +28043,7 @@ export default function init(pi) {
                     reserve_tokens: Some(2),
                     keep_recent_tokens: Some(1),
                     mode: None,
+                    ..Default::default()
                 });
 
                 let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);

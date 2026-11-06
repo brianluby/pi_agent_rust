@@ -3156,16 +3156,69 @@ impl Agent {
         self.config.system_prompt = system_prompt;
     }
 
+    /// Snapshot the effective reader, including an explicit image-input ban.
+    pub(crate) const fn compaction_reader(&self) -> compaction::CompactionReader {
+        compaction::CompactionReader {
+            accepts_images: self.config.model_accepts_images && !self.config.block_images,
+            source_text_budget: Some(self.snapcompact_text_tokens),
+        }
+    }
+
+    /// Apply the same exclusion and user-image policy for request construction
+    /// and compaction budgeting. Text-only contexts keep their borrowed view.
+    fn input_messages<'a>(&self, messages: &'a [Message]) -> Cow<'a, [Message]> {
+        let has_excluded = messages.iter().any(|message| {
+            matches!(message, Message::Custom(custom) if context_excluded_custom_message(custom))
+                || crate::turn_recovery::context_excludes_empty_response(message)
+        });
+        let needs_image_filter = (self.config.block_images || !self.config.model_accepts_images)
+            && messages.iter().any(message_has_images);
+        if !has_excluded && !needs_image_filter {
+            return Cow::Borrowed(messages);
+        }
+        let mut messages = messages.to_vec();
+        messages.retain(|message| match message {
+            Message::Custom(custom) => !context_excluded_custom_message(custom),
+            Message::Assistant(_) => {
+                !crate::turn_recovery::context_excludes_empty_response(message)
+            }
+            _ => true,
+        });
+        apply_image_input_policy(
+            &mut messages,
+            self.config.block_images,
+            self.config.model_accepts_images,
+        );
+        Cow::Owned(messages)
+    }
+
     /// Estimate a session candidate using the same archive reading and budget
     /// as this agent's next request, without changing its durable messages.
     pub(crate) fn estimate_message_context_tokens(&self, messages: &[Message]) -> u64 {
+        let messages = self.input_messages(messages);
+        let reader = self.compaction_reader();
         compaction::estimate_model_context_tokens_for_model(
-            messages,
-            self.config.model_accepts_images && !self.config.block_images,
-            Some(self.snapcompact_text_tokens),
+            &messages,
+            reader.accepts_images,
+            reader.source_text_budget,
             self.provider.name(),
             self.provider.model_id(),
         )
+    }
+
+    /// Include reminders and rewind projection outside the raw kept slice.
+    /// Session replay owns those rules; estimates must not reimplement them.
+    pub(crate) fn refresh_compaction_retained_tokens(
+        &self,
+        preparation: &mut compaction::CompactionPreparation,
+        path_entries: &[crate::session::SessionEntry],
+    ) -> Result<()> {
+        let retained = Session::messages_retained_after_compaction(
+            path_entries,
+            &preparation.first_kept_entry_id,
+        )?;
+        preparation.retained_tokens = Some(self.estimate_message_context_tokens(&retained));
+        Ok(())
     }
 
     /// What the next completion request would carry: the system prompt,
@@ -3215,28 +3268,7 @@ impl Agent {
         // would only spend context budget. Until 2026-09-02 every hidden
         // custom message was dropped here, which silently discarded hidden
         // hook injections.
-        let has_excluded = self.messages.iter().any(|m| {
-            matches!(m, Message::Custom(c) if context_excluded_custom_message(c))
-                || crate::turn_recovery::context_excludes_empty_response(m)
-        });
-        let needs_image_filter = (self.config.block_images || !self.config.model_accepts_images)
-            && self.messages.iter().any(message_has_images);
-        let messages: Cow<'_, [Message]> = if needs_image_filter || has_excluded {
-            let mut msgs = self.messages.clone();
-            msgs.retain(|m| match m {
-                Message::Custom(c) => !context_excluded_custom_message(c),
-                Message::Assistant(_) => !crate::turn_recovery::context_excludes_empty_response(m),
-                _ => true,
-            });
-            apply_image_input_policy(
-                &mut msgs,
-                self.config.block_images,
-                self.config.model_accepts_images,
-            );
-            Cow::Owned(msgs)
-        } else {
-            Cow::Borrowed(self.messages.as_slice())
-        };
+        let messages = self.input_messages(&self.messages);
 
         // Borrow cached tool defs if available; otherwise build + cache + borrow.
         // Load modes (bd-cv653.1.6): discoverable-tier tools are excluded
@@ -7705,6 +7737,13 @@ impl SessionEditSnapshot {
     }
 }
 
+/// Recheck an automatic result against the selected live branch after all
+/// admission waits. Background generation may retain newly appended turns.
+struct CompactionInstallGuard {
+    origin: Option<CompactionOrigin>,
+    require_policy_fit: bool,
+}
+
 pub struct AgentSession {
     pub agent: Agent,
     pub session: Arc<Mutex<Session>>,
@@ -8401,6 +8440,54 @@ impl ExtensionModelCatalogSnapshot {
     }
 }
 
+/// An automatic policy may finish with a local shake. Resolve credentials only
+/// when a selected method actually enters the existing, cost-guarded provider.
+struct AutomaticCompactionProvider {
+    inner: Arc<dyn Provider>,
+    entry: Option<ModelEntry>,
+    auth: Option<AuthStorage>,
+    explicit_key: Option<String>,
+}
+
+#[async_trait]
+impl Provider for AutomaticCompactionProvider {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn api(&self) -> &str {
+        self.inner.api()
+    }
+
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn model_cost(&self) -> Option<crate::provider::ModelCost> {
+        self.inner.model_cost()
+    }
+
+    fn cost_budget(&self) -> Option<&crate::cost::CostBudget> {
+        self.inner.cost_budget()
+    }
+
+    async fn stream(
+        &self,
+        context: &Context<'_>,
+        options: &StreamOptions,
+    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>> {
+        let mut options = options.clone();
+        ExtensionCompactionModelState::refresh_key_from_sources(
+            self.inner.as_ref(),
+            &mut options,
+            self.entry.as_ref(),
+            self.auth.as_ref(),
+            self.explicit_key.as_deref(),
+        )?;
+        self.inner.stream(context, &options).await
+    }
+}
+
 #[derive(Clone, Default)]
 struct ExtensionCompactionModelState {
     registry: Option<Arc<ModelRegistry>>,
@@ -8478,14 +8565,41 @@ impl ExtensionCompactionModelState {
         mut stream_options: StreamOptions,
         options: &ExtensionCompactionOptions,
     ) -> Result<(Arc<dyn Provider>, StreamOptions)> {
-        let (provider_id, model_id) = options.model.as_ref().map_or_else(
+        stream_options.thinking_level = Some(
+            options
+                .thinking_level
+                .or(stream_options.thinking_level)
+                .unwrap_or(crate::model::ThinkingLevel::High),
+        );
+        self.resolve_model(
+            current_provider,
+            stream_options,
+            options
+                .model
+                .as_ref()
+                .map(|model| (model.provider.as_str(), model.id.as_str())),
+            "compact",
+        )
+    }
+
+    /// Nested extension requests use the same trusted registry, credential
+    /// refresh, and cost account as compaction. Request-provided model metadata
+    /// never supplies an endpoint, authorization header, or credential.
+    fn resolve_model(
+        &self,
+        current_provider: Arc<dyn Provider>,
+        mut stream_options: StreamOptions,
+        requested: Option<(&str, &str)>,
+        operation: &str,
+    ) -> Result<(Arc<dyn Provider>, StreamOptions)> {
+        let (provider_id, model_id) = requested.map_or_else(
             || (current_provider.name(), current_provider.model_id()),
-            |model| (model.provider.trim(), model.id.trim()),
+            |(provider, model)| (provider.trim(), model.trim()),
         );
         if provider_id.is_empty() || model_id.is_empty() {
-            return Err(Error::validation(
-                "compact: model provider and id must be non-empty strings",
-            ));
+            return Err(Error::validation(format!(
+                "{operation}: model provider and id must be non-empty strings"
+            )));
         }
         let entry = self
             .registry
@@ -8500,20 +8614,18 @@ impl ExtensionCompactionModelState {
             .iter()
             .any(|id| id == resolved_provider)
         {
-            return Err(Error::validation(
-                "compact: extension streamSimple models cannot be called from a compaction hook",
-            ));
+            return Err(Error::validation(format!(
+                "{operation}: extension streamSimple models cannot be called recursively"
+            )));
         }
 
         let same_provider = resolved_provider == current_provider.name();
         let same_model = same_provider && resolved_model == current_provider.model_id();
-        let requested_thinking = options
-            .thinking_level
-            .or(stream_options.thinking_level)
-            .unwrap_or(crate::model::ThinkingLevel::High);
-        stream_options.thinking_level = Some(entry.as_ref().map_or(requested_thinking, |entry| {
-            entry.clamp_thinking_level(requested_thinking)
-        }));
+        stream_options.thinking_level = stream_options.thinking_level.map(|level| {
+            entry
+                .as_ref()
+                .map_or(level, |entry| entry.clamp_thinking_level(level))
+        });
         // The normal provider hook can itself be the extension awaiting this
         // request. The summary engine also clears it for ordinary callers.
         stream_options.before_provider_request = None;
@@ -8524,7 +8636,7 @@ impl ExtensionCompactionModelState {
 
         let mut entry = entry.ok_or_else(|| {
             Error::validation(format!(
-                "compact: model {provider_id}/{model_id} is not registered"
+                "{operation}: model {provider_id}/{model_id} is not registered"
             ))
         })?;
         let explicit = self.explicit_key(&entry.model.provider);
@@ -8561,7 +8673,7 @@ impl ExtensionCompactionModelState {
             && !Self::has_registered_header_auth(&entry, provider.as_ref())
         {
             return Err(Error::auth(format!(
-                "compact: missing credentials for {}/{}",
+                "{operation}: missing credentials for {}/{}",
                 entry.model.provider, entry.model.id
             )));
         }
@@ -8736,7 +8848,7 @@ impl ExtensionHostActions for AgentSessionHostActions {
 
     async fn complete_ai(&self, request: ExtensionAiCompletionRequest) -> Result<Value> {
         let _provider_admission = self.acquire_provider_admission().await?;
-        let (provider, mut stream_options, credentials) = {
+        let (provider, stream_options, models) = {
             let state = self.ai_completion.lock().map_err(|_| {
                 Error::extension("extension completion host state mutex poisoned".to_string())
             })?;
@@ -8747,9 +8859,17 @@ impl ExtensionHostActions for AgentSessionHostActions {
             )
         };
 
-        apply_pi_ai_completion_options(&request.options, &mut stream_options)?;
         let context = build_pi_ai_completion_context(&request)?;
-        credentials.refresh_current_key(provider.as_ref(), &mut stream_options)?;
+        let requested = pi_ai_completion_model(&request.model, provider.as_ref())?;
+        let (provider, mut stream_options) = models.resolve_model(
+            provider,
+            stream_options,
+            requested
+                .as_ref()
+                .map(|(provider, model)| (provider.as_str(), model.as_str())),
+            "pi-ai completion",
+        )?;
+        apply_pi_ai_completion_options(&request.options, &mut stream_options)?;
         let provider_name = provider.name().to_string();
         let mut events = provider.stream(&context, &stream_options).await?;
         let mut streamed_text = String::new();
@@ -9126,6 +9246,42 @@ fn pi_ai_model_registry_values(registry: &ModelRegistry) -> Vec<Value> {
         .collect()
 }
 
+fn pi_ai_completion_model(
+    model: &Value,
+    current: &dyn Provider,
+) -> Result<Option<(String, String)>> {
+    let (provider, id) = match model {
+        Value::Null => return Ok(None),
+        Value::String(id) => (current.name(), id.as_str()),
+        Value::Object(model) => {
+            let id = model
+                .get("id")
+                .or_else(|| model.get("modelId"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    Error::validation("pi-ai completion model.id must be a non-empty string")
+                })?;
+            let provider = model.get("provider").map_or(Ok(current.name()), |value| {
+                value.as_str().ok_or_else(|| {
+                    Error::validation("pi-ai completion model.provider must be a non-empty string")
+                })
+            })?;
+            (provider, id)
+        }
+        _ => {
+            return Err(Error::validation(
+                "pi-ai completion model must be a model object or model ID string",
+            ));
+        }
+    };
+    if provider.trim().is_empty() || id.trim().is_empty() {
+        return Err(Error::validation(
+            "pi-ai completion model provider and id must be non-empty strings",
+        ));
+    }
+    Ok(Some((provider.trim().to_string(), id.trim().to_string())))
+}
+
 fn apply_pi_ai_completion_options(
     options: &Value,
     stream_options: &mut StreamOptions,
@@ -9176,11 +9332,11 @@ fn build_pi_ai_completion_context(
     let mut system_prompts = Vec::new();
     let mut messages = Vec::new();
     collect_pi_ai_context_messages(&request.context, &mut system_prompts, &mut messages)?;
+    let tools = pi_ai_context_tools(&request.context)?;
 
     if messages.is_empty() {
         return Err(Error::validation(
-            "@mariozechner/pi-ai completion requires at least one user or assistant message"
-                .to_string(),
+            "@mariozechner/pi-ai completion requires at least one context message".to_string(),
         ));
     }
 
@@ -9196,8 +9352,52 @@ fn build_pi_ai_completion_context(
             Some(system_prompt)
         },
         messages,
-        Vec::new(),
+        tools,
     ))
+}
+
+fn pi_ai_context_tools(context: &Value) -> Result<Vec<ToolDef>> {
+    let Some(value) = context.get("tools").filter(|value| !value.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let tools = value
+        .as_array()
+        .ok_or_else(|| Error::validation("pi-ai completion context.tools must be an array"))?;
+    tools
+        .iter()
+        .enumerate()
+        .map(|(index, tool)| {
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::validation(format!(
+                        "pi-ai completion tool {index} requires a non-empty name"
+                    ))
+                })?;
+            let description = tool.get("description").map_or(Ok(""), |value| {
+                value.as_str().ok_or_else(|| {
+                    Error::validation(format!(
+                        "pi-ai completion tool {name:?} description must be a string"
+                    ))
+                })
+            })?;
+            let parameters = tool
+                .get("parameters")
+                .filter(|value| value.is_object())
+                .ok_or_else(|| {
+                    Error::validation(format!(
+                        "pi-ai completion tool {name:?} parameters must be a JSON schema object"
+                    ))
+                })?;
+            Ok(ToolDef {
+                name: name.to_string(),
+                description: description.to_string(),
+                parameters: parameters.clone(),
+            })
+        })
+        .collect()
 }
 
 fn collect_pi_ai_context_messages(
@@ -9223,7 +9423,10 @@ fn collect_pi_ai_context_messages(
                 system_prompts.push(system);
             }
 
-            if let Some(items) = map.get("messages").and_then(Value::as_array) {
+            if let Some(value) = map.get("messages") {
+                let items = value.as_array().ok_or_else(|| {
+                    Error::validation("pi-ai completion context.messages must be an array")
+                })?;
                 for item in items {
                     push_pi_ai_message(item, system_prompts, messages)?;
                 }
@@ -9255,32 +9458,75 @@ fn push_pi_ai_message(
         return Ok(());
     };
 
-    let role = map
-        .get("role")
-        .and_then(Value::as_str)
-        .unwrap_or("user")
-        .trim()
-        .to_ascii_lowercase();
-    let content = map
-        .get("content")
-        .or_else(|| map.get("text"))
-        .and_then(pi_ai_text_from_value)
-        .unwrap_or_default();
-
-    match role.as_str() {
+    let role = map.get("role").map_or(Ok("user"), |value| {
+        value.as_str().ok_or_else(|| {
+            Error::validation("pi-ai completion context message role must be a string")
+        })
+    })?;
+    let role = role.trim().to_ascii_lowercase();
+    let role = match role.as_str() {
         "system" => {
-            if !content.trim().is_empty() {
+            if let Some(content) = map
+                .get("content")
+                .or_else(|| map.get("text"))
+                .and_then(pi_ai_text_from_value)
+                .filter(|text| !text.trim().is_empty())
+            {
                 system_prompts.push(content);
             }
+            return Ok(());
         }
-        "user" => push_pi_ai_user_message(&content, messages),
-        "assistant" => push_pi_ai_assistant_message(&content, messages),
+        "user" => "user",
+        "assistant" => "assistant",
+        "toolresult" => "toolResult",
         other => {
             return Err(Error::validation(format!(
                 "@mariozechner/pi-ai completion does not support {other:?} context messages"
             )));
         }
+    };
+
+    // Keep the native message wire format intact, including signatures,
+    // provider identity, and tool-result details. Supply defaults only for
+    // metadata omitted by shorthand history messages.
+    let mut normalized = map.clone();
+    normalized.insert("role".to_string(), Value::String(role.to_string()));
+    normalized
+        .entry("timestamp")
+        .or_insert_with(|| json!(Utc::now().timestamp_millis()));
+    let content = map
+        .get("content")
+        .or_else(|| map.get("text"))
+        .filter(|value| !value.is_null())
+        .cloned()
+        .unwrap_or_else(|| Value::String(String::new()));
+    let content = match content {
+        Value::String(text) if role != "user" => json!([{"type": "text", "text": text}]),
+        Value::Object(block) if block.contains_key("type") => {
+            Value::Array(vec![Value::Object(block)])
+        }
+        value => value,
+    };
+    normalized.insert("content".to_string(), content);
+    if role == "assistant" {
+        for (key, default) in [
+            ("api", json!("")),
+            ("provider", json!("")),
+            ("model", json!("")),
+            ("usage", json!(Usage::default())),
+            ("stopReason", json!("stop")),
+        ] {
+            normalized.entry(key).or_insert(default);
+        }
+    } else if role == "toolResult" {
+        normalized.entry("isError").or_insert(Value::Bool(false));
     }
+    let message = serde_json::from_value(Value::Object(normalized)).map_err(|err| {
+        Error::validation(format!(
+            "pi-ai completion has an invalid {role} context message: {err}"
+        ))
+    })?;
+    messages.push(message);
     Ok(())
 }
 
@@ -9288,15 +9534,6 @@ fn push_pi_ai_user_message(text: &str, messages: &mut Vec<Message>) {
     messages.push(Message::User(UserMessage {
         content: UserContent::Text(text.to_string()),
         timestamp: Utc::now().timestamp_millis(),
-    }));
-}
-
-fn push_pi_ai_assistant_message(text: &str, messages: &mut Vec<Message>) {
-    messages.push(Message::assistant(AssistantMessage {
-        content: vec![ContentBlock::Text(TextContent::new(text.to_string()))],
-        timestamp: Utc::now().timestamp_millis(),
-        stop_details: None,
-        ..AssistantMessage::default()
     }));
 }
 
@@ -10094,6 +10331,7 @@ mod extensions_integration_tests {
     use super::*;
 
     use crate::session::Session;
+    use crate::session::SessionMessage;
     use asupersync::runtime::RuntimeBuilder;
     use async_trait::async_trait;
     use futures::Stream;
@@ -10351,6 +10589,90 @@ mod extensions_integration_tests {
         > {
             Ok(Box::pin(futures::stream::empty()))
         }
+    }
+
+    #[test]
+    fn native_input_rejects_before_handoff_and_authored_provenance() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for (use_blocks, invalid) in [(false, false), (true, false), (true, true)] {
+                let agent = Agent::new(
+                    Arc::new(NoopProvider),
+                    ToolRegistry::new(&[], Path::new("."), None),
+                    AgentConfig::default(),
+                );
+                let mut session = AgentSession::new(
+                    agent,
+                    Arc::new(Mutex::new(Session::in_memory())),
+                    false,
+                    ResolvedCompactionSettings::default(),
+                );
+                // SDK preflight can succeed before a separate transition
+                // closes admission. The native check must still precede both
+                // the caller's receipt and its one-shot authored provenance.
+                session
+                    .ensure_provider_reentry_allowed()
+                    .expect("preflight");
+                if invalid {
+                    session
+                        .agent
+                        .set_magic_keyword_scan_override(Some("prior provenance".into()));
+                } else {
+                    let independent_gate = session.provider_admission_gate();
+                    independent_gate
+                        .block("transition became indeterminate after preflight".into());
+                }
+                let handed_off = Arc::new(AtomicBool::new(false));
+                let receipt = Arc::clone(&handed_off);
+                let handoff = move |agent: &mut Agent| {
+                    receipt.store(true, Ordering::SeqCst);
+                    agent
+                        .set_magic_keyword_scan_override(Some("ultrathink recovered input".into()));
+                };
+                let mut turn_system_prompt = None;
+                let result = if use_blocks {
+                    let content = if invalid {
+                        ContentBlock::ToolCall(ToolCall {
+                            id: "assistant-only".into(),
+                            name: "read".into(),
+                            arguments: json!({}),
+                            thought_signature: None,
+                        })
+                    } else {
+                        ContentBlock::Text(TextContent::new("prepared content"))
+                    };
+                    session
+                        .run_with_content_with_abort_capturing_prompt_and_handoff(
+                            vec![content],
+                            None,
+                            &mut turn_system_prompt,
+                            |_| panic!("rejected input cannot dispatch provider events"),
+                            handoff,
+                        )
+                        .await
+                } else {
+                    session
+                        .run_text_with_abort_capturing_prompt_and_handoff(
+                            "prepared text".into(),
+                            None,
+                            &mut turn_system_prompt,
+                            |_| panic!("rejected input cannot dispatch provider events"),
+                            handoff,
+                        )
+                        .await
+                };
+                let error = result.expect_err("native admission refusal");
+                if invalid {
+                    assert!(matches!(error, Error::Validation(_)));
+                } else {
+                    assert!(error.is_session_persistence());
+                }
+                assert!(!handed_off.load(Ordering::SeqCst));
+                assert_eq!(session.agent.magic_keyword_scan_override, None);
+                assert!(session.agent.messages().is_empty());
+                assert_eq!(turn_system_prompt, None);
+            }
+        });
     }
 
     #[derive(Debug)]
@@ -11487,6 +11809,7 @@ mod extensions_integration_tests {
     pub(super) struct PiAiCapturedProviderContext {
         pub(super) system_prompt: Option<String>,
         pub(super) messages: Vec<Message>,
+        pub(super) tools: Vec<ToolDef>,
         pub(super) options: StreamOptions,
     }
 
@@ -11524,6 +11847,7 @@ mod extensions_integration_tests {
                 .push(PiAiCapturedProviderContext {
                     system_prompt: context.system_prompt.as_ref().map(ToString::to_string),
                     messages: context.messages.iter().cloned().collect(),
+                    tools: context.tools.iter().cloned().collect(),
                     options: options.clone(),
                 });
             let final_message = AssistantMessage {
@@ -11649,6 +11973,255 @@ mod extensions_integration_tests {
                 1,
                 "quarantine must reject before provider.stream"
             );
+        });
+    }
+
+    fn pi_ai_host_actions(
+        provider: Arc<dyn Provider>,
+        options: StreamOptions,
+        models: ExtensionCompactionModelState,
+    ) -> AgentSessionHostActions {
+        AgentSessionHostActions {
+            session: Arc::new(Mutex::new(Session::in_memory())),
+            injected: Arc::new(StdMutex::new(ExtensionInjectedQueue::default())),
+            is_streaming: Arc::new(AtomicBool::new(false)),
+            is_turn_active: Arc::new(AtomicBool::new(false)),
+            pending_idle_actions: Arc::new(StdMutex::new(VecDeque::new())),
+            ai_completion: Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
+                provider,
+                stream_options: options,
+                models: Vec::new(),
+                compaction_models: models,
+                compaction_privacy: Arc::new(StdMutex::new(
+                    compaction::CompactionPrivacy::default(),
+                )),
+            })),
+            provider_admission: ProviderAdmissionGate::default(),
+            session_action_admission: SessionActionAdmissionGate::default(),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn agent_host_actions_complete_ai_preserves_structured_history_and_tools() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            let actions = pi_ai_host_actions(
+                Arc::new(PiAiCaptureProvider {
+                    calls: Arc::clone(&calls),
+                }),
+                StreamOptions {
+                    api_key: Some("host-managed-key".to_string()),
+                    before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                        |_| {
+                            Box::pin(async {
+                                panic!("nested completion must not re-enter the extension hook")
+                            })
+                        },
+                    )),
+                    ..StreamOptions::default()
+                },
+                ExtensionCompactionModelState::default(),
+            );
+            let history = json!([
+                {"role": "user", "timestamp": 11, "content": [
+                    {"type": "text", "text": "Inspect this image"},
+                    {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/png"},
+                    {"type": "media", "data": "YXVkaW8=", "mimeType": "audio/wav", "name": "clip.wav"}
+                ]},
+                {"role": "assistant", "timestamp": 12, "api": "anthropic-messages",
+                 "provider": "history-provider", "model": "history-model", "usage": Usage::default(),
+                 "stopReason": "toolUse", "content": [
+                    {"type": "thinking", "thinking": "Signed reasoning", "thinkingSignature": "thinking-sig"},
+                    {"type": "redacted_thinking", "data": "opaque-reasoning"},
+                    {"type": "text", "text": "Looking up the caption", "textSignature": "text-sig"},
+                    {"type": "toolCall", "id": "lookup-1", "name": "lookup", "arguments": {"key": "caption"},
+                     "thoughtSignature": "tool-sig"}
+                ]},
+                {"role": "toolResult", "timestamp": 13, "toolCallId": "lookup-1", "toolName": "lookup",
+                 "isError": false, "details": {"source": "extension"}, "content": [
+                    {"type": "text", "text": "A caption"},
+                    {"type": "image", "data": "cmVzdWx0", "mimeType": "image/png"}
+                ]}
+            ]);
+            let tools = json!([{"name": "lookup", "description": "Find a stored caption", "parameters": {
+                "type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]
+            }}]);
+            actions
+                .complete_ai(ExtensionAiCompletionRequest {
+                    model: Value::Null,
+                    context: json!({
+                        "systemPrompt": "Keep signatures", "messages": history, "tools": tools
+                    }),
+                    options: json!({"maxTokens": 73, "temperature": 0.25}),
+                    simple: false,
+                })
+                .await
+                .expect("structured completion");
+
+            let calls = calls.lock().expect("captured provider request");
+            assert_eq!(calls.len(), 1);
+            let captured = &calls[0];
+            assert_eq!(serde_json::to_value(&captured.messages).unwrap(), history);
+            assert_eq!(captured.system_prompt.as_deref(), Some("Keep signatures"));
+            assert_eq!(captured.tools.len(), 1);
+            assert_eq!(captured.tools[0].name, "lookup");
+            assert_eq!(captured.tools[0].description, "Find a stored caption");
+            assert_eq!(captured.tools[0].parameters, tools[0]["parameters"]);
+            assert_eq!(captured.options.api_key.as_deref(), Some("host-managed-key"));
+            assert_eq!(captured.options.max_tokens, Some(73));
+            assert_eq!(captured.options.temperature, Some(0.25));
+            assert_eq!(captured.options.thinking_level, None);
+            assert!(captured.options.before_provider_request.is_none());
+        });
+    }
+
+    #[test]
+    fn agent_host_actions_complete_ai_keeps_current_model_shorthands() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            let actions = pi_ai_host_actions(
+                Arc::new(PiAiCaptureProvider {
+                    calls: Arc::clone(&calls),
+                }),
+                StreamOptions::default(),
+                ExtensionCompactionModelState::default(),
+            );
+            for model in [
+                Value::Null,
+                json!("capture-model"),
+                json!({"id": "capture-model"}),
+                json!({"provider": "capturing-provider", "modelId": "capture-model"}),
+            ] {
+                let result = actions
+                    .complete_ai(ExtensionAiCompletionRequest {
+                        model,
+                        context: json!([
+                            "plain prompt", {"role": "assistant", "content": "plain reply"}
+                        ]),
+                        options: json!({}),
+                        simple: true,
+                    })
+                    .await
+                    .expect("current-model shorthand");
+                assert_eq!(result, "captured");
+            }
+            let calls = calls.lock().expect("captured requests");
+            assert_eq!(calls.len(), 4);
+            for call in calls.iter() {
+                assert!(matches!(
+                    &call.messages[0],
+                    Message::User(UserMessage { content: UserContent::Text(text), .. })
+                        if text == "plain prompt"
+                ));
+                assert!(matches!(
+                    &call.messages[1], Message::Assistant(message)
+                        if pi_ai_assistant_text(message) == "plain reply"
+                ));
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn agent_host_actions_complete_ai_rejects_invalid_context_and_targets_before_dispatch() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            let mut registry = ModelRegistry::load_with_credential_resolver(None, |_| None);
+            registry.merge_entries(vec![
+                compaction_override_entry("completion-private", "requires-key", true),
+                compaction_override_entry("completion-js", "js-model", false),
+            ]);
+            let actions = pi_ai_host_actions(
+                Arc::new(PiAiCaptureProvider {
+                    calls: Arc::clone(&calls),
+                }),
+                StreamOptions {
+                    api_key: Some("source-key".to_string()),
+                    ..StreamOptions::default()
+                },
+                ExtensionCompactionModelState {
+                    registry: Some(Arc::new(registry)),
+                    js_provider_ids: vec!["completion-js".to_string()],
+                    ..ExtensionCompactionModelState::default()
+                },
+            );
+            for (model, expected) in [
+                (json!([]), "model object"),
+                (json!({}), "model.id"),
+                (json!({"id": ""}), "non-empty"),
+                (
+                    json!({"provider": false, "id": "capture-model"}),
+                    "model.provider",
+                ),
+                (json!("unregistered-model"), "not registered"),
+                (
+                    json!({"provider": "other-provider", "id": "capture-model"}),
+                    "not registered",
+                ),
+                (
+                    json!({"provider": "completion-private", "id": "requires-key"}),
+                    "missing credentials",
+                ),
+                (
+                    json!({"provider": "completion-js", "id": "js-model"}),
+                    "recursively",
+                ),
+            ] {
+                let error = actions
+                    .complete_ai(ExtensionAiCompletionRequest {
+                        model,
+                        context: json!("do not dispatch"),
+                        options: json!({}),
+                        simple: false,
+                    })
+                    .await
+                    .expect_err("explicit invalid model must not fall back to current");
+                assert!(
+                    error.to_string().contains(expected),
+                    "unexpected error: {error}"
+                );
+            }
+            for context in [
+                json!({"messages": "not an array"}),
+                json!({"messages": [{"role": false, "content": "invalid role"}]}),
+                json!({"messages": [{"role": "user", "content": [{"type": "image", "mimeType": "image/png"}]}]}),
+                json!({"messages": [{"role": "assistant", "content": [{"type": "toolCall", "id": "missing-name"}]}]}),
+                json!({"messages": [{"role": "toolResult", "content": "missing tool identity"}]}),
+                json!({"messages": ["prompt"], "tools": {"name": "bad"}}),
+                json!({"messages": ["prompt"], "tools": [{"name": "lookup", "parameters": "invalid"}]}),
+            ] {
+                actions
+                    .complete_ai(ExtensionAiCompletionRequest {
+                        model: Value::Null,
+                        context,
+                        options: json!({}),
+                        simple: false,
+                    })
+                    .await
+                    .expect_err("malformed context must not be flattened or silently dropped");
+            }
+            actions
+                .ai_completion
+                .lock()
+                .expect("host state")
+                .compaction_models
+                .js_provider_ids
+                .push("capturing-provider".to_string());
+            let error = actions
+                .complete_ai(ExtensionAiCompletionRequest {
+                    model: Value::Null,
+                    context: json!("current JS provider would recurse"),
+                    options: json!({}),
+                    simple: false,
+                })
+                .await
+                .expect_err("same-model JS recursion must also be rejected");
+            assert!(error.to_string().contains("recursively"));
+            assert!(calls.lock().expect("captured requests").is_empty());
         });
     }
 
@@ -11853,6 +12426,70 @@ mod extensions_integration_tests {
     }
 
     #[test]
+    fn pi_ai_model_override_keeps_target_auth_and_the_live_cost_account() {
+        let directory = tempfile::tempdir().expect("auth directory");
+        let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+        auth.set(
+            "completion-target",
+            crate::auth::AuthCredential::ApiKey {
+                key: "fresh-target-key".to_string(),
+            },
+        );
+        let mut entry = compaction_override_entry("completion-target", "target-model", true);
+        entry.api_key = Some("outdated-catalog-key".to_string());
+        let mut registry = ModelRegistry::load_with_credential_resolver(None, |_| None);
+        registry.merge_entries(vec![entry]);
+        let models = ExtensionCompactionModelState {
+            registry: Some(Arc::new(registry)),
+            auth: Some(Arc::new(auth)),
+            ..ExtensionCompactionModelState::default()
+        };
+        let budget = crate::cost::CostBudget::new(None, Some(2.0), 1.0).expect("account");
+        let current = crate::provider::guard_with_cost_budget(
+            Arc::new(PiAiCaptureProvider {
+                calls: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            budget.clone(),
+        );
+        let (provider, mut options) = models
+            .resolve_model(
+                current,
+                StreamOptions {
+                    api_key: Some("private-source-key".to_string()),
+                    headers: std::collections::HashMap::from([(
+                        "Authorization".to_string(),
+                        "Bearer private-source-header".to_string(),
+                    )]),
+                    max_tokens: Some(8192),
+                    ..StreamOptions::default()
+                },
+                Some(("completion-target", "target-model")),
+                "pi-ai completion",
+            )
+            .expect("registered target");
+        assert_eq!(provider.name(), "completion-target");
+        assert_eq!(provider.model_id(), "target-model");
+        assert_eq!(options.api_key.as_deref(), Some("fresh-target-key"));
+        assert_eq!(options.headers["x-target-route"], "target-only");
+        assert!(!options.headers.contains_key("Authorization"));
+        assert_eq!(options.max_tokens, Some(2048));
+        assert_eq!(options.thinking_level, None);
+        apply_pi_ai_completion_options(&json!({"maxTokens": 91}), &mut options)
+            .expect("completion options after model resolution");
+        assert_eq!(options.max_tokens, Some(91));
+        assert!(
+            provider
+                .cost_budget()
+                .is_some_and(|shared| shared.same_tree(&budget))
+        );
+        budget
+            .record(1.0)
+            .expect("sibling exhausts the shared account");
+        let result = futures::executor::block_on(provider.stream(&Context::default(), &options));
+        assert!(matches!(result, Err(Error::CostCap { .. })));
+    }
+
+    #[test]
     fn extension_compaction_override_uses_target_auth_headers_and_model_limits() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
@@ -11945,6 +12582,221 @@ mod extensions_integration_tests {
     }
 
     #[test]
+    fn automatic_compaction_provider_refreshes_auth_and_keeps_the_live_budget() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut auth = AuthStorage::empty_at(directory.path().join("auth.json"));
+        auth.set(
+            "capturing-provider",
+            crate::auth::AuthCredential::ApiKey {
+                key: "fresh-compaction-key".to_string(),
+            },
+        );
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let budget = crate::cost::CostBudget::new(None, Some(2.0), 1.0).expect("account");
+        let provider = AutomaticCompactionProvider {
+            inner: crate::provider::guard_with_cost_budget(
+                Arc::new(PiAiCaptureProvider {
+                    calls: Arc::clone(&calls),
+                }),
+                budget.clone(),
+            ),
+            entry: None,
+            auth: Some(auth),
+            explicit_key: None,
+        };
+        assert!(
+            provider
+                .cost_budget()
+                .is_some_and(|shared| shared.same_tree(&budget))
+        );
+        let cached = StreamOptions {
+            api_key: Some("cached-compaction-key".to_string()),
+            ..StreamOptions::default()
+        };
+        futures::executor::block_on(async {
+            let mut stream = provider
+                .stream(&Context::default(), &cached)
+                .await
+                .expect("summary request");
+            while let Some(event) = stream.next().await {
+                event.expect("summary event");
+            }
+        });
+        {
+            let calls = calls.lock().expect("captured summary requests");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0].options.api_key.as_deref(),
+                Some("fresh-compaction-key"),
+            );
+        }
+        assert_eq!(cached.api_key.as_deref(), Some("cached-compaction-key"));
+        budget.record(1.0).expect("sibling completion");
+        let result = futures::executor::block_on(provider.stream(&Context::default(), &cached));
+        assert!(matches!(result, Err(Error::CostCap { .. })));
+        assert_eq!(calls.lock().expect("captured summary requests").len(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ordered_automatic_compaction_rejects_hook_replacements_but_manual_accepts_them() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().expect("workspace");
+            let entry = directory.path().join("replace-compaction.mjs");
+            std::fs::write(
+                &entry,
+                r"
+                export default function(pi) {
+                    pi.on('session_before_compact', (event) => ({
+                        compaction: {
+                            summary: 'extension replacement',
+                            firstKeptEntryId: event.preparation.firstKeptEntryId,
+                            tokensBefore: event.preparation.tokensBefore
+                        }
+                    }));
+                }
+                ",
+            )
+            .expect("write replacement hook");
+            let mut stored = Session::in_memory();
+            stored.header.provider = Some("capturing-provider".to_string());
+            stored.header.model_id = Some("capture-model".to_string());
+            stored.append_message(SessionMessage::User {
+                content: UserContent::Text("old request".to_string()),
+                timestamp: Some(0),
+            });
+            stored.append_message(SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new(
+                        "archive context ".repeat(128),
+                    ))],
+                    provider: "capturing-provider".to_string(),
+                    model: "capture-model".to_string(),
+                    usage: Usage {
+                        total_tokens: 80_000,
+                        ..Usage::default()
+                    },
+                    ..AssistantMessage::default()
+                },
+            });
+            stored.append_message(SessionMessage::User {
+                content: UserContent::Text("retained recent turn".to_string()),
+                timestamp: Some(0),
+            });
+            let original_messages = stored.to_messages_for_current_path();
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            let mut agent = Agent::new(
+                Arc::new(PiAiCaptureProvider {
+                    calls: Arc::clone(&calls),
+                }),
+                ToolRegistry::new(&[], directory.path(), None),
+                AgentConfig::default(),
+            );
+            agent.replace_messages(original_messages.clone());
+            let session = Arc::new(Mutex::new(stored));
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                false,
+                ResolvedCompactionSettings {
+                    enabled: true,
+                    threshold_tokens: Some(2_000),
+                    keep_recent_tokens: 1,
+                    method_order: Some(vec![
+                        compaction::AutoCompactionMethod::Shake,
+                        compaction::AutoCompactionMethod::Soft,
+                    ]),
+                    ..ResolvedCompactionSettings::default()
+                },
+            );
+            agent_session
+                .enable_extensions(&[], directory.path(), None, &[entry])
+                .await
+                .expect("enable replacement hook");
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let (source, metrics_before) = {
+                let stored = session.lock(cx.cx()).await.expect("stored session");
+                (
+                    SessionEditSnapshot::capture(&stored).expect("source snapshot"),
+                    stored.autosave_metrics(),
+                )
+            };
+            for overflow in [false, true] {
+                let events = Arc::new(StdMutex::new(Vec::new()));
+                let captured = Arc::clone(&events);
+                let on_event: AgentEventHandler = Arc::new(move |event| {
+                    captured.lock().expect("compaction events").push(event);
+                });
+                let outcome = if overflow {
+                    agent_session
+                        .compact_after_context_overflow(&AbortHandle::new().1, move |event| {
+                            on_event(event);
+                        })
+                        .await
+                        .map(|_| ())
+                } else {
+                    agent_session.maybe_compact(on_event).await
+                };
+                let error = outcome.expect_err("automatic policy rejects extension replacement");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("does not accept extension replacement"),
+                    "overflow={overflow}: {error}",
+                );
+                {
+                    let events = events.lock().expect("compaction events");
+                    assert_eq!(events.len(), 2, "overflow={overflow}");
+                    assert!(matches!(events[0], AgentEvent::AutoCompactionStart { .. }));
+                    assert!(matches!(
+                        &events[1],
+                        AgentEvent::AutoCompactionEnd {
+                            result: None,
+                            aborted: false,
+                            will_retry: false,
+                            error_message: Some(message),
+                        } if message.contains("does not accept extension replacement")
+                    ));
+                }
+                assert!(
+                    !agent_session
+                        .extensions_is_compacting
+                        .load(Ordering::SeqCst)
+                );
+                let stored = session.lock(cx.cx()).await.expect("stored session");
+                assert!(source == SessionEditSnapshot::capture(&stored).expect("final snapshot"));
+                assert_eq!(
+                    stored.autosave_metrics().coalesced_mutations,
+                    metrics_before.coalesced_mutations,
+                );
+                assert_eq!(
+                    serde_json::to_value(agent_session.agent.messages()).unwrap(),
+                    serde_json::to_value(&original_messages).unwrap(),
+                );
+                assert!(calls.lock().expect("provider calls").is_empty());
+            }
+            assert!(
+                agent_session
+                    .compact_now(None, |_| {})
+                    .await
+                    .expect("manual compaction retains replacement compatibility")
+            );
+            let stored = session.lock(cx.cx()).await.expect("stored session");
+            let replacements = stored
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(entry, crate::session::SessionEntry::Compaction(compaction)
+                        if compaction.summary == "extension replacement")
+                })
+                .count();
+            assert_eq!(replacements, 1);
+            assert!(calls.lock().expect("provider calls").is_empty());
+        });
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn extension_completion_and_compaction_revalidate_exhausted_pools() {
         const CHILD: &str = "PI_COMPACTION_POOL_EXHAUSTION_CHILD";
@@ -12007,6 +12859,59 @@ mod extensions_integration_tests {
         let error = state
             .refresh_current_key(current.as_ref(), &mut cached.clone())
             .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(crate::auth::CREDENTIAL_POOL_EXHAUSTED)
+        );
+
+        let automatic: Arc<dyn Provider> = Arc::new(AutomaticCompactionProvider {
+            inner: Arc::clone(&current),
+            entry: state
+                .registry
+                .as_ref()
+                .and_then(|registry| registry.find(current.name(), current.model_id())),
+            auth: state.auth.as_deref().cloned(),
+            explicit_key: None,
+        });
+        let preparation = compaction::CompactionPreparation {
+            first_kept_entry_id: "retained-turn".to_string(),
+            messages_to_summarize: vec![SessionMessage::User {
+                content: UserContent::Text("historical fact".to_string()),
+                timestamp: Some(0),
+            }],
+            turn_prefix_messages: Vec::new(),
+            is_split_turn: false,
+            tokens_before: 80_000,
+            retained_tokens: Some(0),
+            previous_summary: None,
+            file_ops: compaction::FileOperations::default(),
+            settings: ResolvedCompactionSettings {
+                threshold_tokens: Some(2_000),
+                method_order: Some(vec![
+                    compaction::AutoCompactionMethod::Remote,
+                    compaction::AutoCompactionMethod::Shake,
+                    compaction::AutoCompactionMethod::Soft,
+                ]),
+                ..ResolvedCompactionSettings::default()
+            },
+        };
+        let result = futures::executor::block_on(compaction::compact_auto(
+            preparation,
+            Arc::clone(&automatic),
+            &cached,
+            None,
+            &compaction::CompactionPrivacy::default(),
+            compaction::CompactionReader {
+                accepts_images: false,
+                source_text_budget: None,
+            },
+        ))
+        .expect("local reclamation must not resolve an exhausted credential pool");
+        assert_eq!(result.details.mode.as_deref(), Some("shake"));
+        let error = futures::executor::block_on(automatic.stream(&Context::default(), &cached))
+            .err()
+            .expect("a later provider method must revalidate the same exhausted pool");
         assert!(
             error
                 .to_string()
@@ -12401,6 +13306,7 @@ mod extensions_integration_tests {
                         turn_prefix_messages: Vec::new(),
                         is_split_turn: false,
                         tokens_before: 100,
+                        retained_tokens: None,
                         previous_summary: None,
                         file_ops: compaction::FileOperations::default(),
                         settings: ResolvedCompactionSettings::default(),
@@ -12539,6 +13445,7 @@ mod extensions_integration_tests {
                         turn_prefix_messages: Vec::new(),
                         is_split_turn: false,
                         tokens_before: 100,
+                        retained_tokens: None,
                         previous_summary: None,
                         file_ops: compaction::FileOperations::default(),
                         settings: ResolvedCompactionSettings::default(),
@@ -18824,6 +19731,19 @@ impl AgentSession {
         )
     }
 
+    pub(crate) fn automatic_compaction_provider(&self) -> Arc<dyn Provider> {
+        let provider = self.agent.provider();
+        let explicit_key = self
+            .recovery_api_key_override(provider.name(), None)
+            .map(str::to_string);
+        Arc::new(AutomaticCompactionProvider {
+            inner: provider,
+            entry: self.current_model_entry(),
+            auth: self.auth_storage.clone(),
+            explicit_key,
+        })
+    }
+
     pub(crate) async fn sync_runtime_selection_from_session_header(&mut self) -> Result<()> {
         self.ensure_provider_reentry_allowed()?;
         let cx = crate::agent_cx::AgentCx::for_request();
@@ -19836,39 +20756,22 @@ impl AgentSession {
         Ok((target_thinking, source))
     }
 
-    async fn current_compaction_origin(&self) -> Result<CompactionOrigin> {
+    fn compaction_origin_for_session(&self, session: &Session) -> CompactionOrigin {
         let provider = self.agent.provider();
-        let cx = crate::agent_cx::AgentCx::for_request();
-        let session = self
-            .session
-            .lock(cx.cx())
-            .await
-            .map_err(|e| Error::session(e.to_string()))?;
-        Ok(CompactionOrigin {
+        CompactionOrigin {
             session_id: session.header.id.clone(),
             provider_id: provider.name().to_string(),
             model_id: provider.model_id().to_string(),
             snapshot_leaf_id: session.leaf_id().map(str::to_string),
-        })
+        }
     }
 
-    async fn compaction_origin_matches_current(
+    fn compaction_origin_matches_session(
         &self,
         origin: &CompactionOrigin,
-    ) -> Result<(bool, CompactionOrigin)> {
-        let provider = self.agent.provider();
-        let cx = crate::agent_cx::AgentCx::for_request();
-        let session = self
-            .session
-            .lock(cx.cx())
-            .await
-            .map_err(|e| Error::session(e.to_string()))?;
-        let current = CompactionOrigin {
-            session_id: session.header.id.clone(),
-            provider_id: provider.name().to_string(),
-            model_id: provider.model_id().to_string(),
-            snapshot_leaf_id: session.leaf_id().map(str::to_string),
-        };
+        session: &Session,
+    ) -> (bool, CompactionOrigin) {
+        let current = self.compaction_origin_for_session(session);
         let snapshot_is_ancestor = origin.snapshot_leaf_id.as_ref().map_or_else(
             || session.leaf_id().is_none(),
             |snapshot_leaf_id| {
@@ -19883,7 +20786,63 @@ impl AgentSession {
             && origin.provider_id == current.provider_id
             && origin.model_id == current.model_id
             && snapshot_is_ancestor;
-        Ok((matches, current))
+        (matches, current)
+    }
+
+    async fn current_compaction_origin(&self) -> Result<CompactionOrigin> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let session = self
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        Ok(self.compaction_origin_for_session(&session))
+    }
+
+    async fn compaction_origin_matches_current(
+        &self,
+        origin: &CompactionOrigin,
+    ) -> Result<(bool, CompactionOrigin)> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let session = self
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        Ok(self.compaction_origin_matches_session(origin, &session))
+    }
+
+    /// Validate the complete replay context under the caller's live Session
+    /// lock, including descendants appended after background preparation.
+    /// Both views must be fully hydrated before this pre-persistence check.
+    pub(crate) fn validate_automatic_compaction_candidate(
+        &self,
+        current: &Session,
+        candidate: &Session,
+        trigger: u64,
+    ) -> Result<u64> {
+        if current.has_partial_v2_hydration() || candidate.has_partial_v2_hydration() {
+            return Err(Error::session(
+                "Automatic compaction requires a fully hydrated source before installation",
+            ));
+        }
+        let tokens_before = self
+            .agent
+            .estimate_message_context_tokens(&current.to_messages_for_current_path());
+        let tokens_after = self
+            .agent
+            .estimate_message_context_tokens(&candidate.to_messages_for_current_path());
+        if tokens_after >= tokens_before {
+            return Err(Error::api(
+                "Automatic compaction made no progress; the candidate did not reduce the live context",
+            ));
+        }
+        if tokens_after >= trigger {
+            return Err(Error::api(format!(
+                "Automatic compaction candidate still reaches the live trigger ({tokens_after} >= {trigger}); the result was not applied",
+            )));
+        }
+        Ok(tokens_after)
     }
 
     /// Persist a private session candidate before installing its live context.
@@ -20122,6 +21081,44 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<Value> {
+        self.execute_extension_interaction_with_abort(
+            crate::extensions::ExtensionInteraction::Command {
+                name: command_name.to_string(),
+                args: args.to_string(),
+            },
+            timeout_ms,
+            abort,
+            on_event,
+        )
+        .await
+    }
+
+    /// Execute a registered keyboard handler and finish its requested turns.
+    pub async fn execute_extension_shortcut_with_abort(
+        &mut self,
+        key_id: &str,
+        timeout_ms: u64,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<Value> {
+        self.execute_extension_interaction_with_abort(
+            crate::extensions::ExtensionInteraction::Shortcut {
+                key_id: key_id.to_string(),
+            },
+            timeout_ms,
+            abort,
+            on_event,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_extension_interaction_with_abort(
+        &mut self,
+        interaction: crate::extensions::ExtensionInteraction,
+        timeout_ms: u64,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<Value> {
         self.ensure_provider_reentry_allowed()?;
         let manager = self
             .extensions
@@ -20133,15 +21130,18 @@ impl AgentSession {
 
         self.run_pending_idle_actions_with_abort(abort.clone(), Arc::clone(&on_event))
             .await?;
+        if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+            return Err(Error::Aborted);
+        }
 
-        let command_result = manager
-            .execute_command(command_name, args, timeout_ms)
+        let handler_result = manager
+            .execute_interaction_with_abort(interaction, timeout_ms, abort.clone())
             .await;
         let replay_result = self
             .run_pending_idle_actions_with_abort(abort, Arc::clone(&on_event))
             .await;
 
-        match command_result {
+        match handler_result {
             Ok(value) => {
                 replay_result?;
                 Ok(value)
@@ -20149,7 +21149,7 @@ impl AgentSession {
             Err(err) => {
                 if let Err(replay_err) = replay_result {
                     tracing::warn!(
-                        "extension command follow-up replay failed after command error: {replay_err}"
+                        "extension follow-up replay failed after handler error: {replay_err}"
                     );
                 }
                 Err(err)
@@ -20256,6 +21256,10 @@ impl AgentSession {
                         None,
                         None,
                         None,
+                        Some(CompactionInstallGuard {
+                            origin: Some(origin),
+                            require_policy_fit: self.compaction_settings.method_order.is_some(),
+                        }),
                     )
                     .await?;
                     self.compaction_worker.mark_applied_success();
@@ -20289,17 +21293,35 @@ impl AgentSession {
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             session.ensure_entry_ids();
-            let entries = session
-                .entries_for_current_path()
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            let prep = compaction::prepare_compaction_for_model(
-                &entries,
-                self.compaction_settings.clone(),
-                &origin_provider_id,
-                &origin_model_id,
-            );
+            let prepare = |session: &Session| {
+                let entries = session
+                    .entries_for_current_path()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let prep = compaction::prepare_compaction_for_model(
+                    &entries,
+                    self.compaction_settings.clone(),
+                    &origin_provider_id,
+                    &origin_model_id,
+                );
+                (entries, prep)
+            };
+            let (mut entries, mut prep) = prepare(&session);
+            // Fast-resume sessions stay lazy until eligible. Hydrate before
+            // binding the archive and retained projection, since a later save
+            // can restore older reminders and branches into the same path.
+            if prep.is_some() && session.has_partial_v2_hydration() {
+                session.ensure_full_v2_hydration_before_save()?;
+                session.ensure_entry_ids();
+                (entries, prep) = prepare(&session);
+            }
+            if let Some(prep) = prep.as_mut()
+                && prep.settings.method_order.is_some()
+            {
+                self.agent
+                    .refresh_compaction_retained_tokens(prep, &entries)?;
+            }
             let origin = CompactionOrigin {
                 session_id: session.header.id.clone(),
                 provider_id: origin_provider_id,
@@ -20364,6 +21386,18 @@ impl AgentSession {
             }
 
             if let Some(compaction) = before_outcome.compaction {
+                if prep.settings.method_order.is_some() {
+                    let error = Error::extension(
+                        "Explicit automatic compaction methodOrder does not accept extension replacement summaries; cancel the replacement or use /compact",
+                    );
+                    on_event(AgentEvent::AutoCompactionEnd {
+                        result: None,
+                        aborted: false,
+                        will_retry: false,
+                        error_message: Some(error.to_string()),
+                    });
+                    return Err(error);
+                }
                 let cx = crate::agent_cx::AgentCx::for_current_or_request();
                 let provider_admission = match self.provider_admission.acquire(cx.cx()).await {
                     Ok(provider_admission) => provider_admission,
@@ -20388,6 +21422,10 @@ impl AgentSession {
                         false,
                         None,
                         None,
+                        Some(CompactionInstallGuard {
+                            origin: Some(origin),
+                            require_policy_fit: false,
+                        }),
                     )
                     .await;
                 let tokens_after = match apply_result {
@@ -20418,7 +21456,12 @@ impl AgentSession {
                 return Ok(());
             }
 
-            let provider = self.agent.provider();
+            let explicit_order = prep.settings.method_order.is_some();
+            let provider = if explicit_order {
+                self.automatic_compaction_provider()
+            } else {
+                self.agent.provider()
+            };
             let mut stream_options = self.agent.stream_options().clone();
 
             let runtime_handle = match self.compaction_runtime_handle() {
@@ -20456,7 +21499,9 @@ impl AgentSession {
                 });
                 return Err(err);
             }
-            if let Err(err) = self.refresh_compaction_credential(&mut stream_options) {
+            if !explicit_order
+                && let Err(err) = self.refresh_compaction_credential(&mut stream_options)
+            {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
                     aborted: false,
@@ -20474,6 +21519,7 @@ impl AgentSession {
                 stream_options,
                 None,
                 self.agent.compaction_privacy(),
+                self.agent.compaction_reader(),
             ) {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
@@ -20500,6 +21546,11 @@ impl AgentSession {
     /// `before_compact` dispatch: this path exists to guarantee forward
     /// progress, so nothing may cancel it.
     async fn force_local_compaction_if_oversized(&self, on_event: AgentEventHandler) -> Result<()> {
+        // An explicit policy must not install a different, unconfigured
+        // transformation after its attempts have failed or exhausted quotas.
+        if self.compaction_settings.method_order.is_some() {
+            return Ok(());
+        }
         let decision = self
             .compaction_worker
             .admission_decision(None, &CompactionAdmissionSignals::default());
@@ -20509,7 +21560,7 @@ impl AgentSession {
             return Ok(());
         }
 
-        let preparation = {
+        let (preparation, origin) = {
             let cx = crate::agent_cx::AgentCx::for_request();
             let mut session = self
                 .session
@@ -20523,12 +21574,13 @@ impl AgentSession {
                 .cloned()
                 .collect::<Vec<_>>();
             let provider = self.agent.provider();
-            compaction::prepare_compaction_for_model(
+            let preparation = compaction::prepare_compaction_for_model(
                 &entries,
                 self.compaction_settings.clone(),
                 provider.name(),
                 provider.model_id(),
-            )
+            );
+            (preparation, self.compaction_origin_for_session(&session))
         };
 
         let Some(prep) = preparation else {
@@ -20571,6 +21623,10 @@ impl AgentSession {
             None,
             None,
             None,
+            Some(CompactionInstallGuard {
+                origin: Some(origin),
+                require_policy_fit: false,
+            }),
         )
         .await
     }
@@ -20627,11 +21683,12 @@ impl AgentSession {
         require_reduction: bool,
         handoff_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
         manual_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
+        install_guard: Option<CompactionInstallGuard>,
     ) -> Result<u64> {
         let cx = crate::agent_cx::AgentCx::for_request();
         let source = handoff_source.or(manual_source);
         let abort = source.map(|(_, abort)| abort);
-        let session_action_permit = if source.is_some() {
+        let session_action_permit = if source.is_some() || install_guard.is_some() {
             Some(
                 await_compaction_admission(abort, self.session_action_admission.acquire(cx.cx()))
                     .await?,
@@ -20657,6 +21714,32 @@ impl AgentSession {
                     "Compaction source changed during generation; the result was not applied"
                 }));
             }
+        }
+        if install_guard.is_some() || require_reduction {
+            // Save may fully hydrate a V2 snapshot. Project the same complete
+            // source now so a successful size check cannot grow during save.
+            session.ensure_full_v2_hydration_before_save()?;
+            session.ensure_entry_ids();
+        }
+        if let Some(origin) = install_guard
+            .as_ref()
+            .and_then(|guard| guard.origin.as_ref())
+            && !self.compaction_origin_matches_session(origin, &session).0
+        {
+            return Err(Error::session(
+                "Automatic compaction source changed while awaiting installation; the result was not applied",
+            ));
+        }
+        if install_guard.is_some()
+            && !session.entries_for_current_path().iter().any(|entry| {
+                entry
+                    .base_id()
+                    .is_some_and(|entry_id| entry_id == first_kept_entry_id.as_str())
+            })
+        {
+            return Err(Error::session(
+                "Automatic compaction retained boundary is no longer on the selected path",
+            ));
         }
         if handoff_source.is_some()
             && (summary.trim().is_empty()
@@ -20693,19 +21776,31 @@ impl AgentSession {
         // Count the context actually sent next, not the archived tree entries
         // or pre-compaction usage. Refuse a no-progress overflow recovery
         // before writing or installing its candidate.
-        let tokens_after = self
-            .agent
-            .estimate_message_context_tokens(&candidate.to_messages_for_current_path());
-        if require_reduction
-            && tokens_after
-                >= self
-                    .agent
-                    .estimate_message_context_tokens(&session.to_messages_for_current_path())
+        let tokens_after = if install_guard
+            .as_ref()
+            .is_some_and(|guard| guard.require_policy_fit)
         {
-            return Err(Error::api(
-                "Context overflow recovery made no progress; compaction did not reduce the active context",
-            ));
-        }
+            self.validate_automatic_compaction_candidate(
+                &session,
+                &candidate,
+                self.compaction_settings.trigger_tokens(),
+            )?
+        } else {
+            let tokens_after = self
+                .agent
+                .estimate_message_context_tokens(&candidate.to_messages_for_current_path());
+            if require_reduction
+                && tokens_after
+                    >= self
+                        .agent
+                        .estimate_message_context_tokens(&session.to_messages_for_current_path())
+            {
+                return Err(Error::api(
+                    "Context overflow recovery made no progress; compaction did not reduce the active context",
+                ));
+            }
+            tokens_after
+        };
 
         if let Some(budget) = self.agent.cost_budget() {
             budget.checkpoint(&mut candidate)?;
@@ -20781,6 +21876,7 @@ impl AgentSession {
     }
 
     /// Apply a completed compaction result to the session.
+    #[allow(clippy::too_many_arguments)] // one durable append transaction
     async fn apply_compaction_result(
         &self,
         result: compaction::CompactionResult,
@@ -20789,10 +21885,14 @@ impl AgentSession {
         overflow_abort: Option<&AbortSignal>,
         handoff_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
         manual_source: Option<(&SessionEditSnapshot, &AbortSignal)>,
+        install_guard: Option<CompactionInstallGuard>,
     ) -> Result<()> {
         let overflow = overflow_abort.is_some();
         let details = match compaction::compaction_details_to_value(&result.details) {
-            Ok(details) => Some(details),
+            Ok(details) => Some(match result.snap_payload.as_ref() {
+                Some(payload) => crate::compaction_snap::payload_to_details(Some(details), payload),
+                None => details,
+            }),
             Err(err) => {
                 on_event(AgentEvent::AutoCompactionEnd {
                     result: None,
@@ -20814,6 +21914,7 @@ impl AgentSession {
                 overflow,
                 handoff_source,
                 manual_source,
+                install_guard,
             )
             .await
         {
@@ -20873,7 +21974,7 @@ impl AgentSession {
         }
         let overflow = overflow_abort.is_some();
 
-        let (entries, preparation, source_snapshot) = {
+        let (entries, preparation, source_snapshot, install_guard) = {
             let cx = crate::agent_cx::AgentCx::for_request();
             let mut session = await_compaction_admission(abort, async {
                 self.session
@@ -20882,7 +21983,10 @@ impl AgentSession {
                     .map_err(|e| Error::session(e.to_string()))
             })
             .await?;
-            if handoff.is_some() || manual_abort.is_some() {
+            if handoff.is_some()
+                || manual_abort.is_some()
+                || (overflow && self.compaction_settings.method_order.is_some())
+            {
                 session.ensure_full_v2_hydration_before_save()?;
             }
             session.ensure_entry_ids();
@@ -20895,7 +21999,7 @@ impl AgentSession {
                 .cloned()
                 .collect::<Vec<_>>();
             let mut settings = self.compaction_settings.clone();
-            let prep = if handoff.is_some() {
+            let mut prep = if handoff.is_some() {
                 compaction::prepare_handoff_compaction(&entries, settings)
             } else if overflow {
                 // A provider may reject a request smaller than the configured
@@ -20908,12 +22012,28 @@ impl AgentSession {
                 settings.keep_recent_tokens = settings
                     .keep_recent_tokens
                     .min(u32::try_from(tokens / 2).unwrap_or(u32::MAX));
-                compaction::prepare_overflow_compaction(&entries, settings)
+                let provider = self.agent.provider();
+                compaction::prepare_overflow_compaction_for_model(
+                    &entries,
+                    settings,
+                    provider.name(),
+                    provider.model_id(),
+                )
             } else {
                 // `/compact` and `/shake`; automatic compaction does not run here.
                 compaction::prepare_manual_compaction(&entries, settings)
             };
-            (entries, prep, source_snapshot)
+            if let Some(prep) = prep.as_mut()
+                && prep.settings.method_order.is_some()
+            {
+                self.agent
+                    .refresh_compaction_retained_tokens(prep, &entries)?;
+            }
+            let install_guard = overflow.then(|| CompactionInstallGuard {
+                origin: Some(self.compaction_origin_for_session(&session)),
+                require_policy_fit: self.compaction_settings.method_order.is_some(),
+            });
+            (entries, prep, source_snapshot, install_guard)
         };
 
         if abort.is_some_and(AbortSignal::is_aborted) {
@@ -20955,6 +22075,18 @@ impl AgentSession {
             }
 
             if let Some(compaction) = before_outcome.compaction {
+                if overflow && prep.settings.method_order.is_some() {
+                    let error = Error::extension(
+                        "Explicit automatic compaction methodOrder does not accept extension replacement summaries; cancel the replacement or use /compact",
+                    );
+                    on_event(AgentEvent::AutoCompactionEnd {
+                        result: None,
+                        aborted: false,
+                        will_retry: false,
+                        error_message: Some(error.to_string()),
+                    });
+                    return Err(error);
+                }
                 if handoff.is_some() {
                     let error = Error::extension(
                         "Native handoff does not accept extension replacement summaries; cancel the replacement or use /compact",
@@ -20996,6 +22128,7 @@ impl AgentSession {
                         overflow,
                         None,
                         source_snapshot.as_ref().zip(manual_abort),
+                        install_guard,
                     )
                     .await;
                 let tokens_after = match apply_result {
@@ -21026,7 +22159,12 @@ impl AgentSession {
                 return Ok(true);
             }
 
-            let provider = self.agent.provider();
+            let explicit_order = overflow && prep.settings.method_order.is_some();
+            let provider = if explicit_order {
+                self.automatic_compaction_provider()
+            } else {
+                self.agent.provider()
+            };
             let mut stream_options = self.agent.stream_options().clone();
 
             self.invalidate_background_compaction();
@@ -21059,6 +22197,7 @@ impl AgentSession {
             let compaction_result = if abort.is_some_and(AbortSignal::is_aborted) {
                 Err(Error::Aborted)
             } else if !shake
+                && !explicit_order
                 && let Err(error) = self.refresh_compaction_credential(&mut stream_options)
             {
                 Err(error)
@@ -21068,8 +22207,22 @@ impl AgentSession {
             } else if shake {
                 Ok(compaction::compact_shake(prep, &privacy))
             } else {
-                let compact =
-                    compaction::compact(prep, provider, &stream_options, instructions, &privacy);
+                let compact = async {
+                    if explicit_order {
+                        compaction::compact_auto(
+                            prep,
+                            provider,
+                            &stream_options,
+                            instructions,
+                            &privacy,
+                            self.agent.compaction_reader(),
+                        )
+                        .await
+                    } else {
+                        compaction::compact(prep, provider, &stream_options, instructions, &privacy)
+                            .await
+                    }
+                };
                 if let Some(abort) = abort {
                     let cancelled = abort.wait();
                     futures::pin_mut!(compact, cancelled);
@@ -21093,6 +22246,7 @@ impl AgentSession {
                             .as_ref()
                             .zip(handoff.map(|(_, abort)| abort)),
                         source_snapshot.as_ref().zip(manual_abort),
+                        install_guard,
                     )
                     .await?;
                 }
@@ -21833,9 +22987,32 @@ impl AgentSession {
         turn_system_prompt: &mut Option<String>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.run_text_with_abort_capturing_prompt_and_handoff(
+            input,
+            abort,
+            turn_system_prompt,
+            on_event,
+            |_| {},
+        )
+        .await
+    }
+
+    /// Accept ownership after the final native admission check, immediately
+    /// before consuming provenance and dispatching input hooks. SDK startup
+    /// checks cannot substitute for this boundary: another transition may
+    /// quarantine provider re-entry before the native call begins.
+    pub(crate) async fn run_text_with_abort_capturing_prompt_and_handoff(
+        &mut self,
+        input: String,
+        abort: Option<AbortSignal>,
+        turn_system_prompt: &mut Option<String>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+        handoff_input: impl FnOnce(&mut Agent) + Send,
+    ) -> Result<AssistantMessage> {
         self.ensure_provider_reentry_allowed()?;
         let _turn_active = AtomicBoolGuard::activate(&self.extensions_turn_active);
         async {
+            handoff_input(&mut self.agent);
             // Consume the one-shot provenance before extension dispatch so a
             // blocked/failed input cannot leak it into the next user turn.
             let keyword_scan_override = self.agent.magic_keyword_scan_override.take();
@@ -21916,13 +23093,38 @@ impl AgentSession {
         turn_system_prompt: &mut Option<String>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.run_with_content_with_abort_capturing_prompt_and_handoff(
+            content,
+            abort,
+            turn_system_prompt,
+            on_event,
+            |_| {},
+        )
+        .await
+    }
+
+    /// Content counterpart of the native text ownership boundary above.
+    /// Invalid content consumes any prior provenance without claiming the
+    /// prepared payload or installing the incoming caller's provenance.
+    pub(crate) async fn run_with_content_with_abort_capturing_prompt_and_handoff(
+        &mut self,
+        content: Vec<ContentBlock>,
+        abort: Option<AbortSignal>,
+        turn_system_prompt: &mut Option<String>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+        handoff_input: impl FnOnce(&mut Agent) + Send,
+    ) -> Result<AssistantMessage> {
         self.ensure_provider_reentry_allowed()?;
         let _turn_active = AtomicBoolGuard::activate(&self.extensions_turn_active);
         async {
+            if let Err(error) = Self::validate_user_content_blocks(&content) {
+                self.agent.set_magic_keyword_scan_override(None);
+                return Err(error);
+            }
+            handoff_input(&mut self.agent);
             // See the text path above: provenance is one-shot even when an
             // input extension blocks before the Agent loop starts.
             let keyword_scan_override = self.agent.magic_keyword_scan_override.take();
-            Self::validate_user_content_blocks(&content)?;
             let (original_text, images) = Self::split_content_blocks_for_input(&content);
             let outcome = self
                 .dispatch_input_event(original_text.clone(), images)
@@ -22459,6 +23661,12 @@ impl AgentSession {
 
         let source_scope = SessionInputSourceGuard::new(self, InputSource::Extension);
         for action in actions {
+            // Cancellation owns the entire command workflow, including its
+            // not-yet-started generated turns. Never persist another prompt
+            // or run its hooks after the operator has stopped the command.
+            if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+                return Err(Error::Aborted);
+            }
             match action {
                 PendingIdleAction::CustomMessage(message) => {
                     let handler = Arc::clone(&on_event);
@@ -22485,6 +23693,9 @@ impl AgentSession {
                         })
                         .await?;
                 }
+            }
+            if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+                return Err(Error::Aborted);
             }
         }
         Ok(())

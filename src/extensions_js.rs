@@ -196,6 +196,8 @@ fn compat_env_fallback_value(key: &str, env: &HashMap<String, String>) -> Option
 pub enum HostcallKind {
     /// pi.tool(name, input) - invoke a tool
     Tool { name: String },
+    /// Imported tool factory delegation to an admitted native implementation.
+    BuiltinTool { name: String },
     /// pi.exec(cmd, args) - execute a shell command
     Exec { cmd: String },
     /// pi.http(request) - make an HTTP request
@@ -312,7 +314,7 @@ impl HostcallRequest {
     #[must_use]
     pub const fn method(&self) -> &'static str {
         match self.kind {
-            HostcallKind::Tool { .. } => "tool",
+            HostcallKind::Tool { .. } | HostcallKind::BuiltinTool { .. } => "tool",
             HostcallKind::Exec { .. } => "exec",
             HostcallKind::Http => "http",
             HostcallKind::Session { .. } => "session",
@@ -325,7 +327,9 @@ impl HostcallRequest {
     #[must_use]
     pub fn required_capability(&self) -> &'static str {
         match &self.kind {
-            HostcallKind::Tool { name } => builtin_tool_required_capability(name),
+            HostcallKind::Tool { name } | HostcallKind::BuiltinTool { name } => {
+                builtin_tool_required_capability(name)
+            }
             HostcallKind::Exec { .. } => "exec",
             HostcallKind::Http => "http",
             HostcallKind::Session { .. } => "session",
@@ -345,7 +349,7 @@ impl HostcallRequest {
         match &self.kind {
             HostcallKind::Http => HostcallIoHint::IoHeavy,
             HostcallKind::Exec { .. } => HostcallIoHint::CpuBound,
-            HostcallKind::Tool { name } => {
+            HostcallKind::Tool { name } | HostcallKind::BuiltinTool { name } => {
                 let name = name.trim();
                 if name.eq_ignore_ascii_case("read")
                     || name.eq_ignore_ascii_case("write")
@@ -397,6 +401,12 @@ impl HostcallRequest {
         match &self.kind {
             HostcallKind::Tool { name } => {
                 serde_json::json!({ "name": name, "input": self.payload.clone() })
+            }
+            HostcallKind::BuiltinTool { name } => {
+                let mut params = self.payload.as_object().cloned().unwrap_or_default();
+                params.insert("name".to_string(), serde_json::Value::String(name.clone()));
+                params.insert("builtin".to_string(), serde_json::Value::Bool(true));
+                serde_json::Value::Object(params)
             }
             HostcallKind::Exec { cmd } => canonical_exec_params(cmd, &self.payload),
             HostcallKind::Http | HostcallKind::Log => self.payload.clone(),
@@ -8728,8 +8738,17 @@ function completionText(result) {
     .join("");
 }
 
-function completeSimpleArgs(model, prompt, opts) {
-  if (prompt === undefined || (prompt && typeof prompt === "object" && !Array.isArray(prompt))) {
+function completeSimpleArgs(model, prompt, opts, argumentCount) {
+  const hasModelIdentity = model && typeof model === "object" && !Array.isArray(model) &&
+    ("api" in model || "id" in model || "provider" in model || "modelId" in model);
+  const hasContext = prompt && typeof prompt === "object" && !Array.isArray(prompt) &&
+    ("messages" in prompt || "systemPrompt" in prompt || "role" in prompt ||
+      "prompt" in prompt || "input" in prompt || "message" in prompt);
+  // Keep the host shorthand completeSimple(prompt, options), but a normal
+  // Model + Context call must retain its model, messages and third argument.
+  const shorthandOptions = argumentCount < 3 && !hasModelIdentity && !hasContext &&
+    prompt && typeof prompt === "object" && !Array.isArray(prompt);
+  if (prompt === undefined || shorthandOptions) {
     return {
       model: undefined,
       prompt: model,
@@ -8800,11 +8819,12 @@ function assistantMessageFor(model, text, result) {
   const usageObj = resultObj.usage && typeof resultObj.usage === "object" ? resultObj.usage : {};
   const usageCost = usageObj.cost && typeof usageObj.cost === "object" ? usageObj.cost : {};
   return {
+    ...resultObj,
     role: "assistant",
-    content: text ? [{ type: "text", text }] : [],
-    api: modelObj.api || "",
-    provider: modelObj.provider || "",
-    model: modelObj.id || modelObj.modelId || (typeof model === "string" ? model : ""),
+    content: Array.isArray(resultObj.content) ? resultObj.content : text ? [{ type: "text", text }] : [],
+    api: resultObj.api || modelObj.api || "",
+    provider: resultObj.provider || modelObj.provider || "",
+    model: resultObj.model || modelObj.id || modelObj.modelId || (typeof model === "string" ? model : ""),
     usage: {
       input: Number(usageObj.input ?? 0),
       output: Number(usageObj.output ?? 0),
@@ -8824,7 +8844,45 @@ function assistantMessageFor(model, text, result) {
   };
 }
 
-function providerBridgeStream(name, model, context, opts = {}, simple = true) {
+function publishBridgeCompletion(stream, message) {
+  if (message.stopReason === "error" || message.stopReason === "aborted") {
+    stream.push({ type: "error", reason: message.stopReason, error: message });
+    return;
+  }
+  // The completion host owns the provider request and currently returns its
+  // terminal envelope. Replay that envelope as valid assistant events; never
+  // flatten tool calls, signed reasoning or usage into a text-only reply.
+  let content = [];
+  stream.push({ type: "start", partial: { ...message, content } });
+  for (const block of message.content) {
+    const contentIndex = content.length;
+    const before = content;
+    content = before.concat([block]);
+    const partial = { ...message, content };
+    if (block.type === "text" || block.type === "thinking") {
+      const kind = block.type;
+      const value = kind === "text" ? block.text : block.thinking;
+      stream.push({
+        type: `${kind}_start`, contentIndex,
+        partial: { ...message, content: before.concat([{ ...block, [kind]: "" }]) },
+      });
+      if (value) stream.push({ type: `${kind}_delta`, contentIndex, delta: value, partial });
+      stream.push({ type: `${kind}_end`, contentIndex, content: value, partial });
+    } else if (block.type === "toolCall") {
+      stream.push({
+        type: "toolcall_start", contentIndex,
+        partial: { ...message, content: before.concat([{ ...block, arguments: {} }]) },
+      });
+      stream.push({
+        type: "toolcall_delta", contentIndex, delta: JSON.stringify(block.arguments), partial,
+      });
+      stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial });
+    }
+  }
+  stream.push({ type: "done", reason: message.stopReason, message });
+}
+
+function providerBridgeStream(name, model, context, opts = {}) {
   const stream = createAssistantMessageEventStream();
   (async () => {
     try {
@@ -8832,17 +8890,16 @@ function providerBridgeStream(name, model, context, opts = {}, simple = true) {
         model,
         context,
         options: opts || {},
-        simple,
+        // `simple` is the host's text-only response shorthand, not the public
+        // streamSimple contract. Both stream APIs need the complete message.
+        simple: false,
       });
       const text = completionText(result);
-      if (text) {
-        stream.push({ type: "text_delta", delta: text });
-      }
-      const message =
+      const envelope =
         result && typeof result === "object" && result.message && typeof result.message === "object"
           ? result.message
-          : assistantMessageFor(model, text, result);
-      stream.push({ type: "done", message });
+          : result;
+      publishBridgeCompletion(stream, assistantMessageFor(model, text, envelope));
     } catch (error) {
       const message = assistantMessageFor(model, "", {});
       message.stopReason = "error";
@@ -8859,9 +8916,9 @@ function apiProviderBridge(api) {
   return {
     api: apiId,
     stream: (model, context, opts = {}) =>
-      providerBridgeStream(`getApiProvider(${apiId}).stream`, model, context, opts, false),
+      providerBridgeStream(`getApiProvider(${apiId}).stream`, model, context, opts),
     streamSimple: (model, context, opts = {}) =>
-      providerBridgeStream(`getApiProvider(${apiId}).streamSimple`, model, context, opts, true),
+      providerBridgeStream(`getApiProvider(${apiId}).streamSimple`, model, context, opts),
   };
 }
 
@@ -8979,33 +9036,22 @@ Object.defineProperty(globalThis, "__pi_api_provider_registry_size", {
   enumerable: false,
 });
 
-async function* streamSimpleBridge(name, model, context, opts = {}) {
-  const result = await callProviderBridge(name, "completeAi", {
-    model,
-    context,
-    options: opts || {},
-    simple: true,
-  });
-  const text = completionText(result);
-  if (text) yield text;
-}
-
 export function streamSimpleAnthropic(model, context, opts = {}) {
-  return streamSimpleBridge("streamSimpleAnthropic", model, context, opts);
+  return providerBridgeStream("streamSimpleAnthropic", model, context, opts);
 }
 
 export function streamSimpleOpenAIResponses(model, context, opts = {}) {
-  return streamSimpleBridge("streamSimpleOpenAIResponses", model, context, opts);
+  return providerBridgeStream("streamSimpleOpenAIResponses", model, context, opts);
 }
 
 export function streamSimpleOpenAICompletions(model, context, opts = {}) {
-  return streamSimpleBridge("streamSimpleOpenAICompletions", model, context, opts);
+  return providerBridgeStream("streamSimpleOpenAICompletions", model, context, opts);
 }
 
 export function stream(model, context, opts = {}) {
   const api = model && typeof model === "object" ? model.api : undefined;
   if (!api) {
-    return providerBridgeStream("stream", model, context, opts || {}, false);
+    return providerBridgeStream("stream", model, context, opts || {});
   }
   const provider = getApiProvider(api);
   if (!provider) {
@@ -9017,7 +9063,7 @@ export function stream(model, context, opts = {}) {
 export function streamSimple(model, context, opts = {}) {
   const api = model && typeof model === "object" ? model.api : undefined;
   if (!api) {
-    return providerBridgeStream("streamSimple", model, context, opts || {}, true);
+    return providerBridgeStream("streamSimple", model, context, opts || {});
   }
   const provider = getApiProvider(api);
   if (!provider) {
@@ -9047,7 +9093,7 @@ export async function complete(model, messages, opts = {}) {
 }
 
 export async function completeSimple(model, prompt, opts = {}) {
-  const args = completeSimpleArgs(model, prompt, opts);
+  const args = completeSimpleArgs(model, prompt, opts, arguments.length);
   if (!args.model || typeof args.model !== "object" || !args.model.api) {
     return await callProviderBridge("completeSimple", "completeAi", {
       model: args.model,
@@ -9930,7 +9976,43 @@ export class CustomEditor {
   }
 }
 
-export function createBashTool(_cwd, _opts = {}) {
+function builtinToolExecute(name, cwd, opts, supported = {}) {
+  if (cwd !== undefined && (typeof cwd !== "string" || !cwd || cwd.includes("\0"))) {
+    throw new TypeError(`${name} factory cwd must be a non-empty path`);
+  }
+  if (!opts || typeof opts !== "object" || Array.isArray(opts) ||
+      (Object.getPrototypeOf(opts) !== Object.prototype && Object.getPrototypeOf(opts) !== null)) {
+    throw new TypeError(`${name} factory options must be an object`);
+  }
+  const options = Object.create(null);
+  for (const key of Reflect.ownKeys(opts)) {
+    if (typeof key !== "string" || !Object.prototype.hasOwnProperty.call(supported, key)) {
+      throw new TypeError(`${name} factory option '${String(key)}' is not supported by the native host`);
+    }
+    const value = opts[key];
+    if (value === undefined) continue;
+    if (typeof value !== supported[key]) {
+      throw new TypeError(`${name} factory option '${key}' must be a ${supported[key]}`);
+    }
+    options[key] = value;
+  }
+  return async function execute(_id, params, signal, onUpdate) {
+    if (!params || typeof params !== "object" || Array.isArray(params)) {
+      throw new TypeError(`${name} tool input must be an object`);
+    }
+    if (onUpdate !== undefined && onUpdate !== null && typeof onUpdate !== "function") {
+      throw new TypeError(`${name} tool onUpdate must be a function`);
+    }
+    if (typeof __pi_builtin_tool_hostcall !== "function") {
+      throw new Error("Native tool factory delegation is unavailable in this runtime");
+    }
+    const metadata = { options, stream: typeof onUpdate === "function" };
+    if (cwd !== undefined) metadata.cwd = cwd;
+    return __pi_builtin_tool_hostcall(name, params, metadata, signal, onUpdate);
+  };
+}
+
+export function createBashTool(cwd, opts = {}) {
   return {
     name: "bash",
     label: "bash",
@@ -9939,17 +10021,15 @@ export function createBashTool(_cwd, _opts = {}) {
       type: "object",
       properties: {
         command: { type: "string", description: "The bash command to execute" },
-        timeout: { type: "number", description: "Optional timeout in seconds" },
+        timeout: { type: "integer", minimum: 0, description: "Optional timeout in seconds; 0 disables the timeout" },
       },
       required: ["command"],
     },
-    async execute(_id, params) {
-      return { content: [{ type: "text", text: String(params?.command ?? "") }], details: {} };
-    },
+    execute: builtinToolExecute("bash", cwd, opts, { commandPrefix: "string" }),
   };
 }
 
-export function createReadTool(_cwd, _opts = {}) {
+export function createReadTool(cwd, opts = {}) {
   return {
     name: "read",
     label: "read",
@@ -9958,18 +10038,16 @@ export function createReadTool(_cwd, _opts = {}) {
       type: "object",
       properties: {
         path: { type: "string", description: "The path to the file to read" },
-        offset: { type: "number", description: "Line offset to start reading from (0-indexed)" },
-        limit: { type: "number", description: "Maximum number of lines to read" },
+        offset: { type: "integer", minimum: 1, description: "Line number to start reading from (1-indexed)" },
+        limit: { type: "integer", minimum: 1, description: "Maximum number of lines to read" },
       },
       required: ["path"],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("read", cwd, opts, { autoResizeImages: "boolean" }),
   };
 }
 
-export function createLsTool(_cwd, _opts = {}) {
+export function createLsTool(cwd, opts = {}) {
   return {
     name: "ls",
     label: "ls",
@@ -9977,17 +10055,16 @@ export function createLsTool(_cwd, _opts = {}) {
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "The path to list" },
+        path: { type: "string", description: "The path to list (default: factory working directory)" },
+        limit: { type: "integer", minimum: 1, description: "Maximum number of entries" },
       },
-      required: ["path"],
+      required: [],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("ls", cwd, opts),
   };
 }
 
-export function createGrepTool(_cwd, _opts = {}) {
+export function createGrepTool(cwd, opts = {}) {
   return {
     name: "grep",
     label: "grep",
@@ -10000,13 +10077,11 @@ export function createGrepTool(_cwd, _opts = {}) {
       },
       required: ["pattern"],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("grep", cwd, opts),
   };
 }
 
-export function createFindTool(_cwd, _opts = {}) {
+export function createFindTool(cwd, opts = {}) {
   return {
     name: "find",
     label: "find",
@@ -10016,25 +10091,28 @@ export function createFindTool(_cwd, _opts = {}) {
       properties: {
         pattern: { type: "string", description: "The file name or glob pattern to match" },
         path: { type: "string", description: "The path to search in" },
+        limit: { type: "integer", minimum: 1, description: "Maximum number of results" },
       },
       required: ["pattern"],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("find", cwd, opts),
   };
 }
 
 export function createReadOnlyTools(cwd, opts = {}) {
+  if (!opts || typeof opts !== "object" || Array.isArray(opts) ||
+      Reflect.ownKeys(opts).some((key) => key !== "read")) {
+    throw new TypeError("createReadOnlyTools options support only the read configuration");
+  }
   return [
-    createGrepTool(cwd, opts),
-    createFindTool(cwd, opts),
-    createReadTool(cwd, opts),
-    createLsTool(cwd, opts),
+    createReadTool(cwd, opts.read),
+    createGrepTool(cwd),
+    createFindTool(cwd),
+    createLsTool(cwd),
   ];
 }
 
-export function createWriteTool(_cwd, _opts = {}) {
+export function createWriteTool(cwd, opts = {}) {
   return {
     name: "write",
     label: "write",
@@ -10047,13 +10125,11 @@ export function createWriteTool(_cwd, _opts = {}) {
       },
       required: ["path", "content"],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("write", cwd, opts),
   };
 }
 
-export function createEditTool(_cwd, _opts = {}) {
+export function createEditTool(cwd, opts = {}) {
   return {
     name: "edit",
     label: "edit",
@@ -10067,9 +10143,7 @@ export function createEditTool(_cwd, _opts = {}) {
       },
       required: ["path", "oldText", "newText"],
     },
-    async execute(_id, _params) {
-      return { content: [{ type: "text", text: "" }], details: {} };
-    },
+    execute: builtinToolExecute("edit", cwd, opts),
   };
 }
 
@@ -10121,12 +10195,10 @@ export function rawKeyHint(key, description = "") {
 // thinkingLevel, streamFn, env) signature. Host-owned arguments must be absent.
 // ctx.compact uses this same implementation with an options object.
 //
-// Cancellation (gh #178): a signal (`options.signal`, or the sixth
-// argument) that has already aborted rejects before any host work starts.
-// An abort that fires mid-call is NOT propagated: hostcalls are serialized on
-// the extension runtime thread, so no JS abort handler can run until the
-// compact hostcall returns. The host's dedicated compact event budget bounds
-// that round-trip instead.
+// Both signal forms cancel the exact pending generation hostcall. The runtime
+// keeps native dispatches pollable while advancing JavaScript timers and abort
+// listeners. Compaction hostcalls only return candidates: cancellation never
+// rolls back a candidate already returned or interrupts its later session save.
 export async function compact(preparation, modelOrOptions, apiKey, headers, customInstructions, signal, thinkingLevel, streamFn, env) {
   const supplied = modelOrOptions ?? {};
   if (typeof supplied !== "object" || Array.isArray(supplied)) {
@@ -10182,7 +10254,7 @@ export async function compact(preparation, modelOrOptions, apiKey, headers, cust
   } else if (options.request !== undefined && options.request !== null) {
     throw new TypeError("compact: request requires a native strategy");
   }
-  return await globalThis.pi.events("compact", payload);
+  return await globalThis.pi.events("compact", payload, { signal: abortSignal });
 }
 
 /// Stub: AssistantMessageComponent for rendering assistant messages
@@ -12477,6 +12549,8 @@ import * as v8 from "node:v8";
 import * as workerThreads from "node:worker_threads";
 import * as testMod from "node:test";
 import * as bunSqlite from "bun:sqlite";
+import * as betterSqlite from "better-sqlite3";
+import * as axiosModule from "axios";
 
 function __normalizeBuiltin(id) {
   const spec = String(id ?? "");
@@ -12593,6 +12667,8 @@ function __normalizeBuiltin(id) {
 
 const __builtinModules = {
   "bun:sqlite": bunSqlite,
+  "better-sqlite3": betterSqlite,
+  "axios": axiosModule,
   "node:fs": fs,
   "node:fs/promises": fsPromises,
   "node:path": path,
@@ -17727,41 +17803,7 @@ export default { parse, stringify };
 
     modules.insert(
         "better-sqlite3".to_string(),
-        compressed_js_literal!(
-            r#"
-class Statement {
-    all() { return []; }
-    get() { return undefined; }
-    run() { return { changes: 0, lastInsertRowid: 0 }; }
-}
-
-function BetterSqlite3(filename, options = {}) {
-    if (!(this instanceof BetterSqlite3)) return new BetterSqlite3(filename, options);
-    this.filename = String(filename ?? "");
-    this.options = options;
-}
-
-BetterSqlite3.prototype.prepare = function(_sql) { return new Statement(); };
-BetterSqlite3.prototype.exec = function(_sql) { return this; };
-BetterSqlite3.prototype.pragma = function(_sql) { return []; };
-BetterSqlite3.prototype.transaction = function(fn) {
-    const wrapped = (...args) => (typeof fn === "function" ? fn(...args) : undefined);
-    wrapped.immediate = wrapped;
-    wrapped.deferred = wrapped;
-    wrapped.exclusive = wrapped;
-    return wrapped;
-};
-BetterSqlite3.prototype.close = function() {};
-
-BetterSqlite3.Statement = Statement;
-BetterSqlite3.Database = BetterSqlite3;
-
-export { Statement };
-export default BetterSqlite3;
-"#
-        )
-        .trim()
-        .to_string(),
+        include_str!("extensions_js/better_sqlite3.mjs").to_string(),
     );
 
     modules.insert(
@@ -17874,69 +17916,7 @@ export default WebSocket;
 
     modules.insert(
         "axios".to_string(),
-        compressed_js_literal!(
-            r#"
-function __makeResponse(config, data) {
-  return {
-    data: data ?? null,
-    status: 200,
-    statusText: "OK",
-    headers: {},
-    config: config ?? {},
-    request: {},
-  };
-}
-
-async function axios(config = {}) {
-  return __makeResponse(config, config.data);
-}
-
-axios.request = (config) => axios(config);
-axios.defaults = {};
-axios.get = (url, config = {}) => axios({ ...config, url, method: "get" });
-axios.delete = (url, config = {}) => axios({ ...config, url, method: "delete" });
-axios.head = (url, config = {}) => axios({ ...config, url, method: "head" });
-axios.options = (url, config = {}) => axios({ ...config, url, method: "options" });
-axios.post = (url, data, config = {}) => axios({ ...config, url, data, method: "post" });
-axios.put = (url, data, config = {}) => axios({ ...config, url, data, method: "put" });
-axios.patch = (url, data, config = {}) => axios({ ...config, url, data, method: "patch" });
-axios.create = (defaults = {}) => {
-  const instance = (config = {}) => axios({ ...defaults, ...config });
-  instance.request = (config) => instance(config);
-  instance.get = (url, config = {}) => instance({ ...config, url, method: "get" });
-  instance.delete = (url, config = {}) => instance({ ...config, url, method: "delete" });
-  instance.head = (url, config = {}) => instance({ ...config, url, method: "head" });
-  instance.options = (url, config = {}) => instance({ ...config, url, method: "options" });
-  instance.post = (url, data, config = {}) => instance({ ...config, url, data, method: "post" });
-  instance.put = (url, data, config = {}) => instance({ ...config, url, data, method: "put" });
-  instance.patch = (url, data, config = {}) => instance({ ...config, url, data, method: "patch" });
-  instance.defaults = { ...defaults };
-  return instance;
-};
-axios.isAxiosError = (err) => !!(err && err.isAxiosError);
-axios.AxiosError = class AxiosError extends Error {
-  constructor(message) {
-    super(message || "AxiosError");
-    this.isAxiosError = true;
-  }
-};
-axios.Cancel = class Cancel extends Error {
-  constructor(message) {
-    super(message || "Cancel");
-    this.__CANCEL__ = true;
-  }
-};
-axios.CancelToken = {
-  source() { return { token: {}, cancel: () => {} }; },
-};
-axios.all = (promises) => Promise.all(promises);
-axios.spread = (cb) => (arr) => cb(...arr);
-
-export default axios;
-"#
-        )
-        .trim()
-        .to_string(),
+        include_str!("extensions_js/axios.mjs").to_string(),
     );
 
     modules.insert(
@@ -19196,6 +19176,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         self.hostcall_tracker.borrow().pending_count()
     }
 
+    /// Snapshot outstanding native calls without draining or changing admission.
+    pub(crate) fn pending_hostcall_ids(&self) -> HashSet<String> {
+        self.hostcall_tracker.borrow().pending.clone()
+    }
+
     /// Snapshot queue depth/backpressure counters for diagnostics.
     pub fn hostcall_queue_telemetry(&self) -> HostcallQueueTelemetry {
         self.hostcall_queue.borrow().snapshot()
@@ -20181,7 +20166,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 // Install native functions that return call_ids
                 // These are wrapped by JS to create Promises
 
-                // __pi_tool_native(name, input) -> call_id
+                // __pi_tool_native(name, input, factory_options?) -> call_id
                 global.set(
                     "__pi_tool_native",
                     Func::from({
@@ -20193,9 +20178,25 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let trace_seq = Arc::clone(&trace_seq);
                         move |ctx: Ctx<'_>,
                               name: String,
-                              input: Value<'_>|
+                              input: Value<'_>,
+                              factory: Opt<Value<'_>>|
                               -> rquickjs::Result<String> {
-                            let payload = js_to_json(&input)?;
+                            let input = js_to_json(&input)?;
+                            let (kind, payload) = match factory.0 {
+                                Some(options) if !options.is_undefined() && !options.is_null() => {
+                                    let mut options = js_to_json(&options)?;
+                                    let Some(params) = options.as_object_mut() else {
+                                        return Err(rquickjs::Error::new_into_js_message(
+                                            "factory",
+                                            "options",
+                                            "Tool factory metadata must be an object",
+                                        ));
+                                    };
+                                    params.insert("input".to_string(), input);
+                                    (HostcallKind::BuiltinTool { name }, options)
+                                }
+                                _ => (HostcallKind::Tool { name }, input),
+                            };
                             let call_id = format!("call-{}", generate_call_id());
                             hostcalls_total.fetch_add(1, AtomicOrdering::SeqCst);
                             let trace_id = trace_seq.fetch_add(1, AtomicOrdering::SeqCst);
@@ -20214,7 +20215,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let extension_id = current_extension_id(&ctx);
                             let request = HostcallRequest {
                                 call_id: call_id.clone(),
-                                kind: HostcallKind::Tool { name },
+                                kind,
                                 payload,
                                 trace_id,
                                 extension_id,
@@ -24308,7 +24309,7 @@ function __pi_make_extension_ctx(ctx_payload) {
             // pi-better-compaction feature-detects the absence and fails
             // open to normal compaction.
         },
-        // Share the public summary options, credential checks and pre-abort
+        // Share the public summary options, credential checks and cancellation
         // behavior with the exported API. Native strategy requests remain
         // host-sanitized and pinned to the current session model.
         compact: async (preparation, options) => {
@@ -25001,6 +25002,11 @@ function __pi_complete_hostcall_impl(call_id, outcome) {
 
         if (pending.stream) {
             pending.stream.pushChunk(outcome.chunk, outcome.isFinal);
+        } else if (pending.onUpdate && !outcome.isFinal) {
+            // Tool progress is an ordered snapshot. Deliver it before a
+            // following completion can settle and retire the callback.
+            try { pending.onUpdate(outcome.chunk); }
+            catch (error) { console.error('Tool onUpdate error:', error); }
         } else if (pending.onChunk) {
             const chunk = outcome.chunk;
             const isFinal = outcome.isFinal;
@@ -25126,6 +25132,104 @@ function __pi_make_hostcall(nativeFn) {
     };
 }
 
+// Abortable generation and native tool execution share request retirement.
+// Session mutation hostcalls retain their admitted transaction lifetime.
+function __pi_abortable_hostcall(start, signal, label, onUpdate) {
+    return new Promise((resolve, reject) => {
+        const hasSignal = signal !== undefined && signal !== null;
+        if (hasSignal && (typeof signal.aborted !== 'boolean' ||
+            typeof signal.addEventListener !== 'function' ||
+            typeof signal.removeEventListener !== 'function')) {
+            throw new TypeError(`${label}: signal must be an AbortSignal`);
+        }
+        let callId = null;
+        let settled = false;
+        let listening = false;
+        const abortReason = () => {
+            const reason = signal.reason;
+            if (reason !== undefined) return reason;
+            const error = new Error('This operation was aborted');
+            error.name = 'AbortError';
+            return error;
+        };
+        const finish = (callback, value) => {
+            if (settled) return;
+            settled = true;
+            if (listening) {
+                listening = false;
+                // A foreign signal shim must not hide the original result or
+                // abort reason by throwing during listener cleanup.
+                try { signal.removeEventListener('abort', onAbort); } catch (_) {}
+            }
+            callback(value);
+        };
+        const cancelNative = () => {
+            if (callId === null) return;
+            __pi_cancel_hostcall_native(callId);
+            __pi_pending_hostcalls.delete(callId);
+        };
+        const onAbort = () => {
+            // Synthetic abort events cannot retire a live request or consume
+            // the listener needed for the controller's actual cancellation.
+            if (settled || !signal.aborted) return;
+            const reason = abortReason();
+            cancelNative();
+            finish(reject, reason);
+        };
+        try {
+            if (hasSignal && signal.aborted) {
+                finish(reject, abortReason());
+                return;
+            }
+            if (hasSignal) {
+                listening = true;
+                signal.addEventListener('abort', onAbort);
+                if (signal.aborted) onAbort();
+            }
+            if (settled) return;
+            callId = start();
+            // Payload getters can abort while the native bridge captures the
+            // request, before its call ID has been returned to this closure.
+            if (settled) {
+                cancelNative();
+                return;
+            }
+            __pi_pending_hostcalls.set(callId, {
+                resolve: (value) => finish(resolve, value),
+                reject: (error) => finish(reject, error),
+                onUpdate: typeof onUpdate === 'function'
+                    ? (chunk) => {
+                        if (!settled) onUpdate(chunk);
+                    }
+                    : undefined,
+                extensionId: __pi_get_current_extension_id()
+            });
+            if (hasSignal && signal.aborted) onAbort();
+        } catch (error) {
+            cancelNative();
+            finish(reject, error);
+        }
+    });
+}
+
+function __pi_compact_hostcall(payload, signal) {
+    return __pi_abortable_hostcall(
+        () => __pi_events_native('compact', payload), signal, 'compact'
+    );
+}
+
+function __pi_builtin_tool_hostcall(name, input, metadata, signal, onUpdate) {
+    const owner = __pi_get_current_extension_id();
+    const publish = typeof onUpdate === 'function'
+        ? (update) => owner
+            ? __pi_with_extension_sync(owner, () => onUpdate(update))
+            : onUpdate(update)
+        : undefined;
+    return __pi_abortable_hostcall(
+        () => __pi_tool_native(name, input, metadata), signal, name, publish
+    );
+}
+
 function __pi_make_streaming_hostcall(nativeFn, ...args) {
     const call_id = nativeFn(...args);
     let options = undefined;
@@ -25203,6 +25307,7 @@ function __pi_sleep(ms) {
 
 // Create the pi global object with Promise-returning methods
 const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
+const __pi_events_hostcall = __pi_make_hostcall(__pi_events_native);
 	const pi = {
     // pi.tool(name, input) - invoke a tool
     tool: __pi_make_hostcall(__pi_tool_native),
@@ -25262,8 +25367,13 @@ const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
     // pi.ui(op, args) - UI operations
     ui: __pi_make_hostcall(__pi_ui_native),
 
-	    // pi.events(op, args) - event operations
-	    events: __pi_make_hostcall(__pi_events_native),
+    // The signal is runtime-local and never serialized into host authority.
+    events: (op, args, options = undefined) => {
+        const signal = options && options.signal;
+        if (signal === undefined || signal === null) return __pi_events_hostcall(op, args);
+        if (op !== 'compact') return Promise.reject(new TypeError('events: signal is only supported for compact'));
+        return __pi_compact_hostcall(args, signal);
+    },
 
     // pi.log(entry) - structured log emission
     log: __pi_make_hostcall(__pi_log_native),
@@ -28184,6 +28294,15 @@ Object.defineProperty(globalThis, '__pi_get_current_extension_id', {
     enumerable: false,
 });
 
+// Public module adapter: every call still crosses the native capability and
+// enabled-tool gates. No privileged lifecycle operation is exposed here.
+Object.defineProperty(globalThis, '__pi_builtin_tool_hostcall', {
+    value: __pi_builtin_tool_hostcall,
+    writable: false,
+    configurable: false,
+    enumerable: false,
+});
+
 for (const name of Object.getOwnPropertyNames(globalThis)) {
     if (!name.startsWith('__pi_')) continue;
     const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
@@ -28349,11 +28468,16 @@ mod tests {
     /// 251_512 -> 256_684 (+144 inventory/reset, +635 tool dispatch,
     /// +4_393 private lifetime controls). The pinned real-subagent source
     /// diagnostic and native lifecycle regressions cover these edits.
+    ///
+    /// Native tool factory delegation adds 1_640 bridge bytes (259_969 ->
+    /// 261_609) and 1_832 trimmed coding-agent module bytes (29_584 -> 31_416).
+    /// These baselines include earlier source drift from the prior receipts;
+    /// only the two sources changed by this feature are re-pinned here.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
-            256_684,
-            "2f2004075b71ba724fcda8d3be81183324eb27e34cc35027e8b9013bcfe92096",
+            261_609,
+            "fc46d7ab3f31ba0d1fdacebb34dcbdf2e52c32a3220b53150c7ff52b5b72ce2d",
         ),
         (
             "node:fs",
@@ -28375,11 +28499,11 @@ mod tests {
             21_108,
             "b35c1978b8bb6c50571e4b4c31f12582380a1b024d3dfe0ac918681ee65e882a",
         ),
-        // Re-pinned with public compaction options and the nine-argument API.
+        // Re-pinned with native tool factory execution.
         (
             "@mariozechner/pi-coding-agent",
-            29_603,
-            "90cd8ffeb6ad50922ad4e5923efe2ede8e5d68f8d8507655fdc3ae989704968e",
+            31_416,
+            "7b445ed9b02ea58abd24b614b5f3a0a1d48fb2f10929975bd07eefc2d81b2550",
         ),
         (
             "@mariozechner/pi-tui",
@@ -28863,6 +28987,190 @@ mod tests {
             // The explicit host payload model wins over sessionState.model;
             // with neither present, ctx.model is undefined (upstream parity).
             assert_eq!(probe["modelAbsent"], json!("undefined"));
+        });
+    }
+
+    #[test]
+    fn pi_coding_agent_tool_factories_delegate_all_tools_and_preserve_results() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock)).await.unwrap();
+            runtime.eval(r"
+                globalThis.factoryProbe = { done: false, updates: [] };
+                import('@mariozechner/pi-coding-agent').then(async (mod) => {
+                    const tools = [
+                        ...mod.createReadOnlyTools('/workspace/sub', { read: { autoResizeImages: false } }),
+                        mod.createWriteTool('/workspace/sub'), mod.createEditTool('/workspace/sub'),
+                        mod.createBashTool('/workspace/sub', { commandPrefix: 'export FOO=bar' }),
+                    ];
+                    factoryProbe.names = tools.map((tool) => tool.name);
+                    factoryProbe.values = await Promise.all(tools.map((tool) => tool.execute(
+                        'extension-id', { path: 'file.txt', command: 'printf real', pattern: 'text',
+                            content: 'body', oldText: 'before', newText: 'after' },
+                        undefined, (update) => factoryProbe.updates.push({ name: tool.name, update })
+                    )));
+                }).catch((error) => { factoryProbe.error = String(error); })
+                  .finally(() => { factoryProbe.done = true; });
+            ").await.unwrap();
+            drain_until_idle(&runtime, &clock).await;
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 7);
+            let mut ids = std::collections::HashSet::new();
+            for request in requests {
+                let HostcallKind::BuiltinTool { name } = &request.kind else {
+                    panic!(
+                        "factory used the ordinary override lookup: {:?}",
+                        request.kind
+                    );
+                };
+                assert!(ids.insert(request.call_id.clone()));
+                assert_eq!(request.payload["cwd"], json!("/workspace/sub"));
+                assert_eq!(request.payload["stream"], json!(true));
+                assert_eq!(request.params_for_hash()["builtin"], json!(true));
+                assert_eq!(
+                    request.params_for_hash()["input"]["path"],
+                    json!("file.txt")
+                );
+                match name.as_str() {
+                    "read" => assert_eq!(
+                        request.payload["options"],
+                        json!({"autoResizeImages":false})
+                    ),
+                    "bash" => assert_eq!(
+                        request.payload["options"],
+                        json!({"commandPrefix":"export FOO=bar"})
+                    ),
+                    _ => assert_eq!(request.payload["options"], json!({})),
+                }
+                runtime.complete_hostcall(&request.call_id, HostcallOutcome::StreamChunk {
+                    sequence: 0,
+                    chunk: json!({"content":[{"type":"text", "text":"progress"}], "details":{"partial":true}}),
+                    is_final: false,
+                });
+                runtime.complete_hostcall(
+                    request.call_id,
+                    HostcallOutcome::Success(json!({
+                        "content":[{"type":"text", "text":format!("executed {name}")}],
+                        "details":{"native":true}, "isError":name == "bash",
+                    })),
+                );
+            }
+            drain_until_idle(&runtime, &clock).await;
+            let probe = get_global_json(&runtime, "factoryProbe").await;
+            assert_eq!(probe["done"], json!(true), "{probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "{probe}");
+            assert_eq!(
+                probe["names"],
+                json!(["read", "grep", "find", "ls", "write", "edit", "bash"])
+            );
+            assert_eq!(probe["updates"].as_array().unwrap().len(), 7, "{probe}");
+            assert_eq!(
+                probe["values"][0]["content"][0]["text"],
+                json!("executed read")
+            );
+            assert_eq!(probe["values"][6]["isError"], json!(true));
+            assert_eq!(probe["values"][6]["details"]["native"], json!(true));
+        });
+    }
+
+    #[test]
+    fn pi_coding_agent_tool_factories_reject_unsupported_options_and_pre_abort() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock)).await.unwrap();
+            runtime.eval(r"
+                globalThis.factoryProbe = { done: false, errors: [] };
+                import('@mariozechner/pi-coding-agent').then(async (mod) => {
+                    for (const create of [
+                        () => mod.createReadTool('/workspace', { operations: {} }),
+                        () => mod.createWriteTool('/workspace', { operations: {} }),
+                        () => mod.createEditTool('/workspace', { operations: {} }),
+                        () => mod.createBashTool('/workspace', { spawnHook() {} }),
+                        () => mod.createReadTool('/workspace', { autoResizeImages: 'false' }),
+                    ]) {
+                        try { create(); factoryProbe.errors.push('accepted'); }
+                        catch (error) { factoryProbe.errors.push(String(error)); }
+                    }
+                    try {
+                        await mod.createWriteTool('/workspace').execute('pre-abort',
+                            { path: 'must-not-exist', content: 'no' }, AbortSignal.abort('stopped'));
+                    } catch (error) { factoryProbe.aborted = error; }
+                }).catch((error) => { factoryProbe.error = String(error); })
+                  .finally(() => { factoryProbe.done = true; });
+            ").await.unwrap();
+            drain_until_idle(&runtime, &clock).await;
+            assert!(runtime.drain_hostcall_requests().is_empty());
+            let probe = get_global_json(&runtime, "factoryProbe").await;
+            assert_eq!(probe["done"], json!(true), "{probe}");
+            assert_eq!(probe["aborted"], json!("stopped"), "{probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "{probe}");
+            assert_eq!(probe["errors"].as_array().unwrap().len(), 5);
+            assert!(
+                probe["errors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|error| { error.as_str().unwrap().starts_with("TypeError:") }),
+                "{probe}"
+            );
+        });
+    }
+
+    #[test]
+    fn pi_coding_agent_tool_factory_abort_retires_host_work_and_progress() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock)).await.unwrap();
+            runtime
+                .eval(
+                    r"
+                globalThis.factoryProbe = { done: false, updates: [] };
+                globalThis.factoryAbort = new AbortController();
+                import('@mariozechner/pi-coding-agent').then((mod) =>
+                    mod.createBashTool('/workspace').execute('cancelled', { command: 'slow' },
+                        factoryAbort.signal, (update) => factoryProbe.updates.push(update)))
+                  .then(() => { factoryProbe.resolved = true; })
+                  .catch((error) => { factoryProbe.error = String(error); })
+                  .finally(() => { factoryProbe.done = true; });
+            ",
+                )
+                .await
+                .unwrap();
+            drain_until_idle(&runtime, &clock).await;
+            let request = runtime.drain_hostcall_requests().pop_front().unwrap();
+            runtime.complete_hostcall(
+                &request.call_id,
+                HostcallOutcome::StreamChunk {
+                    sequence: 0,
+                    chunk: json!({"content":[], "details":{"before":true}}),
+                    is_final: false,
+                },
+            );
+            drain_until_idle(&runtime, &clock).await;
+            runtime
+                .eval("factoryAbort.abort('caller stopped');")
+                .await
+                .unwrap();
+            drain_until_idle(&runtime, &clock).await;
+            assert!(!runtime.is_hostcall_active(&request.call_id));
+            runtime.complete_hostcall(
+                &request.call_id,
+                HostcallOutcome::StreamChunk {
+                    sequence: 1,
+                    chunk: json!({"content":[], "details":{"late":true}}),
+                    is_final: false,
+                },
+            );
+            runtime.complete_hostcall(
+                request.call_id,
+                HostcallOutcome::Success(json!({"content":[]})),
+            );
+            drain_until_idle(&runtime, &clock).await;
+            let probe = get_global_json(&runtime, "factoryProbe").await;
+            assert_eq!(probe["done"], json!(true), "{probe}");
+            assert_eq!(probe["error"], json!("caller stopped"), "{probe}");
+            assert_eq!(probe["resolved"], serde_json::Value::Null);
+            assert_eq!(probe["updates"].as_array().unwrap().len(), 1, "{probe}");
         });
     }
 
@@ -38952,18 +39260,30 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .await
                 .expect("create runtime");
 
+            #[allow(clippy::literal_string_with_formatting_args)] // JS template literal, not a format string
             runtime
                 .eval(
                     r#"
                     globalThis.piAiFailClosed = {};
                     (async () => {
                         const ai = await import('@mariozechner/pi-ai');
+                        const rejectStream = async (name) => {
+                            const stream = ai[name]("model", "hi");
+                            const events = [];
+                            for await (const event of stream) events.push(event);
+                            const result = await stream.result();
+                            if (events.length !== 1 || events[0].type !== "error" ||
+                                result.stopReason !== "error") {
+                                throw new Error(`${name}: missing terminal bridge error`);
+                            }
+                            throw new Error(result.errorMessage);
+                        };
                         const checks = [
                             ["complete", () => ai.complete("model", [{ role: "user", content: "hi" }])],
                             ["completeSimple", () => ai.completeSimple("model", "hi")],
-                            ["streamSimpleAnthropic", async () => { for await (const _ of ai.streamSimpleAnthropic("model", "hi")) {} }],
-                            ["streamSimpleOpenAIResponses", async () => { for await (const _ of ai.streamSimpleOpenAIResponses("model", "hi")) {} }],
-                            ["streamSimpleOpenAICompletions", async () => { for await (const _ of ai.streamSimpleOpenAICompletions("model", "hi")) {} }],
+                            ["streamSimpleAnthropic", () => rejectStream("streamSimpleAnthropic")],
+                            ["streamSimpleOpenAIResponses", () => rejectStream("streamSimpleOpenAIResponses")],
+                            ["streamSimpleOpenAICompletions", () => rejectStream("streamSimpleOpenAICompletions")],
                             ["getModel", () => ai.getModel()],
                             ["getApiProvider", () => ai.getApiProvider()],
                             ["getModels", () => ai.getModels()],
@@ -39440,13 +39760,16 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                             { maxTokens: 12 }
                         );
                         globalThis.piAiBridge.simple = await ai.completeSimple("mock-model", "hello", { maxTokens: 4 });
+                        globalThis.piAiBridge.shorthand = await ai.completeSimple("hello", { maxTokens: 3 });
                         globalThis.piAiBridge.model = await ai.getModel();
                         globalThis.piAiBridge.provider = await ai.getApiProvider();
                         globalThis.piAiBridge.models = await ai.getModels();
                         globalThis.piAiBridge.stream = [];
-                        for await (const chunk of ai.streamSimpleOpenAIResponses("mock-model", "stream")) {
-                            globalThis.piAiBridge.stream.push(chunk);
+                        const stream = ai.streamSimpleOpenAIResponses("mock-model", "stream");
+                        for await (const event of stream) {
+                            if (event.type === "text_delta") globalThis.piAiBridge.stream.push(event.delta);
                         }
+                        globalThis.piAiBridge.streamResult = await stream.result();
                         globalThis.piAiBridge.done = true;
                     })().catch((e) => {
                         globalThis.piAiBridge.error = String((e && e.message) || e || "");
@@ -39491,16 +39814,27 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                                 .and_then(serde_json::Value::as_bool)
                                 .unwrap_or(false);
                             if simple {
+                                assert_eq!(request.payload["context"], json!("hello"));
+                                if request.payload["model"].is_null() {
+                                    assert_eq!(request.payload["options"]["maxTokens"], json!(3));
+                                } else {
+                                    assert_eq!(request.payload["model"], json!("mock-model"));
+                                    assert_eq!(request.payload["options"]["maxTokens"], json!(4));
+                                }
                                 runtime.complete_hostcall(
                                     request.call_id,
                                     HostcallOutcome::Success(json!("bridge-simple")),
                                 );
                             } else {
-                                assert_eq!(
-                                    request.payload["context"][0]["content"],
-                                    json!("hello")
-                                );
-                                assert_eq!(request.payload["options"]["maxTokens"], json!(12));
+                                if request.payload["context"].is_array() {
+                                    assert_eq!(
+                                        request.payload["context"][0]["content"],
+                                        json!("hello")
+                                    );
+                                    assert_eq!(request.payload["options"]["maxTokens"], json!(12));
+                                } else {
+                                    assert_eq!(request.payload["context"], json!("stream"));
+                                }
                                 runtime.complete_hostcall(
                                     request.call_id,
                                     HostcallOutcome::Success(json!({
@@ -39542,10 +39876,16 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(r["error"], serde_json::Value::Null);
             assert_eq!(r["complete"]["text"], json!("bridge-complete"));
             assert_eq!(r["simple"], json!("bridge-simple"));
+            assert_eq!(r["shorthand"], json!("bridge-simple"));
             assert_eq!(r["model"]["modelId"], json!("mock-model"));
             assert_eq!(r["provider"], json!("mock-provider"));
             assert_eq!(r["models"][0]["id"], json!("mock-model"));
-            assert_eq!(r["stream"][0], json!("bridge-simple"));
+            assert_eq!(r["stream"][0], json!("bridge-complete"));
+            assert_eq!(r["streamResult"]["stopReason"], json!("stop"));
+            assert_eq!(
+                r["streamResult"]["content"][0]["text"],
+                json!("bridge-complete")
+            );
         });
     }
 

@@ -85,7 +85,7 @@ Generated: 2026-02-07 | Corpus: 1,167 files across 230 extensions
 | `ws` | 4 | Stub | P2 |
 | `chokidar` | 3 | Stub | P2 |
 | `jsdom` | 3 | Stub | P2 |
-| `better-sqlite3` | 3 | Stub | P3 |
+| `better-sqlite3` | 3 | Partial | P3 |
 | `diff` | 3 | Partial | P2 |
 | `glob` | 3 | Partial | P2 |
 | `dotenv` | 3 | Partial | P2 |
@@ -94,7 +94,7 @@ Generated: 2026-02-07 | Corpus: 1,167 files across 230 extensions
 | `chalk` | 2 | Stub | P3 |
 | `node-pty` | 2 | Stub | P3 |
 | `@anthropic-ai/sdk` | 2 | Stub | P2 |
-| `axios` | 2 | Stub | P2 |
+| `axios` | 2 | Partial | P2 |
 
 ## Bun API Usage
 
@@ -107,8 +107,8 @@ Minimal. Only 5 extensions (all T3) use Bun-specific APIs.
 | Status | Count | Description |
 |--------|-------|-------------|
 | Real | 18 | Full functional implementation |
-| Partial | 21 | Mix of real + stubs |
-| Stub | 25 | Returns default/empty values |
+| Partial | 23 | Mix of real + stubs |
+| Stub | 23 | Returns default/empty values |
 | External | 5 | Delegated to external JS shim file |
 | Error throw | 2 | Throws "not available in PiJS" |
 | Missing | 2 | Remaining unregistered npm packages used by corpus |
@@ -128,9 +128,10 @@ All P0 modules (path, fs, os, child_process) have real implementations.
 - `fs.watch` (9 calls) - path-checking no-op watcher, no real file watching
 - `glob` npm package - partial VFS-backed glob/globSync subset
 - `ws` npm package - stubbed WebSocket facade, no real network I/O
-- `axios` npm package - stubbed HTTP client facade, no real network I/O
+- `axios` npm package - real HTTP through capability-gated PiJS fetch, with JSON/form/binary bodies, response errors, interceptors, cancellation, timeout and byte limits; custom transports/agents, progress callbacks and streaming/blob response types are unsupported. Native integration tests await DSR qualification.
 
 ### P3 Gaps (low priority)
+- `better-sqlite3` - real persistence, statements, bindings, transactions, nested rollback, BLOBs and safe integers through the existing native SQLite engine; advanced statement modes, user-defined SQL functions and native addons remain unsupported. Native integration tests await DSR qualification.
 - `child_process.fork` (72 calls) - throws error, not feasible in QuickJS
 - `node:net` (7 ext) - stubbed sockets (no network I/O)
 - `node:test` (7 ext) - partial runner (test/describe/it + hooks + run); reporters/concurrency not supported

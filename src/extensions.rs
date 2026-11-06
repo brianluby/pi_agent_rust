@@ -10069,6 +10069,30 @@ pub const EXTENSION_COMMAND_BUDGET_MS: u64 = 30_000;
 /// Default cancellation budget for extension shortcut execution (ms).
 pub const EXTENSION_SHORTCUT_BUDGET_MS: u64 = 30_000;
 
+/// Operator-invoked extension handlers share session context, cancellation,
+/// native hostcall settlement and generated-turn ownership.
+#[derive(Debug, Clone)]
+pub(crate) enum ExtensionInteraction {
+    Command { name: String, args: String },
+    Shortcut { key_id: String },
+}
+
+impl ExtensionInteraction {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Command { .. } => "command",
+            Self::Shortcut { .. } => "shortcut",
+        }
+    }
+
+    fn route_name(&self) -> &str {
+        match self {
+            Self::Command { name, .. } => name,
+            Self::Shortcut { key_id } => key_id,
+        }
+    }
+}
+
 /// Default cancellation budget for UI dialog operations (ms).
 pub const EXTENSION_UI_BUDGET_MS: u64 = 1_000;
 
@@ -11483,21 +11507,14 @@ enum JsRuntimeCommand {
         invocation: Arc<JsToolInvocation>,
         reply: oneshot::Sender<Result<Value>>,
     },
-    ExecuteCommand {
-        command_name: String,
-        args: String,
+    ExecuteInteraction {
+        interaction: ExtensionInteraction,
         ctx_payload: Arc<Value>,
         origin: Option<SessionActionOrigin>,
         timeout_ms: u64,
         deadline: Instant,
-        reply: oneshot::Sender<Result<Value>>,
-    },
-    ExecuteShortcut {
-        key_id: String,
-        ctx_payload: Arc<Value>,
-        origin: Option<SessionActionOrigin>,
-        timeout_ms: u64,
-        deadline: Instant,
+        started: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
         reply: oneshot::Sender<Result<Value>>,
     },
     ProviderStreamSimpleStart {
@@ -12505,83 +12522,62 @@ impl JsExtensionRuntimeHandle {
                             };
                             let _ = reply.send(&cx, result);
                         }
-                        JsRuntimeCommand::ExecuteCommand {
-                            command_name,
-                            args,
+                        JsRuntimeCommand::ExecuteInteraction {
+                            interaction,
                             ctx_payload,
                             origin,
                             timeout_ms: _,
                             deadline,
+                            started,
+                            cancelled,
                             reply,
                         } => {
                             if reply.is_closed() {
                                 continue;
                             }
-                            let timeout_ms = match js_runtime_remaining_timeout_ms(deadline, "command") {
+                            // Pair with the caller's cancellation handshake:
+                            // either it observes this admission and drains us,
+                            // or we observe cancellation before entering JS.
+                            started.store(true, StdOrdering::SeqCst);
+                            if cancelled.load(StdOrdering::SeqCst) {
+                                let _ = reply.send(&cx, Err(Error::Aborted));
+                                continue;
+                            }
+                            let timeout_ms = match js_runtime_remaining_timeout_ms(deadline, interaction.kind()) {
                                 Ok(timeout_ms) => timeout_ms,
                                 Err(err) => {
                                     let _ = reply.send(&cx, Err(err));
                                     continue;
                                 }
                             };
-                            let route_name = js_command_route_name(&command_name);
-                            let result = match shard_set.shard_index_for_route(
-                                &shard_set.command_owner,
-                                "command",
-                                route_name,
-                            ) {
-                                Ok(shard_index) => {
-                                    execute_extension_command_sharded(
-                                        &mut shard_set,
-                                        &host,
-                                        shard_index,
-                                        route_name,
-                                        &args,
-                                        ctx_payload.as_ref(),
-                                        origin.as_ref(),
-                                        timeout_ms,
-                                        deadline,
+                            let route = match &interaction {
+                                ExtensionInteraction::Command { name, .. } => {
+                                    shard_set.shard_index_for_route(
+                                        &shard_set.command_owner,
+                                        "command",
+                                        js_command_route_name(name),
                                     )
-                                    .await
                                 }
-                                Err(err) => Err(err),
-                            };
-                            let _ = reply.send(&cx, result);
-                        }
-                        JsRuntimeCommand::ExecuteShortcut {
-                            key_id,
-                            ctx_payload,
-                            origin,
-                            timeout_ms: _,
-                            deadline,
-                            reply,
-                        } => {
-                            if reply.is_closed() {
-                                continue;
-                            }
-                            let timeout_ms = match js_runtime_remaining_timeout_ms(deadline, "shortcut") {
-                                Ok(timeout_ms) => timeout_ms,
-                                Err(err) => {
-                                    let _ = reply.send(&cx, Err(err));
-                                    continue;
+                                ExtensionInteraction::Shortcut { key_id } => {
+                                    shard_set.shard_index_for_route(
+                                        &shard_set.shortcut_owner,
+                                        "shortcut",
+                                        &key_id.trim().to_lowercase(),
+                                    )
                                 }
                             };
-                            let route_name = key_id.trim().to_ascii_lowercase();
-                            let result = match shard_set.shard_index_for_route(
-                                &shard_set.shortcut_owner,
-                                "shortcut",
-                                &route_name,
-                            ) {
+                            let result = match route {
                                 Ok(shard_index) => {
-                                    execute_extension_shortcut_sharded(
+                                    execute_extension_interaction_sharded(
                                         &mut shard_set,
                                         &host,
                                         shard_index,
-                                        &route_name,
+                                        &interaction,
                                         ctx_payload.as_ref(),
                                         origin.as_ref(),
                                         timeout_ms,
                                         deadline,
+                                        &cancelled,
                                     )
                                     .await
                                 }
@@ -13456,16 +13452,58 @@ impl JsExtensionRuntimeHandle {
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
     ) -> Result<Value> {
+        self.execute_command_with_abort(command_name, args, ctx_payload, timeout_ms, None)
+            .await
+    }
+
+    pub async fn execute_command_with_abort(
+        &self,
+        command_name: String,
+        args: String,
+        ctx_payload: Arc<Value>,
+        timeout_ms: u64,
+        abort: Option<crate::agent::AbortSignal>,
+    ) -> Result<Value> {
+        self.execute_interaction_with_abort(
+            ExtensionInteraction::Command {
+                name: command_name,
+                args,
+            },
+            ctx_payload,
+            timeout_ms,
+            abort,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_interaction_with_abort(
+        &self,
+        interaction: ExtensionInteraction,
+        ctx_payload: Arc<Value>,
+        timeout_ms: u64,
+        abort: Option<crate::agent::AbortSignal>,
+    ) -> Result<Value> {
+        if abort
+            .as_ref()
+            .is_some_and(crate::agent::AbortSignal::is_aborted)
+        {
+            return Err(Error::Aborted);
+        }
+        let kind = interaction.kind();
         let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = Cx::for_request();
+        let started = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = JsEventInvocationGuard(Arc::clone(&cancelled));
         let (reply_tx, mut reply_rx) = oneshot::channel();
-        let command = JsRuntimeCommand::ExecuteCommand {
-            command_name,
-            args,
+        let command = JsRuntimeCommand::ExecuteInteraction {
+            interaction,
             ctx_payload,
             origin: self.capture_session_action_origin(),
             timeout_ms,
             deadline,
+            started: Arc::clone(&started),
+            cancelled: Arc::clone(&cancelled),
             reply: reply_tx,
         };
         let fut = async move {
@@ -13479,17 +13517,54 @@ impl JsExtensionRuntimeHandle {
                 .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
         };
 
-        timeout(
+        futures::pin_mut!(fut);
+        let completion = async {
+            let Some(abort) = &abort else {
+                return Some(fut.as_mut().await);
+            };
+            let stopped = abort.wait();
+            futures::pin_mut!(stopped);
+            match futures::future::select(stopped, fut.as_mut()).await {
+                futures::future::Either::Left(_) => None,
+                futures::future::Either::Right((result, _)) => Some(result),
+            }
+        };
+        let completion = timeout(
             wall_now(),
             js_runtime_remaining_timeout(deadline),
-            Box::pin(fut),
+            Box::pin(completion),
         )
-        .await
-        .unwrap_or_else(|_| {
-            Err(Error::extension(format!(
-                "JS extension runtime command timed out after {timeout_ms}ms"
-            )))
-        })
+        .await;
+        if let Ok(Some(result)) = completion {
+            if abort
+                .as_ref()
+                .is_some_and(crate::agent::AbortSignal::is_aborted)
+            {
+                Err(Error::Aborted)
+            } else {
+                result
+            }
+        } else {
+            cancelled.store(true, StdOrdering::SeqCst);
+            if started.load(StdOrdering::SeqCst) {
+                // Cleanup is outside the deadline wrapper. Even an abort
+                // racing that deadline must wait for admitted native work
+                // and its guest realm to lose their ownership first.
+                let _ = fut.await;
+            }
+            // For a queued command, admission's matching handshake
+            // prevents execution after this immediate cancellation reply.
+            if abort
+                .as_ref()
+                .is_some_and(crate::agent::AbortSignal::is_aborted)
+            {
+                Err(Error::Aborted)
+            } else {
+                Err(Error::extension(format!(
+                    "JS extension runtime {kind} timed out after {timeout_ms}ms"
+                )))
+            }
+        }
     }
 
     pub async fn execute_shortcut(
@@ -13498,39 +13573,24 @@ impl JsExtensionRuntimeHandle {
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
     ) -> Result<Value> {
-        let deadline = js_runtime_request_deadline(timeout_ms);
-        let cx = Cx::for_request();
-        let (reply_tx, mut reply_rx) = oneshot::channel();
-        let command = JsRuntimeCommand::ExecuteShortcut {
-            key_id,
-            ctx_payload,
-            origin: self.capture_session_action_origin(),
-            timeout_ms,
-            deadline,
-            reply: reply_tx,
-        };
-        let fut = async move {
-            self.sender
-                .send(&cx, command)
-                .await
-                .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
-            reply_rx
-                .recv(&cx)
-                .await
-                .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
-        };
+        self.execute_shortcut_with_abort(key_id, ctx_payload, timeout_ms, None)
+            .await
+    }
 
-        timeout(
-            wall_now(),
-            js_runtime_remaining_timeout(deadline),
-            Box::pin(fut),
+    pub async fn execute_shortcut_with_abort(
+        &self,
+        key_id: String,
+        ctx_payload: Arc<Value>,
+        timeout_ms: u64,
+        abort: Option<crate::agent::AbortSignal>,
+    ) -> Result<Value> {
+        self.execute_interaction_with_abort(
+            ExtensionInteraction::Shortcut { key_id },
+            ctx_payload,
+            timeout_ms,
+            abort,
         )
         .await
-        .unwrap_or_else(|_| {
-            Err(Error::extension(format!(
-                "JS extension runtime shortcut timed out after {timeout_ms}ms"
-            )))
-        })
     }
 
     pub async fn set_flag_value(
@@ -16684,125 +16744,179 @@ async fn abort_js_tool_task(
     }
 }
 
+/// Operator handlers' public sendMessage/sendUserMessage calls are fire-and-forget.
+/// A handler can enqueue them in the tick that settles its own promise, so
+/// finish native dispatch before the session drains the resulting idle turns.
+/// A fixed settlement snapshot excludes older background calls and calls
+/// issued by future timer ticks, so neither can extend command completion.
 #[allow(clippy::future_not_send, clippy::too_many_arguments)]
-async fn execute_extension_command_sharded(
+async fn await_js_interaction_task(
     shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
     shard_index: usize,
-    command_name: &str,
-    args: &str,
-    ctx_payload: &Value,
-    origin: Option<&SessionActionOrigin>,
-    timeout_ms: u64,
+    task_id: &str,
+    cancelled: &AtomicBool,
     deadline: Instant,
-) -> Result<Value> {
-    shards.ensure_shard_healthy(shard_index)?;
-    let timeout = remaining_js_task_timeout(deadline, "command")?;
-    let started_at = Instant::now();
-    tracing::info!(
-        event = "ext.command.start",
-        command = %command_name,
-        timeout_ms,
-        "Extension command execution start"
-    );
-    let task_id = next_runtime_task_id("task-cmd");
-    let origin_guard = {
-        let runtime = &shards
-            .shards
-            .get(shard_index)
-            .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
-            .runtime;
-        let origin_guard = runtime.enter_session_action_origin(origin.cloned());
-        let bridge_secret = runtime.bridge_secret().to_string();
-        runtime
-            .with_ctx(|ctx| {
-                let global = ctx.globals();
-                let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_command")?;
-                let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
-                let ctx_js = json_to_js(&ctx, ctx_payload)?;
-                let promise: rquickjs::Value<'_> =
-                    exec_fn.call((bridge_secret.as_str(), command_name, args, ctx_js))?;
-                let _task: String =
-                    task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
-                Ok(())
-            })
-            .await?;
-        origin_guard
+    previous_hostcalls: &HashSet<String>,
+) -> JsCancellableTaskOutcome {
+    let outcome =
+        await_js_cancellable_task(shards, host, shard_index, task_id, cancelled, deadline).await;
+    let JsCancellableTaskOutcome::Finished(result) = outcome else {
+        return outcome;
     };
-
-    let result =
-        await_js_task_in_shards_and_refresh(shards, host, shard_index, &task_id, timeout, deadline)
-            .await;
-    drop(origin_guard);
-    let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let is_err = result.is_err();
-    tracing::info!(
-        event = "ext.command.end",
-        command = %command_name,
-        duration_ms,
-        is_error = is_err,
-        "Extension command execution end"
-    );
-    result
+    let outstanding: Vec<_> = shards.shards[shard_index]
+        .runtime
+        .pending_hostcall_ids()
+        .difference(previous_hostcalls)
+        .cloned()
+        .collect();
+    loop {
+        if cancelled.load(StdOrdering::Acquire) || Instant::now() >= deadline {
+            return JsCancellableTaskOutcome::Stopped { settled: true };
+        }
+        let shard = &mut shards.shards[shard_index];
+        if outstanding
+            .iter()
+            .all(|call_id| !shard.runtime.is_hostcall_active(call_id))
+        {
+            return JsCancellableTaskOutcome::Finished(result);
+        }
+        if let Err(err) = pump_active_runtime_shard(shard, host).await {
+            return JsCancellableTaskOutcome::Fault(err);
+        }
+        extension_wait_cooperate(deadline).await;
+    }
 }
 
-#[allow(clippy::future_not_send, clippy::too_many_arguments)]
-async fn execute_extension_shortcut_sharded(
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+async fn execute_extension_interaction_sharded(
     shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
     shard_index: usize,
-    key_id: &str,
+    interaction: &ExtensionInteraction,
     ctx_payload: &Value,
     origin: Option<&SessionActionOrigin>,
     timeout_ms: u64,
     deadline: Instant,
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<Value> {
     shards.ensure_shard_healthy(shard_index)?;
-    let timeout = remaining_js_task_timeout(deadline, "shortcut")?;
+    let kind = interaction.kind();
+    let _ = remaining_js_task_timeout(deadline, kind)?;
+    if cancelled.load(StdOrdering::Acquire) {
+        return Err(Error::Aborted);
+    }
     let started_at = Instant::now();
     tracing::info!(
-        event = "ext.shortcut.start",
-        key_id = %key_id,
+        event = %format!("ext.{kind}.start"),
+        interaction = %interaction.route_name(),
         timeout_ms,
-        "Extension shortcut execution start"
+        "Extension interaction execution start"
     );
-    let task_id = next_runtime_task_id("task-shortcut");
-    let origin_guard = {
-        let runtime = &shards
+    let task_id = next_runtime_task_id(match interaction {
+        ExtensionInteraction::Command { .. } => "task-cmd",
+        ExtensionInteraction::Shortcut { .. } => "task-shortcut",
+    });
+    let runtime = Rc::clone(
+        &shards
             .shards
             .get(shard_index)
             .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
-            .runtime;
-        let origin_guard = runtime.enter_session_action_origin(origin.cloned());
-        let bridge_secret = runtime.bridge_secret().to_string();
-        runtime
-            .with_ctx(|ctx| {
-                let global = ctx.globals();
-                let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_shortcut")?;
-                let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
-                let ctx_js = json_to_js(&ctx, ctx_payload)?;
-                let promise: rquickjs::Value<'_> =
-                    exec_fn.call((bridge_secret.as_str(), key_id, ctx_js))?;
-                let _task: String =
-                    task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
-                Ok(())
-            })
-            .await?;
-        origin_guard
+            .runtime,
+    );
+    let previous_hostcalls = runtime.pending_hostcall_ids();
+    let origin_guard = runtime.enter_session_action_origin(origin.cloned());
+    let fence = runtime.enter_execution_fence(Arc::clone(cancelled), deadline);
+    let bridge_secret = runtime.bridge_secret().to_string();
+    let started = runtime
+        .with_ctx(|ctx| {
+            let global = ctx.globals();
+            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+            let ctx_js = json_to_js(&ctx, ctx_payload)?;
+            let promise: rquickjs::Value<'_> = match interaction {
+                ExtensionInteraction::Command { name, args } => {
+                    let exec: rquickjs::Function<'_> = global.get("__pi_execute_command")?;
+                    exec.call((bridge_secret.as_str(), name.as_str(), args.as_str(), ctx_js))?
+                }
+                ExtensionInteraction::Shortcut { key_id } => {
+                    let exec: rquickjs::Function<'_> = global.get("__pi_execute_shortcut")?;
+                    exec.call((bridge_secret.as_str(), key_id.as_str(), ctx_js))?
+                }
+            };
+            let _task: String =
+                task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
+            Ok(())
+        })
+        .await;
+    let outcome = match started {
+        Ok(()) => {
+            await_js_interaction_task(
+                shards,
+                host,
+                shard_index,
+                &task_id,
+                cancelled,
+                deadline,
+                &previous_hostcalls,
+            )
+            .await
+        }
+        Err(err) => JsCancellableTaskOutcome::Fault(err),
     };
-
-    let result =
-        await_js_task_in_shards_and_refresh(shards, host, shard_index, &task_id, timeout, deadline)
-            .await;
+    // Operator handlers have no guest AbortSignal contract. As with event
+    // hooks, an unfinished or interrupted handler must lose its entire realm
+    // so timers and hostcalls cannot resume after the operator cancels it.
+    let result = if fence.was_interrupted() {
+        Err(quarantine_runtime_shard(
+            shards,
+            shard_index,
+            &format!("{kind} cancellation or deadline interrupted JavaScript execution"),
+        ))
+    } else {
+        match outcome {
+            JsCancellableTaskOutcome::Finished(result) => {
+                let refreshed = refresh_runtime_shard_snapshot(shards, shard_index).await;
+                if fence.was_interrupted()
+                    || cancelled.load(StdOrdering::Acquire)
+                    || Instant::now() >= deadline
+                {
+                    Err(quarantine_runtime_shard(
+                        shards,
+                        shard_index,
+                        &format!(
+                            "{kind} cancelled or deadline elapsed during registry publication"
+                        ),
+                    ))
+                } else {
+                    refreshed.and(result)
+                }
+            }
+            JsCancellableTaskOutcome::Stopped { .. } => Err(quarantine_runtime_shard(
+                shards,
+                shard_index,
+                &format!("{kind} cancelled or timed out with unresolved JavaScript state"),
+            )),
+            JsCancellableTaskOutcome::Fault(err) => Err(quarantine_runtime_shard(
+                shards,
+                shard_index,
+                &format!("{kind} execution or runtime pump failed: {err}"),
+            )),
+        }
+    };
+    drop(fence);
     drop(origin_guard);
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let is_err = result.is_err();
     tracing::info!(
-        event = "ext.shortcut.end",
-        key_id = %key_id,
+        event = %format!("ext.{kind}.end"),
+        interaction = %interaction.route_name(),
         duration_ms,
         is_error = is_err,
-        "Extension shortcut execution end"
+        "Extension interaction execution end"
     );
     result
 }
@@ -19993,20 +20107,44 @@ async fn dispatch_shared_allowed_fast(
 ) -> HostcallOutcome {
     match opcode {
         CommonHostcallOpcode::ToolRead => {
-            let input = call.params.get("input").cloned().unwrap_or(Value::Null);
-            dispatch_hostcall_tool(ctx.tools, &call.call_id, "read", input).await
+            dispatch_hostcall_tool(
+                ctx.tools,
+                ctx.js_runtime,
+                &call.call_id,
+                "read",
+                &call.params,
+            )
+            .await
         }
         CommonHostcallOpcode::ToolWrite => {
-            let input = call.params.get("input").cloned().unwrap_or(Value::Null);
-            dispatch_hostcall_tool(ctx.tools, &call.call_id, "write", input).await
+            dispatch_hostcall_tool(
+                ctx.tools,
+                ctx.js_runtime,
+                &call.call_id,
+                "write",
+                &call.params,
+            )
+            .await
         }
         CommonHostcallOpcode::ToolEdit => {
-            let input = call.params.get("input").cloned().unwrap_or(Value::Null);
-            dispatch_hostcall_tool(ctx.tools, &call.call_id, "edit", input).await
+            dispatch_hostcall_tool(
+                ctx.tools,
+                ctx.js_runtime,
+                &call.call_id,
+                "edit",
+                &call.params,
+            )
+            .await
         }
         CommonHostcallOpcode::ToolBash => {
-            let input = call.params.get("input").cloned().unwrap_or(Value::Null);
-            dispatch_hostcall_tool(ctx.tools, &call.call_id, "bash", input).await
+            dispatch_hostcall_tool(
+                ctx.tools,
+                ctx.js_runtime,
+                &call.call_id,
+                "bash",
+                &call.params,
+            )
+            .await
         }
         CommonHostcallOpcode::SessionGetName => {
             let Some(ref manager) = ctx.manager else {
@@ -20439,8 +20577,8 @@ async fn dispatch_shared_allowed_legacy(
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let input = call.params.get("input").cloned().unwrap_or(Value::Null);
-            dispatch_hostcall_tool(ctx.tools, &call.call_id, name, input).await
+            dispatch_hostcall_tool(ctx.tools, ctx.js_runtime, &call.call_id, name, &call.params)
+                .await
         }
         "exec" => {
             let cmd = call
@@ -20834,21 +20972,126 @@ async fn dispatch_hostcall_with_runtime(
     host_result_to_outcome(result)
 }
 
-#[allow(clippy::future_not_send)]
-async fn dispatch_hostcall_tool(
+/// One replaceable progress snapshot bounds memory while JavaScript is busy.
+#[derive(Default)]
+struct NativeFactoryProgress {
+    latest: Mutex<Option<ToolUpdate>>,
+    waker: futures::task::AtomicWaker,
+}
+
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
+pub(crate) async fn dispatch_hostcall_tool<C: crate::scheduler::Clock + 'static>(
     tools: &ToolRegistry,
+    runtime: Option<&PiJsRuntime<C>>,
     call_id: &str,
     name: &str,
-    payload: Value,
+    params: &Value,
 ) -> HostcallOutcome {
-    let Some(tool) = tools.get(name) else {
+    let builtin = params.get("builtin") == Some(&Value::Bool(true));
+    if params
+        .get("builtin")
+        .is_some_and(|value| !value.is_boolean())
+    {
         return HostcallOutcome::Error {
             code: "invalid_request".to_string(),
-            message: format!("Unknown tool: {name}"),
+            message: "Tool builtin selector must be a boolean".to_string(),
+        };
+    }
+    let tool = if builtin {
+        tools.get_factory_tool(name)
+    } else {
+        tools.get(name)
+    };
+    let Some(tool) = tool else {
+        return HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: if builtin {
+                format!("Native tool factory '{name}' is not enabled by this host")
+            } else {
+                format!("Unknown tool: {name}")
+            },
         };
     };
-
-    match tool.execute(call_id, payload, None).await {
+    let empty_options = json!({});
+    let options = params.get("options").unwrap_or(&empty_options);
+    let cwd = params.get("cwd").and_then(Value::as_str);
+    let stream = builtin && params.get("stream") == Some(&Value::Bool(true));
+    if builtin
+        && (params.get("cwd").is_some_and(|value| !value.is_string())
+            || params
+                .get("stream")
+                .is_some_and(|value| !value.is_boolean())
+            || !options.is_object()
+            || params.as_object().is_some_and(|object| {
+                object.keys().any(|key| {
+                    !matches!(
+                        key.as_str(),
+                        "name" | "input" | "builtin" | "cwd" | "options" | "stream"
+                    )
+                })
+            }))
+    {
+        return HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: "Invalid native tool factory options".to_string(),
+        };
+    }
+    if stream && runtime.is_none() {
+        return HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: "Tool factory progress requires a JavaScript runtime".to_string(),
+        };
+    }
+    let progress = stream.then(|| Arc::new(NativeFactoryProgress::default()));
+    let on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>> =
+        progress.as_ref().map(|progress| {
+            let progress = Arc::clone(progress);
+            Box::new(move |update| {
+                *progress
+                    .latest
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(update);
+                progress.waker.wake();
+            }) as Box<dyn Fn(ToolUpdate) + Send + Sync>
+        });
+    let input = params.get("input").cloned().unwrap_or(Value::Null);
+    let mut execution = if builtin {
+        tool.execute_from_factory(call_id, input, cwd, options, on_update)
+    } else {
+        tool.execute(call_id, input, on_update)
+    };
+    let mut sequence = 0_u64;
+    let output = if let Some(progress) = progress {
+        futures::future::poll_fn(|task_cx| {
+            progress.waker.register(task_cx.waker());
+            let output = execution.as_mut().poll(task_cx);
+            let update = progress
+                .latest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(update) = update
+                && let Some(runtime) = runtime
+                && runtime.is_hostcall_active(call_id)
+                && let Ok(chunk) = serde_json::to_value(update)
+            {
+                runtime.complete_hostcall(
+                    call_id,
+                    HostcallOutcome::StreamChunk {
+                        sequence,
+                        chunk,
+                        is_final: false,
+                    },
+                );
+                sequence = sequence.saturating_add(1);
+            }
+            output
+        })
+        .await
+    } else {
+        execution.await
+    };
+    match output {
         Ok(output) => match serde_json::to_value(output) {
             Ok(value) => HostcallOutcome::Success(value),
             Err(err) => HostcallOutcome::Error {
@@ -21773,16 +22016,19 @@ export default async function(pi) {{
                     .await
                     .expect("activation response")
             } else {
-                execute_extension_command_sharded(
+                execute_extension_interaction_sharded(
                     &mut shards,
                     &host,
                     0,
-                    "native-fetch",
-                    "",
+                    &ExtensionInteraction::Command {
+                        name: "native-fetch".to_string(),
+                        args: String::new(),
+                    },
                     &json!({}),
                     None,
                     5_000,
                     js_runtime_request_deadline(5_000),
+                    &Arc::new(AtomicBool::new(false)),
                 )
                 .await
                 .expect("command response without starving native I/O")

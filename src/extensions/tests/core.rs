@@ -2253,15 +2253,19 @@ fn isolated_runtime_actor_skips_expired_or_abandoned_commands_before_side_effect
             .sender
             .send(
                 &cx,
-                JsRuntimeCommand::ExecuteCommand {
-                    command_name: "expired-probe".to_string(),
-                    args: String::new(),
+                JsRuntimeCommand::ExecuteInteraction {
+                    interaction: ExtensionInteraction::Command {
+                        name: "expired-probe".to_string(),
+                        args: String::new(),
+                    },
                     ctx_payload: Arc::new(json!({})),
                     origin: None,
                     timeout_ms: 5_000,
                     deadline: Instant::now()
                         .checked_sub(Duration::from_millis(1))
                         .expect("past deadline"),
+                    started: Arc::new(AtomicBool::new(false)),
+                    cancelled: Arc::new(AtomicBool::new(false)),
                     reply: expired_tx,
                 },
             )
@@ -2285,13 +2289,17 @@ fn isolated_runtime_actor_skips_expired_or_abandoned_commands_before_side_effect
             .sender
             .send(
                 &cx,
-                JsRuntimeCommand::ExecuteCommand {
-                    command_name: "expired-probe".to_string(),
-                    args: String::new(),
+                JsRuntimeCommand::ExecuteInteraction {
+                    interaction: ExtensionInteraction::Command {
+                        name: "expired-probe".to_string(),
+                        args: String::new(),
+                    },
                     ctx_payload: Arc::new(json!({})),
                     origin: None,
                     timeout_ms: 5_000,
                     deadline: js_runtime_request_deadline(5_000),
+                    started: Arc::new(AtomicBool::new(false)),
+                    cancelled: Arc::new(AtomicBool::new(false)),
                     reply: abandoned_tx,
                 },
             )

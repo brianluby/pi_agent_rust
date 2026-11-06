@@ -572,11 +572,11 @@ fn test_api_usage_matrix_npm_virtual_module_contract() {
 
     for (module, status) in [
         ("ws", "stub"),
-        ("axios", "stub"),
+        ("axios", "partial"),
         ("open", "stub"),
         ("commander", "stub"),
         ("chalk", "stub"),
-        ("better-sqlite3", "stub"),
+        ("better-sqlite3", "partial"),
         ("glob", "partial"),
     ] {
         let actual = matrix

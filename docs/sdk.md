@@ -365,6 +365,86 @@ guard before resolving packages or executing cached project paths. Both
 terminal UIs validate before resource loading; the default UI also validates
 before session replacement side effects.
 
+### Durable file undo for SDK hosts
+
+SDK hosts can opt into persisted file undo by supplying a
+`FileMutationRecorder` through `SessionOptions::mutation_recorder`. The
+ordinary recorder remains in memory. Durable journals currently require Unix;
+non-Unix construction fails closed until native ownership and persistence
+protections are qualified. Linux restart tests exercise the journal engine;
+this does not establish macOS or full application lifecycle qualification.
+Use a stable, host-owned identifier for
+one conversation and the same canonical workspace roots when reopening its
+journal:
+
+```rust
+use pi::sdk::SessionOptions;
+use pi::undo::FileMutationRecorder;
+use std::{io, path::PathBuf, sync::Arc};
+
+fn options_with_durable_undo(
+    session_id: &str,
+    cwd: PathBuf,
+) -> io::Result<SessionOptions> {
+    let cwd = std::fs::canonicalize(cwd)?;
+    let recorder = Arc::new(FileMutationRecorder::for_session(
+        session_id,
+        std::slice::from_ref(&cwd),
+    )?);
+    if let Some(error) = recorder.stats().durability_error {
+        return Err(io::Error::other(error));
+    }
+    Ok(SessionOptions {
+        working_directory: Some(cwd),
+        mutation_recorder: Some(recorder),
+        ..SessionOptions::default()
+    })
+}
+```
+
+`for_session` uses a private directory under the configured agent directory.
+Hosts that own a separate private state directory can call `open_journal`
+with an explicit path, session identifier, roots, and byte budget. Keep the
+journal outside imported or shared source trees. Retain the same `Arc` when
+rebuilding the same live session; a new session or fork needs a different
+identifier and recorder. A journal holds its exclusive lease until the last
+recorder reference is dropped.
+
+The recorder's allowed root set is fixed for its lifetime. SDK workspace-root
+changes do not retarget an existing recorder. Hosts must keep those roots fixed
+while the recorder is attached; to change the set, rebuild with a new recorder
+and identifier for the new canonical roots. Do not retain an old recorder as an
+undo path after revoking a root. Reopening the old identifier with different roots
+fails closed and preserves the original journal for inspection.
+
+Custom mutators must check the result of `begin_file` before touching a file.
+It returns an error when a durable pre-write intent cannot be saved or the
+journal has lost authority. The built-in mutators propagate that error before
+their write. Call `commit` after successful persistence, or `abort` after any
+rollback has finished. A failure while saving the completed state leaves the
+already-persisted pending intent available for conservative restart recovery.
+
+The journal preserves the bounded content-addressed history, verifies saved
+hashes and workspace scope, and refuses ambiguous recovery. An edit that was
+pending when the process stopped becomes a gap that blocks replay through it;
+old redo history is discarded. An interrupted restore requires manual
+reconciliation. Corrupt, busy, replaced, or unsafe journals are preserved for
+inspection. `for_session` returns a recorder with undo disabled in that case;
+`open_journal` returns the error directly. Hosts should surface
+`RecorderStats::durability_error` instead of claiming recovery succeeded.
+Recorded mutators also refuse writes through an unavailable durable recorder;
+opening a conversation does not silently downgrade its persistence contract.
+
+External content changes still require explicit force. Force cannot override
+missing snapshots, unsafe paths, pending mutations, or failed journal
+authority. Multi-file restore is a sequence of atomic file replacements, so a
+failure can leave a partially restored unit requiring inspection. Separate
+session journals do not serialize all writers to the workspace.
+An uncoordinated writer can still change an existing file between its final
+content check and replacement; hosts must coordinate concurrent writers.
+Automatic CLI and terminal-session restart wiring requires separate lifecycle
+qualification.
+
 ### Stream rules
 
 SDK sessions load global stream rules from the configured agent directory and
@@ -511,7 +591,7 @@ fn main() -> pi::sdk::Result<()> {
 
 ```rust
 use futures::executor::block_on;
-use pi::sdk::{ResolvedCompactionSettings, SessionOptions, create_agent_session};
+use pi::sdk::{AutoCompactionMethod, ResolvedCompactionSettings, SessionOptions, create_agent_session};
 
 fn main() -> pi::sdk::Result<()> {
     let session = block_on(create_agent_session(SessionOptions {
@@ -521,6 +601,10 @@ fn main() -> pi::sdk::Result<()> {
             context_window_tokens: 200_000,
             reserve_tokens: 32_768,
             keep_recent_tokens: 40_000,
+            threshold_tokens: Some(60_000),
+            threshold_percent: Some(75.0),
+            method_order: Some(vec![AutoCompactionMethod::Shake, AutoCompactionMethod::Soft]),
+            ..Default::default()
         }),
         ..SessionOptions::default()
     }))?;
@@ -528,6 +612,51 @@ fn main() -> pi::sdk::Result<()> {
     Ok(())
 }
 ```
+
+`threshold_tokens` and `threshold_percent` are optional earlier automatic
+triggers; both default to `None` and either can be supplied alone.
+`ResolvedCompactionSettings::trigger_tokens()` returns the smallest of the
+context window minus reserved response tokens (with a minimum of zero), the
+explicit token threshold, and the percentage of the context window rounded
+down. The example becomes eligible at `60_000` tokens: the minimum of
+`167_232` reserved-window tokens, `60_000` explicit tokens, and `150_000`
+percentage-based tokens.
+
+Eligibility starts at equality. The calculation uses `context_window_tokens`
+each time; configuration-derived settings use the active model's window when
+models change. An explicit `SessionOptions::compaction_settings` override
+supplies its own capacity and budgets. Leave it as `None` to use the shared
+[compaction settings](settings.md#compaction-defaults).
+
+Token thresholds must be positive and percentage thresholds must be finite,
+greater than zero, and at most `100`. Configuration files reject invalid
+values; direct Rust settings ignore invalid optional thresholds defensively.
+The keep-recent budget and safe-cut rules remain in force, so a threshold
+cannot force an unsafe cut. Explicit `compact` and `shake` operations bypass
+the automatic thresholds and enable switch.
+
+`method_order` is an optional ordered list of `AutoCompactionMethod` values.
+The example tries a provider-free shake before requesting a soft summary.
+Each candidate must reclaim space and fit below the trigger with the actual
+retained tail included. Only one successful candidate is installed. Ordinary
+provider failures and insufficient candidates may advance; cancellation,
+privacy, authentication, persistence, and cost failures remain terminal.
+`Remote` is an unavailable choice until native remote-window replay exists;
+it can precede a supported fallback but never issues a remote request.
+
+Leave the list as `None` to keep the legacy automatic mode. Explicit lists
+must be nonempty and contain no duplicate methods. Text and SnapCompact
+rendering are supported; archive acceptance uses the effective image policy
+and the same source-text allowance as the next provider request. Native
+preparation includes the projected retained turns and preserved rule reminders,
+and installation rechecks the complete candidate before saving it.
+
+Low-level `compact_auto` calls also take an explicit `CompactionReader` with
+`accepts_images` and `source_text_budget`; a manually constructed
+`CompactionPreparation` must supply `retained_tokens` for the context that
+will actually remain after session replay. Session-owned SDK operations bind
+these values automatically. See the
+[ordered-method settings](settings.md#ordered-automatic-methods) for details.
 
 ## Recipe 6: Use RPC Transport Client
 

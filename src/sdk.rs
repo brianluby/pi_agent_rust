@@ -44,7 +44,7 @@ use std::time::Duration;
 pub use crate::agent::{
     AbortHandle, AbortSignal, Agent, AgentConfig, AgentEvent, AgentSession, QueueMode,
 };
-pub use crate::compaction::ResolvedCompactionSettings;
+pub use crate::compaction::{AutoCompactionMethod, CompactionReader, ResolvedCompactionSettings};
 pub use crate::config::Config;
 pub use crate::error::{Error, Result};
 pub use crate::extension_dispatcher::ExtensionUiHandler;
@@ -528,10 +528,13 @@ pub struct SessionOptions {
     pub workspace: Option<crate::workspace::WorkspaceHandle>,
 
     /// Undo history for the default registry's `write`, `edit` and
-    /// `hashline_edit` (bd-cv653.3.13). `None` starts an empty one. A host
-    /// that rebuilds the session, as FTUI does on `/new`, `/resume`, `/reload`
-    /// and `/fork`, passes the same recorder so `/undo` keeps working across
-    /// the rebuild, as on the classic stack. [`ExplicitBuiltinTools`] uses it;
+    /// `hashline_edit` (bd-cv653.3.13). `None` starts an empty in-memory recorder.
+    /// Supply [`crate::undo::FileMutationRecorder::for_session`] or
+    /// [`crate::undo::FileMutationRecorder::open_journal`] for durable history.
+    /// A host rebuilding the same live conversation passes the same recorder
+    /// so `/undo` keeps working across the rebuild. Durable hosts use a distinct
+    /// recorder and session identifier for a new conversation or fork.
+    /// [`ExplicitBuiltinTools`] uses it;
     /// custom factories can opt in through [`ToolFactoryContext`].
     pub mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
 
@@ -2813,7 +2816,10 @@ impl AgentSessionHandle {
                         }
                         Err(err) => {
                             let warning = format!("failed to flush session autosave: {err}");
-                            tracing::warn!(event = "sdk.session.shutdown.autosave_failed", "{warning}");
+                            tracing::warn!(
+                                event = "sdk.session.shutdown.autosave_failed",
+                                "{warning}"
+                            );
                             report.fail(warning);
                         }
                     }
@@ -3686,6 +3692,64 @@ impl AgentSessionHandle {
         Ok(())
     }
 
+    /// Execute a registered command and finish any turns it requests through
+    /// `sendUserMessage` or `sendMessage(..., { triggerTurn: true })`.
+    /// Subscribers, typed hooks and the supplied callback receive those turns
+    /// through the same event fan-out as ordinary SDK prompts. Keep polling
+    /// after requesting cancellation so handler and turn cleanup can finish.
+    pub async fn execute_extension_command_with_abort(
+        &mut self,
+        command_name: &str,
+        args: &str,
+        timeout_ms: u64,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<Value> {
+        self.execute_extension_interaction_with_abort(
+            crate::extensions::ExtensionInteraction::Command {
+                name: command_name.to_string(),
+                args: args.to_string(),
+            },
+            timeout_ms,
+            abort,
+            on_event,
+        )
+        .await
+    }
+
+    /// Execute a registered shortcut with the same cancellation, generated
+    /// turns and subscriber delivery as a registered extension command.
+    pub async fn execute_extension_shortcut_with_abort(
+        &mut self,
+        key_id: &str,
+        timeout_ms: u64,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<Value> {
+        self.execute_extension_interaction_with_abort(
+            crate::extensions::ExtensionInteraction::Shortcut {
+                key_id: key_id.to_string(),
+            },
+            timeout_ms,
+            abort,
+            on_event,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_extension_interaction_with_abort(
+        &mut self,
+        interaction: crate::extensions::ExtensionInteraction,
+        timeout_ms: u64,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<Value> {
+        let on_event = self.make_combined_callback(on_event);
+        self.session
+            .execute_extension_interaction_with_abort(interaction, timeout_ms, abort, on_event)
+            .await
+    }
+
     /// Access the underlying `AgentSession`.
     pub const fn session(&self) -> &AgentSession {
         &self.session
@@ -4367,19 +4431,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     let session_arc = Arc::new(asupersync::sync::Mutex::new(session));
 
     let compaction_settings = options.compaction_settings.clone().unwrap_or_else(|| {
-        let context_window_tokens = if selection.model_entry.model.context_window == 0 {
-            ResolvedCompactionSettings::default().context_window_tokens
-        } else {
-            selection.model_entry.model.context_window
-        };
-        ResolvedCompactionSettings {
-            enabled: config.compaction_enabled(),
-            reserve_tokens: config.compaction_reserve_tokens(),
-            keep_recent_tokens: config.compaction_keep_recent_tokens(),
-            context_window_tokens,
-            mode: config.compaction_mode(),
-            render_mode: config.compaction_render_mode(),
-        }
+        config.resolved_compaction_settings(selection.model_entry.model.context_window)
     });
 
     let mut agent_session = AgentSession::new(
@@ -7228,13 +7280,9 @@ mod tests {
             load_session_config(&cwd, &global_dir, None, true).expect("load trusted config");
         assert_eq!(trusted.default_thinking_level.as_deref(), Some("high"));
         let cli = Cli::try_parse_from(["pi"]).expect("default CLI");
-        let untrusted_registry = default_tool_registry(
-            &cli.enabled_tools(&untrusted),
-            &cwd,
-            &untrusted,
-        );
-        let trusted_registry =
-            default_tool_registry(&cli.enabled_tools(&trusted), &cwd, &trusted);
+        let untrusted_registry =
+            default_tool_registry(&cli.enabled_tools(&untrusted), &cwd, &untrusted);
+        let trusted_registry = default_tool_registry(&cli.enabled_tools(&trusted), &cwd, &trusted);
         for name in ["eval", "github", "security_scan", "subagent"] {
             assert!(untrusted_registry.get(name).is_none(), "untrusted {name}");
             assert!(trusted_registry.get(name).is_some(), "trusted {name}");
@@ -7281,10 +7329,22 @@ mod tests {
             };
             let handle = run_async(create_agent_session(options)).expect("create SDK session");
             for name in OPTIONAL {
-                assert_eq!(handle.has_tool(name), expected, "{name}, config={configured}");
+                assert_eq!(
+                    handle.has_tool(name),
+                    expected,
+                    "{name}, config={configured}"
+                );
             }
             if no_builtins {
-                assert!(handle.session().agent.shared_tools().snapshot().tools().is_empty());
+                assert!(
+                    handle
+                        .session()
+                        .agent
+                        .shared_tools()
+                        .snapshot()
+                        .tools()
+                        .is_empty()
+                );
             }
             let shutdown = run_async(handle.shutdown_owned_resources());
             assert!(shutdown.completed_cleanly());
@@ -7740,8 +7800,7 @@ mod tests {
             name: "tts",
             endpoint,
         }));
-        let handle =
-            run_async(create_agent_session(options)).expect("native media SDK session");
+        let handle = run_async(create_agent_session(options)).expect("native media SDK session");
         assert_eq!(
             handle.session().agent.stream_options().api_key.as_deref(),
             Some(MEDIA_CHAT_KEY)
@@ -8375,9 +8434,8 @@ printf sdk-owned-command-key
                 .to_string(),
             )
             .expect("global automatic tool settings");
-            options.tool_factory = strict.then(|| {
-                Arc::new(ExplicitBuiltinTools) as Arc<dyn ToolFactory>
-            });
+            options.tool_factory =
+                strict.then(|| Arc::new(ExplicitBuiltinTools) as Arc<dyn ToolFactory>);
             options.enabled_tools =
                 selected.map(|names| names.iter().map(|name| (*name).to_string()).collect());
             let handle = run_async(create_agent_session(options)).expect("create SDK session");
@@ -8493,12 +8551,16 @@ printf sdk-owned-command-key
         const OPTIONAL: [&str; 4] = ["eval", "github", "security_scan", "subagent"];
         for changed_surface in ["settings", "extension"] {
             let (_tmp, mut options) = guarded_optional_tool_fixture(true);
-            let cwd = options.working_directory.clone().expect("fixture workspace");
+            let cwd = options
+                .working_directory
+                .clone()
+                .expect("fixture workspace");
             let extension_path = cwd.join(".pi/extensions/trust_guard.js");
             options.extension_paths = vec![extension_path.clone()];
             assert!(!options.workspace_trusted, "the captured grant must win");
             let probe = cwd.join("still_live.txt");
-            std::fs::write(&probe, "the admitted session is still usable").expect("write read probe");
+            std::fs::write(&probe, "the admitted session is still usable")
+                .expect("write read probe");
             let handle = run_async(create_agent_session(options.clone()))
                 .expect("construct originally admitted session");
             assert!(handle.extension_manager().is_some());
@@ -8556,7 +8618,10 @@ printf sdk-owned-command-key
         );
         let handle = run_async(create_agent_session(options)).expect("create denied session");
         for name in ["eval", "github", "security_scan", "subagent"] {
-            assert!(!handle.has_tool(name), "captured denial must exclude {name}");
+            assert!(
+                !handle.has_tool(name),
+                "captured denial must exclude {name}"
+            );
         }
         assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
     }
@@ -8569,7 +8634,10 @@ printf sdk-owned-command-key
         };
 
         let (tmp, mut options) = guarded_optional_tool_fixture(true);
-        let cwd = options.working_directory.clone().expect("fixture workspace");
+        let cwd = options
+            .working_directory
+            .clone()
+            .expect("fixture workspace");
         let global_dir = tmp.path().join("global");
         let agents = cwd.join(".pi/agents");
         std::fs::create_dir_all(&agents).expect("project agent directory");
@@ -8760,7 +8828,11 @@ printf sdk-owned-command-key
         assert_eq!(initial.out.as_ref().unwrap().enabled, Some(true));
         assert!(options.out_enabled.is_none());
 
-        std::fs::write(cwd.join(".pi/settings.json"), r#"{"out":{"enabled":false}}"#).unwrap();
+        std::fs::write(
+            cwd.join(".pi/settings.json"),
+            r#"{"out":{"enabled":false}}"#,
+        )
+        .unwrap();
         let rebuilt_options = options.clone();
         assert!(options.out_enabled.is_none());
         let mut rebuilt = load_session_config(&cwd, &global_dir, None, true).unwrap();
@@ -10306,6 +10378,12 @@ printf sdk-owned-command-key
             context_window_tokens: 55_555,
             reserve_tokens: 1_234,
             keep_recent_tokens: 4_321,
+            threshold_tokens: Some(20_000),
+            threshold_percent: Some(50.0),
+            method_order: Some(vec![
+                AutoCompactionMethod::Shake,
+                AutoCompactionMethod::Soft,
+            ]),
             mode: crate::compaction::AutoCompactionMode::default(),
             render_mode: crate::compaction::CompactionRenderMode::default(),
         };
@@ -10320,19 +10398,50 @@ printf sdk-owned-command-key
         assert_eq!(resolved.context_window_tokens, custom.context_window_tokens);
         assert_eq!(resolved.reserve_tokens, custom.reserve_tokens);
         assert_eq!(resolved.keep_recent_tokens, custom.keep_recent_tokens);
+        assert_eq!(resolved.threshold_tokens, custom.threshold_tokens);
+        assert_eq!(resolved.threshold_percent, custom.threshold_percent);
+        assert_eq!(resolved.method_order, custom.method_order);
+        assert_eq!(resolved.trigger_tokens(), 20_000);
     }
 
     #[test]
     fn create_agent_session_derives_compaction_without_override() {
         let tmp = tempdir().expect("tempdir");
-        let options = hermetic_session_options(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".pi")).expect("project config directory");
+        std::fs::write(
+            tmp.path().join(".pi/settings.json"),
+            r#"{"compaction":{
+                "enabled":true,"reserveTokens":1234,"keepRecentTokens":4321,
+                "thresholdTokens":20000,"thresholdPercent":50,
+                "methodOrder":["remote","shake","soft"]
+            }}"#,
+        )
+        .expect("project compaction settings");
+        let options = SessionOptions {
+            workspace_trusted: true,
+            ..hermetic_session_options(tmp.path())
+        };
 
         let handle = run_async(create_agent_session(options)).expect("create session");
         let resolved = handle.compaction_settings();
+        assert!(resolved.enabled);
         assert!(
             resolved.context_window_tokens > 0,
             "derived settings must resolve a context window"
         );
+        assert_eq!(resolved.reserve_tokens, 1_234);
+        assert_eq!(resolved.keep_recent_tokens, 4_321);
+        assert_eq!(resolved.threshold_tokens, Some(20_000));
+        assert_eq!(resolved.threshold_percent, Some(50.0));
+        assert_eq!(
+            resolved.method_order,
+            Some(vec![
+                AutoCompactionMethod::Remote,
+                AutoCompactionMethod::Shake,
+                AutoCompactionMethod::Soft,
+            ])
+        );
+        assert_eq!(resolved.trigger_tokens(), 20_000);
     }
 
     #[test]
@@ -10548,8 +10657,7 @@ printf sdk-owned-command-key
                 assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
                 let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
                 assert!(
-                    (crate::cost::recorded_spend(&reopened).unwrap() - 1.5).abs()
-                        < f64::EPSILON
+                    (crate::cost::recorded_spend(&reopened).unwrap() - 1.5).abs() < f64::EPSILON
                 );
                 let resumed = budget.for_replacement(&reopened, false).unwrap();
                 assert!(!resumed.same_tree(&budget));
@@ -10741,9 +10849,7 @@ printf sdk-owned-command-key
             drop(prepared);
             budget.record(0.5).unwrap();
             let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
-            assert!(
-                (crate::cost::recorded_spend(&reopened).unwrap() - 0.25).abs() < f64::EPSILON
-            );
+            assert!((crate::cost::recorded_spend(&reopened).unwrap() - 0.25).abs() < f64::EPSILON);
 
             let prepared = handle.preflight_replacement().await.unwrap();
             let mut next = saving_handle(tmp.path());
@@ -10766,9 +10872,7 @@ printf sdk-owned-command-key
             assert!(handle.shutdown_owned_resources().await.completed_cleanly());
             budget.record(0.5).unwrap();
             let reopened = Session::open(source_path.to_str().unwrap()).await.unwrap();
-            assert!(
-                (crate::cost::recorded_spend(&reopened).unwrap() - 1.5).abs() < f64::EPSILON
-            );
+            assert!((crate::cost::recorded_spend(&reopened).unwrap() - 1.5).abs() < f64::EPSILON);
         });
     }
 

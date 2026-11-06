@@ -840,6 +840,12 @@ Pi runs in four modes, each suited to different workflows:
 | **RPC** | `pi --mode rpc` | Headless JSON protocol over stdin/stdout for IDE integrations |
 | **ACP** | `pi --acp` | JSON-RPC 2.0 Agent Client Protocol over stdin/stdout (e.g. the Zed editor) |
 
+**Interactive queued input.** In the default terminal interface, messages
+accepted as a turn finishes continue in their original order, with each
+message's prepared file contents preserved. They keep separate message
+boundaries and their own authored instructions. Aborts, failures, and run-time
+caps return unsent authored text to the editor for review before resubmission.
+
 **ACP workspace settings.** Sessions created by `pi --acp` resolve global
 settings and trusted settings from the requested workspace when creating,
 loading from disk, or forking a session. Reattaching to a running session keeps
@@ -999,6 +1005,13 @@ Pi supports two extension runtime families with capability-gated host connectors
 - Workspace trust-on-first-use gate: project settings, extension files, MCP configuration, and discovered project agent profiles require approval keyed to workspace path and content digest. `--trust`, `PI_WORKSPACE_TRUST`, or global `trustAllWorkspaces` support automation; non-interactive launches fail closed.
 - Hostcall reactor mesh with deterministic shard routing, bounded queue backpressure, and optional NUMA-aware telemetry
 - Fresh owner-isolated realms on every reload, with versioned persistent transpile caching instead of mutable realm reuse
+
+Imported `createReadTool`, `createWriteTool`, `createEditTool`, `createBashTool`,
+`createGrepTool`, `createFindTool`, and `createLsTool` factories execute the host's
+enabled native tools, including when an extension wraps the same tool name.
+They preserve file undo recording, capability checks, workspace boundaries,
+cancellation, and progress callbacks. Supported factory settings and limitations
+are listed in the [extension compatibility matrix](docs/extension-compatibility-matrix.md).
 
 ### Credential-Aware Model Selection
 
@@ -1384,7 +1397,9 @@ is parsed as-is and is never rewritten to snake_case:
   "compaction": {
     "enabled": true,
     "reserve_tokens": 8192,
-    "keep_recent_tokens": 20000
+    "keep_recent_tokens": 20000,
+    "thresholdPercent": 75,
+    "methodOrder": ["shake", "soft"]
   },
 
   "retry": {
@@ -2323,6 +2338,13 @@ preserves the previous credentials, source, and trust. If login succeeds
 but source persistence or reconnection fails, Pi reports that the login was
 saved so the remaining problem can be repaired without mistaking it for a
 failed authorization.
+
+For a server's third-party authorization, Pi also supports MCP URL elicitation.
+The host picker shows the complete URL and destination host before you choose
+to open it in an external browser, acknowledge opening it yourself, decline,
+or cancel. The manual option works when Pi runs remotely. Pi returns your
+consent decision without reading the browser page or treating it as completed
+authorization. See [server-requested browser interactions](docs/tools/mcp-configuration.md#browser-interactions-requested-by-servers).
 
 Native settings support the OMP project-configuration switch:
 

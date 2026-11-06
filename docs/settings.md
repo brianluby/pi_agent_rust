@@ -553,6 +553,7 @@ Legacy aliases: `steeringMode`, `followUpMode`.
 ### Compaction (defaults)
 
 Accessor defaults:
+
 - `compaction.enabled`: `true`
 - `compaction.reserve_tokens`: `16384`
 - `compaction.keep_recent_tokens`: `20000`
@@ -566,6 +567,117 @@ Accessor defaults:
   }
 }
 ```
+
+Optional settings can trigger automatic compaction earlier:
+
+- `compaction.threshold_tokens` (alias `thresholdTokens`): A positive `u32`
+  integer token count.
+- `compaction.threshold_percent` (alias `thresholdPercent`): A finite number
+  greater than `0` and at most `100`, expressed as a percentage of the active
+  model's context window.
+
+Both default to unset, preserving the existing automatic trigger. Omitting a
+field or setting it to `null` supplies no override in that configuration layer;
+the usual global/project field merge still applies. Invalid non-null values
+produce a configuration error.
+
+For example, keep the existing reserve and keep-recent budgets while adding
+earlier triggers:
+
+```json
+{
+  "compaction": {
+    "thresholdTokens": 60000,
+    "thresholdPercent": 75
+  }
+}
+```
+
+Either threshold can be used alone. When both are set, automatic compaction
+becomes eligible when the estimated context reaches or exceeds the smallest
+of:
+
+- The active model's context window minus `reserve_tokens`, with a minimum of
+  zero.
+- `threshold_tokens`, when set.
+- The active model's context window multiplied by `threshold_percent / 100`,
+  rounded down to whole tokens, when set.
+
+This preserves the reserved response headroom even if an explicit threshold is
+larger. Percentages are recalculated against the active model's context window
+when models change. The policy applies to native print, SDK, classic and FTUI
+interactive, ACP, and RPC sessions using configuration-derived settings.
+
+`keep_recent_tokens` and the safe-cut rules still apply: reaching a threshold
+does not force compaction when no older prefix can be safely summarized.
+Explicit `/compact`, `/shake`, and their SDK operations continue to bypass the
+automatic thresholds and enable switch.
+
+#### Ordered automatic methods
+
+`compaction.method_order` (alias `methodOrder`) selects the order in which
+automatic compaction tries native methods:
+
+```json
+{
+  "compaction": {
+    "methodOrder": ["shake", "soft"],
+    "thresholdPercent": 75
+  }
+}
+```
+
+| Method | Behavior |
+|--------|----------|
+| `shake` | Builds a local checkpoint that preserves conversation text and replaces bulky tool output with references. Makes no model request. |
+| `soft` | Requests a model-written summary through the session's existing provider and spending guard. |
+| `remote` | Unavailable in the native policy because encrypted remote windows do not yet have a supported replay path. Advances to the next configured method without sending a request. |
+
+The list must contain one to three distinct methods. Unknown methods, empty
+lists, and duplicates are configuration errors. A project list replaces the
+global list in full. An omitted or `null` list supplies no override; with no
+list in any layer, the existing `compactionMode` policy remains in effect.
+An explicit list overrides that legacy policy, including its aggressive
+keep-recent adjustment, and preserves the configured retention budget.
+
+Each attempt reads the same source snapshot. A candidate is accepted only if
+its projected context, including the actual retained tail and preserved rule
+reminders, is smaller than the original context and below the automatic trigger.
+An unavailable method,
+an ordinary provider failure, or insufficient reclamation advances to the
+next method. Cancellation, privacy refusals, authentication failures, cost
+limits, and persistence failures stop the operation. Provider requests remain
+billable even when their candidate is insufficient; fallback does not reset
+the session's spending limit.
+
+Only the accepted candidate is installed through the existing session
+transaction. The complete candidate is checked again under the installation
+lock, using the current reader and any new retained turns; a background result
+that no longer fits is discarded before saving. Exhausting the list leaves
+the session history unchanged and
+reports an error; it does not append an ineffective summary or silently choose
+an unconfigured local truncation. Model changes recalculate both the trigger
+and retained-tail estimate using the active reader.
+
+Both `compaction.mode: "text"` and `"snapcompact"` work with explicit method
+ordering. Snapcompact constructs one privacy-screened archive per operation
+and budgets the same reading that the selected model will receive. Vision
+models use the archive images; text-only models and sessions with images
+blocked use retained source text within the session's source-token allowance.
+If image rendering exceeds its archive limits, the text reading is budgeted
+instead. A small summary does not hide a large archive: the archive reading,
+summary envelope, retained turns, and preserved reminders must fit together.
+The stored archive remains independent of the model and is reprojected after
+resume or a model switch.
+Manual `/compact`, `/shake`, and handoff commands retain their explicit
+operation semantics and do not run the automatic method list.
+
+With an explicit method list, `session_before_compact` hooks may cancel
+automatic or overflow compaction, but returning a replacement compaction is
+rejected without installing it. Replacement summaries can change the retained
+cut or rendering outside the configured method policy. Extension replacements
+remain supported for ordinary manual compaction and the legacy automatic
+policy without a method list.
 
 ### Branch summary
 
