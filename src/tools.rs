@@ -8602,12 +8602,175 @@ pub struct BashRunResult {
     pub truncated: bool,
     pub full_output_path: Option<String>,
     pub truncation: Option<TruncationResult>,
+    pub capture: Option<BashCapture>,
+}
+
+/// Capture limitations are separate from the command's exit status and from
+/// truncating the displayed tail. A capped artifact can accompany complete EOF.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BashCapture {
+    pub output_complete: bool,
+    #[serde(default)]
+    pub artifact_truncated: bool,
+    #[serde(default)]
+    pub artifact_error: Option<String>,
+    #[serde(default)]
+    pub artifact_path: Option<String>,
+}
+
+impl BashCapture {
+    pub(crate) const fn is_complete(&self) -> bool {
+        self.output_complete && !self.artifact_truncated && self.artifact_error.is_none()
+    }
+
+    pub(crate) fn append_notice(&self, output: &mut String) {
+        if !self.output_complete {
+            output.push_str(
+                "\n\n[Output capture stopped before all readers finished; output may be missing.]",
+            );
+        }
+        let _ = write!(
+            output,
+            "\n\n[Command capture: outputComplete={}, artifactTruncated={}, artifactError={}. \
+             Retained artifact: {}]",
+            self.output_complete,
+            self.artifact_truncated,
+            self.artifact_error.as_deref().unwrap_or("none"),
+            self.artifact_path.as_deref().unwrap_or("unavailable"),
+        );
+    }
 }
 
 #[derive(Debug)]
 enum BashPipeFrame {
     Chunk(Vec<u8>),
     Error(String),
+}
+
+const BASH_PIPE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Own foreground pipe readers and Unix PTY readers until they have stopped.
+/// These workers only read nonblocking descriptors and publish to a
+/// cancellation-aware bounded channel; neither an escaped writer nor a full
+/// output queue can prevent retirement.
+#[derive(Default)]
+struct BashPipePumps {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl BashPipePumps {
+    fn spawn<R: Read + Send + 'static>(
+        &mut self,
+        reader: R,
+        stream_name: &'static str,
+        tx: mpsc::SyncSender<BashPipeFrame>,
+    ) -> Result<()> {
+        let stop = Arc::clone(&self.stop);
+        let worker = thread::Builder::new()
+            .name(format!("pi-bash-{stream_name}"))
+            .spawn(move || pump_stream(reader, stream_name, &tx, Some(&stop)))
+            .map_err(|error| {
+                Error::tool(
+                    "bash",
+                    format!("Failed to start bash {stream_name} reader: {error}"),
+                )
+            })?;
+        self.workers.push(worker);
+        Ok(())
+    }
+
+    fn is_finished(&self) -> bool {
+        self.workers.iter().all(thread::JoinHandle::is_finished)
+    }
+
+    fn stop_and_join(&mut self) -> bool {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        for worker in &self.workers {
+            worker.thread().unpark();
+        }
+        let mut succeeded = true;
+        for worker in self.workers.drain(..) {
+            succeeded &= worker.join().is_ok();
+        }
+        succeeded
+    }
+}
+
+impl Drop for BashPipePumps {
+    fn drop(&mut self) {
+        // Also covers future abandonment, partial setup, capture failures and
+        // unwinding. Joining is safe because these readers never do blocking
+        // filesystem I/O or a blocking send, including on Windows.
+        let _ = self.stop_and_join();
+    }
+}
+
+#[cfg(windows)]
+struct WindowsBashPipe(crate::jobs::windows_job_pipe::Reader);
+
+#[cfg(windows)]
+impl Read for WindowsBashPipe {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        // Reader::read waits on a shared notification lock. Foreground pumps
+        // own their cancellable polling interval and must never enter that wait.
+        self.0.try_read(buffer)
+    }
+}
+
+#[cfg(unix)]
+fn prepare_bash_pipe(reader: &impl std::os::fd::AsFd) -> std::io::Result<()> {
+    let flags = rustix::fs::fcntl_getfl(reader)?;
+    rustix::fs::fcntl_setfl(reader, flags | rustix::fs::OFlags::NONBLOCK)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_bash_pty_master(master: &dyn portable_pty::MasterPty) -> Result<()> {
+    use std::os::fd::{AsRawFd, RawFd};
+
+    // MasterPty exposes only a raw descriptor. Keep its owner borrowed while
+    // filedescriptor safely duplicates it into an owned, AsFd-capable handle.
+    struct BorrowedMaster<'a> {
+        _master: &'a dyn portable_pty::MasterPty,
+        fd: RawFd,
+    }
+
+    impl AsRawFd for BorrowedMaster<'_> {
+        fn as_raw_fd(&self) -> RawFd {
+            self.fd
+        }
+    }
+
+    let fd = master.as_raw_fd().ok_or_else(|| {
+        Error::tool(
+            "bash",
+            "The PTY backend does not expose its master descriptor",
+        )
+    })?;
+    let borrowed = BorrowedMaster {
+        _master: master,
+        fd,
+    };
+    let duplicate = filedescriptor::FileDescriptor::dup(&borrowed)
+        .map_err(|error| Error::tool("bash", format!("Failed to duplicate PTY master: {error}")))?;
+    // Duplicates share status flags. Keep portable-pty's actual reader so its
+    // Unix adapter still translates the terminal's EIO-at-close into EOF.
+    prepare_bash_pipe(&duplicate).map_err(|error| {
+        Error::tool(
+            "bash",
+            format!("Failed to make PTY reader nonblocking: {error}"),
+        )
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn prepare_bash_pipe<R>(_reader: &R) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "cancellable foreground shell pipes are unavailable on this platform",
+    ))
 }
 
 #[allow(clippy::unnecessary_lazy_evaluations)] // lazy eval needed on unix for signal()
@@ -8673,6 +8836,7 @@ async fn execute_bash_spawn(
             timeout_secs,
             on_update,
             shell_state,
+            None,
         )
         .await
     }
@@ -8949,11 +9113,76 @@ pub(crate) async fn run_bash_command(
         timeout_secs,
         on_update,
         None,
+        None,
     )
     .await
 }
 
-#[allow(clippy::too_many_lines)]
+/// Per-call cancellation for transports such as RPC. Checking a local probe
+/// avoids cancelling the server's shared context just to stop one command.
+pub(crate) struct BashRunControl<'a> {
+    pub abort_requested: &'a mut (dyn FnMut() -> bool + Send),
+    pub drain_timeout: Duration,
+}
+
+/// Report cancellation before any shell or extension hook has started.
+/// The caller supplies a normalized timeout: `None` means unlimited execution.
+#[must_use]
+pub(crate) fn bash_cancelled_before_start(timeout_secs: Option<u64>) -> BashRunResult {
+    assemble_bash_run_result(
+        BashOutputState::new(DEFAULT_MAX_BYTES.saturating_mul(2)),
+        Some(-1),
+        false,
+        true,
+        Some(BashCancellationReason::AmbientCancellation),
+        timeout_secs,
+    )
+}
+
+/// Run an explicitly controlled command without the foreground tool's default
+/// execution timeout or persistent shell transaction.
+pub(crate) async fn run_bash_command_with_control(
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    control: BashRunControl<'_>,
+) -> Result<BashRunResult> {
+    run_bash_command_with_control_timeout(
+        cwd,
+        shell_path,
+        command_prefix,
+        command,
+        Some(0),
+        control,
+    )
+    .await
+}
+
+/// Run with per-command cancellation and the foreground timeout convention:
+/// `None` keeps the default, `Some(0)` is unlimited, and other values are seconds.
+pub(crate) async fn run_bash_command_with_control_timeout(
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    control: BashRunControl<'_>,
+) -> Result<BashRunResult> {
+    run_bash_command_with_state(
+        cwd,
+        shell_path,
+        command_prefix,
+        command,
+        timeout_secs,
+        None,
+        None,
+        Some(control),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_bash_command_with_state(
     cwd: &Path,
     shell_path: Option<&str>,
@@ -8962,12 +9191,32 @@ async fn run_bash_command_with_state(
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     shell_state: Option<&bash_session::ShellTransaction>,
+    mut control: Option<BashRunControl<'_>>,
 ) -> Result<BashRunResult> {
     let timeout_secs = match timeout_secs {
         None => Some(DEFAULT_BASH_TIMEOUT_SECS),
         Some(0) => None,
         Some(value) => Some(value),
     };
+    let cx = AgentCx::for_current_or_request();
+    let controlled = control.is_some();
+    let drain_timeout = control
+        .as_ref()
+        .map_or(Duration::from_secs(5), |control| control.drain_timeout);
+
+    // A request cancelled while queued must not launch a command with side
+    // effects. Keep this before shell resolution and process creation.
+    if control
+        .as_mut()
+        .is_some_and(|control| (control.abort_requested)())
+        || cx.checkpoint().is_err()
+    {
+        return Ok(bash_cancelled_before_start(timeout_secs));
+    }
+    let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
+    let mut bash_output = BashOutputState::new(max_chunks_bytes);
+    bash_output.timeout_ms = timeout_secs.map(|s| s.saturating_mul(1000));
+
     let command = command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
         || command.to_string(),
         |prefix| format!("{prefix}\n{command}"),
@@ -8992,9 +9241,22 @@ async fn run_bash_command_with_state(
     cmd.arg("-c")
         .arg(&command)
         .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdin(Stdio::null());
+    #[cfg(not(windows))]
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    // Windows anonymous pipes have blocking reads. Reuse the owned overlapped
+    // readers used by jobs, while the shell keeps ordinary synchronous writers.
+    #[cfg(windows)]
+    let (stdout, stderr) = {
+        let (stdout, stdout_writer) = crate::jobs::windows_job_pipe::pair()
+            .map_err(|error| Error::tool("bash", format!("Failed to prepare stdout: {error}")))?;
+        let (stderr, stderr_writer) = crate::jobs::windows_job_pipe::pair()
+            .map_err(|error| Error::tool("bash", format!("Failed to prepare stderr: {error}")))?;
+        cmd.stdout(Stdio::from(stdout_writer))
+            .stderr(Stdio::from(stderr_writer));
+        (WindowsBashPipe(stdout), WindowsBashPipe(stderr))
+    };
 
     // #210: a proxy configured for Pi also routes the tools Pi shells out to
     // (git/curl/npm), via a per-child copy of the standard variables. Empty
@@ -9010,43 +9272,40 @@ async fn run_bash_command_with_state(
 
     let child = spawn_command_with_job_discipline(&mut cmd)
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell}: {e}")))?;
+    // Command retains explicitly supplied Stdio handles after spawn. Its
+    // parent copies must not keep the Windows writers alive after shell exit.
+    drop(cmd);
     let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree)
         .with_shell_state(shell_state);
 
+    #[cfg(not(windows))]
     let stdout = guard
         .child
         .as_mut()
         .and_then(|child| child.stdout.take())
         .ok_or_else(|| Error::tool("bash", "Missing stdout".to_string()))?;
+    #[cfg(not(windows))]
     let stderr = guard
         .child
         .as_mut()
         .and_then(|child| child.stderr.take())
         .ok_or_else(|| Error::tool("bash", "Missing stderr".to_string()))?;
 
-    // We use a bounded channel to provide backpressure. If the child process
-    // produces output faster than the async loop can drain it (and spill to disk),
-    // the pump threads will block on send(), which stops them from reading from the OS pipe.
-    // The OS pipe buffer will fill up, causing the child's `write()` calls to block.
-    // This correctly pauses the child until we catch up, preventing unbounded memory growth (OOM).
-    let (tx, rx) = mpsc::sync_channel::<BashPipeFrame>(1024);
-    let tx_stdout = tx.clone();
+    #[cfg(not(windows))]
+    {
+        prepare_bash_pipe(&stdout)
+            .map_err(|error| Error::tool("bash", format!("Failed to prepare stdout: {error}")))?;
+        prepare_bash_pipe(&stderr)
+            .map_err(|error| Error::tool("bash", format!("Failed to prepare stderr: {error}")))?;
+    }
 
-    // Design Decision (bd-xdcrh.4.3):
-    // We intentionally use raw dedicated OS threads here rather than `asupersync::runtime::spawn_blocking`.
-    // The `pump_stream` loop blocks indefinitely on `read()` until the subprocess closes the pipe (EOF).
-    // If we used the runtime's blocking pool, concurrently running long-lived bash tools (like compilers
-    // or servers) could easily exhaust the pool's thread limit, starving the rest of the application
-    // of threads needed for short-lived blocking I/O (e.g., SQLite transactions or filesystem metadata).
-    // Dedicated threads cleanly isolate this unbounded blocking risk.
-    let stdout_thread = thread::spawn(move || pump_stream(stdout, "stdout", &tx_stdout));
-    let stderr_thread = thread::spawn(move || pump_stream(stderr, "stderr", &tx));
+    // Bounded publication preserves backpressure without trapping a worker in
+    // send(): cancellation must retire the readers even if the consumer stops.
+    let (tx, mut rx) = mpsc::sync_channel::<BashPipeFrame>(1024);
+    let mut pumps = BashPipePumps::default();
+    pumps.spawn(stdout, "stdout", tx.clone())?;
+    pumps.spawn(stderr, "stderr", tx)?;
 
-    let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
-    let mut bash_output = BashOutputState::new(max_chunks_bytes);
-    bash_output.timeout_ms = timeout_secs.map(|s| s.saturating_mul(1000));
-
-    let cx = AgentCx::for_current_or_request();
     let mut timed_out = false;
     let mut cancelled = false;
     let mut cancellation_reason: Option<BashCancellationReason> = None;
@@ -9060,17 +9319,28 @@ async fn run_bash_command_with_state(
 
     let tick = Duration::from_millis(10);
     loop {
-        let mut updated = false;
-        while let Ok(frame) = rx.try_recv() {
-            if let Err(err) = ingest_bash_pipe_frame(frame, &mut bash_output).await {
+        let updated = match ingest_bash_output_batch(&mut rx, &mut bash_output).await {
+            Ok(updated) => updated,
+            Err(err) => {
                 let _ = guard.kill();
                 return Err(err);
             }
-            updated = true;
-        }
+        };
 
         if updated {
             emit_bash_update(&bash_output, on_update)?;
+        }
+
+        // Output publication is bounded, so a continuously busy command
+        // cannot starve an explicit abort. Preserve abort-before-exit ordering.
+        if control
+            .as_mut()
+            .is_some_and(|control| (control.abort_requested)())
+        {
+            cancelled = true;
+            cancellation_reason = Some(BashCancellationReason::AmbientCancellation);
+            exit_code = Some(guard.kill().map_or(-1, exit_status_code));
+            break;
         }
 
         match guard.try_wait_child() {
@@ -9118,42 +9388,50 @@ async fn run_bash_command_with_state(
 
     // Drain any remaining channel frames while waiting for the pump threads
     // to observe EOF and exit. Because the channel is bounded, they may still
-    // be blocked on send() until we consume the buffered output after the child
-    // closes its pipe ends. The 5-second cap is a safety net for pathological
-    // cases (e.g. the child spawned a grandchild that inherited the pipe fd
-    // and is still running).
+    // be waiting for queue space until we consume buffered output after the
+    // child closes its pipe ends. The bounded grace interval covers descendants
+    // that retain a pipe after the root exits; RPC supplies its two-second cap.
     {
         let drain_start = cx
             .cx()
             .timer_driver()
             .map_or_else(wall_now, |timer| timer.now());
-        let drain_deadline = drain_start + Duration::from_secs(5);
+        let drain_deadline = drain_start + drain_timeout;
         let allow_drain_cancellation = !cancelled && !timed_out && exit_code.is_none();
         loop {
-            // Drain everything currently available in the channel.
-            let mut got_data = false;
-            while let Ok(frame) = rx.try_recv() {
-                if let Err(err) = ingest_bash_pipe_frame(frame, &mut bash_output).await {
+            // A descendant may still be filling the pipe. Return to the
+            // deadline even when the bounded channel never becomes empty.
+            let got_data = match ingest_bash_output_batch(&mut rx, &mut bash_output).await {
+                Ok(updated) => updated,
+                Err(err) => {
                     let _ = guard.kill();
                     return Err(err);
                 }
-                got_data = true;
-            }
+            };
             if got_data {
                 emit_bash_update(&bash_output, on_update)?;
             }
 
-            // If both pump threads have finished, all data is in the channel
-            // and we've drained it above, so we're done.
-            if stdout_thread.is_finished() && stderr_thread.is_finished() {
-                // One final drain in case they sent items between our last
-                // try_recv loop and the is_finished check.
-                while let Ok(frame) = rx.try_recv() {
-                    if let Err(err) = ingest_bash_pipe_frame(frame, &mut bash_output).await {
-                        let _ = guard.kill();
-                        return Err(err);
-                    }
+            let readers_finished = pumps.is_finished();
+            // The RPC request still owns its output drain after root exit.
+            // Honour a fresh abort or an already-consumed abort here, while
+            // retaining a known exit status and every accepted channel frame.
+            if controlled
+                && (cancelled
+                    || control
+                        .as_mut()
+                        .is_some_and(|control| (control.abort_requested)())
+                    || cx.checkpoint().is_err())
+            {
+                cancelled = true;
+                cancellation_reason.get_or_insert(BashCancellationReason::AmbientCancellation);
+                if !readers_finished {
+                    bash_output.output_complete = false;
                 }
+                break;
+            }
+
+            if readers_finished {
                 break;
             }
 
@@ -9162,15 +9440,36 @@ async fn run_bash_command_with_state(
                 .timer_driver()
                 .map_or_else(wall_now, |timer| timer.now());
             if now >= drain_deadline {
+                bash_output.output_complete = false;
                 break;
             }
             if allow_drain_cancellation && cx.checkpoint().is_err() {
                 cancelled = true;
                 cancellation_reason.get_or_insert(BashCancellationReason::AmbientCancellation);
+                bash_output.output_complete = false;
                 break;
             }
             sleep(now, tick).await;
         }
+    }
+
+    // The grace interval can expire before an escaped descendant closes its
+    // inherited descriptor. Stop and join both readers before publishing a
+    // result, then preserve every accepted frame, including trailing errors.
+    // With no remaining producers, this entire terminal tail is finite.
+    let readers_succeeded = pumps.stop_and_join();
+    let mut got_tail = false;
+    while let Ok(frame) = rx.try_recv() {
+        ingest_bash_pipe_frame(frame, &mut bash_output).await?;
+        got_tail = true;
+    }
+    if got_tail {
+        emit_bash_update(&bash_output, on_update)?;
+    }
+    if !readers_succeeded {
+        let message = bash_capture_error_message("A bash output reader panicked", &bash_output);
+        bash_output.abandon_spill_file();
+        return Err(Error::tool("bash", message));
     }
 
     // Explicitly reap the child process to prevent zombies. try_wait_child()
@@ -9206,6 +9505,7 @@ fn assemble_bash_run_result(
     timeout_secs: Option<u64>,
 ) -> BashRunResult {
     drop(bash_output.temp_file.take());
+    let capture = bash_output.capture_details();
 
     let raw_output = concat_chunks(&bash_output.chunks);
     let full_output = String::from_utf8_lossy(&raw_output).into_owned();
@@ -9231,7 +9531,9 @@ fn assemble_bash_run_result(
 
     let mut full_output_path = None;
     if truncation.truncated {
-        if let Some(path) = bash_output.temp_file_path.as_ref() {
+        if capture.is_none()
+            && let Some(path) = bash_output.temp_file_path.as_ref()
+        {
             full_output_path = Some(path.display().to_string());
         }
 
@@ -9241,20 +9543,13 @@ fn assemble_bash_run_result(
             .saturating_add(1);
         let end_line = truncation.total_lines;
 
-        let display_path = bash_output
-            .partial_output_path
+        let display_path = capture
             .as_ref()
-            .map(|path| path.display().to_string())
+            .and_then(|details| details.artifact_path.clone())
             .or_else(|| full_output_path.clone())
             .unwrap_or_else(|| "unavailable".to_string());
-        let file_limit_hit = bash_output.total_bytes > BASH_FILE_LIMIT_BYTES;
-        let output_qualifier = if bash_output.partial_output_path.is_some() {
+        let output_qualifier = if capture.is_some() {
             "Partial output artifact".to_string()
-        } else if file_limit_hit {
-            format!(
-                "Partial output (capped at {})",
-                format_size(BASH_FILE_LIMIT_BYTES)
-            )
         } else {
             "Full output".to_string()
         };
@@ -9280,6 +9575,10 @@ fn assemble_bash_run_result(
                 format_size(DEFAULT_MAX_BYTES)
             );
         }
+    }
+
+    if let Some(details) = &capture {
+        details.append_notice(&mut output_text);
     }
 
     if timed_out {
@@ -9312,6 +9611,7 @@ fn assemble_bash_run_result(
         } else {
             None
         },
+        capture,
     }
 }
 
@@ -9367,6 +9667,8 @@ pub(crate) async fn run_bash_command_pty(
             pixel_height: 0,
         })
         .map_err(|e| Error::tool("bash", format!("Failed to allocate PTY: {e}")))?;
+    #[cfg(unix)]
+    prepare_bash_pty_master(pair.master.as_ref())?;
 
     let mut pty_cmd = CommandBuilder::new(shell);
     pty_cmd.arg("-c");
@@ -9395,9 +9697,21 @@ pub(crate) async fn run_bash_command_pty(
         .master
         .try_clone_reader()
         .map_err(|e| Error::tool("bash", format!("Failed to clone PTY reader: {e}")))?;
+    // On Unix the cloned reader owns the master endpoint. Retaining a second
+    // master would keep the terminal alive after the reader has retired.
+    // ConPTY's master also owns the console control object and must stay alive.
+    #[cfg(unix)]
+    drop(pair.master);
 
-    let (tx, rx) = mpsc::sync_channel::<BashPipeFrame>(1024);
-    let pty_thread = thread::spawn(move || pump_stream(reader, "pty", &tx));
+    let (tx, mut rx) = mpsc::sync_channel::<BashPipeFrame>(1024);
+    #[cfg(unix)]
+    let mut pty_pumps = {
+        let mut pumps = BashPipePumps::default();
+        pumps.spawn(reader, "pty", tx)?;
+        pumps
+    };
+    #[cfg(not(unix))]
+    let pty_thread = thread::spawn(move || pump_stream(reader, "pty", &tx, None));
 
     let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
     let mut bash_output = BashOutputState::new(max_chunks_bytes);
@@ -9417,14 +9731,13 @@ pub(crate) async fn run_bash_command_pty(
 
     let tick = Duration::from_millis(10);
     loop {
-        let mut updated = false;
-        while let Ok(frame) = rx.try_recv() {
-            if let Err(err) = ingest_bash_pipe_frame(frame, &mut bash_output).await {
+        let updated = match ingest_bash_output_batch(&mut rx, &mut bash_output).await {
+            Ok(updated) => updated,
+            Err(err) => {
                 let _ = child.kill();
                 return Err(err);
             }
-            updated = true;
-        }
+        };
 
         if updated {
             emit_bash_update(&bash_output, on_update)?;
@@ -9482,25 +9795,22 @@ pub(crate) async fn run_bash_command_pty(
             .map_or_else(wall_now, |timer| timer.now());
         let drain_deadline = drain_start + Duration::from_secs(5);
         loop {
-            let mut got_data = false;
-            while let Ok(frame) = rx.try_recv() {
-                if let Err(err) = ingest_bash_pipe_frame(frame, &mut bash_output).await {
+            let got_data = match ingest_bash_output_batch(&mut rx, &mut bash_output).await {
+                Ok(updated) => updated,
+                Err(err) => {
                     let _ = child.kill();
                     return Err(err);
                 }
-                got_data = true;
-            }
+            };
             if got_data {
                 emit_bash_update(&bash_output, on_update)?;
             }
 
-            if pty_thread.is_finished() {
-                while let Ok(frame) = rx.try_recv() {
-                    if let Err(err) = ingest_bash_pipe_frame(frame, &mut bash_output).await {
-                        let _ = child.kill();
-                        return Err(err);
-                    }
-                }
+            #[cfg(unix)]
+            let reader_finished = pty_pumps.is_finished();
+            #[cfg(not(unix))]
+            let reader_finished = pty_thread.is_finished();
+            if reader_finished {
                 break;
             }
 
@@ -9509,9 +9819,40 @@ pub(crate) async fn run_bash_command_pty(
                 .timer_driver()
                 .map_or_else(wall_now, |timer| timer.now());
             if now >= drain_deadline {
+                bash_output.output_complete = false;
                 break;
             }
             sleep(now, tick).await;
+        }
+    }
+
+    // Unix retirement is bounded even while an escaped descendant holds the
+    // slave open. Other backends expose an opaque blocking reader, so they can
+    // only be joined after EOF; a cutoff still reports incomplete capture.
+    #[cfg(unix)]
+    let reader_joined = Some(pty_pumps.stop_and_join());
+    #[cfg(not(unix))]
+    let reader_joined = if bash_output.output_complete {
+        Some(pty_thread.join().is_ok())
+    } else {
+        None
+    };
+    if let Some(succeeded) = reader_joined {
+        // There is no producer left. Preserve every accepted frame, including
+        // terminal errors, before returning the bounded final tail.
+        let mut got_tail = false;
+        while let Ok(frame) = rx.try_recv() {
+            ingest_bash_pipe_frame(frame, &mut bash_output).await?;
+            got_tail = true;
+        }
+        if got_tail {
+            emit_bash_update(&bash_output, on_update)?;
+        }
+        if !succeeded {
+            let message =
+                bash_capture_error_message("The bash PTY output reader panicked", &bash_output);
+            bash_output.abandon_spill_file();
+            return Err(Error::tool("bash", message));
         }
     }
 
@@ -9725,6 +10066,9 @@ impl BashTool {
             && !snapshot.artifact_truncated
             && snapshot.artifact_error.is_none();
         let mut state = BashOutputState::new(DEFAULT_MAX_BYTES.saturating_mul(2));
+        state.output_complete = snapshot.output_complete;
+        state.artifact_truncated = snapshot.artifact_truncated;
+        state.artifact_error.clone_from(&snapshot.artifact_error);
         state.total_bytes = snapshot.output_bytes;
         state.last_byte_was_newline = snapshot.output_tail.ends_with('\n');
         state.line_count = snapshot.output_lines.saturating_sub(usize::from(
@@ -9765,40 +10109,26 @@ impl BashTool {
         {
             text.text.push_str("\n\nCommand cancelled");
         }
-        if !capture_complete {
-            let warning = format!(
-                "\n\n[Command capture: outputComplete={}, artifactTruncated={}, artifactError={}. \
-                 Retained artifact: {}]",
-                snapshot.output_complete,
-                snapshot.artifact_truncated,
-                snapshot.artifact_error.as_deref().unwrap_or("none"),
-                snapshot.artifact_path,
-            );
-            if let Some(ContentBlock::Text(text)) = output.content.first_mut() {
-                text.text.push_str(&warning);
-            }
-            output.is_error |= !snapshot.output_complete;
-            let details = output.details.get_or_insert_with(|| serde_json::json!({}));
-            details["capture"] = serde_json::json!({
-                "outputComplete": snapshot.output_complete,
-                "artifactTruncated": snapshot.artifact_truncated,
-                "artifactError": snapshot.artifact_error,
-                "artifactPath": snapshot.artifact_path,
-            });
-        }
         Ok(output)
     }
 
     fn bash_result_output(&self, tool_call_id: &str, result: BashRunResult) -> Result<ToolOutput> {
         let mut details_map = serde_json::Map::new();
+        let full_output_path = result
+            .full_output_path
+            .as_deref()
+            .filter(|_| result.capture.as_ref().is_none_or(BashCapture::is_complete));
         if let Some(truncation) = result.truncation.as_ref() {
             details_map.insert("truncation".to_string(), serde_json::to_value(truncation)?);
         }
-        if let Some(path) = result.full_output_path.as_ref() {
+        if let Some(path) = full_output_path {
             details_map.insert(
                 "fullOutputPath".to_string(),
-                serde_json::Value::String(path.clone()),
+                serde_json::Value::String(path.to_string()),
             );
+        }
+        if let Some(capture) = &result.capture {
+            details_map.insert("capture".to_string(), serde_json::to_value(capture)?);
         }
         if let Some(reason) = result.cancellation_reason {
             details_map.insert(
@@ -9815,7 +10145,7 @@ impl BashTool {
         let mut details = details;
         let mut output_text = result.output;
 
-        if let Some(path) = result.full_output_path.as_deref() {
+        if let Some(path) = full_output_path {
             attach_text_artifact_from_path_if_needed_with_root(
                 self.artifact_root.as_deref(),
                 &mut output_text,
@@ -9827,7 +10157,12 @@ impl BashTool {
             );
         }
 
-        let is_error = result.cancelled || result.exit_code != 0;
+        let is_error = result.cancelled
+            || result.exit_code != 0
+            || result
+                .capture
+                .as_ref()
+                .is_some_and(|capture| !capture.output_complete);
 
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(output_text))],
@@ -16843,25 +17178,92 @@ fn pump_stream<R: Read + Send + 'static>(
     mut reader: R,
     stream_name: &'static str,
     tx: &mpsc::SyncSender<BashPipeFrame>,
+    stop: Option<&std::sync::atomic::AtomicBool>,
 ) {
     let mut buf = vec![0u8; 8192];
     loop {
+        if stop.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+            break;
+        }
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if tx.send(BashPipeFrame::Chunk(buf[..n].to_vec())).is_err() {
+                if !send_bash_pipe_frame(tx, BashPipeFrame::Chunk(buf[..n].to_vec()), stop) {
                     break;
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::park_timeout(BASH_PIPE_POLL_INTERVAL);
+            }
             Err(err) => {
-                let _ = tx.send(BashPipeFrame::Error(format!(
-                    "Failed to read bash {stream_name}: {err}"
-                )));
+                let _ = send_bash_pipe_frame(
+                    tx,
+                    BashPipeFrame::Error(format!("Failed to read bash {stream_name}: {err}")),
+                    stop,
+                );
                 break;
             }
         }
     }
+}
+
+fn send_bash_pipe_frame(
+    tx: &mpsc::SyncSender<BashPipeFrame>,
+    mut frame: BashPipeFrame,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> bool {
+    let Some(stop) = stop else {
+        // Non-Unix PTY backends still supply opaque blocking readers. Keep
+        // their transport here; the owned pump guard cannot safely join them.
+        return tx.send(frame).is_ok();
+    };
+    loop {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        match tx.try_send(frame) {
+            Ok(()) => return true,
+            Err(mpsc::TrySendError::Disconnected(_)) => return false,
+            Err(mpsc::TrySendError::Full(pending)) => {
+                frame = pending;
+                thread::park_timeout(BASH_PIPE_POLL_INTERVAL);
+            }
+        }
+    }
+}
+
+const BASH_OUTPUT_DRAIN_MAX_FRAMES: usize = 64;
+const BASH_OUTPUT_DRAIN_MAX_BYTES: usize = 256 * 1024;
+
+/// Consume one bounded batch before returning control to process supervision.
+/// Channel capacity bounds memory, but it does not bound a try_recv loop when
+/// active producers keep replacing every consumed frame. Both bounds matter:
+/// many tiny writes must not starve cancellation, and large writes must not
+/// postpone the timeout while capture spills to disk.
+// Receiver is Send but not Sync; borrowing it mutably across the await keeps
+// the command future Send, just as owning the receiver does.
+#[allow(clippy::needless_pass_by_ref_mut)]
+async fn ingest_bash_output_batch(
+    rx: &mut mpsc::Receiver<BashPipeFrame>,
+    state: &mut BashOutputState,
+) -> Result<bool> {
+    let mut updated = false;
+    let mut bytes = 0usize;
+    for _ in 0..BASH_OUTPUT_DRAIN_MAX_FRAMES {
+        let Ok(frame) = rx.try_recv() else {
+            break;
+        };
+        if let BashPipeFrame::Chunk(chunk) = &frame {
+            bytes = bytes.saturating_add(chunk.len());
+        }
+        ingest_bash_pipe_frame(frame, state).await?;
+        updated = true;
+        if bytes >= BASH_OUTPUT_DRAIN_MAX_BYTES {
+            break;
+        }
+    }
+    Ok(updated)
 }
 
 async fn ingest_bash_pipe_frame(frame: BashPipeFrame, state: &mut BashOutputState) -> Result<()> {
@@ -16989,6 +17391,9 @@ struct BashOutputState {
     chunks_bytes: usize,
     max_chunks_bytes: usize,
     spill_failed: bool,
+    output_complete: bool,
+    artifact_truncated: bool,
+    artifact_error: Option<String>,
 }
 
 impl BashOutputState {
@@ -17006,7 +17411,33 @@ impl BashOutputState {
             chunks_bytes: 0,
             max_chunks_bytes,
             spill_failed: false,
+            output_complete: true,
+            artifact_truncated: false,
+            artifact_error: None,
         }
+    }
+
+    fn capture_details(&self) -> Option<BashCapture> {
+        if self.output_complete
+            && !self.artifact_truncated
+            && self.artifact_error.is_none()
+            && !self.spill_failed
+        {
+            return None;
+        }
+        Some(BashCapture {
+            output_complete: self.output_complete,
+            artifact_truncated: self.artifact_truncated,
+            artifact_error: self.artifact_error.clone().or_else(|| {
+                self.spill_failed
+                    .then(|| "The Bash output artifact could not be retained".to_string())
+            }),
+            artifact_path: self
+                .partial_output_path
+                .as_ref()
+                .or(self.temp_file_path.as_ref())
+                .map(|path| path.display().to_string()),
+        })
     }
 
     fn abandon_spill_file(&mut self) {
@@ -17105,11 +17536,17 @@ async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Resul
                                     tracing::warn!(
                                         "Temp file identity mismatch (possible TOCTOU attack)"
                                     );
+                                    state.artifact_error = Some(
+                                        "Bash output artifact identity changed before capture"
+                                            .to_string(),
+                                    );
                                     identity_match = false;
                                 }
                             }
                             Err(e) => {
                                 tracing::warn!("Failed to stat temp file: {e}");
+                                state.artifact_error =
+                                    Some(format!("Failed to verify Bash output artifact: {e}"));
                                 identity_match = false;
                             }
                         }
@@ -17121,6 +17558,8 @@ async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Resul
                         for existing in &state.chunks {
                             if let Err(e) = file.write_all(existing).await {
                                 tracing::warn!("Failed to flush bash chunk to temp file: {e}");
+                                state.artifact_error =
+                                    Some(format!("Failed to flush Bash output artifact: {e}"));
                                 failed_flush = true;
                                 break;
                             }
@@ -17139,12 +17578,16 @@ async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Resul
                 }
                 Err(e) => {
                     tracing::warn!("Failed to open temp file async: {e}");
+                    state.artifact_error =
+                        Some(format!("Failed to open Bash output artifact: {e}"));
                     state.temp_file_path = Some(path);
                     state.abandon_spill_file();
                 }
             }
         } else {
             state.spill_failed = true;
+            state.artifact_error =
+                Some("Failed to create or verify the Bash output artifact".to_string());
         }
     }
 
@@ -17154,12 +17597,14 @@ async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Resul
         if state.total_bytes <= BASH_FILE_LIMIT_BYTES {
             if let Err(e) = file.write_all(&chunk).await {
                 tracing::warn!("Failed to write bash chunk to temp file: {e}");
+                state.artifact_error = Some(format!("Failed to write Bash output artifact: {e}"));
                 abandon_spill_file = true;
             }
         } else {
             // Hard limit reached. Stop writing and close the file to release the FD.
             if !state.spill_failed {
                 tracing::warn!("Bash output exceeded hard limit; stopping file log");
+                state.artifact_truncated = true;
                 close_spill_file = true;
             }
         }
@@ -17236,7 +17681,11 @@ fn emit_bash_update(
         if truncation.truncated {
             details_map.insert("truncation".into(), serde_json::to_value(&truncation)?);
         }
-        if let Some(path) = state.temp_file_path.as_ref() {
+        let mut content = truncation.content;
+        if let Some(capture) = state.capture_details() {
+            capture.append_notice(&mut content);
+            details_map.insert("capture".into(), serde_json::to_value(capture)?);
+        } else if let Some(path) = state.temp_file_path.as_ref() {
             details_map.insert(
                 "fullOutputPath".into(),
                 serde_json::Value::String(path.display().to_string()),
@@ -17244,7 +17693,7 @@ fn emit_bash_update(
         }
 
         callback(ToolUpdate {
-            content: vec![ContentBlock::Text(TextContent::new(truncation.content))],
+            content: vec![ContentBlock::Text(TextContent::new(content))],
             details: Some(details),
         });
     }
@@ -19100,6 +19549,10 @@ impl Tool for HashlineEditTool {
 #[cfg(test)]
 #[path = "tools/notebook_tests.rs"]
 mod notebook_tool_tests;
+
+#[cfg(test)]
+#[path = "tools/bash_capture_tests.rs"]
+mod bash_capture_tests;
 
 #[cfg(test)]
 mod tests {
@@ -23867,6 +24320,315 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_output_flood_still_reaches_timeout_on_pipe_and_pty() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("temporary command directory");
+            // The independent watchdog makes a regressed, starving receiver
+            // fail by ordinary process exit instead of hanging the suite.
+            let command = "(sleep 15; kill -KILL $$) & \
+                while :; do printf '%8192s' stdout; printf '%8192s' stderr >&2; done";
+
+            for use_pty in [false, true] {
+                let result = if use_pty {
+                    run_bash_command_pty(tmp.path(), None, None, command, Some(1), None, None).await
+                } else {
+                    run_bash_command(tmp.path(), None, None, command, Some(1), None).await
+                }
+                .expect("flooding command must return its timeout result");
+
+                assert_eq!(
+                    result.cancellation_reason,
+                    Some(BashCancellationReason::Timeout),
+                    "output flood bypassed timeout (pty={use_pty}): {result:?}"
+                );
+                assert!(result.output.contains("stdout") || result.output.contains("stderr"));
+                assert!(result.truncated, "the flood must exercise output spilling");
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_output_flood_delivers_updates_and_cancellation_on_pipe_and_pty() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("temporary command directory");
+            let command = "(sleep 15; kill -KILL $$) & \
+                while :; do printf '%8192s' stdout; printf '%8192s' stderr >&2; done";
+
+            for use_pty in [false, true] {
+                let ambient_cx = asupersync::Cx::for_testing();
+                let cancel_cx = ambient_cx.clone();
+                let _current = asupersync::Cx::set_current(Some(ambient_cx));
+                // Cancel from the first delivered output update, without a
+                // timing race between a sleeping canceller and process spawn.
+                let on_update = move |_update: ToolUpdate| cancel_cx.set_cancel_requested(true);
+                let result = if use_pty {
+                    run_bash_command_pty(
+                        tmp.path(),
+                        None,
+                        None,
+                        command,
+                        Some(30),
+                        Some(&on_update),
+                        None,
+                    )
+                    .await
+                } else {
+                    run_bash_command(tmp.path(), None, None, command, Some(30), Some(&on_update))
+                        .await
+                }
+                .expect("flooding command must return its cancellation result");
+
+                assert!(result.cancelled, "output flood bypassed cancellation");
+                assert_eq!(
+                    result.cancellation_reason,
+                    Some(BashCancellationReason::AmbientCancellation),
+                    "output update must remain reachable while flooding (pty={use_pty})"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_bash_output_batches_yield_with_ready_frames_and_preserve_order() {
+        asupersync::test_utils::run_test(|| async {
+            // Small frames hit the frame bound; full-size pump frames hit the
+            // byte bound first. Both cases start with an always-ready queue.
+            for frame_bytes in [1, 8192] {
+                let (tx, mut rx) = mpsc::sync_channel::<BashPipeFrame>(128);
+                let mut expected = Vec::new();
+                for marker in 0..128u8 {
+                    let chunk = vec![marker; frame_bytes];
+                    expected.extend_from_slice(&chunk);
+                    tx.send(BashPipeFrame::Chunk(chunk)).expect("queue frame");
+                }
+                drop(tx);
+                let mut output = BashOutputState::new(expected.len());
+                // This witness concerns channel scheduling and byte order,
+                // independently of filesystem spill availability.
+                output.spill_failed = true;
+
+                assert!(
+                    ingest_bash_output_batch(&mut rx, &mut output)
+                        .await
+                        .expect("first batch")
+                );
+                assert!(output.total_bytes > 0);
+                assert!(
+                    output.total_bytes < expected.len(),
+                    "a ready producer queue must yield to process supervision"
+                );
+                while ingest_bash_output_batch(&mut rx, &mut output)
+                    .await
+                    .expect("remaining batch")
+                {}
+                assert_eq!(output.total_bytes, expected.len());
+                assert_eq!(concat_chunks(&output.chunks), expected);
+            }
+        });
+    }
+
+    #[test]
+    fn test_bash_output_batch_surfaces_an_error_after_the_yield_boundary() {
+        asupersync::test_utils::run_test(|| async {
+            let (tx, mut rx) = mpsc::sync_channel::<BashPipeFrame>(129);
+            for _ in 0..128 {
+                tx.send(BashPipeFrame::Chunk(b"x".to_vec()))
+                    .expect("queue output");
+            }
+            tx.send(BashPipeFrame::Error("late pipe failure".to_string()))
+                .expect("queue trailing error");
+            drop(tx);
+            let mut output = BashOutputState::new(DEFAULT_MAX_BYTES);
+
+            assert!(
+                ingest_bash_output_batch(&mut rx, &mut output)
+                    .await
+                    .expect("first batch ends before the error")
+            );
+            let error = loop {
+                match ingest_bash_output_batch(&mut rx, &mut output).await {
+                    Ok(true) => {}
+                    Ok(false) => panic!("a batch boundary discarded the read error"),
+                    Err(error) => break error,
+                }
+            };
+            assert!(error.to_string().contains("late pipe failure"));
+            assert!(error.to_string().contains("Partial output before failure"));
+            assert_eq!(output.total_bytes, 128);
+        });
+    }
+
+    mod bash_pipe_pump_ownership {
+        use super::*;
+
+        type ReadResult = std::result::Result<usize, std::io::ErrorKind>;
+
+        struct RetirementProbe<R> {
+            reader: R,
+            first_read: Option<mpsc::Sender<ReadResult>>,
+            retired: mpsc::Sender<()>,
+        }
+
+        impl<R: Read> Read for RetirementProbe<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let result = self.reader.read(buffer);
+                if let Some(first_read) = self.first_read.take() {
+                    let _ = first_read.send(result.as_ref().copied().map_err(std::io::Error::kind));
+                }
+                result
+            }
+        }
+
+        impl<R> Drop for RetirementProbe<R> {
+            fn drop(&mut self) {
+                let _ = self.retired.send(());
+            }
+        }
+
+        fn observed_reader<R>(
+            reader: R,
+        ) -> (
+            RetirementProbe<R>,
+            mpsc::Receiver<ReadResult>,
+            mpsc::Receiver<()>,
+        ) {
+            let (first_read, started) = mpsc::channel();
+            let (retired, retirement) = mpsc::channel();
+            (
+                RetirementProbe {
+                    reader,
+                    first_read: Some(first_read),
+                    retired,
+                },
+                started,
+                retirement,
+            )
+        }
+
+        fn assert_retirement_without_releasing_dependencies(
+            pumps: BashPipePumps,
+            retirement: &mpsc::Receiver<()>,
+            release_dependencies: impl FnOnce(),
+        ) {
+            let (finished, completion) = mpsc::channel();
+            let owner = thread::spawn(move || {
+                drop(pumps);
+                let _ = finished.send(());
+            });
+            let completed = completion.recv_timeout(Duration::from_secs(5));
+            let retired_before_release = retirement.try_recv();
+            // Keep the real writer/consumer dependency alive until after the
+            // deadline. Release it before joining so a blocking-read/send
+            // regression fails instead of hanging the entire test process.
+            release_dependencies();
+            if matches!(completed, Err(mpsc::RecvTimeoutError::Timeout)) {
+                completion
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("cleanup remained blocked after releasing its peers");
+            }
+            owner.join().expect("reader owner did not panic");
+            assert!(completed.is_ok(), "reader retirement waited on its peer");
+            retired_before_release.expect("the owned reader was dropped before cleanup returned");
+        }
+
+        #[test]
+        fn dropping_owner_retires_reader_while_output_queue_stays_full() {
+            let (tx, rx) = mpsc::sync_channel(1);
+            tx.send(BashPipeFrame::Chunk(b"queued".to_vec()))
+                .expect("fill output queue");
+            let (reader, started, retirement) =
+                observed_reader(std::io::Cursor::new(b"pending output".to_vec()));
+            let mut pumps = BashPipePumps::default();
+            pumps.spawn(reader, "stdout", tx).expect("start reader");
+            let read_started = started.recv_timeout(Duration::from_secs(5));
+
+            assert_retirement_without_releasing_dependencies(pumps, &retirement, || {
+                let queued = rx.try_recv().expect("original queued frame remains");
+                drop(rx);
+                assert!(matches!(queued, BashPipeFrame::Chunk(bytes) if bytes == b"queued"));
+            });
+            assert!(read_started.is_ok(), "reader never reached the full queue");
+        }
+
+        #[cfg(any(unix, windows))]
+        #[test]
+        fn dropping_owner_retires_idle_reader_while_writer_stays_open() {
+            #[cfg(unix)]
+            let (reader, writer) = {
+                let (reader, writer) = std::io::pipe().expect("held output endpoints");
+                prepare_bash_pipe(&reader).expect("nonblocking output reader");
+                (reader, writer)
+            };
+            #[cfg(windows)]
+            let (reader, writer) = {
+                let (reader, writer) =
+                    crate::jobs::windows_job_pipe::pair().expect("held output endpoints");
+                (WindowsBashPipe(reader), writer)
+            };
+            let (reader, started, retirement) = observed_reader(reader);
+            let (tx, rx) = mpsc::sync_channel(1);
+            let mut pumps = BashPipePumps::default();
+            pumps.spawn(reader, "stdout", tx).expect("start reader");
+            let read_started = started.recv_timeout(Duration::from_secs(5));
+
+            assert_retirement_without_releasing_dependencies(pumps, &retirement, || {
+                drop(writer);
+                drop(rx);
+            });
+            assert!(read_started.is_ok(), "idle read did not return WouldBlock");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn dropping_owner_retires_idle_pty_reader_while_slave_stays_open() {
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .expect("native PTY endpoints");
+            prepare_bash_pty_master(pair.master.as_ref()).expect("nonblocking PTY master");
+            let reader = pair.master.try_clone_reader().expect("native PTY reader");
+            drop(pair.master);
+            let (reader, started, retirement) = observed_reader(reader);
+            let (tx, rx) = mpsc::sync_channel(1);
+            let mut pumps = BashPipePumps::default();
+            pumps.spawn(reader, "pty", tx).expect("start PTY reader");
+            let read_started = started.recv_timeout(Duration::from_secs(5));
+
+            assert_retirement_without_releasing_dependencies(pumps, &retirement, || {
+                drop(pair.slave);
+                drop(rx);
+            });
+            assert_eq!(
+                read_started,
+                Ok(Err(std::io::ErrorKind::WouldBlock)),
+                "the native reader clone must inherit nonblocking mode"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn closed_pty_slave_is_clean_eof_instead_of_a_capture_error() {
+            let pair = portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize::default())
+                .expect("native PTY endpoints");
+            prepare_bash_pty_master(pair.master.as_ref()).expect("nonblocking PTY master");
+            let reader = pair.master.try_clone_reader().expect("native PTY reader");
+            drop(pair.master);
+            drop(pair.slave);
+            let (tx, rx) = mpsc::sync_channel(1);
+            let mut pumps = BashPipePumps::default();
+            pumps.spawn(reader, "pty", tx).expect("start PTY reader");
+            let terminal_frame = rx.recv_timeout(Duration::from_secs(5));
+            assert!(pumps.stop_and_join(), "PTY reader panicked");
+            assert!(
+                matches!(terminal_frame, Err(mpsc::RecvTimeoutError::Disconnected)),
+                "closing the slave must end capture without an EIO frame: {terminal_frame:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_bash_pump_stream_emits_io_error_frame_after_partial_output() {
         let reader = FailingReader::new([
@@ -23875,7 +24637,7 @@ mod tests {
         ]);
         let (tx, rx) = mpsc::sync_channel::<BashPipeFrame>(4);
 
-        pump_stream(reader, "stdout", &tx);
+        pump_stream(reader, "stdout", &tx, None);
 
         match rx.recv().expect("partial chunk") {
             BashPipeFrame::Chunk(chunk) => assert_eq!(chunk, b"partial stdout"),

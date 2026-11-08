@@ -4797,7 +4797,15 @@ impl ExtensionManager {
         };
 
         #[cfg(feature = "wasm-host")]
-        let response = if has_hook_wasm {
+        let response = if has_hook_wasm
+            && (event != ExtensionEventName::UserBash
+                || response.as_ref().is_none_or(Value::is_null))
+        {
+            let timeout_ms = if event == ExtensionEventName::UserBash {
+                user_bash_remaining_timeout(timeout_ms, started_at)?
+            } else {
+                timeout_ms
+            };
             let mut wasm_payload = event_payload;
             if let Value::Object(map) = &mut wasm_payload {
                 map.insert("ctx".into(), (*ctx_payload).clone());
@@ -4833,6 +4841,37 @@ impl ExtensionManager {
         event_payload: &Value,
         timeout_ms: u64,
     ) -> Result<Option<Value>> {
+        if event_name == "user_bash" {
+            // A shell override owns execution once it responds. Starting later
+            // handlers concurrently could perform the same command twice, even
+            // if only one of their results is eventually kept.
+            let started_at = Instant::now();
+            for extension in extensions
+                .iter()
+                .filter(|ext| ext.event_hooks().iter().any(|hook| hook == event_name))
+            {
+                let remaining_timeout_ms = user_bash_remaining_timeout(timeout_ms, started_at)?;
+                match extension
+                    .handle_event_value(event_payload, remaining_timeout_ms)
+                    .await
+                {
+                    Ok(Some(value)) => return Ok(Some(value)),
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            event = "ext.wasm.dispatch.failed",
+                            extension_name = %extension.registration().name,
+                            event_name = %event_name,
+                            error = %err,
+                            "WASM extension event dispatch failed"
+                        );
+                        return Err(err);
+                    }
+                }
+            }
+            return Ok(None);
+        }
+
         // Fan out across subscribed extensions concurrently. A single
         // slow or deadlocked extension bounds to its own per-instance
         // timeout and cannot block its peers — each `WasmExtensionHandle`
@@ -4939,13 +4978,15 @@ impl ExtensionManager {
 
     /// Dispatch `user_bash` for a `!command` the user typed. A hook that ran
     /// the command itself answers `{ result: BashResult }`, which replaces the
-    /// shell run; any other answer lets the command run.
+    /// shell run. Only an unhandled response permits the local shell to run:
+    /// dispatch failures and malformed execution claims may follow effects
+    /// that have already occurred and must never replay the command.
     pub async fn dispatch_user_bash(
         &self,
         command: &str,
         exclude_from_context: bool,
         cwd: &Path,
-    ) -> Option<crate::tools::BashRunResult> {
+    ) -> Result<Option<crate::tools::BashRunResult>> {
         let response = match self
             .dispatch_event_with_response(
                 ExtensionEventName::UserBash,
@@ -4958,25 +4999,33 @@ impl ExtensionManager {
             )
             .await
         {
-            Ok(response) => response?,
+            Ok(Some(response)) => response,
+            Ok(None) => return Ok(None),
             Err(err) => {
                 tracing::warn!(
                     event = "ext.user_bash.failed",
                     error = %err,
                     "Failed to dispatch user_bash"
                 );
-                return None;
+                return Err(err);
             }
         };
+        if let Some(result) = response.get("result") {
+            return user_bash_result(result).map(Some).ok_or_else(|| {
+                Error::extension(
+                    "A user_bash hook returned a non-object result; refusing to execute the command locally",
+                )
+            });
+        }
         if response.get("operations").is_some() {
             // pi-mono's `{ operations }` (run through the extension's own
-            // exec) cannot cross the bridge: its members are functions.
-            tracing::warn!(
-                event = "ext.user_bash.operations_unsupported",
-                "A user_bash hook returned shell operations; running the command locally"
-            );
+            // exec) cannot cross the bridge: its members are functions. Do
+            // not silently run a command intended for a different executor.
+            return Err(Error::extension(
+                "A user_bash hook returned unsupported shell operations; return a completed result instead. The command was not executed locally",
+            ));
         }
-        user_bash_result(response.get("result")?)
+        Ok(None)
     }
 
     pub async fn discover_resources(&self, cwd: &Path, reason: &str) -> ExtensionResourcePaths {
@@ -5456,12 +5505,25 @@ impl ExtensionManager {
     }
 }
 
+#[cfg(feature = "wasm-host")]
+fn user_bash_remaining_timeout(timeout_ms: u64, started_at: Instant) -> Result<u64> {
+    let remaining = Duration::from_millis(timeout_ms)
+        .checked_sub(started_at.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| Error::extension("user_bash hook dispatch timed out"))?;
+    // The WASM handle treats zero as unlimited, so a sub-millisecond remainder
+    // must stay bounded instead of accidentally disabling the deadline.
+    Ok(u64::try_from(remaining.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1))
+}
+
 /// A `user_bash` hook's `result` (OMP's `BashResult`, camelCase or
 /// snake_case keys).
 fn user_bash_result(result: &Value) -> Option<crate::tools::BashRunResult> {
     let obj = result.as_object()?;
 
-    let output = obj
+    let mut output = obj
         .get("output")
         .and_then(Value::as_str)
         .unwrap_or("")
@@ -5479,11 +5541,51 @@ fn user_bash_result(result: &Value) -> Option<crate::tools::BashRunResult> {
         .get("truncated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // A hook has already executed its command. Invalid optional metadata must
+    // not discard its result and cause the caller to execute the command again.
+    let capture = obj.get("capture").and_then(|value| {
+        serde_json::from_value::<crate::tools::BashCapture>(value.clone())
+            .ok()
+            .or_else(|| {
+                // A malformed optional detail must not erase a known capture
+                // limitation or restore a contradictory full-output claim.
+                let fields = value.as_object()?;
+                let capture = crate::tools::BashCapture {
+                    output_complete: fields
+                        .get("outputComplete")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                    artifact_truncated: fields
+                        .get("artifactTruncated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    artifact_error: fields
+                        .get("artifactError")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                    artifact_path: fields
+                        .get("artifactPath")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                };
+                (!capture.is_complete()).then_some(capture)
+            })
+    });
+    if let Some(capture) = &capture
+        && !capture.is_complete()
+    {
+        capture.append_notice(&mut output);
+    }
     let full_output_path = obj
         .get("fullOutputPath")
         .or_else(|| obj.get("full_output_path"))
         .and_then(Value::as_str)
-        .map(ToString::to_string);
+        .map(ToString::to_string)
+        .filter(|_| {
+            capture
+                .as_ref()
+                .is_none_or(crate::tools::BashCapture::is_complete)
+        });
     let cancellation = obj.get("cancellation").and_then(Value::as_object);
     let cancellation_reason = cancellation
         .and_then(|details| details.get("reason"))
@@ -5509,5 +5611,163 @@ fn user_bash_result(result: &Value) -> Option<crate::tools::BashRunResult> {
         truncated,
         full_output_path,
         truncation: None,
+        capture,
     })
+}
+
+#[cfg(test)]
+mod user_bash_result_tests {
+    use super::user_bash_result;
+    use serde_json::json;
+
+    #[cfg(feature = "wasm-host")]
+    #[test]
+    fn exhausted_user_bash_budget_never_becomes_an_unlimited_wasm_timeout() {
+        let now = std::time::Instant::now();
+        assert!(super::user_bash_remaining_timeout(0, now).is_err());
+        let expired = now
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("earlier instant");
+        assert!(super::user_bash_remaining_timeout(1, expired).is_err());
+    }
+
+    #[test]
+    fn incomplete_capture_never_advertises_a_full_output_path() {
+        for (output_complete, artifact_truncated, artifact_error) in [
+            (false, false, None),
+            (true, true, None),
+            (true, false, Some("disk full")),
+        ] {
+            let result = user_bash_result(&json!({
+                "output": "retained command output",
+                "exitCode": 0,
+                "fullOutputPath": "retained.log",
+                "capture": {
+                    "outputComplete": output_complete,
+                    "artifactTruncated": artifact_truncated,
+                    "artifactError": artifact_error,
+                    "artifactPath": "retained.log"
+                }
+            }))
+            .expect("capture limitations must preserve the executed hook result");
+
+            assert!(result.full_output_path.is_none());
+            assert!(result.output.starts_with("retained command output"));
+            assert!(result.output.contains("[Command capture:"));
+            assert_eq!(
+                result
+                    .output
+                    .contains("[Output capture stopped before all readers finished"),
+                !output_complete
+            );
+            let capture = result.capture.expect("typed capture metadata");
+            assert_eq!(capture.output_complete, output_complete);
+            assert_eq!(capture.artifact_truncated, artifact_truncated);
+            assert_eq!(capture.artifact_error.as_deref(), artifact_error);
+            assert_eq!(capture.artifact_path.as_deref(), Some("retained.log"));
+        }
+    }
+
+    #[test]
+    fn complete_capture_keeps_full_output_and_defaults_optional_fields() {
+        let result = user_bash_result(&json!({
+            "output": "complete command output",
+            "fullOutputPath": "complete.log",
+            "capture": {
+                "outputComplete": true,
+                "futureCaptureDetail": "ignored"
+            }
+        }))
+        .expect("complete hook result");
+
+        assert_eq!(result.output, "complete command output");
+        assert_eq!(result.full_output_path.as_deref(), Some("complete.log"));
+        let capture = result.capture.expect("recognized capture metadata");
+        assert!(capture.output_complete);
+        assert!(!capture.artifact_truncated);
+        assert!(capture.artifact_error.is_none());
+        assert!(capture.artifact_path.is_none());
+    }
+
+    #[test]
+    fn known_capture_limits_survive_malformed_optional_metadata() {
+        for (supplied_capture, complete, truncated, error, path) in [
+            (
+                json!({"outputComplete": false, "artifactPath": false}),
+                false,
+                false,
+                None,
+                None,
+            ),
+            (
+                json!({"artifactTruncated": true, "artifactPath": 5}),
+                true,
+                true,
+                None,
+                None,
+            ),
+            (
+                json!({
+                    "outputComplete": "unknown",
+                    "artifactError": "disk full",
+                    "artifactPath": "partial.log"
+                }),
+                true,
+                false,
+                Some("disk full"),
+                Some("partial.log"),
+            ),
+        ] {
+            let result = user_bash_result(&json!({
+                "output": "hook already ran",
+                "fullOutputPath": "claimed-full.log",
+                "capture": supplied_capture
+            }))
+            .expect("partly malformed metadata must preserve the executed hook result");
+
+            assert!(result.full_output_path.is_none());
+            assert!(result.output.starts_with("hook already ran"));
+            assert!(result.output.contains("[Command capture:"));
+            let capture = result.capture.expect("known capture limitation");
+            assert_eq!(capture.output_complete, complete);
+            assert_eq!(capture.artifact_truncated, truncated);
+            assert_eq!(capture.artifact_error.as_deref(), error);
+            assert_eq!(capture.artifact_path.as_deref(), path);
+        }
+    }
+
+    #[test]
+    fn absent_or_malformed_capture_keeps_the_executed_hook_result() {
+        for capture in [
+            None,
+            Some(json!(null)),
+            Some(json!("unknown capture format")),
+            Some(json!([])),
+            Some(json!({"futureCaptureDetail": true})),
+            Some(json!({"outputComplete": "yes"})),
+            Some(json!({"outputComplete": true, "artifactTruncated": "yes"})),
+            Some(json!({"outputComplete": true, "artifactError": 5})),
+            Some(json!({"outputComplete": true, "artifactPath": false})),
+        ] {
+            let mut supplied = json!({
+                "output": "hook already ran",
+                "exit_code": 23,
+                "cancelled": true,
+                "truncated": true,
+                "full_output_path": "hook.log"
+            });
+            if let Some(capture) = capture {
+                supplied["capture"] = capture;
+            }
+            let result = user_bash_result(&supplied)
+                .expect("optional metadata must not cause command re-execution");
+
+            assert_eq!(result.output, "hook already ran");
+            assert_eq!(result.exit_code, 23);
+            assert!(result.cancelled);
+            assert!(result.truncated);
+            assert_eq!(result.full_output_path.as_deref(), Some("hook.log"));
+            assert!(result.capture.is_none());
+        }
+    }
 }
