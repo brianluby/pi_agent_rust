@@ -44,7 +44,7 @@ use pi::extensions::{
     resolve_extension_load_spec,
 };
 use pi::extensions_js::PiJsRuntimeConfig;
-use pi::failover::RecoveryEventStream;
+use pi::failover::{LogicalTurnEventState, RecoveryEventStream};
 use pi::file_identity::FileIdentity;
 use pi::model::{AssistantMessage, ContentBlock, StopReason, ThinkingLevel};
 use pi::models::{
@@ -795,13 +795,17 @@ fn main_impl() -> Result<()> {
     };
 
     validate_fetch_models_is_standalone(&cli, &extension_flags, &raw_args)?;
-    if cli.session_workdir.is_some() && cli.command.is_some() {
-        bail!("--session-workdir requires resuming an existing --session");
-    }
-
     if cli.version {
         print_version()?;
         return Ok(());
+    }
+
+    prepare_web_companion_launch(
+        &mut cli,
+        io::stdin().is_terminal() && io::stdout().is_terminal(),
+    )?;
+    if cli.session_workdir.is_some() && cli.command.is_some() {
+        bail!("--session-workdir requires resuming an existing --session");
     }
 
     // Recovery intentionally precedes crash capture, config/auth loading,
@@ -2592,11 +2596,7 @@ async fn run(
         &cwd,
         &file_args,
         &mut messages,
-        config
-            .images
-            .as_ref()
-            .and_then(|i| i.auto_resize)
-            .unwrap_or(true),
+        pi::tools::FileArgumentOptions::from_config(&config),
         &workspace,
     )?;
     messages.retain(|message| !message.trim().is_empty());
@@ -2893,6 +2893,8 @@ async fn run(
             ftui_models,
             ftui_sessions,
             pi::interactive_ftui::FtuiSettings {
+                web_remote: cli.web_companion.take(),
+                web_remote_mode: cli.web_remote_mode,
                 markdown_spacing: config.markdown_spacing(),
                 // Resolved exactly as the classic stack resolves it; the
                 // `--no-mouse-capture` flag has already been folded into
@@ -2953,6 +2955,7 @@ async fn run(
                 .and_then(|resolution| {
                     pi::btw::BtwClient::for_model_entry(
                         &resolution.model_entry,
+                        &selection.model_entry,
                         cli.api_key.as_deref(),
                         &auth,
                         config.secrets.as_ref(),
@@ -3147,6 +3150,7 @@ async fn run(
             .and_then(|resolution| {
                 pi::btw::BtwClient::for_model_entry(
                     &resolution.model_entry,
+                    &selection.model_entry,
                     cli.api_key.as_deref(),
                     &auth,
                     config.secrets.as_ref(),
@@ -3155,6 +3159,7 @@ async fn run(
     // Rebinding factory (bd-9jgrt): lets `/model smol <spec>` rebuild the
     // /btw client mid-session against fresh on-disk credentials.
     let btw_api_key = cli.api_key.clone();
+    let btw_primary_entry = selection.model_entry.clone();
     let btw_secrets_settings = config.secrets.clone();
     let btw_cwd = cwd.clone();
     let btw_factory: pi::btw::BtwClientFactory = std::sync::Arc::new(move |entry| {
@@ -3164,6 +3169,7 @@ async fn run(
         auth.set_command_working_directory(&btw_cwd).ok()?;
         pi::btw::BtwClient::for_model_entry(
             entry,
+            &btw_primary_entry,
             btw_api_key.as_deref(),
             &auth,
             btw_secrets_settings.as_ref(),
@@ -3679,6 +3685,82 @@ async fn run(
     result
 }
 
+/// Both browser modes use the normal local FTUI host with another output
+/// surface. Remove the subcommand before any session/trust/bootstrap decision;
+/// constructing a separate abbreviated session would bypass those policies.
+fn prepare_web_companion_launch(cli: &mut cli::Cli, has_local_terminal: bool) -> Result<()> {
+    let Some(cli::Commands::Web {
+        terminal,
+        port,
+        bind,
+        view_only,
+        max_viewers,
+    }) = cli.command.as_ref()
+    else {
+        return Ok(());
+    };
+    if !cfg!(feature = "ftui") {
+        bail!("`pi web` requires a build with FrankenTUI support");
+    }
+    if cli.classic
+        || cli.print
+        || cli.rpc
+        || cli.acp
+        || cli.mode.is_some()
+        || cli.export.is_some()
+        || cli.list_models.is_some()
+        || cli.fetch_models.is_some()
+        || cli.list_providers
+        || cli.explain_extension_policy
+        || cli.explain_repair_policy
+    {
+        bail!(
+            "`pi web` runs the local FrankenTUI session; output/query modes and --classic cannot be combined with it"
+        );
+    }
+    if *terminal && cli.inline {
+        bail!("`pi web --terminal` requires fullscreen rendering; remove --inline");
+    }
+    if !has_local_terminal {
+        bail!(
+            "`pi web` requires a local terminal for prompt and tool approvals; headless browser control is not supported"
+        );
+    }
+    let (mode, bind_mode, viewer_limit) = if *terminal {
+        (
+            pi::web_remote::WebRemoteMode::Terminal,
+            bind.parse().map_err(anyhow::Error::msg)?,
+            pi::web_remote::MAX_WEB_VIEWERS,
+        )
+    } else {
+        if bind != "loopback" {
+            bail!("`pi web` supports only --bind loopback; other bindings require --terminal");
+        }
+        (
+            pi::web_remote::WebRemoteMode::Companion,
+            pi::web_remote::BindMode::Loopback,
+            16,
+        )
+    };
+    if !(1..=viewer_limit).contains(max_viewers) {
+        bail!("`pi web --max-viewers` must be between 1 and {viewer_limit}");
+    }
+    cli.web_companion = Some(pi::web_remote::WebRemoteSettings {
+        port: *port,
+        bind_mode,
+        view_only: *view_only,
+        max_viewers: *max_viewers,
+        ..Default::default()
+    });
+    cli.web_remote_mode = mode;
+    cli.command = None;
+    #[cfg(feature = "ftui")]
+    {
+        cli.ftui = true;
+    }
+    Ok(())
+}
+
 const fn subcommand_uses_package_manager(command: &cli::Commands) -> bool {
     matches!(
         command,
@@ -3987,14 +4069,7 @@ async fn handle_subcommand(
             }
         }
         cli::Commands::Web { .. } => {
-            // There is no web remote server behind this command yet. It used
-            // to print a "listening" line, a client URL and a pairing token,
-            // then exit with nothing serving that port (gh #182). Say so and
-            // fail instead of reporting a server that does not exist.
-            bail!(
-                "`pi web` is not available: this build has no web remote server, \
-                 so nothing would listen on the requested port"
-            );
+            bail!("`pi web` must launch through the local FrankenTUI session");
         }
         cli::Commands::Gallery { format } => {
             let matrix = pi::gallery::GalleryMatrix::new();
@@ -11107,16 +11182,29 @@ where
     EH: Fn(AgentEvent) + Send + Sync + 'static,
 {
     let prewalk_turn = session.begin_prewalk_turn();
-    let recovery_events = RecoveryEventStream::new(move |event| {
-        if is_json {
-            emit_json_event(&event);
+    // Provider attempts may end before retry, failover or persistence does.
+    // Keep their messages, but expose one completed request to JSON clients.
+    // Native extension lifecycle events are dispatched by Agent itself.
+    let turn_events = Arc::new(StdMutex::new(LogicalTurnEventState::default()));
+    let make_turn_event_handler = || {
+        let state = Arc::clone(&turn_events);
+        let output = make_event_handler();
+        move |event: AgentEvent| {
+            let event = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .observe(event);
+            if let Some(event) = event {
+                output(event);
+            }
         }
-    });
+    };
+    let recovery_events = RecoveryEventStream::new(make_turn_event_handler());
     let mut result = run_print_prompt_attempts(
         session,
         config,
         abort_signal,
-        make_event_handler,
+        &make_turn_event_handler,
         retry_enabled,
         max_retries,
         is_json,
@@ -11126,6 +11214,7 @@ where
         failover_state,
         &prewalk_turn,
         &recovery_events,
+        &turn_events,
     )
     .await;
     let exhaustion = match &result {
@@ -11164,7 +11253,14 @@ where
             })
         },
     );
-    recovery_events.finish(!interrupted, final_error);
+    recovery_events.finish(!interrupted, final_error.clone());
+    let terminal = turn_events
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .finish(final_error);
+    if let Some(terminal) = terminal {
+        make_event_handler()(terminal);
+    }
     result
 }
 
@@ -11183,6 +11279,7 @@ async fn run_print_prompt_attempts<H, EH>(
     failover_state: &mut PrintFailoverState,
     prewalk_turn: &pi::prewalk::PrewalkTurn,
     recovery_events: &RecoveryEventStream,
+    turn_events: &StdMutex<LogicalTurnEventState>,
 ) -> Result<AssistantMessage>
 where
     H: Fn() -> EH + Sync,
@@ -11416,6 +11513,10 @@ where
                     emit_print_failover_end(recovery_events, failed_over, session, false);
                     return Err(restore_err);
                 }
+                turn_events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .restored_tail();
                 if let Some((provider, key)) = quota_credential.as_ref()
                     && let Err(error) = session
                         .rotate_rate_limited_credential_after_retry(
@@ -11485,6 +11586,10 @@ where
                         }
                     };
                     if swapped.is_some() {
+                        turn_events
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .restored_tail();
                         failed_over = true;
                         failovers_this_turn += 1;
                         retry_count = 0;
@@ -11573,6 +11678,10 @@ where
                         emit_print_failover_end(recovery_events, failed_over, session, false);
                         return Err(terminal_err);
                     }
+                    turn_events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .restored_tail();
                     if let Some((provider, key)) = quota_credential.as_ref()
                         && let Err(error) = session
                             .rotate_rate_limited_credential_after_retry(
@@ -11625,6 +11734,10 @@ where
                         }
                     };
                     if swapped.is_some() {
+                        turn_events
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .restored_tail();
                         failed_over = true;
                         failovers_this_turn += 1;
                         retry_count = 0;
@@ -11811,6 +11924,191 @@ mod tests {
     use pi::compaction::ResolvedCompactionSettings;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    #[cfg(feature = "ftui")]
+    fn web_launch_keeps_normal_session_trust_approval_and_budget_options() {
+        let mut cli = cli::Cli::parse_from([
+            "pi",
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-test",
+            "--session",
+            "saved-session.jsonl",
+            "--session-workdir",
+            "/tmp/pi-web-workspace",
+            "--trust",
+            "--approval-mode",
+            "write",
+            "--max-cost",
+            "1.5",
+            "--tools",
+            "read,grep",
+            "web",
+            "--port",
+            "0",
+            "--max-viewers",
+            "2",
+            "--view-only",
+        ]);
+        assert!(!cli_uses_runtime_session(&cli));
+        prepare_web_companion_launch(&mut cli, true).unwrap();
+        assert!(cli_uses_runtime_session(&cli));
+        assert!(cli.command.is_none());
+        assert!(cli.ftui);
+        assert_eq!(
+            cli.web_remote_mode,
+            pi::web_remote::WebRemoteMode::Companion
+        );
+        assert_eq!(cli.provider.as_deref(), Some("anthropic"));
+        assert_eq!(cli.model.as_deref(), Some("claude-test"));
+        assert_eq!(cli.session.as_deref(), Some("saved-session.jsonl"));
+        assert_eq!(
+            cli.session_workdir.as_deref(),
+            Some(Path::new("/tmp/pi-web-workspace"))
+        );
+        assert!(cli.trust);
+        assert_eq!(cli.approval_mode.as_deref(), Some("write"));
+        assert_eq!(cli.max_cost, Some(1.5));
+        assert_eq!(cli.tools.as_deref(), Some("read,grep"));
+        let browser = cli.web_companion.as_ref().unwrap();
+        assert_eq!(browser.port, 0);
+        assert_eq!(browser.max_viewers, 2);
+        assert!(browser.view_only);
+        assert_eq!(browser.bind_mode, pi::web_remote::BindMode::Loopback);
+    }
+
+    #[test]
+    #[cfg(feature = "ftui")]
+    fn web_launch_requires_local_terminal_and_rejects_other_output_modes() {
+        let mut cli = cli::Cli::parse_from(["pi", "web"]);
+        let error = prepare_web_companion_launch(&mut cli, false).unwrap_err();
+        assert!(error.to_string().contains("requires a local terminal"));
+        assert!(cli.web_companion.is_none());
+        assert!(cli.command.is_some());
+        for args in [
+            vec!["pi", "--classic", "web"],
+            vec!["pi", "--print", "web"],
+            vec!["pi", "--rpc", "web"],
+            vec!["pi", "--acp", "web"],
+            vec!["pi", "--mode", "json", "web"],
+            vec!["pi", "--list-providers", "web"],
+        ] {
+            let mut cli = cli::Cli::parse_from(args);
+            let error = prepare_web_companion_launch(&mut cli, true).unwrap_err();
+            assert!(error.to_string().contains("cannot be combined"));
+            assert!(cli.web_companion.is_none());
+        }
+        for limit in ["0", "17"] {
+            let mut cli = cli::Cli::parse_from(["pi", "web", "--max-viewers", limit]);
+            assert!(prepare_web_companion_launch(&mut cli, true).is_err());
+        }
+        for bind in ["lan", "tailscale"] {
+            let mut cli = cli::Cli::parse_from(["pi", "web", "--bind", bind]);
+            let error = prepare_web_companion_launch(&mut cli, true).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("other bindings require --terminal")
+            );
+            assert!(cli.web_companion.is_none());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "ftui")]
+    fn web_terminal_launch_preserves_session_options_and_selects_requested_binding() {
+        for (bind, expected) in [
+            ("loopback", pi::web_remote::BindMode::Loopback),
+            ("tailscale", pi::web_remote::BindMode::Tailscale),
+            ("lan", pi::web_remote::BindMode::Lan),
+        ] {
+            let mut cli = cli::Cli::parse_from([
+                "pi",
+                "--session",
+                "saved-session.jsonl",
+                "--session-workdir",
+                "/tmp/pi-web-terminal",
+                "--trust",
+                "--approval-mode",
+                "write",
+                "--max-cost",
+                "1.5",
+                "--tools",
+                "read,grep",
+                "web",
+                "--terminal",
+                "--bind",
+                bind,
+                "--port",
+                "0",
+                "--max-viewers",
+                "64",
+                "--view-only",
+            ]);
+            prepare_web_companion_launch(&mut cli, true).unwrap();
+            assert_eq!(cli.web_remote_mode, pi::web_remote::WebRemoteMode::Terminal);
+            assert!(cli.command.is_none());
+            assert!(cli.ftui);
+            assert!(cli_uses_runtime_session(&cli));
+            assert!(cli.trust);
+            assert_eq!(cli.session.as_deref(), Some("saved-session.jsonl"));
+            assert_eq!(
+                cli.session_workdir.as_deref(),
+                Some(Path::new("/tmp/pi-web-terminal"))
+            );
+            assert_eq!(cli.approval_mode.as_deref(), Some("write"));
+            assert_eq!(cli.max_cost, Some(1.5));
+            assert_eq!(cli.tools.as_deref(), Some("read,grep"));
+            let settings = cli.web_companion.as_ref().unwrap();
+            assert_eq!(settings.bind_mode, expected);
+            assert_eq!(settings.port, 0);
+            assert_eq!(settings.max_viewers, 64);
+            assert!(settings.view_only);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "ftui")]
+    fn web_terminal_launch_requires_local_terminal_fullscreen_and_bounded_viewers() {
+        let mut cli = cli::Cli::parse_from(["pi", "web", "--terminal"]);
+        let error = prepare_web_companion_launch(&mut cli, false).unwrap_err();
+        assert!(error.to_string().contains("requires a local terminal"));
+        assert!(cli.web_companion.is_none());
+        assert!(cli.command.is_some());
+        let mut cli = cli::Cli::parse_from(["pi", "--inline", "web", "--terminal"]);
+        let error = prepare_web_companion_launch(&mut cli, true).unwrap_err();
+        assert!(error.to_string().contains("requires fullscreen rendering"));
+        assert!(cli.web_companion.is_none());
+        for limit in ["0", "65"] {
+            let mut cli = cli::Cli::parse_from(["pi", "web", "--terminal", "--max-viewers", limit]);
+            let error = prepare_web_companion_launch(&mut cli, true).unwrap_err();
+            assert!(error.to_string().contains("between 1 and 64"));
+            assert!(cli.web_companion.is_none());
+        }
+        let mut cli = cli::Cli::parse_from(["pi", "--inline", "web"]);
+        prepare_web_companion_launch(&mut cli, true).unwrap();
+        assert_eq!(
+            cli.web_remote_mode,
+            pi::web_remote::WebRemoteMode::Companion
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "ftui"))]
+    fn web_launch_requires_the_ftui_feature() {
+        for args in [vec!["pi", "web"], vec!["pi", "web", "--terminal"]] {
+            let mut cli = cli::Cli::parse_from(args);
+            let error = prepare_web_companion_launch(&mut cli, true).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires a build with FrankenTUI support")
+            );
+            assert!(cli.web_companion.is_none());
+        }
+    }
 
     #[test]
     fn print_mcp_auth_commands_preserve_exact_names_and_use_native_dispatch() {
@@ -14925,7 +15223,7 @@ mod tests {
                 directory.path(),
                 &["input.txt".to_string()],
                 &mut messages,
-                false,
+                pi::tools::FileArgumentOptions::default(),
                 &workspace,
             )
             .unwrap()
@@ -14941,7 +15239,7 @@ mod tests {
             directory.path(),
             &["input.txt".to_string()],
             &mut messages,
-            false,
+            pi::tools::FileArgumentOptions::default(),
             &workspace,
         )
         .unwrap()
@@ -15897,6 +16195,14 @@ mod tests {
     }
 
     fn print_recovery_session(provider: &Arc<PrintRecoveryProvider>) -> AgentSession {
+        print_recovery_session_with_store(provider, Session::in_memory(), false)
+    }
+
+    fn print_recovery_session_with_store(
+        provider: &Arc<PrintRecoveryProvider>,
+        mut stored: Session,
+        save_enabled: bool,
+    ) -> AgentSession {
         let mut agent = Agent::new(
             Arc::clone(provider) as Arc<dyn pi::provider::Provider>,
             ToolRegistry::new(&[], Path::new("."), None),
@@ -15906,13 +16212,12 @@ mod tests {
             },
         );
         agent.set_model_accepts_images(true);
-        let mut stored = Session::in_memory();
         stored.header.provider = Some("print-recovery".to_string());
         stored.header.model_id = Some("test-model".to_string());
         AgentSession::new(
             agent,
             Arc::new(Mutex::new(stored)),
-            false,
+            save_enabled,
             ResolvedCompactionSettings {
                 enabled: false,
                 ..ResolvedCompactionSettings::default()
@@ -15949,6 +16254,144 @@ mod tests {
             &mut PrintFailoverState::default(),
         )
         .await
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn print_logical_turn_ends_after_retry_success_abort_or_restore_failure() {
+        run_cli_workdir_test(async {
+            for transport_error in [false, true] {
+                for outcome in ["success", "abort", "restore_failure"] {
+                    let provider = Arc::new(PrintRecoveryProvider {
+                        calls: std::sync::atomic::AtomicUsize::new(0),
+                        prompts: StdMutex::new(Vec::new()),
+                        input_tokens: 0,
+                        transport_error,
+                    });
+                    let temp = tempfile::tempdir().expect("print lifecycle root");
+                    let poison = temp.path().join("retry-save-directory");
+                    fs::create_dir(&poison).expect("directory cannot be a session file");
+                    let mut stored = Session::create_with_dir(Some(temp.path().to_path_buf()));
+                    stored.path = Some(temp.path().join("session.jsonl"));
+                    stored.save().await.expect("initial session save");
+                    let mut session = print_recovery_session_with_store(&provider, stored, true);
+                    let store = Arc::clone(&session.session);
+                    let events = Arc::new(StdMutex::new(Vec::new()));
+                    let (abort, signal) = AbortHandle::new();
+                    let make_handler = || {
+                        let events = Arc::clone(&events);
+                        let store = Arc::clone(&store);
+                        let abort = abort.clone();
+                        let poison = poison.clone();
+                        move |event: AgentEvent| {
+                            if matches!(event, AgentEvent::AutoRetryStart { .. }) {
+                                if outcome == "abort" {
+                                    abort.abort();
+                                } else if outcome == "restore_failure" {
+                                    store.try_lock().expect("retry boundary is unlocked").path =
+                                        Some(poison.clone());
+                                }
+                            }
+                            events.lock().expect("record print event").push(event);
+                        }
+                    };
+                    let config = Config {
+                        retry: Some(pi::config::RetrySettings {
+                            enabled: Some(true),
+                            max_retries: Some(1),
+                            base_delay_ms: Some(1),
+                            max_delay_ms: Some(1),
+                            ..pi::config::RetrySettings::default()
+                        }),
+                        ..Config::default()
+                    };
+                    let result = run_print_prompt_with_retry(
+                        &mut session,
+                        &config,
+                        &signal,
+                        &make_handler,
+                        true,
+                        1,
+                        true,
+                        &Arc::new(StdMutex::new(PrintTextStreamState::default())),
+                        PromptInput::Text {
+                            text: "original prompt".to_string(),
+                            keyword_scan_source: None,
+                        },
+                        None,
+                        &mut PrintFailoverState::default(),
+                    )
+                    .await;
+                    let expected_error = result.as_ref().err().map(ToString::to_string);
+                    assert_eq!(result.is_ok(), outcome == "success");
+                    assert_eq!(
+                        provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+                        if outcome == "success" { 2 } else { 1 },
+                        "cancelled or unpersisted recovery must not call the provider"
+                    );
+                    let events = events.lock().expect("captured print events");
+                    let lifecycle: Vec<&str> = events
+                        .iter()
+                        .filter_map(|event| match event {
+                            AgentEvent::AgentStart { .. } => Some("agent_start"),
+                            AgentEvent::AutoRetryStart { .. } => Some("auto_retry_start"),
+                            AgentEvent::AutoRetryEnd { .. } => Some("auto_retry_end"),
+                            AgentEvent::AgentEnd { .. } => Some("agent_end"),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(
+                        lifecycle,
+                        [
+                            "agent_start",
+                            "auto_retry_start",
+                            "auto_retry_end",
+                            "agent_end",
+                        ],
+                        "{outcome}, transport_error={transport_error}"
+                    );
+                    let Some(AgentEvent::AgentEnd {
+                        messages, error, ..
+                    }) = events.last()
+                    else {
+                        panic!("the logical end must be the final callback");
+                    };
+                    assert_eq!(
+                        error, &expected_error,
+                        "terminal error must describe the outcome"
+                    );
+                    assert_eq!(
+                        messages
+                            .iter()
+                            .filter(|message| matches!(message, pi::model::Message::User(_)))
+                            .count(),
+                        1,
+                        "the terminal retains the original input without replaying it"
+                    );
+                    let errors = messages
+                        .iter()
+                        .filter(|message| matches!(message, pi::model::Message::Assistant(message)
+                            if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)))
+                        .count();
+                    assert_eq!(
+                        errors,
+                        usize::from(outcome != "success"),
+                        "failed tails disappear only after a successful durable rewind"
+                    );
+                    if outcome == "abort" {
+                        assert!(matches!(
+                            result.unwrap_err().downcast_ref::<pi::error::Error>(),
+                            Some(pi::error::Error::Aborted)
+                        ));
+                    } else if outcome == "restore_failure" {
+                        assert!(
+                            expected_error.unwrap().contains("retry restoration"),
+                            "the final frame must report the save failure, not stale provider error"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     #[test]
@@ -16261,6 +16704,7 @@ mod tests {
     /// after a typed session-persistence failure, even when the wrapped prose
     /// looks like a transient connection reset.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn run_print_prompt_with_retry_rejects_session_persistence_after_tool() {
         use std::sync::atomic::Ordering;
 
@@ -16319,11 +16763,16 @@ mod tests {
             };
             let (_abort_handle, abort_signal) = AbortHandle::new();
             let text_stream_state = Arc::new(StdMutex::new(PrintTextStreamState::default()));
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let make_handler = || {
+                let events = Arc::clone(&events);
+                move |event| events.lock().expect("record persistence event").push(event)
+            };
             let error = run_print_prompt_with_retry(
                 &mut agent_session,
                 &config,
                 &abort_signal,
-                &|| |_| {},
+                &make_handler,
                 true,
                 3,
                 true,
@@ -16359,6 +16808,33 @@ mod tests {
             assert!(
                 write_path.is_file(),
                 "the write tool must have executed before persistence failed"
+            );
+            let events = events.lock().expect("persistence events");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::AgentEnd { .. }))
+                    .count(),
+                1,
+                "native termination is held until the persistence result"
+            );
+            let Some(AgentEvent::AgentEnd {
+                messages, error, ..
+            }) = events.last()
+            else {
+                panic!("the terminal frame follows the failed save");
+            };
+            assert_eq!(error.as_deref(), Some(message.as_str()));
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(
+                        |message| matches!(message, pi::model::Message::ToolResult(result)
+                        if result.tool_call_id == "step1")
+                    )
+                    .count(),
+                1,
+                "the terminal must retain completed tool effects despite the failed save"
             );
         });
     }

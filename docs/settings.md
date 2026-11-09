@@ -998,7 +998,7 @@ visibility.
 - `media.image_gen_provider` / `media.imageGenProvider` (string): Default `"openai"`. Supported: `"openai"`, `"gemini"`, `"xai"`.
 - `media.image_gen_model` / `media.imageGenModel` (string): Default generation model; otherwise chosen for the selected provider.
 - `media.enable_read_media` / `media.enableReadMedia` (bool): Default `false`. When `true`, activates `read_media`, which attaches a local video/audio file (mp4, webm, mov, mp3, wav, m4a, ogg, flac) as a native media block. Gemini-family models consume audio/video natively. OpenAI Chat Completions models declaring audio input and separate audio pricing consume WAV/MP3 natively and return text; `openai/gpt-audio-1.5` includes that configuration. Unsupported media produces `[media omitted: <name>, <mime>, <size>]`. See [native audio model configuration](models.md#native-audio-with-openai-chat-completions).
-- `media.max_bytes` / `media.maxBytes` (integer): Default `5242880` (5 MiB). Hard cap on one `read_media` file in bytes; larger files are rejected with an error naming the cap. Session media can be stored in sidecars and is restored for subsequent provider requests until compaction, so keep this small. Provider-specific per-request transport bounds also apply.
+- `media.max_bytes` / `media.maxBytes` (integer): Default `5242880` (5 MiB). Maximum decoded bytes per audio/video attachment, shared by `read_media`, CLI `@file` inputs, and both interactive interfaces. Files exactly at the cap are accepted; larger `@file` inputs produce a notice naming the cap, and `read_media` returns an error. The same limit applies to interactive prompt templates. Image resizing and text-file limits are separate. Session media can be stored in sidecars and is restored for subsequent provider requests until compaction. Provider-specific per-request transport bounds also apply.
 
 For provider, model, and voice choices, explicit tool-call arguments win over
 settings, followed by the corresponding `PI_VISION_*`, `PI_IMAGE_GEN_*`, or
@@ -1035,11 +1035,20 @@ Native backends:
 
 The browser executable and user agent are set with the `PI_BROWSER_EXECUTABLE` and `PI_BROWSER_USER_AGENT` environment variables, not settings. Pi always asks the operating system for a free debugging port, so it has no port setting; to use a fixed port, start the browser yourself and attach with `PI_BROWSER_CDP_URL`. See [browser automation](tools/browser-cdp.md).
 
-### Web Remote & Collab
+### Local browser companion
 
-Not available yet: this build has no web remote server, `pi web` exits with an
-error, and there are no `web.*` settings (Pi reports them as unrecognised). See
-[the web remote design notes](tools/web_remote.md).
+`pi web` starts the normal FrankenTUI session with supervised browser access on
+loopback. Use `--port`, `--view-only`, and `--max-viewers` on that subcommand.
+The local terminal must accept each browser prompt and retains tool approval
+and login input. There are no persistent `web.*` settings (Pi reports them as
+unrecognised). See [the browser companion guide](tools/web_remote.md).
+
+`pi web --terminal` selects the fullscreen terminal mirror, with locally
+approved remote control and a separate browser composer. This mode additionally
+accepts `--bind tailscale` or `--bind lan`; `--view-only` disables remote input.
+Its viewer limit is 1–64 (default 4), while the companion limit is 1–16.
+The modes own separate credentials and input permissions and cannot run on the
+same launch. Neither mode adds persistent settings or supports headless access.
 
 ## Full reference
 

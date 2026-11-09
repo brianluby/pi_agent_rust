@@ -2190,6 +2190,9 @@ pub enum PiMsg {
     /// built-in list; the charmed stack builds its catalog inline and
     /// ignores this.
     AutocompleteCatalog(crate::autocomplete::AutocompleteCatalog),
+    /// Live model identities and display names after extension registration or
+    /// session replacement. No credentials or provider options enter the UI.
+    ModelCatalog(Vec<(String, String)>),
     /// Atomically replace reloaded prompt/skill bodies and their completion
     /// catalog. Side-command routing must use the same loader as the driver.
     ResourcesReloadedWithCatalog {
@@ -2282,6 +2285,11 @@ pub enum PiMsg {
     McpAuthFinished { request_id: String, message: String },
     /// A terminal handoff reply can settle only the request that admitted it.
     HandoffFinished {
+        request_id: String,
+        event: Box<Self>,
+    },
+    /// Only the matching FTUI compaction may release its operation owner.
+    CompactionFinished {
         request_id: String,
         event: Box<Self>,
     },

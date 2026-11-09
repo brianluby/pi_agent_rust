@@ -6,8 +6,8 @@
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
-    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ThinkingContent,
-    ToolCall, Usage, UserContent,
+    AssistantMessage, BillingTokenCounts, BillingUsage, ContentBlock, Message, StopReason,
+    StreamEvent, TextContent, ThinkingContent, ToolCall, Usage, UserContent,
 };
 use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
@@ -595,6 +595,7 @@ impl Provider for OpenAIResponsesProvider {
             self.model.clone(),
             self.api().to_string(),
             self.name().to_string(),
+            options.usage_observer.clone(),
         ))
     }
 }
@@ -619,6 +620,7 @@ fn wire_stream<S>(
     model: String,
     api: String,
     provider: String,
+    usage_observer: Option<crate::provider::UsageObserver>,
 ) -> EventStream
 where
     S: Stream<Item = std::io::Result<Vec<u8>>> + Unpin + Send + 'static,
@@ -628,12 +630,19 @@ where
     } else {
         ResponsesEventStream::Sse(SseStream::new(source))
     };
-    let state = StreamState::new(event_source, model, api, provider);
+    let mut state = StreamState::new(event_source, model, api, provider);
+    state.usage_observer = usage_observer;
     let output = stream::unfold(Some(state), |active| async move {
         let mut state = active?;
-        let mut ready_events = 0;
         loop {
+            // Bound a caller draining visible deltas as well as silent wire
+            // frames. Returning a public item does not reset the work budget.
+            if state.ready_work_since_yield == MAX_READY_EVENTS_PER_YIELD {
+                yield_stream_turn().await;
+                state.ready_work_since_yield = 0;
+            }
             if let Some(event) = state.pending_events.pop_front() {
+                state.ready_work_since_yield += 1;
                 let terminal =
                     matches!(&event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
                 // Release the source, buffered wire data, and partial tool state
@@ -647,13 +656,7 @@ where
                 return None;
             }
 
-            // Metadata-only events can always be ready, even when the underlying
-            // SSE/NDJSON parser yields fairly within each individual event.
-            if ready_events == MAX_READY_EVENTS_PER_YIELD {
-                yield_stream_turn().await;
-                ready_events = 0;
-            }
-            ready_events += 1;
+            state.ready_work_since_yield += 1;
 
             match state.event_source.next().await {
                 Some(Ok(msg)) => {
@@ -1110,6 +1113,11 @@ where
     terminal_outcome: Option<ResponseOutcome>,
     /// Consecutive WriteZero errors seen without a successful event in between.
     transient_error_count: usize,
+    /// Shared by wire reads and queued event delivery across next() calls.
+    ready_work_since_yield: usize,
+    /// Billing must reach the session account when it arrives, even while
+    /// trailing response items delay the public terminal event.
+    usage_observer: Option<crate::provider::UsageObserver>,
 }
 
 impl<S> StreamState<S>
@@ -1141,6 +1149,8 @@ where
             tool_identities: ToolIdentities::default(),
             terminal_outcome: None,
             transient_error_count: 0,
+            ready_work_since_yield: 0,
+            usage_observer: None,
         }
     }
 
@@ -1157,21 +1167,14 @@ where
         &mut self,
         response: OpenAIResponsesDonePayload,
         event: ResponseTerminalEvent,
-    ) {
+    ) -> Result<()> {
         self.ensure_started();
-        self.partial.usage.input = response.usage.input_tokens;
-        self.partial.usage.output = response.usage.output_tokens;
-        self.partial.usage.total_tokens = response.usage.total_tokens.unwrap_or_else(|| {
-            response
-                .usage
-                .input_tokens
-                .saturating_add(response.usage.output_tokens)
-        });
+        self.record_usage(&response.usage)?;
         let outcome = match response.outcome(event) {
             Ok(outcome) => outcome,
             Err(message) => {
                 self.reject_tool_response(message.to_string());
-                return;
+                return Ok(());
             }
         };
         if self
@@ -1182,9 +1185,21 @@ where
             self.reject_tool_response(
                 "OpenAI Responses sent conflicting completion metadata".to_string(),
             );
-            return;
+            return Ok(());
         }
         self.terminal_outcome = Some(outcome);
+        Ok(())
+    }
+
+    fn record_usage(&mut self, usage: &OpenAIResponsesUsage) -> Result<()> {
+        // Replace the complete snapshot, including any earlier locally priced
+        // cost. Reusing that cost would mistake an estimate for a wire bill
+        // and prevent a later cumulative update from changing it.
+        self.partial.usage = usage.normalized();
+        if let Some(observer) = &self.usage_observer {
+            observer.observe_authoritative(&mut self.partial.usage)?;
+        }
+        Ok(())
     }
 
     fn finish_terminal_response(&mut self) -> bool {
@@ -1639,16 +1654,19 @@ where
                 }
             }
             OpenAIResponsesChunk::ResponseCompleted { response } => {
-                self.record_terminal_response(response, ResponseTerminalEvent::Completed);
+                self.record_terminal_response(response, ResponseTerminalEvent::Completed)?;
             }
             OpenAIResponsesChunk::ResponseDone { response } => {
-                self.record_terminal_response(response, ResponseTerminalEvent::Done);
+                self.record_terminal_response(response, ResponseTerminalEvent::Done)?;
             }
             OpenAIResponsesChunk::ResponseIncomplete { response } => {
-                self.record_terminal_response(response, ResponseTerminalEvent::Incomplete);
+                self.record_terminal_response(response, ResponseTerminalEvent::Incomplete)?;
             }
             OpenAIResponsesChunk::ResponseFailed { response } => {
                 self.ensure_started();
+                if let Some(usage) = &response.usage {
+                    self.record_usage(usage)?;
+                }
                 self.partial.stop_reason = StopReason::Error;
                 self.partial.error_message = Some(
                     response
@@ -2741,6 +2759,8 @@ enum OpenAIResponsesTerminalItem {
 struct OpenAIResponsesFailedPayload {
     #[serde(default)]
     error: Option<OpenAIResponsesFailedError>,
+    #[serde(default)]
+    usage: Option<OpenAIResponsesUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2762,6 +2782,157 @@ struct OpenAIResponsesUsage {
     output_tokens: u64,
     #[serde(default)]
     total_tokens: Option<u64>,
+    #[serde(default)]
+    input_tokens_details: Option<OpenAIResponsesInputTokensDetails>,
+    #[serde(default)]
+    output_tokens_details: Option<OpenAIResponsesOutputTokensDetails>,
+    #[serde(default, deserialize_with = "deserialize_reported_cost")]
+    cost: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(clippy::struct_field_names)]
+struct OpenAIResponsesInputTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+    #[serde(default)]
+    cache_write_tokens: u64,
+    #[serde(default)]
+    audio_tokens: u64,
+    #[serde(default)]
+    cache_write_tokens_details: Option<OpenAIResponsesCacheWriteTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIResponsesCacheWriteTokensDetails {
+    ttl_30m_tokens: u64,
+    ttl_12h_tokens: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIResponsesOutputTokensDetails {
+    #[serde(default)]
+    audio_tokens: u64,
+}
+
+/// Missing cost is different from a supplied null or another invalid bill.
+/// Keep the outer usage object typed so duplicate known fields still fail.
+fn deserialize_reported_cost<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
+impl OpenAIResponsesUsage {
+    fn normalized(&self) -> Usage {
+        let unavailable = |reason: &str| Usage {
+            billing: Some(BillingUsage::Unavailable {
+                reason: reason.to_string(),
+            }),
+            ..Usage::default()
+        };
+        let reported_total = if let Some(cost) = &self.cost {
+            let Some(total) = cost
+                .as_f64()
+                .filter(|total| total.is_finite() && *total >= 0.0)
+            else {
+                return unavailable("OpenAI Responses reported an invalid billed total");
+            };
+            Some(total)
+        } else {
+            None
+        };
+        let mut usage = match self.token_usage() {
+            Ok(usage) => usage,
+            Err(reason) => {
+                // A trustworthy USD bill can enforce a spending cap even when
+                // the token partition cannot be priced with catalog rates.
+                return reported_total.map_or_else(
+                    || unavailable(reason),
+                    |total| Usage {
+                        billing: Some(BillingUsage::ReportedTotal { total }),
+                        cost: crate::model::Cost {
+                            total,
+                            ..Default::default()
+                        },
+                        ..Usage::default()
+                    },
+                );
+            }
+        };
+        if let Some(total) = reported_total {
+            usage.cost.total = total;
+        }
+        // Positive token counts alone do not establish a zero-dollar bill for
+        // an unknown-price model. Leave those snapshots on legacy pricing so
+        // they cannot refund earlier acknowledged USD through default rates.
+        if reported_total.is_some() || usage.total_tokens == 0 {
+            usage.billing = Some(BillingUsage::Tokens {
+                text: BillingTokenCounts {
+                    input: usage.input,
+                    output: usage.output,
+                    cache_read: usage.cache_read,
+                    cache_write: usage.cache_write,
+                },
+                audio: BillingTokenCounts::default(),
+                reported_total,
+            });
+        }
+        usage
+    }
+
+    fn token_usage(&self) -> std::result::Result<Usage, &'static str> {
+        let inconsistent = "OpenAI Responses reported inconsistent token usage";
+        let total = self
+            .input_tokens
+            .checked_add(self.output_tokens)
+            .ok_or(inconsistent)?;
+        if self.total_tokens.is_some_and(|reported| reported != total) {
+            return Err(inconsistent);
+        }
+        let details = self.input_tokens_details.as_ref();
+        let cached = details.map_or(0, |details| details.cached_tokens);
+        let written = details.map_or(0, |details| details.cache_write_tokens);
+        // Responses counts include cache reads and writes in input_tokens.
+        // ModelCost prices exclusive buckets; neither is an additive fee.
+        let input = cached
+            .checked_add(written)
+            .and_then(|cache| self.input_tokens.checked_sub(cache))
+            .ok_or(inconsistent)?;
+        if let Some(lifetimes) =
+            details.and_then(|details| details.cache_write_tokens_details.as_ref())
+        {
+            if lifetimes
+                .ttl_30m_tokens
+                .checked_add(lifetimes.ttl_12h_tokens)
+                != Some(written)
+            {
+                return Err(inconsistent);
+            }
+            if lifetimes.ttl_12h_tokens > 0 {
+                return Err("OpenAI Responses 12-hour cache writes require a billed total");
+            }
+        }
+        if details.is_some_and(|details| details.audio_tokens > 0)
+            || self
+                .output_tokens_details
+                .as_ref()
+                .is_some_and(|details| details.audio_tokens > 0)
+        {
+            return Err("OpenAI Responses audio usage requires a billed total");
+        }
+        Ok(Usage {
+            input,
+            output: self.output_tokens,
+            cache_read: cached,
+            cache_write: written,
+            total_tokens: total,
+            ..Usage::default()
+        })
+    }
 }
 
 impl OpenAIResponsesDonePayload {
@@ -7328,6 +7499,7 @@ mod tests {
                     model.into(),
                     api.into(),
                     provider.into(),
+                    None,
                 ),
                 observation,
             )
@@ -7370,6 +7542,507 @@ mod tests {
                 "type": "response.completed",
                 "response": {"usage": {"input_tokens": input, "output_tokens": output, "total_tokens": input + output}}
             })
+        }
+
+        struct UsageHttpFixture {
+            provider: Arc<dyn Provider>,
+            budget: crate::cost::CostBudget,
+            options: StreamOptions,
+            requests: mpsc::Receiver<CapturedRequest>,
+        }
+
+        impl UsageHttpFixture {
+            fn new(mode: Mode, body: Vec<u8>, limit: f64) -> Self {
+                Self::with_rates(
+                    mode,
+                    body,
+                    limit,
+                    Some(crate::provider::ModelCost {
+                        audio: None,
+                        input: 1_000_000.0,
+                        output: 1_000_000.0,
+                        cache_read: 1_000_000.0,
+                        cache_write: 1_000_000.0,
+                    }),
+                )
+            }
+
+            fn with_rates(
+                mode: Mode,
+                body: Vec<u8>,
+                limit: f64,
+                rates: Option<crate::provider::ModelCost>,
+            ) -> Self {
+                let content_type = if mode.ndjson {
+                    "application/x-ndjson"
+                } else {
+                    "text/event-stream"
+                };
+                let body = String::from_utf8(body).expect("UTF-8 fixture body");
+                let (base_url, requests) = spawn_test_server(200, content_type, &body);
+                let (model, api, provider) = mode.identity();
+                let transport = OpenAIResponsesProvider::new(model)
+                    .with_base_url(base_url)
+                    .with_provider_name(provider)
+                    .with_api_name(api)
+                    .with_codex_mode(mode.codex);
+                let provider: Arc<dyn Provider> = if let Some(cost) = rates {
+                    Arc::new(crate::providers::PricedProvider {
+                        inner: Arc::new(transport),
+                        cost,
+                    })
+                } else {
+                    Arc::new(transport)
+                };
+                let budget = crate::cost::CostBudget::new(None, Some(limit), 0.0).unwrap();
+                Self {
+                    provider: crate::provider::guard_with_cost_budget(provider, budget.clone()),
+                    budget,
+                    options: StreamOptions {
+                        api_key: Some(build_test_jwt("usage-fixture-account")),
+                        ..StreamOptions::default()
+                    },
+                    requests,
+                }
+            }
+
+            fn assert_request(&self) {
+                self.requests
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("real HTTP request");
+            }
+        }
+
+        #[test]
+        fn http_usage_prices_exclusive_input_cache_read_and_cache_write_buckets() {
+            for mode in MODES {
+                for lifetime_details in [false, true] {
+                    let mut frame = completion(100, 10);
+                    frame["response"]["usage"]["input_tokens_details"] = json!({
+                        "cached_tokens": 60, "cache_write_tokens": 30
+                    });
+                    if lifetime_details {
+                        frame["response"]["usage"]["input_tokens_details"]["cache_write_tokens_details"] =
+                            json!({"ttl_30m_tokens": 30, "ttl_12h_tokens": 0});
+                    }
+                    let fixture = UsageHttpFixture::with_rates(
+                        mode,
+                        mode.events(&[frame]),
+                        100.0,
+                        Some(crate::provider::ModelCost {
+                            audio: None,
+                            input: 1_000_000.0,
+                            output: 2_000_000.0,
+                            cache_read: 250_000.0,
+                            cache_write: 1_250_000.0,
+                        }),
+                    );
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    runtime.block_on(async {
+                        let mut output = fixture
+                            .provider
+                            .stream(&Context::default(), &fixture.options)
+                            .await
+                            .unwrap();
+                        let events = terminal_events(&mut output).await;
+                        let Some(StreamEvent::Done { message, .. }) = events.last() else {
+                            panic!("expected completed cache usage for {mode:?}");
+                        };
+                        let usage = &message.usage;
+                        assert_eq!(
+                            (
+                                usage.input,
+                                usage.output,
+                                usage.cache_read,
+                                usage.cache_write,
+                                usage.total_tokens
+                            ),
+                            (10, 10, 60, 30, 110)
+                        );
+                        assert_eq!(
+                            (
+                                usage.cost.input,
+                                usage.cost.output,
+                                usage.cost.cache_read,
+                                usage.cost.cache_write
+                            ),
+                            (10.0, 20.0, 15.0, 37.5)
+                        );
+                        assert_eq!(usage.cost.total, 82.5);
+                        assert_eq!(fixture.budget.spent(), 82.5);
+                        fixture.budget.admit().unwrap();
+                    });
+                    fixture.assert_request();
+                }
+            }
+        }
+
+        #[test]
+        fn http_reported_and_zero_bills_replace_estimates_without_refunding_unknown_prices() {
+            for mode in MODES {
+                for case in ["reported", "zero_bill", "zero_work", "unpriced"] {
+                    let mut first = completion(7, 3);
+                    first["response"]["usage"]["cost"] = json!(10.0);
+                    let mut last = if case == "zero_work" {
+                        completion(0, 0)
+                    } else {
+                        completion(200, 100)
+                    };
+                    let expected = match case {
+                        "reported" => {
+                            last["response"]["usage"]["cost"] = json!(2.5);
+                            2.5
+                        }
+                        "zero_bill" => {
+                            last["response"]["usage"]["cost"] = json!(0.0);
+                            0.0
+                        }
+                        "zero_work" => 0.0,
+                        _ => 10.0,
+                    };
+                    let rates = (case != "unpriced").then_some(crate::provider::ModelCost {
+                        audio: None,
+                        input: 1_000_000.0,
+                        output: 1_000_000.0,
+                        cache_read: 1_000_000.0,
+                        cache_write: 1_000_000.0,
+                    });
+                    let fixture =
+                        UsageHttpFixture::with_rates(mode, mode.events(&[first, last]), 9.0, rates);
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    runtime.block_on(async {
+                        let mut output = fixture
+                            .provider
+                            .stream(&Context::default(), &fixture.options)
+                            .await
+                            .unwrap();
+                        assert!(matches!(
+                            output.next().await,
+                            Some(Ok(StreamEvent::Start { .. }))
+                        ));
+                        assert_eq!(fixture.budget.snapshot().pending, 10.0);
+                        let events = terminal_events(&mut output).await;
+                        let Some(StreamEvent::Done { message, .. }) = events.last() else {
+                            panic!("expected completed bill for {mode:?}/{case}");
+                        };
+                        if case != "unpriced" {
+                            assert_eq!(message.usage.cost.total, expected);
+                            assert!(message.usage.has_explicit_billing());
+                            fixture.budget.admit().unwrap();
+                        } else {
+                            assert!(!message.usage.has_explicit_billing());
+                            assert!(matches!(fixture.budget.admit(), Err(Error::CostCap { .. })));
+                        }
+                        assert_eq!(fixture.budget.spent(), expected);
+                        assert_eq!(fixture.budget.snapshot().pending, 0.0);
+                        drop(output);
+                        assert_eq!(fixture.budget.spent(), expected);
+                    });
+                    fixture.assert_request();
+                }
+            }
+        }
+
+        #[test]
+        fn http_invalid_billing_quarantines_followups_without_losing_prior_spend() {
+            let invalid = [
+                json!({"input_tokens": 10, "output_tokens": 1, "input_tokens_details": {"cached_tokens": 6, "cache_write_tokens": 5}}),
+                json!({"input_tokens": u64::MAX, "output_tokens": 0, "input_tokens_details": {"cached_tokens": u64::MAX, "cache_write_tokens": 1}}),
+                json!({"input_tokens": u64::MAX, "output_tokens": 1}),
+                json!({"input_tokens": 10, "output_tokens": 1, "total_tokens": 10}),
+                json!({"input_tokens": 10, "output_tokens": 1, "input_tokens_details": {"cache_write_tokens": 5, "cache_write_tokens_details": {"ttl_30m_tokens": 1, "ttl_12h_tokens": 1}}}),
+                json!({"input_tokens": 10, "output_tokens": 1, "input_tokens_details": {"cache_write_tokens": 5, "cache_write_tokens_details": {"ttl_30m_tokens": u64::MAX, "ttl_12h_tokens": 1}}}),
+                json!({"input_tokens": 10, "output_tokens": 1, "input_tokens_details": {"cache_write_tokens": 5, "cache_write_tokens_details": {"ttl_30m_tokens": 0, "ttl_12h_tokens": 5}}}),
+                json!({"input_tokens": 10, "output_tokens": 1, "input_tokens_details": {"audio_tokens": 1}}),
+                json!({"input_tokens": 10, "output_tokens": 1, "output_tokens_details": {"audio_tokens": 1}}),
+                json!({"input_tokens": 10, "output_tokens": 1, "cost": null}),
+                json!({"input_tokens": 10, "output_tokens": 1, "cost": -1}),
+                json!({"input_tokens": 10, "output_tokens": 1, "cost": "0"}),
+            ];
+            for mode in MODES {
+                for usage in &invalid {
+                    let frame = json!({"type": "response.completed", "response": {"usage": usage}});
+                    let fixture = UsageHttpFixture::new(
+                        mode,
+                        mode.events(&[completion(7, 3), frame, completion(0, 0)]),
+                        100.0,
+                    );
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    runtime.block_on(async {
+                        let mut output = fixture
+                            .provider
+                            .stream(&Context::default(), &fixture.options)
+                            .await
+                            .unwrap();
+                        assert!(matches!(
+                            output.next().await,
+                            Some(Ok(StreamEvent::Start { .. }))
+                        ));
+                        let error = output.next().await.unwrap().expect_err("invalid billing");
+                        assert!(
+                            error.to_string().contains("cost accounting"),
+                            "{usage}: {error}"
+                        );
+                        assert_eq!(fixture.budget.spent(), 10.0, "{usage}");
+                        assert_eq!(fixture.budget.snapshot().pending, 0.0);
+                        assert!(
+                            fixture.budget.admit().is_err(),
+                            "invalid bill reopened budget: {usage}"
+                        );
+                        assert!(
+                            fixture
+                                .provider
+                                .stream(&Context::default(), &fixture.options)
+                                .await
+                                .is_err()
+                        );
+                        assert!(matches!(output.next().now_or_never(), Some(None)));
+                    });
+                    fixture.assert_request();
+                }
+            }
+        }
+
+        #[test]
+        fn http_explicit_bill_accounts_for_unpriceable_token_partitions() {
+            for mode in MODES {
+                for details in [
+                    json!({"cached_tokens": 11}),
+                    json!({"audio_tokens": 1}),
+                    json!({"cache_write_tokens": 5, "cache_write_tokens_details": {"ttl_30m_tokens": 0, "ttl_12h_tokens": 5}}),
+                ] {
+                    let mut frame = completion(10, 1);
+                    frame["response"]["usage"]["input_tokens_details"] = details;
+                    frame["response"]["usage"]["cost"] = json!(2.5);
+                    let fixture =
+                        UsageHttpFixture::with_rates(mode, mode.events(&[frame]), 2.0, None);
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    runtime.block_on(async {
+                        let mut output = fixture
+                            .provider
+                            .stream(&Context::default(), &fixture.options)
+                            .await
+                            .unwrap();
+                        let events = terminal_events(&mut output).await;
+                        let Some(StreamEvent::Done { message, .. }) = events.last() else {
+                            panic!("expected reported bill for {mode:?}");
+                        };
+                        assert!(matches!(
+                            message.usage.billing.as_ref(),
+                            Some(BillingUsage::ReportedTotal { total }) if *total == 2.5
+                        ));
+                        assert_eq!(message.usage.cost.total, 2.5);
+                        assert_eq!(fixture.budget.spent(), 2.5);
+                        assert!(matches!(fixture.budget.admit(), Err(Error::CostCap { .. })));
+                    });
+                    fixture.assert_request();
+                }
+            }
+        }
+
+        #[test]
+        fn http_usage_reserves_before_public_terminal_and_survives_drop() {
+            for mode in MODES {
+                let fixture = UsageHttpFixture::new(mode, mode.events(&[completion(7, 3)]), 9.0);
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                runtime.block_on(async {
+                    let mut output = fixture
+                        .provider
+                        .stream(&Context::default(), &fixture.options)
+                        .await
+                        .unwrap();
+                    assert_eq!(fixture.budget.snapshot().pending, 0.0);
+                    let Some(Ok(StreamEvent::Start { partial })) = output.next().await else {
+                        panic!("expected Start for {mode:?}");
+                    };
+                    mode.assert_identity(&partial);
+                    // Start is cloned before the completion frame's usage is
+                    // applied; only the private observer can reserve this bill.
+                    assert_eq!(partial.usage.total_tokens, 0);
+                    assert_eq!(partial.usage.cost.total, 0.0);
+                    assert_eq!(fixture.budget.snapshot().pending, 10.0);
+                    assert_eq!(fixture.budget.spent(), 0.0);
+                    assert!(matches!(
+                        fixture
+                            .provider
+                            .stream(&Context::default(), &fixture.options)
+                            .await,
+                        Err(Error::CostCap { .. })
+                    ));
+                    drop(output);
+                    assert_eq!(fixture.budget.spent(), 10.0);
+                    assert_eq!(fixture.budget.snapshot().pending, 0.0);
+                });
+                fixture.assert_request();
+            }
+        }
+
+        #[test]
+        fn http_failed_responses_preserve_optional_and_previously_reported_usage() {
+            for mode in MODES {
+                for usage_source in ["failure", "earlier", "none"] {
+                    let mut failure = json!({
+                        "type": "response.failed",
+                        "response": {"error": {"message": "fixture failure"}}
+                    });
+                    let mut frames = Vec::new();
+                    if usage_source == "failure" {
+                        failure["response"]["usage"] =
+                            completion(7, 3)["response"]["usage"].clone();
+                    } else if usage_source == "earlier" {
+                        frames.push(completion(7, 3));
+                    }
+                    frames.extend([failure, completion(99, 99)]);
+                    let expected = if usage_source == "none" { 0.0 } else { 10.0 };
+                    let fixture = UsageHttpFixture::new(mode, mode.events(&frames), 9.0);
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    runtime.block_on(async {
+                        let mut output = fixture
+                            .provider
+                            .stream(&Context::default(), &fixture.options)
+                            .await
+                            .unwrap();
+                        assert!(matches!(
+                            output.next().await,
+                            Some(Ok(StreamEvent::Start { .. }))
+                        ));
+                        assert_eq!(fixture.budget.snapshot().pending, expected);
+                        let Some(Ok(StreamEvent::Error { error, .. })) = output.next().await else {
+                            panic!("expected failure for {mode:?}/{usage_source}");
+                        };
+                        mode.assert_identity(&error);
+                        assert_eq!(error.error_message.as_deref(), Some("fixture failure"));
+                        assert_eq!(error.usage.cost.total, expected);
+                        assert_eq!(fixture.budget.spent(), expected);
+                        assert_eq!(fixture.budget.snapshot().pending, 0.0);
+                        assert!(matches!(output.next().now_or_never(), Some(None)));
+                        drop(output);
+                        assert_eq!(fixture.budget.spent(), expected);
+                    });
+                    fixture.assert_request();
+                }
+            }
+        }
+
+        #[test]
+        fn http_semantic_rejection_keeps_usage_from_the_same_frame() {
+            for mode in MODES {
+                for invalid_status in ["in_progress", "incomplete"] {
+                    let mut frame = completion(7, 3);
+                    frame["response"]["status"] = json!(invalid_status);
+                    let fixture =
+                        UsageHttpFixture::new(mode, mode.events(&[frame, completion(99, 99)]), 9.0);
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    runtime.block_on(async {
+                        let mut output = fixture
+                            .provider
+                            .stream(&Context::default(), &fixture.options)
+                            .await
+                            .unwrap();
+                        let Some(Ok(StreamEvent::Start { partial })) = output.next().await else {
+                            panic!("expected Start for {mode:?}/{invalid_status}");
+                        };
+                        assert_eq!(partial.usage.total_tokens, 0);
+                        assert_eq!(fixture.budget.snapshot().pending, 10.0);
+                        let Some(Ok(StreamEvent::Error { error, .. })) = output.next().await else {
+                            panic!("invalid completion must remain rejected");
+                        };
+                        assert_eq!((error.usage.input, error.usage.output), (7, 3));
+                        assert_eq!(error.usage.cost.total, 10.0);
+                        assert_eq!(fixture.budget.spent(), 10.0);
+                        assert_eq!(fixture.budget.snapshot().pending, 0.0);
+                        assert!(matches!(output.next().now_or_never(), Some(None)));
+                        drop(output);
+                        assert_eq!(fixture.budget.spent(), 10.0);
+                    });
+                    fixture.assert_request();
+                }
+            }
+        }
+
+        #[test]
+        fn http_decode_error_after_usage_settles_the_acknowledged_bill() {
+            for mode in MODES {
+                let mut body = mode.events(&[completion(7, 3)]);
+                body.extend(mode.frame("{"));
+                body.extend(mode.events(&[completion(99, 99)]));
+                let fixture = UsageHttpFixture::new(mode, body, 9.0);
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                runtime.block_on(async {
+                    let mut output = fixture
+                        .provider
+                        .stream(&Context::default(), &fixture.options)
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        output.next().await,
+                        Some(Ok(StreamEvent::Start { .. }))
+                    ));
+                    assert_eq!(fixture.budget.snapshot().pending, 10.0);
+                    let error = output.next().await.unwrap().expect_err("invalid JSON");
+                    assert!(error.to_string().contains("JSON parse error"));
+                    assert_eq!(fixture.budget.spent(), 10.0);
+                    assert_eq!(fixture.budget.snapshot().pending, 0.0);
+                    assert!(matches!(output.next().now_or_never(), Some(None)));
+                    drop(output);
+                    assert_eq!(fixture.budget.spent(), 10.0);
+                });
+                fixture.assert_request();
+            }
+        }
+
+        #[test]
+        fn http_cumulative_usage_reprices_updates_and_settles_repeated_metadata_once() {
+            for mode in MODES {
+                let mut body = mode.events(&[
+                    completion(7, 3),
+                    completion(7, 3),
+                    completion(17, 9),
+                    completion(17, 9),
+                    text_delta("late text"),
+                ]);
+                body.extend(mode.frame("[DONE]"));
+                let fixture = UsageHttpFixture::new(mode, body, 25.0);
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                runtime.block_on(async {
+                    let mut output = fixture
+                        .provider
+                        .stream(&Context::default(), &fixture.options)
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        output.next().await,
+                        Some(Ok(StreamEvent::Start { .. }))
+                    ));
+                    assert_eq!(fixture.budget.snapshot().pending, 10.0);
+                    assert!(matches!(
+                        output.next().await,
+                        Some(Ok(StreamEvent::TextStart { .. }))
+                    ));
+                    assert_eq!(fixture.budget.snapshot().pending, 26.0);
+                    assert_eq!(fixture.budget.spent(), 0.0);
+                    assert!(matches!(
+                        fixture
+                            .provider
+                            .stream(&Context::default(), &fixture.options)
+                            .await,
+                        Err(Error::CostCap { .. })
+                    ));
+                    let events = terminal_events(&mut output).await;
+                    let Some(StreamEvent::Done { message, .. }) = events.last() else {
+                        panic!("expected completion for {mode:?}");
+                    };
+                    mode.assert_identity(message);
+                    assert_eq!((message.usage.input, message.usage.output), (17, 9));
+                    assert_eq!(message.usage.cost.total, 26.0);
+                    assert_eq!(fixture.budget.spent(), 26.0);
+                    assert_eq!(fixture.budget.snapshot().pending, 0.0);
+                    assert!(matches!(output.next().now_or_never(), Some(None)));
+                    drop(output);
+                    assert_eq!(fixture.budget.spent(), 26.0);
+                });
+                fixture.assert_request();
+            }
         }
 
         fn text_delta(text: &str) -> Value {
@@ -7668,6 +8341,139 @@ mod tests {
                 };
                 assert_eq!((message.usage.input, message.usage.output), (17, 9));
                 assert_retired(&mut output, &observation);
+            }
+        }
+
+        fn visible_burst(mode: Mode, tools: bool, count: usize) -> Vec<u8> {
+            let mut frames = if tools {
+                (0..count)
+                    .map(|index| {
+                        json!({
+                            "type": "response.output_item.done",
+                            "item": {
+                                "type": "function_call", "id": format!("fc_{index}"),
+                                "call_id": format!("call_{index}"), "name": "echo", "arguments": "{}"
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                let mut frames = (0..count).map(|_| text_delta("λ")).collect::<Vec<_>>();
+                frames.push(json!({
+                    "type": "response.output_item.done",
+                    "item": {"type": "message", "id": "msg_1"}
+                }));
+                frames
+            };
+            frames.push(completion(17, 9));
+            let mut body = mode.events(&frames);
+            body.extend(mode.frame("[DONE]"));
+            body
+        }
+
+        #[test]
+        fn draining_visible_text_and_tools_yields_without_losing_usage_or_replay_ids() {
+            for mode in MODES {
+                for tools in [false, true] {
+                    let count = MAX_READY_EVENTS_PER_YIELD * 2;
+                    let (mut output, observation) = observed_stream(
+                        mode,
+                        vec![Ok(visible_burst(mode, tools, count))],
+                        Tail::Pending,
+                    );
+                    let flag = Arc::new(WakeFlag::default());
+                    let waker = Waker::from(Arc::clone(&flag));
+                    let mut task = TaskContext::from_waker(&waker);
+                    let mut drain = Box::pin(output.by_ref().collect::<Vec<_>>());
+                    assert!(
+                        std::future::Future::poll(drain.as_mut(), &mut task).is_pending(),
+                        "{mode:?} drained every visible event without yielding"
+                    );
+                    assert!(
+                        flag.0.load(Ordering::SeqCst),
+                        "visible drain must self-wake"
+                    );
+                    assert!(!observation.dropped.load(Ordering::SeqCst));
+                    let events = futures::executor::block_on(drain)
+                        .into_iter()
+                        .collect::<Result<Vec<_>>>()
+                        .unwrap();
+                    let Some(StreamEvent::Done { reason, message }) = events.last() else {
+                        panic!("visible drain lost terminal event for {mode:?}");
+                    };
+                    mode.assert_identity(message);
+                    assert_eq!((message.usage.input, message.usage.output), (17, 9));
+                    assert_eq!(message.usage.total_tokens, 26);
+                    if tools {
+                        assert_eq!(*reason, StopReason::ToolUse);
+                        assert_eq!(message.content.len(), count);
+                        assert_eq!(
+                            events
+                                .iter()
+                                .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                                .count(),
+                            count
+                        );
+                        for (index, block) in message.content.iter().enumerate() {
+                            let ContentBlock::ToolCall(call) = block else {
+                                panic!("tool burst changed content kind");
+                            };
+                            assert_eq!(call.id, format!("call_{index}"));
+                            assert_eq!(call.arguments, json!({}));
+                            assert_eq!(call.thought_signature, Some(format!("fc_{index}")));
+                        }
+                    } else {
+                        assert_eq!(*reason, StopReason::Stop);
+                        let text = events
+                            .iter()
+                            .filter_map(|event| match event {
+                                StreamEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                                _ => None,
+                            })
+                            .collect::<String>();
+                        assert_eq!(text, "λ".repeat(count));
+                        let [ContentBlock::Text(block)] = message.content.as_slice() else {
+                            panic!("text burst changed content kind");
+                        };
+                        assert_eq!(block.text, text);
+                        assert_eq!(block.text_signature.as_deref(), Some("msg_1"));
+                    }
+                    assert_retired(&mut output, &observation);
+                }
+            }
+        }
+
+        #[test]
+        fn cancellation_wins_while_a_consumer_drains_ready_visible_events() {
+            for mode in MODES {
+                for tools in [false, true] {
+                    let (mut output, observation) = observed_stream(
+                        mode,
+                        vec![Ok(visible_burst(
+                            mode,
+                            tools,
+                            MAX_READY_EVENTS_PER_YIELD * 2,
+                        ))],
+                        Tail::Pending,
+                    );
+                    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                    runtime.block_on(async {
+                        let (abort, signal) = crate::agent::AbortHandle::new();
+                        let drain = Box::pin(output.by_ref().collect::<Vec<_>>());
+                        let cancel = Box::pin(async move {
+                            abort.abort();
+                            signal.wait().await;
+                        });
+                        match futures::future::select(drain, cancel).await {
+                            futures::future::Either::Right(((), pending)) => drop(pending),
+                            futures::future::Either::Left(_) => {
+                                panic!("visible drain starved cancellation for {mode:?}")
+                            }
+                        }
+                    });
+                    drop(output);
+                    assert!(observation.dropped.load(Ordering::SeqCst));
+                }
             }
         }
 

@@ -120,6 +120,10 @@ pub trait CostRemote: Send + Sync {
 /// outlive work cancellation, but cannot admit another request or alter limits.
 pub trait CostRemoteAttempt: Send {
     fn observe(&mut self, cost: f64) -> Result<CostSnapshot>;
+    /// Replace this live attempt's provisional amount with an acknowledged bill.
+    /// Implementations must order corrections with ordinary observations and
+    /// retain the corrected amount if the owning channel is later cancelled.
+    fn observe_authoritative(&mut self, cost: f64) -> Result<CostSnapshot>;
     /// `None` reports invalid billing and quarantines the owning account while
     /// retaining the last valid partial charge. This operation is never replayed.
     /// A supplied deadline bounds cleanup of a group of owned attempts, so
@@ -1009,7 +1013,7 @@ impl CostBudget {
             // sink for each fork would make the safety bound a lifetime limit.
             return state.persist_retired(None);
         }
-        origins.insert(
+        let previous_origin = origins.insert(
             origin.key.clone(),
             ReadOrigin::from_source(Arc::clone(&origin), BTreeSet::from([state.account.clone()])),
         );
@@ -1054,7 +1058,8 @@ impl CostBudget {
                 "saved model cost coverage exceeds the live account",
             ));
         }
-        let retired = Retirement::prepare(origin, baseline, covered, owner)?;
+        let retired =
+            Retirement::prepare(origin, baseline, covered, previous_origin.as_ref(), owner)?;
         // Hold the account mutex across initial persistence and registration:
         // settlement during the asynchronous source save is included relative
         // to the exact saved counter, and no later settlement can miss its sink.
@@ -1089,9 +1094,24 @@ pub struct CostAttempt {
 }
 
 impl CostAttempt {
+    /// Retain the highest acknowledged provisional estimate for this request.
     pub fn observe(&mut self, cost: f64) -> Result<()> {
+        self.observe_snapshot(cost, false)
+    }
+
+    /// Correct this request's pending amount without settling or releasing its
+    /// ownership. A later drop charges the corrected bill exactly once.
+    pub fn observe_authoritative(&mut self, cost: f64) -> Result<()> {
+        self.observe_snapshot(cost, true)
+    }
+
+    #[allow(clippy::float_cmp)] // Identical cumulative snapshots require no new receipt.
+    fn observe_snapshot(&mut self, cost: f64, authoritative: bool) -> Result<()> {
         if self.settled {
             return Err(Error::session("model cost attempt is already settled"));
+        }
+        if self.invalid_usage {
+            return Err(Error::session("provider returned invalid model cost"));
         }
         if !cost.is_finite() || cost < 0.0 {
             self.invalid_usage = true;
@@ -1099,7 +1119,7 @@ impl CostAttempt {
                 .quarantine("provider returned invalid model cost");
             return Err(Error::session("provider returned invalid model cost"));
         }
-        if cost <= self.known_cost {
+        if cost == self.known_cost || (!authoritative && cost < self.known_cost) {
             return Ok(());
         }
         self.known_cost = cost;
@@ -1117,7 +1137,14 @@ impl CostAttempt {
                 *entry = cost;
                 state.changed()
             }
-            AttemptSource::Remote(remote) => self.budget.accept_remote(remote.observe(cost)),
+            AttemptSource::Remote(remote) => {
+                let result = if authoritative {
+                    remote.observe_authoritative(cost)
+                } else {
+                    remote.observe(cost)
+                };
+                self.budget.accept_remote(result)
+            }
         }
     }
 
@@ -1800,6 +1827,63 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_usage_corrects_only_its_owned_pending_charge_before_settlement() {
+        for corrected in [0.0, 0.25, 3.0] {
+            let budget = CostBudget::new(None, Some(2.0), 0.0).unwrap();
+            let mut first = budget.start_attempt().unwrap();
+            let mut sibling = budget.start_attempt().unwrap();
+            sibling.observe(0.5).unwrap();
+            first.observe(2.0).unwrap();
+            assert!(matches!(budget.admit(), Err(Error::CostCap { .. })));
+            let old = budget.snapshot();
+
+            first.observe_authoritative(corrected).unwrap();
+            let current = budget.snapshot();
+            assert_eq!(current.spent, 0.0, "a correction is not settlement");
+            assert_eq!(current.pending, corrected + 0.5);
+            assert!(current.revision > old.revision);
+            assert_eq!(budget.admit().is_ok(), corrected < 1.5);
+            first.observe_authoritative(corrected).unwrap();
+            assert_eq!(budget.snapshot().revision, current.revision);
+            budget.accept_remote(Ok(old)).unwrap();
+            assert_eq!(budget.snapshot().pending, corrected + 0.5);
+
+            first.observe(corrected / 2.0).unwrap();
+            assert_eq!(budget.snapshot().pending, corrected + 0.5);
+            drop(first);
+            assert_eq!(budget.spent(), corrected);
+            assert_eq!(budget.snapshot().pending, 0.5);
+            drop(sibling);
+            assert_eq!(budget.spent(), corrected + 0.5);
+            assert_eq!(budget.snapshot().pending, 0.0);
+        }
+    }
+
+    #[test]
+    fn invalid_corrections_cannot_refund_known_usage_or_reopen_a_settled_attempt() {
+        for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+            let budget = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+            let mut attempt = budget.start_attempt().unwrap();
+            attempt.observe(2.0).unwrap();
+            assert!(attempt.observe_authoritative(invalid).is_err());
+            assert!(attempt.observe_authoritative(0.0).is_err());
+            assert_eq!(budget.snapshot().pending, 2.0);
+            assert!(budget.admit().is_err());
+            drop(attempt);
+            assert_eq!(budget.spent(), 2.0);
+            assert_eq!(budget.snapshot().pending, 0.0);
+            assert!(budget.admit().is_err());
+        }
+
+        let budget = CostBudget::new(None, Some(5.0), 0.0).unwrap();
+        let mut attempt = budget.start_attempt().unwrap();
+        attempt.finish(0.5).unwrap();
+        assert!(attempt.observe_authoritative(0.0).is_err());
+        assert_eq!(budget.spent(), 0.5);
+        assert_eq!(budget.snapshot().pending, 0.0);
+    }
+
+    #[test]
     fn dropped_attempts_preserve_known_usage_and_invalid_bills_do_not_refund_it() {
         let budget = CostBudget::new(None, Some(1.0), 0.0).unwrap();
         let mut first = budget.start_attempt().unwrap();
@@ -1912,7 +1996,7 @@ mod tests {
                             total: 0.5,
                             ..Cost::default()
                         },
-                        billing: Some(BillingUsage::ReportedTotal { usd: 0.5 }),
+                        billing: Some(BillingUsage::ReportedTotal { total: 0.5 }),
                         ..Usage::default()
                     },
                     stop_reason: StopReason::Stop,
@@ -2309,6 +2393,221 @@ mod tests {
     }
 
     #[test]
+    fn acknowledged_cost_sinks_refuse_missing_or_rolled_back_writers() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+        for corruption in [
+            "missing-journal",
+            "missing-writer",
+            "decreased-total",
+            "increased-baseline",
+            "lost-billing-refusal",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut source = Session::create_with_dir(Some(directory.path().to_path_buf()));
+            let budget = CostBudget::new(None, Some(10.0), 0.0).unwrap();
+            budget.checkpoint(&mut source).unwrap();
+            runtime.block_on(source.save()).unwrap();
+            budget
+                .acknowledge_saved_session(&source, owner.cx())
+                .unwrap();
+            budget.record(1.0).unwrap();
+            let mut outstanding = budget.start_attempt().unwrap();
+            let account = budget.state.lock().unwrap().account.clone();
+
+            // A second live owner bills the same saved session after the first
+            // owner's last read. Recreating the journal from the first owner's
+            // memory would discard this peer's uncheckpointed two-dollar bill.
+            let peer = CostBudget::from_session(&source, None, Some(10.0)).unwrap();
+            peer.checkpoint(&mut source).unwrap();
+            runtime.block_on(source.save()).unwrap();
+            peer.acknowledge_saved_session(&source, owner.cx()).unwrap();
+            peer.record(2.0).unwrap();
+            assert_eq!(latest_checkpoint(&source).unwrap()["spent"], 1.0);
+            assert_eq!(recorded_spend(&source).unwrap(), 3.0);
+            if corruption == "lost-billing-refusal" {
+                budget.quarantine("known billing failure");
+            }
+
+            let origin = Origin::for_session(&source).unwrap().unwrap();
+            if corruption == "missing-journal" {
+                std::fs::rename(&origin.key, directory.path().join("retained-journal.json"))
+                    .unwrap();
+            } else {
+                let mut journal = serde_json::to_value(origin.read().unwrap()).unwrap();
+                match corruption {
+                    "missing-writer" => {
+                        journal["writers"].as_object_mut().unwrap().remove(&account);
+                    }
+                    "decreased-total" => {
+                        journal["writers"][&account]["ownTotal"] = serde_json::json!(0.5);
+                    }
+                    "increased-baseline" => {
+                        journal["writers"][&account]["baselineOwn"] = serde_json::json!(0.5);
+                    }
+                    "lost-billing-refusal" => {
+                        journal["writers"][&account]["billingUnavailable"] =
+                            serde_json::json!(false);
+                    }
+                    _ => unreachable!(),
+                }
+                std::fs::write(&origin.key, serde_json::to_vec(&journal).unwrap()).unwrap();
+            }
+            let before = std::fs::read(&origin.key).ok();
+            assert!(outstanding.finish(0.25).is_err(), "{corruption}");
+            assert_eq!(budget.spent(), 1.25, "retain the known final bill");
+            assert_eq!(std::fs::read(&origin.key).ok(), before, "{corruption}");
+            assert!(matches!(budget.admit(), Err(Error::Session(_))));
+            assert_eq!(std::fs::read(&origin.key).ok(), before, "{corruption}");
+        }
+    }
+
+    #[test]
+    fn settlement_cannot_rebuild_a_missing_or_rolled_back_live_peer() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+        for observe_by_refresh in [false, true] {
+            for remove_peer in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut source = Session::create_with_dir(Some(directory.path().to_path_buf()));
+                let budget = CostBudget::new(None, Some(10.0), 0.0).unwrap();
+                budget.checkpoint(&mut source).unwrap();
+                runtime.block_on(source.save()).unwrap();
+                budget
+                    .acknowledge_saved_session(&source, owner.cx())
+                    .unwrap();
+                budget.record(1.0).unwrap();
+                let mut outstanding = budget.start_attempt().unwrap();
+                let peer = CostBudget::from_session(&source, None, Some(10.0)).unwrap();
+                peer.checkpoint(&mut source).unwrap();
+                runtime.block_on(source.save()).unwrap();
+                peer.acknowledge_saved_session(&source, owner.cx()).unwrap();
+                peer.record(2.0).unwrap();
+                let known_spent = if observe_by_refresh {
+                    assert_eq!(budget.refresh().unwrap().spent, 3.0);
+                    3.0
+                } else {
+                    // A successful settlement observes the whole journal under
+                    // its lock, even without importing peers into live spend.
+                    budget.record(0.25).unwrap();
+                    1.25
+                };
+                peer.record(1.0).unwrap();
+                let origin = Origin::for_session(&source).unwrap().unwrap();
+                let account = peer.state.lock().unwrap().account.clone();
+                let mut journal = serde_json::to_value(origin.read().unwrap()).unwrap();
+                assert_eq!(journal["writers"][&account]["ownTotal"], 3.0);
+                if remove_peer {
+                    journal["writers"].as_object_mut().unwrap().remove(&account);
+                } else {
+                    journal["writers"][&account]["ownTotal"] = serde_json::json!(1.0);
+                }
+                let damaged = serde_json::to_vec(&journal).unwrap();
+                std::fs::write(&origin.key, &damaged).unwrap();
+
+                // The local writer is intact. Its old peer snapshot cannot
+                // recover the missing third dollar, so publishing it would
+                // silently refund a charge which was already acknowledged.
+                assert!(outstanding.finish(0.25).is_err());
+                assert_eq!(budget.spent(), known_spent + 0.25);
+                assert_eq!(std::fs::read(&origin.key).unwrap(), damaged);
+                assert!(matches!(budget.admit(), Err(Error::Session(_))));
+                assert_eq!(std::fs::read(&origin.key).unwrap(), damaged);
+            }
+        }
+    }
+
+    #[test]
+    fn first_retirement_keeps_its_same_source_observations() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+        for remove_journal in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut source = Session::create_with_dir(Some(directory.path().to_path_buf()));
+            let original = CostBudget::new(None, Some(10.0), 0.0).unwrap();
+            original.checkpoint(&mut source).unwrap();
+            runtime.block_on(source.save()).unwrap();
+            original
+                .acknowledge_saved_session(&source, owner.cx())
+                .unwrap();
+            original.record(1.0).unwrap();
+            let observer = CostBudget::from_session(&source, None, Some(10.0)).unwrap();
+            observer.checkpoint(&mut source).unwrap();
+            runtime.block_on(source.save()).unwrap();
+            original.record(1.0).unwrap();
+            let transcript = std::fs::read(source.path.as_ref().unwrap()).unwrap();
+            let origin = Origin::for_session(&source).unwrap().unwrap();
+            if remove_journal {
+                std::fs::rename(&origin.key, directory.path().join("retained-journal.json"))
+                    .unwrap();
+            } else {
+                let mut journal = serde_json::to_value(origin.read().unwrap()).unwrap();
+                journal["writers"] = serde_json::json!({});
+                std::fs::write(&origin.key, serde_json::to_vec(&journal).unwrap()).unwrap();
+            }
+            let damaged = std::fs::read(&origin.key).ok();
+            assert!(observer.state.lock().unwrap().retired.is_empty());
+            assert!(
+                observer
+                    .acknowledge_saved_session(&source, owner.cx())
+                    .is_err()
+            );
+            assert!(observer.state.lock().unwrap().retired.is_empty());
+            assert_eq!(std::fs::read(&origin.key).ok(), damaged);
+            assert_eq!(
+                std::fs::read(source.path.as_ref().unwrap()).unwrap(),
+                transcript
+            );
+            assert!(matches!(observer.admit(), Err(Error::Session(_))));
+        }
+    }
+
+    #[test]
+    fn cached_closed_peer_may_retire_without_blocking_new_bills() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = crate::agent_cx::AgentCx::for_testing_with_io();
+        let mut source = Session::create_with_dir(Some(directory.path().to_path_buf()));
+        let original = CostBudget::new(None, Some(10.0), 0.0).unwrap();
+        original.checkpoint(&mut source).unwrap();
+        runtime.block_on(source.save()).unwrap();
+        original
+            .acknowledge_saved_session(&source, owner.cx())
+            .unwrap();
+        original.record(1.0).unwrap();
+        let account = original.state.lock().unwrap().account.clone();
+        let observer = CostBudget::from_session(&source, None, Some(10.0)).unwrap();
+        observer.checkpoint(&mut source).unwrap();
+        runtime.block_on(source.save()).unwrap();
+        observer
+            .acknowledge_saved_session(&source, owner.cx())
+            .unwrap();
+        drop(original);
+        assert_eq!(observer.refresh().unwrap().spent, 1.0);
+        let origin = Origin::for_session(&source).unwrap().unwrap();
+        let mut journal = serde_json::to_value(origin.read().unwrap()).unwrap();
+        assert_eq!(journal["writers"][&account]["closed"], true);
+        journal["writers"].as_object_mut().unwrap().remove(&account);
+        std::fs::write(&origin.key, serde_json::to_vec(&journal).unwrap()).unwrap();
+        let mut outstanding = observer.start_attempt().unwrap();
+        outstanding.finish(0.5).unwrap();
+        assert_eq!(observer.spent(), 1.5);
+        assert_eq!(recorded_spend(&source).unwrap(), 1.5);
+        let mut next = observer.start_attempt().unwrap();
+        next.finish(0.25).unwrap();
+        assert_eq!(observer.spent(), 1.75);
+        assert_eq!(recorded_spend(&source).unwrap(), 1.75);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // Exercise the complete retirement and reopen lifecycle together.
     fn late_billing_failure_quarantines_live_and_reopened_accounts() {
         fn assert_unavailable<T: std::fmt::Debug>(result: Result<T>) {
@@ -2379,9 +2678,14 @@ mod tests {
                     assert!(journal.writers[&account].billing_unavailable);
                     // A stale healthy acknowledgement must never erase a
                     // refusal already written by this account.
-                    let stale =
-                        Retirement::prepare(Arc::clone(&origin), 1.0, Coverage::new(), owner.cx())
-                            .unwrap();
+                    let stale = Retirement::prepare(
+                        Arc::clone(&origin),
+                        1.0,
+                        Coverage::new(),
+                        None,
+                        owner.cx(),
+                    )
+                    .unwrap();
                     stale
                         .persist(
                             &account,
@@ -3228,8 +3532,9 @@ mod tests {
             assert_eq!(observer.state.lock().unwrap().own_finalized, 10.0);
 
             let target = Origin::for_session(&destination).unwrap().unwrap();
-            let stale = Retirement::prepare(Arc::clone(&target), 10.0, Coverage::new(), owner.cx())
-                .unwrap();
+            let stale =
+                Retirement::prepare(Arc::clone(&target), 10.0, Coverage::new(), None, owner.cx())
+                    .unwrap();
             stale
                 .persist(
                     &observer_id,

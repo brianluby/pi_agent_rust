@@ -2269,7 +2269,7 @@ fn read_scoped_file_capped_sync(
     Ok(contents)
 }
 
-fn read_file_capped_within_roots_sync(
+pub(crate) fn read_file_capped_within_roots_sync(
     path: &Path,
     allowed_roots: &[PathBuf],
     max_bytes: u64,
@@ -4582,6 +4582,38 @@ pub struct ProcessedFiles {
     pub attachments: Vec<ContentBlock>,
 }
 
+/// Effective attachment limits shared by CLI and interactive input. Image
+/// resizing retains its separate image cap; the media limit applies to each
+/// decoded audio/video attachment, just as it does for `read_media`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileArgumentOptions {
+    pub auto_resize_images: bool,
+    pub max_media_bytes: u64,
+}
+
+impl Default for FileArgumentOptions {
+    fn default() -> Self {
+        Self {
+            auto_resize_images: true,
+            max_media_bytes: crate::media_tools::DEFAULT_MEDIA_MAX_BYTES,
+        }
+    }
+}
+
+impl FileArgumentOptions {
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            auto_resize_images: config.image_auto_resize(),
+            max_media_bytes: config
+                .media
+                .as_ref()
+                .and_then(|media| media.max_bytes)
+                .unwrap_or(crate::media_tools::DEFAULT_MEDIA_MAX_BYTES),
+        }
+    }
+}
+
 fn normalize_dot_segments(path: &Path) -> PathBuf {
     use std::ffi::{OsStr, OsString};
     use std::path::Component;
@@ -5396,20 +5428,20 @@ fn append_media_argument(
 /// - Skips empty files
 /// - For images: attaches image blocks and appends `<file name="...">...</file>` references
 /// - For supported video/audio extensions: attaches the unchanged bytes as media,
-///   bounded by the default inline media byte cap
+///   bounded by the session's decoded media byte cap
 /// - For text: embeds the file contents inside `<file>` tags
 pub fn process_file_arguments(
     file_args: &[String],
     cwd: &Path,
-    auto_resize_images: bool,
+    options: FileArgumentOptions,
     workspace: &crate::workspace::WorkspaceHandle,
 ) -> Result<ProcessedFiles> {
     let mut out = ProcessedFiles::default();
 
     for file_arg in file_args {
         let resolved = resolve_read_path(file_arg, cwd);
-        let absolute_path = normalize_dot_segments(&resolved);
-        let absolute_path = enforce_read_scope(&absolute_path, cwd, workspace)?;
+        let attachment_path = normalize_dot_segments(&resolved);
+        let absolute_path = enforce_read_scope(&attachment_path, cwd, workspace)?;
 
         let meta = std::fs::metadata(&absolute_path).map_err(|e| {
             Error::tool(
@@ -5429,7 +5461,7 @@ pub fn process_file_arguments(
         if meta.is_dir() {
             append_file_notice_block(
                 &mut out.text,
-                &absolute_path,
+                &attachment_path,
                 "[Path is a directory, not a file. Use the list tool to view its contents.]",
             );
             continue;
@@ -5439,19 +5471,22 @@ pub fn process_file_arguments(
             continue;
         }
 
-        let media_mime_type = absolute_path
+        // The authored filename describes the attachment, including a symlink
+        // alias such as `recording.wav` backed by an extensionless cache file.
+        // Authorization and every filesystem operation use the canonical path.
+        let media_mime_type = attachment_path
             .extension()
             .and_then(|extension| extension.to_str())
             .and_then(crate::media_tools::media_mime_type_for_extension);
         let max_bytes = if media_mime_type.is_some() {
-            crate::media_tools::DEFAULT_MEDIA_MAX_BYTES
+            options.max_media_bytes
         } else {
             READ_TOOL_MAX_BYTES
         };
         if meta.len() > max_bytes {
             append_file_notice_block(
                 &mut out.text,
-                &absolute_path,
+                &attachment_path,
                 &format!(
                     "[File is too large ({} bytes). Max allowed is {} bytes.]",
                     meta.len(),
@@ -5476,22 +5511,27 @@ pub fn process_file_arguments(
             continue;
         }
 
-        if maybe_append_image_argument(&mut out, &absolute_path, &bytes, auto_resize_images)? {
+        if maybe_append_image_argument(
+            &mut out,
+            &attachment_path,
+            &bytes,
+            options.auto_resize_images,
+        )? {
             continue;
         }
 
         if let Some(mime_type) = media_mime_type {
-            append_media_argument(&mut out, &absolute_path, &bytes, mime_type);
+            append_media_argument(&mut out, &attachment_path, &bytes, mime_type);
         } else if looks_binary(&bytes) {
             // Decoded as text it would be up to a megabyte of replacement
             // characters. OMP skips binary mentions the same way.
             append_file_notice_block(
                 &mut out.text,
-                &absolute_path,
+                &attachment_path,
                 &format!("[Binary file ({} bytes), not included.]", bytes.len()), // ubs:ignore[rust.perf.string-alloc-in-loop] -- once per binary @file argument
             );
         } else {
-            append_text_file_block(&mut out.text, &absolute_path, &bytes);
+            append_text_file_block(&mut out.text, &attachment_path, &bytes);
         }
     }
 
@@ -6262,7 +6302,8 @@ impl ToolRegistry {
                             cwd,
                             vision_provider,
                             vision_model,
-                        ),
+                        )
+                        .with_workspace(workspace.clone()),
                     ));
                 }
                 "read_media" => {
@@ -6270,7 +6311,9 @@ impl ToolRegistry {
                         .and_then(|c| c.media.as_ref())
                         .and_then(|m| m.max_bytes);
                     tools.push(Box::new(
-                        crate::media_tools::ReadMediaTool::new(cwd).with_max_bytes(max_bytes),
+                        crate::media_tools::ReadMediaTool::new(cwd)
+                            .with_max_bytes(max_bytes)
+                            .with_workspace(workspace.clone()),
                     ));
                 }
                 "generate_image" => {
@@ -6278,7 +6321,8 @@ impl ToolRegistry {
                     let provider = media.and_then(|m| m.image_gen_provider.clone());
                     let model = media.and_then(|m| m.image_gen_model.clone());
                     tools.push(Box::new(
-                        crate::media_tools::GenerateImageTool::with_defaults(cwd, provider, model),
+                        crate::media_tools::GenerateImageTool::with_defaults(cwd, provider, model)
+                            .with_workspace(workspace.clone()),
                     ));
                 }
                 "tts" => {
@@ -6401,7 +6445,8 @@ impl ToolRegistry {
                         cwd,
                         media_cfg.vision_provider.clone(),
                         media_cfg.vision_model.clone(),
-                    ),
+                    )
+                    .with_workspace(workspace.clone()),
                 ));
             }
             if automatic_allowed("read_media")
@@ -6409,7 +6454,9 @@ impl ToolRegistry {
                 && !tools.iter().any(|t| t.name() == "read_media")
             {
                 tools.push(Box::new(
-                    crate::media_tools::ReadMediaTool::new(cwd).with_max_bytes(media_cfg.max_bytes),
+                    crate::media_tools::ReadMediaTool::new(cwd)
+                        .with_max_bytes(media_cfg.max_bytes)
+                        .with_workspace(workspace.clone()),
                 ));
             }
             if automatic_allowed("generate_image")
@@ -6424,7 +6471,8 @@ impl ToolRegistry {
                         cwd,
                         media_cfg.image_gen_provider.clone(),
                         media_cfg.image_gen_model.clone(),
-                    ),
+                    )
+                    .with_workspace(workspace.clone()),
                 ));
             }
             if automatic_allowed("tts")
@@ -9125,6 +9173,30 @@ pub(crate) struct BashRunControl<'a> {
     pub drain_timeout: Duration,
 }
 
+/// Shell dispatch must use the invoking context's authority even when the
+/// runner owns raw OS handles. A background monitor does not need the caller's
+/// async timer, so waiting authority is checked separately by foreground paths.
+pub(crate) fn check_bash_spawn_authority(owner: &AgentCx) -> Result<()> {
+    let capabilities = owner.capabilities();
+    if !capabilities.io || !capabilities.spawn {
+        return Err(Error::tool(
+            "bash",
+            "PI_BASH_PERMISSION: shell execution requires I/O and spawn capabilities",
+        ));
+    }
+    Ok(())
+}
+
+fn check_bash_wait_authority(owner: &AgentCx) -> Result<()> {
+    if !owner.capabilities().time {
+        return Err(Error::tool(
+            "bash",
+            "PI_BASH_PERMISSION: waiting for shell execution requires timer capability",
+        ));
+    }
+    Ok(())
+}
+
 /// Report cancellation before any shell or extension hook has started.
 /// The caller supplies a normalized timeout: `None` means unlimited execution.
 #[must_use]
@@ -9213,6 +9285,8 @@ async fn run_bash_command_with_state(
     {
         return Ok(bash_cancelled_before_start(timeout_secs));
     }
+    check_bash_spawn_authority(&cx)?;
+    check_bash_wait_authority(&cx)?;
     let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
     let mut bash_output = BashOutputState::new(max_chunks_bytes);
     bash_output.timeout_ms = timeout_secs.map(|s| s.saturating_mul(1000));
@@ -9270,8 +9344,29 @@ async fn run_bash_command_with_state(
     // can be killed reliably even if the shell exits first.
     isolate_command_process_group(&mut cmd);
 
-    let child = spawn_command_with_job_discipline(&mut cmd)
-        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell}: {e}")))?;
+    // Shell discovery and pipe preparation can take time. A queued abort or
+    // revoked owner must still prevent process creation at this boundary.
+    if control
+        .as_mut()
+        .is_some_and(|control| (control.abort_requested)())
+        || cx.checkpoint().is_err()
+    {
+        return Ok(bash_cancelled_before_start(timeout_secs));
+    }
+    let child = match cx.process().spawn_checked(&mut cmd) {
+        Ok(child) => child,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::Interrupted && cx.checkpoint().is_err() =>
+        {
+            return Ok(bash_cancelled_before_start(timeout_secs));
+        }
+        Err(error) => {
+            return Err(Error::tool(
+                "bash",
+                format!("Failed to spawn shell {shell}: {error}"),
+            ));
+        }
+    };
     // Command retains explicitly supplied Stdio handles after spawn. Its
     // parent copies must not keep the Windows writers alive after shell exit.
     drop(cmd);
@@ -9639,6 +9734,12 @@ pub(crate) async fn run_bash_command_pty(
         Some(0) => None,
         Some(value) => Some(value),
     };
+    let cx = AgentCx::for_current_or_request();
+    if cx.checkpoint().is_err() {
+        return Ok(bash_cancelled_before_start(timeout_secs));
+    }
+    check_bash_spawn_authority(&cx)?;
+    check_bash_wait_authority(&cx)?;
     let command = command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
         || command.to_string(),
         |prefix| format!("{prefix}\n{command}"),
@@ -9685,6 +9786,9 @@ pub(crate) async fn run_bash_command_pty(
     // portable-pty puts the child in its own session (setsid) on unix, so the
     // child pid is its process-group id and the shared tree-kill helpers work
     // exactly as they do for the pipe path's isolated process group.
+    if cx.checkpoint().is_err() {
+        return Ok(bash_cancelled_before_start(timeout_secs));
+    }
     let child = pair
         .slave
         .spawn_command(pty_cmd)
@@ -9717,7 +9821,6 @@ pub(crate) async fn run_bash_command_pty(
     let mut bash_output = BashOutputState::new(max_chunks_bytes);
     bash_output.timeout_ms = timeout_secs.map(|s| s.saturating_mul(1000));
 
-    let cx = AgentCx::for_current_or_request();
     let mut timed_out = false;
     let mut cancelled = false;
     let mut cancellation_reason: Option<BashCancellationReason> = None;
@@ -9930,6 +10033,7 @@ impl BashTool {
         shell_state: Option<&bash_session::ShellTransaction>,
     ) -> Result<Option<ToolOutput>> {
         let owner = AgentCx::for_current_or_request();
+        check_bash_wait_authority(&owner)?;
         owner
             .checkpoint()
             .map_err(|_| Error::tool("bash", "Command cancelled before spawn"))?;
@@ -10311,11 +10415,19 @@ impl Tool for BashTool {
     ) -> Result<ToolOutput> {
         let input: BashInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        let owner = AgentCx::for_current_or_request();
+        check_bash_spawn_authority(&owner)?;
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("bash", "Command cancelled before spawn"))?;
         let client_terminal = if input.background == Some(true) {
             None
         } else {
             self.terminal_client.get()?
         };
+        if input.background != Some(true) && client_terminal.is_none() {
+            check_bash_wait_authority(&owner)?;
+        }
         // PTY auto-selection (bd-cv653.1.7): isatty-requiring commands get a
         // real pseudo-terminal when `bash.pty` is auto/always; the tool
         // contract is identical either way.
@@ -10361,6 +10473,9 @@ impl Tool for BashTool {
             } else {
                 None
             };
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("bash", "Command cancelled before spawn"))?;
         let mut shell_state = None;
         let mut shell_notice = None;
         if persistent {
@@ -10496,6 +10611,9 @@ impl Tool for BashTool {
         // Every execution route passes the same mediation gate above.
         if let Some(client) = client_terminal {
             let command = self.client_terminal_command(&input)?;
+            owner
+                .checkpoint()
+                .map_err(|_| Error::tool("bash", "Command cancelled before client dispatch"))?;
             return client
                 .execute(command, on_update.as_deref())
                 .await
@@ -24123,6 +24241,175 @@ mod tests {
             std::task::Poll::Ready(Ok(false))
         ));
         assert!(owner.is_cancel_requested());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_bash_runners_preserve_restricted_invocation_authority() {
+        asupersync::test_utils::run_test(|| async {
+            let no_spawn = {
+                let restricted = asupersync::Cx::for_request()
+                    .restrict::<asupersync::cx::cap::CapSet<false, true, true, true, true>>();
+                let _current = restricted.set_current_restricted();
+                AgentCx::for_current_or_request()
+            };
+            let no_io = {
+                let restricted = asupersync::Cx::for_request()
+                    .restrict::<asupersync::cx::cap::CapSet<true, true, true, false, true>>();
+                let _current = restricted.set_current_restricted();
+                AgentCx::for_current_or_request()
+            };
+            let no_timer = {
+                let restricted = asupersync::Cx::for_request()
+                    .restrict::<asupersync::cx::cap::CapSet<true, false, true, true, true>>();
+                let _current = restricted.set_current_restricted();
+                AgentCx::for_current_or_request()
+            };
+            for owner in [no_spawn, no_io, no_timer] {
+                for use_pty in [false, true] {
+                    let root = tempfile::tempdir().expect("isolated shell workspace");
+                    let error = owner
+                        .with_current(execute_bash_spawn(
+                            root.path(),
+                            Some("/bin/sh"),
+                            None,
+                            "printf forbidden > command-started",
+                            Some(5),
+                            None,
+                            use_pty,
+                            None,
+                        ))
+                        .await
+                        .expect_err("the polling runtime cannot supply missing authority");
+                    assert!(error.to_string().contains("PI_BASH_PERMISSION"), "{error}");
+                    assert!(!root.path().join("command-started").exists());
+                }
+            }
+
+            // The denied invocations must restore their polling caller's
+            // context, and a valid ordinary shell still performs real work.
+            let root = tempfile::tempdir().expect("unrestricted shell workspace");
+            let result = execute_bash_spawn(
+                root.path(),
+                Some("/bin/sh"),
+                None,
+                "printf allowed > command-started",
+                Some(5),
+                None,
+                false,
+                None,
+            )
+            .await
+            .expect("unrestricted foreground dispatch");
+            assert_eq!(result.exit_code, 0);
+            assert!(!result.cancelled);
+            assert_eq!(
+                std::fs::read(root.path().join("command-started")).expect("command marker"),
+                b"allowed"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_native_bash_refuses_before_pipe_or_pty_startup() {
+        asupersync::test_utils::run_test(|| async {
+            for use_pty in [false, true] {
+                let root = tempfile::tempdir().expect("isolated shell workspace");
+                let absent_shell = root.path().join("shell-must-not-be-resolved");
+                for shell in [
+                    "/bin/sh".to_string(),
+                    absent_shell.to_string_lossy().into_owned(),
+                ] {
+                    let owner = AgentCx::for_request();
+                    owner.cancel_with(
+                        asupersync::types::CancelKind::User,
+                        Some("cancelled before shell startup"),
+                    );
+                    let result = owner
+                        .with_current(execute_bash_spawn(
+                            root.path(),
+                            Some(&shell),
+                            None,
+                            "printf forbidden > command-started",
+                            Some(5),
+                            None,
+                            use_pty,
+                            None,
+                        ))
+                        .await
+                        .expect("pre-cancellation must win before shell lookup or PTY startup");
+                    assert!(result.cancelled);
+                    assert_eq!(result.exit_code, -1);
+                    assert_eq!(
+                        result.cancellation_reason,
+                        Some(BashCancellationReason::AmbientCancellation)
+                    );
+                    assert!(!root.path().join("command-started").exists());
+                }
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_tool_does_not_launch_after_its_session_resolver_cancels_the_owner() {
+        asupersync::test_utils::run_test(|| async {
+            for background in [None, Some(true)] {
+                let root = tempfile::tempdir().expect("isolated shell workspace");
+                let artifacts = root.path().join("artifacts");
+                let owner_id = format!("bash-resolver-cancel-{}", uuid::Uuid::new_v4().simple());
+                let owner = AgentCx::for_request();
+                let resolver_owner = owner.clone();
+                let resolver_id = owner_id.clone();
+                let scope = crate::jobs::JobSessionScope::fixed(owner_id.clone());
+                scope.bind(Arc::new(move || {
+                    let owner = resolver_owner.clone();
+                    let owner_id = resolver_id.clone();
+                    let mut suspended = false;
+                    Box::pin(std::future::poll_fn(move |task| {
+                        if suspended {
+                            owner.cancel_with(
+                                asupersync::types::CancelKind::User,
+                                Some("cancelled while resolving shell ownership"),
+                            );
+                            std::task::Poll::Ready(Some(owner_id.clone()))
+                        } else {
+                            suspended = true;
+                            task.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        }
+                    }))
+                }));
+                let mut tool = BashTool::with_artifact_root(root.path(), &artifacts);
+                tool.shell_path = Some("/bin/sh".to_string());
+                tool.mediation = Some(crate::config::BashSettings {
+                    persistent: Some(false),
+                    ..Default::default()
+                });
+                tool.bind_job_session_scope(scope);
+                let error = owner
+                    .with_current(tool.execute(
+                        "cancelled-shell",
+                        serde_json::json!({
+                            "command": "printf forbidden > command-started",
+                            "background": background,
+                        }),
+                        None,
+                    ))
+                    .await
+                    .expect_err("cancelled session resolution must not dispatch a shell");
+                assert!(error.to_string().contains("cancelled"), "{error}");
+                assert!(!root.path().join("command-started").exists());
+                assert!(!artifacts.exists());
+                assert!(
+                    crate::jobs::list(&owner_id)
+                        .expect("owner listing")
+                        .is_empty()
+                );
+                assert!(!crate::jobs::has_pending_work(&owner_id).expect("owner idle"));
+            }
+        });
     }
 
     #[test]

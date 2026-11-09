@@ -62,6 +62,8 @@ const CURSOR_CLIENT_VERSION: &str = "cli-2026.01.09-231024f";
 
 /// The `api` identifier reported for streamed events / session logs.
 const CURSOR_API_NAME: &str = "cursor-agent";
+/// Error bodies are diagnostic control data, not generated model output.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
 // ============================================================================
 // Minimal protobuf wire codec (proto3 subset)
@@ -595,6 +597,10 @@ struct StreamState {
     open_block: Option<(usize, BlockKind)>,
     output_tokens: u64,
     used_tokens: Option<u64>,
+    usage_observer: Option<crate::provider::UsageObserver>,
+    /// Used only to redact this request's diagnostics; never serialized and
+    /// released with the wire source at the terminal boundary.
+    diagnostic_token: Option<String>,
     error_message: Option<String>,
     started: bool,
     finalized: bool,
@@ -617,12 +623,59 @@ impl StreamState {
             open_block: None,
             output_tokens: 0,
             used_tokens: None,
+            usage_observer: None,
+            diagnostic_token: None,
             error_message: None,
             started: false,
             finalized: false,
             done: false,
             transient_error_count: 0,
         }
+    }
+
+    fn with_usage_observer(mut self, observer: Option<crate::provider::UsageObserver>) -> Self {
+        self.usage_observer = observer;
+        self
+    }
+
+    fn with_diagnostic_token(mut self, token: String) -> Self {
+        self.diagnostic_token = Some(token);
+        self
+    }
+
+    /// A completed response remains exhausted when an SDK consumer polls it
+    /// again. `unfold` itself must not be repolled after returning `None`.
+    fn into_stream(self) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>> {
+        Box::pin(
+            stream::unfold(self, |mut state| async move {
+                state.next_event().await.map(|event| (event, state))
+            })
+            .fuse(),
+        )
+    }
+
+    fn record_usage(&mut self, authoritative: bool) -> Result<()> {
+        let output = self.output_tokens;
+        let total = self.used_tokens.unwrap_or(output);
+        // Token deltas accumulate output; checkpoints replace the aggregate.
+        // The decoded protocol exposes no cache tiers or USD bill. Rebuild the
+        // snapshot so a locally priced earlier value cannot become a wire bill.
+        self.partial.usage = Usage {
+            input: total.saturating_sub(output),
+            output,
+            cache_read: 0,
+            cache_write: 0,
+            total_tokens: total,
+            ..Usage::default()
+        };
+        if let Some(observer) = &self.usage_observer {
+            if authoritative {
+                observer.observe_authoritative(&mut self.partial.usage)?;
+            } else {
+                observer.observe(&self.partial.usage)?;
+            }
+        }
+        Ok(())
     }
 
     fn ensure_started(&mut self) {
@@ -641,6 +694,7 @@ impl StreamState {
         self.done = true;
         self.source = Box::pin(stream::empty());
         self.frames = FrameBuffer::default();
+        self.diagnostic_token = None;
     }
 
     /// Close the currently-open content block, emitting its `*End` event.
@@ -776,8 +830,9 @@ impl StreamState {
         if frame.end_stream {
             // Invalid or absent terminal metadata must never promote partial
             // output to a successful assistant message.
-            self.error_message = connect::terminal_error(&payload)?;
-            self.finalize();
+            self.error_message =
+                connect::terminal_error(&payload, self.diagnostic_token.as_deref())?;
+            self.finalize()?;
             // The end-of-stream frame is the protocol terminator: stop reading so
             // we neither process data frames that arrive after `Done` nor block on
             // `source.next()` if the server holds the HTTP body open. `finalize`
@@ -789,35 +844,36 @@ impl StreamState {
         let events = decode_server_message(&payload)?;
         self.budget
             .admit(&events, self.open_block.map(|(_, kind)| kind))?;
+        let has_usage = events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::TokenDelta(_) | ServerEvent::UsedTokens(_)
+            )
+        });
         for event in events {
             self.apply(event);
+        }
+        if has_usage {
+            // An accepted frame can report usage without producing a public
+            // event. Retain it before pending reads, cancellation or a later
+            // malformed frame can drop this request's private counters.
+            self.record_usage(false)?;
         }
         Ok(())
     }
 
     /// Emit the closing events (open-block `*End`, then `Done`/`Error`).
-    fn finalize(&mut self) {
+    fn finalize(&mut self) -> Result<()> {
         if self.finalized {
-            return;
+            return Ok(());
         }
+        // The validated Connect terminator makes the latest counters final.
+        // Publish that correction before buffered Start/*End events permit
+        // the caller to drop the stream without consuming Done or Error.
+        self.record_usage(true)?;
         self.finalized = true;
         self.ensure_started();
         self.close_open_block();
-
-        let output = self.output_tokens;
-        let total = self.used_tokens.unwrap_or(output);
-        // Cursor reports only an aggregate token count and has no prompt-cache
-        // tiers, so `input` (per pi's #121 convention, cache reads excluded)
-        // is the non-output remainder.
-        let input = total.saturating_sub(output);
-        self.partial.usage = Usage {
-            input,
-            output,
-            cache_read: 0,
-            cache_write: 0,
-            total_tokens: total,
-            ..Usage::default()
-        };
 
         if let Some(message) = self.error_message.take() {
             self.partial.stop_reason = StopReason::Error;
@@ -833,6 +889,7 @@ impl StreamState {
                 message: self.partial.clone(),
             });
         }
+        Ok(())
     }
 
     /// Produce the next [`StreamEvent`], reading and framing more of the HTTP
@@ -1040,10 +1097,12 @@ impl Provider for CursorProvider {
         let response = Box::pin(request.send()).await?;
         let status = response.status();
         if !(200..300).contains(&status) {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|err| format!("<failed to read body: {err}>"));
+            let body = match response.text_limited(MAX_ERROR_BODY_BYTES).await {
+                Ok(body) => connect::diagnostic_detail(&body, Some(&token)),
+                Err(_) => format!(
+                    "response body could not be read within the {MAX_ERROR_BODY_BYTES}-byte diagnostic limit"
+                ),
+            };
             return Err(Error::provider(
                 &self.provider,
                 format!("Cursor API error (HTTP {status}): {body}"),
@@ -1060,12 +1119,11 @@ impl Provider for CursorProvider {
             ..AssistantMessage::default()
         };
 
-        let mut state = StreamState::new(response.bytes_stream(), partial);
+        let mut state = StreamState::new(response.bytes_stream(), partial)
+            .with_usage_observer(options.usage_observer.clone())
+            .with_diagnostic_token(token);
         state.encoding = encoding;
-        let stream = stream::unfold(state, |mut state| async move {
-            state.next_event().await.map(|event| (event, state))
-        });
-        Ok(Box::pin(stream))
+        Ok(state.into_stream())
     }
 }
 

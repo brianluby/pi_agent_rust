@@ -1,6 +1,64 @@
 # Web-Remote Access Threat Model & Security Posture
 
-> **Status:** Active Security Gate  
+## Current implementation: supervised loopback companion
+
+The implemented `pi web` path is documented in the
+[browser companion guide](../tools/web_remote.md). It serves bounded completed
+conversation snapshots over authenticated loopback HTTP. Prompt proposals
+require explicit local F8 acceptance and a final session/credential check at
+driver admission. It does not expose raw terminal frames, WebSockets, Tailscale
+binding, or unattended remote control.
+
+Current controls include 256-bit single-use pairing links, hashed credentials,
+exact Host and Origin checks, a restrictive CSP, privacy discovery before
+omission or clipping, non-restorable redaction, bounded memory and connection
+lifetimes, and revocation of pending proposals. The in-memory audit ring holds
+metadata only. Browser extensions or a compromised browser can still read data
+already delivered to that browser; in-memory storage and CSP do not prevent
+that access.
+
+The real listener and native admission regressions are in
+`src/web_remote/companion/tests.rs`, `src/web_remote/companion/projection.rs`,
+and `src/interactive_ftui.rs`. Their authoritative execution path is DSR.
+
+## Explicit terminal mirror
+
+`pi web --terminal` uses `WebRemoteServer` and `WebRemoteBridge` as a separate
+authenticated WebSocket surface, also available to embedding hosts. It supports terminal keyframes and
+patches, local approval of control leases, and bounded sequenced input with
+provenance revalidated at admission, native consumption, and agent submission.
+Host input revokes control. The approval panel must visibly contain the complete
+client identity and decision hint; small terminals cannot silently approve a
+clipped request. A separate remote composer preserves the local draft.
+
+The mirror requires fullscreen FTUI and a local terminal. Loopback is default;
+Tailscale and LAN binding require explicit flags. Pairing tokens remain in
+memory, expire after ten minutes, and are consumed once. Exact Host/Origin
+checks, a strict CSP, request/write deadlines, bounded input queues, and bounded
+frame history constrain the transport. The server is owned by the native
+session and joins its connections at shutdown.
+
+Complete source blocks are screened before wrapping or clipping with immutable,
+revisioned privacy scopes. A vault change retires a stale scoped publication.
+Local drafts, authentication/questions, in-flight response text, and truncated
+live tool cards are withheld from the browser projection. Completed safe
+transcript and status updates remain visible. Credentials learned in previous
+session states remain protected within the bounded listener history.
+
+Its socket regressions live in
+`src/web_remote/server.rs`; manager and privacy coverage also appears in
+`tests/web_remote.rs`, `tests/web_security.rs`, and `src/interactive_ftui.rs`.
+Only the selected browser mode starts. Mirror credentials and leases cannot
+authorize companion proposals. Neither implementation establishes WASM,
+headless, QR, or a passed runtime security gate; DSR execution remains required.
+
+## Historical design: WASM remote terminal
+
+The sections below retain the earlier design and its proposed acceptance
+criteria. They do not describe the current companion or establish a passed
+security gate for it.
+
+> **Status:** Historical design, not the current runtime contract
 > **Bead ID:** `bd-cv653.10.3`  
 > **Schema:** `pi.web.threat_model.v1`  
 > **Feature:** `pi web` (WASM Browser Client over WebSocket Frame Diffs)
