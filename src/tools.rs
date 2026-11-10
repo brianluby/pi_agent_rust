@@ -1695,7 +1695,11 @@ fn write_text_tool_output_artifact_at_root(
         preview_bytes,
         content_type: "text/plain; charset=utf-8",
         retention_class: TOOL_OUTPUT_ARTIFACT_RETENTION_CLASS,
-        spillover_reason: TOOL_OUTPUT_ARTIFACT_SPILLOVER_REASON,
+        spillover_reason: if full_text.len() > TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES {
+            TOOL_OUTPUT_ARTIFACT_SPILLOVER_REASON
+        } else {
+            "sourceTextExceededPreviewLimit"
+        },
         redaction_summary: redacted.summary,
         safe_delete_candidate: true,
     };
@@ -1838,6 +1842,26 @@ fn attach_text_artifact_if_needed_at_root(
     if full_text.len() <= TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES {
         return false;
     }
+    attach_text_artifact_at_root(
+        root,
+        output_text,
+        details,
+        tool_name,
+        tool_call_id,
+        source_kind,
+        full_text,
+    )
+}
+
+fn attach_text_artifact_at_root(
+    root: &Path,
+    output_text: &mut String,
+    details: &mut Option<serde_json::Value>,
+    tool_name: &str,
+    tool_call_id: &str,
+    source_kind: &str,
+    full_text: &str,
+) -> bool {
     match write_text_tool_output_artifact_at_root(
         root,
         tool_name,
@@ -1859,6 +1883,36 @@ fn attach_text_artifact_if_needed_at_root(
             false
         }
     }
+}
+
+/// Preserve an already-truncated text result, including line-only overflow
+/// below the ordinary byte spill threshold. Persistence failure remains an
+/// explicit bounded-preview diagnostic; it does not change tool execution.
+pub(crate) fn attach_truncated_text_artifact(
+    root: Option<&Path>,
+    output_text: &mut String,
+    details: &mut Option<serde_json::Value>,
+    tool_name: &str,
+    tool_call_id: &str,
+    source_kind: &str,
+    full_text: &str,
+) -> bool {
+    let default_root;
+    let root = if let Some(root) = root {
+        root
+    } else {
+        default_root = tool_output_artifact_root();
+        &default_root
+    };
+    attach_text_artifact_at_root(
+        root,
+        output_text,
+        details,
+        tool_name,
+        tool_call_id,
+        source_kind,
+        full_text,
+    )
 }
 
 fn attach_text_artifact_if_needed(
@@ -7048,6 +7102,14 @@ impl ToolRegistry {
         self.media_auth_scope.set(owner, auth);
     }
 
+    pub(crate) fn set_media_model_registry(
+        &self,
+        owner: &Arc<()>,
+        registry: Option<&crate::models::ModelRegistry>,
+    ) {
+        self.media_auth_scope.set_models(owner, registry);
+    }
+
     /// Get all tools.
     pub fn tools(&self) -> &[Arc<dyn Tool>] {
         &self.tools
@@ -7210,7 +7272,7 @@ impl SharedToolRegistry {
         replacements: Vec<Box<dyn Tool>>,
         active: Option<&[String]>,
         initial: bool,
-    ) -> Vec<Arc<dyn Tool>> {
+    ) -> (Vec<Arc<dyn Tool>>, std::sync::Weak<ToolRegistry>) {
         let mut guard = self
             .inner
             .registry
@@ -7226,13 +7288,15 @@ impl SharedToolRegistry {
                     || before.description() != after.description()
                     || before.parameters() != after.parameters()
             });
-        *guard = Arc::new(next);
+        let next = Arc::new(next);
+        let published_snapshot = Arc::downgrade(&next);
+        *guard = next;
         if schema_changed {
             self.inner
                 .version
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        published
+        (published, published_snapshot)
     }
 
     /// Publish a modified registry: shallow-copy the current snapshot, apply
@@ -29077,19 +29141,26 @@ mod known_tool_name_tests {
                 catalog_tool("denied", "Excluded extension", ToolOrigin::Extension),
             ]
         };
-        let mut owned = shared.reconcile_extension_tools(&[], tools(), None, true);
+        let (mut owned, published_snapshot) =
+            shared.reconcile_extension_tools(&[], tools(), None, true);
         assert_eq!(
             owned.len(),
             1,
             "excluded tools cannot enter inactive ownership"
         );
         let original = shared.snapshot();
+        assert!(std::sync::Weak::ptr_eq(
+            &published_snapshot,
+            &Arc::downgrade(&original)
+        ));
         assert_eq!(
             describe_catalog_tool(&original, "late")["description"],
             "Extension catalog"
         );
         let version = shared.version();
-        owned = shared.reconcile_extension_tools(&owned, tools(), None, false);
+        owned = shared
+            .reconcile_extension_tools(&owned, tools(), None, false)
+            .0;
         assert_eq!(
             shared.version(),
             version,
@@ -29103,12 +29174,14 @@ mod known_tool_name_tests {
         assert!(shelved.get("xdev").is_none());
         assert!(shelved.discoverable_index().is_empty());
         assert_eq!(shelved.inactive_tools().len(), 1);
-        owned = shared.reconcile_extension_tools(
-            &owned,
-            tools(),
-            Some(&["late".to_string(), "denied".to_string()]),
-            false,
-        );
+        owned = shared
+            .reconcile_extension_tools(
+                &owned,
+                tools(),
+                Some(&["late".to_string(), "denied".to_string()]),
+                false,
+            )
+            .0;
         assert!(shared.snapshot().get("denied").is_none());
         assert_eq!(
             describe_catalog_tool(&shared.snapshot(), "late")["description"],
@@ -29136,7 +29209,7 @@ mod known_tool_name_tests {
                 .count(),
             1
         );
-        let released = shared.reconcile_extension_tools(&owned, Vec::new(), None, false);
+        let (released, _) = shared.reconcile_extension_tools(&owned, Vec::new(), None, false);
         assert!(released.is_empty());
         assert_eq!(
             shared.snapshot().get("late").unwrap().origin(),

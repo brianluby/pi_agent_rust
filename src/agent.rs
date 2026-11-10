@@ -959,6 +959,7 @@ struct SemanticContextPromptStats {
 pub struct QueuedAgentMessage {
     message: Message,
     keyword_scan_source: Option<String>,
+    display_text: Option<String>,
     persistence_identity: Arc<OnceLock<QueuedPersistenceIdentity>>,
 }
 
@@ -979,6 +980,7 @@ impl QueuedAgentMessage {
         Self {
             message,
             keyword_scan_source,
+            display_text: None,
             persistence_identity: Arc::new(OnceLock::new()),
         }
     }
@@ -1008,6 +1010,7 @@ impl QueuedAgentMessage {
         Self {
             message,
             keyword_scan_source,
+            display_text: None,
             persistence_identity: Arc::new(OnceLock::new()),
         }
     }
@@ -1019,8 +1022,18 @@ impl QueuedAgentMessage {
         Self {
             message,
             keyword_scan_source: None,
+            display_text: None,
             persistence_identity: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Preserve an editor draft independently of the instruction scan source.
+    /// Attachment paths belong in restored input, but must not activate magic
+    /// keywords when they were removed from the authored instruction text.
+    #[must_use]
+    pub fn with_display_text(mut self, text: impl Into<String>) -> Self {
+        self.display_text = Some(text.into());
+        self
     }
 
     #[must_use]
@@ -1066,21 +1079,24 @@ impl QueuedAgentMessage {
         self.keyword_scan_source.as_deref()
     }
 
-    /// Text suitable for queue previews/editor restoration. Prefer the raw
-    /// authored source, falling back to provider-visible text for explicitly
-    /// suppressed generated entries.
+    /// Text suitable for queue previews/editor restoration. Prefer an explicit
+    /// editor draft, then the authored scan source, then provider-visible text
+    /// for explicitly suppressed generated entries.
     #[must_use]
     pub fn text_for_display(&self) -> Option<&str> {
-        self.keyword_scan_source().or_else(|| match &self.message {
-            Message::User(user) => match &user.content {
-                UserContent::Text(text) => Some(text.as_str()),
-                UserContent::Blocks(blocks) => blocks.iter().find_map(|block| match block {
-                    ContentBlock::Text(text) => Some(text.text.as_str()),
-                    _ => None,
-                }),
-            },
-            _ => None,
-        })
+        self.display_text
+            .as_deref()
+            .or(self.keyword_scan_source())
+            .or_else(|| match &self.message {
+                Message::User(user) => match &user.content {
+                    UserContent::Text(text) => Some(text.as_str()),
+                    UserContent::Blocks(blocks) => blocks.iter().find_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    }),
+                },
+                _ => None,
+            })
     }
 
     #[must_use]
@@ -2024,9 +2040,10 @@ pub struct PrimaryRestoreRequest<'a> {
     /// runtime or the persisted Session as a corrupted model of the session:
     /// it blocks provider admission and fails the call, because re-entering a
     /// provider against a session nobody can describe is how work gets
-    /// re-billed against a record that no longer matches it. Print has no
-    /// admission gate and no long-lived state to corrupt, so it declines and
-    /// runs the next prompt on the fallback, which is a correct outcome there.
+    /// re-billed against a record that no longer matches it. Print and the
+    /// SDK decline a stale selection and retain the fallback. Every surface
+    /// treats interrupted or failed persistence as terminal uncertainty and
+    /// quarantines provider admission regardless of this flag.
     ///
     /// Preserved rather than unified, because unifying it would silently
     /// change a surface people depend on; the divergence is tracked
@@ -2136,7 +2153,9 @@ pub struct Agent {
     /// A prewalk only yields to the owning session driver; it never installs
     /// a provider inside the tool loop or lets a tool choose the destination.
     prewalk: Option<crate::prewalk::PrewalkState>,
-    prewalk_budget: Option<PrewalkRunBudget>,
+    /// One logical request retains its limits through retries, failover,
+    /// compaction recovery and optional prewalk handoffs.
+    run_budget: Option<LogicalRunBudget>,
     prewalk_evidence: StdMutex<crate::prewalk::ToolEvidence>,
 
     /// Discoverable tools promoted into the live schema mid-session via
@@ -2252,10 +2271,11 @@ struct ScopedRuleState {
     activated: std::collections::HashSet<usize>,
 }
 
-/// A prewalk continuation and any recovery attempts share the original run
-/// clock and tool budget. The SDK resets this only at a public turn boundary.
+/// Recovery attempts and prewalk continuations share the original run clock
+/// and tool budget. Native drivers reset this only at a public turn boundary,
+/// regardless of whether the request has an armed prewalk.
 #[derive(Clone, Copy)]
-struct PrewalkRunBudget {
+struct LogicalRunBudget {
     started: std::time::Instant,
     max_time: Option<Duration>,
     iterations: usize,
@@ -2374,7 +2394,7 @@ impl Agent {
             ),
             stream_rule_turn: 0,
             prewalk: None,
-            prewalk_budget: None,
+            run_budget: None,
             prewalk_evidence: StdMutex::new(crate::prewalk::ToolEvidence::default()),
             promoted_tools: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             tool_defs_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2498,7 +2518,7 @@ impl Agent {
         );
         self.stream_rule_turn = 0;
         self.prewalk = None;
-        self.prewalk_budget = None;
+        self.run_budget = None;
         self.take_prewalk_evidence();
         self.keyword_ledger.clear();
         self.retry_keyword_activations.clear();
@@ -2512,7 +2532,7 @@ impl Agent {
         self.prewalk.as_ref().map(|state| &state.target)
     }
 
-    pub(crate) fn begin_prewalk_run(&mut self) {
+    pub(crate) fn begin_logical_run(&mut self) {
         self.take_prewalk_evidence();
         // An abandoned SDK future may have yielded before it installed the
         // target. A later public prompt must not silently resume that decision.
@@ -2523,7 +2543,7 @@ impl Agent {
         {
             self.prewalk = None;
         }
-        self.prewalk_budget = self.prewalk.as_ref().map(|_| PrewalkRunBudget {
+        self.run_budget = Some(LogicalRunBudget {
             started: std::time::Instant::now(),
             max_time: self.config.max_time,
             iterations: 0,
@@ -2533,9 +2553,9 @@ impl Agent {
         });
     }
 
-    pub(crate) fn finish_prewalk_run(&mut self, interrupted: bool) {
+    pub(crate) fn finish_logical_run(&mut self, interrupted: bool) {
         self.take_prewalk_evidence();
-        self.prewalk_budget = None;
+        self.run_budget = None;
         if interrupted {
             self.prewalk = None;
         }
@@ -2574,7 +2594,7 @@ impl Agent {
         input: &Value,
         output: &ToolOutput,
     ) {
-        if self.prewalk_budget.is_none()
+        if self.run_budget.is_none()
             || self.prewalk.is_none()
             || output.is_error
             || crate::agent_cx::AgentCx::for_current_or_request()
@@ -3329,7 +3349,7 @@ impl Agent {
                 .expect("cache populated above"),
         );
 
-        let system_prompt = if self.prewalk_budget.is_some() && self.prewalk.is_some() {
+        let system_prompt = if self.run_budget.is_some() && self.prewalk.is_some() {
             let mut prompt = self.config.system_prompt.clone().unwrap_or_default();
             prompt.push_str("\n\n## Prewalk\nInvestigate the request and plan the implementation before making changes. If the todo tool is available, record a concrete todo list before editing project files. Begin the first real implementation change; the session will automatically hand off after that completed tool batch. Do not stop to announce or request the handoff. For discussion or read-only requests, answer normally without making an artificial edit.");
             Some(Cow::Owned(prompt))
@@ -4183,7 +4203,7 @@ impl Agent {
             .as_deref()
             .unwrap_or("")
             .into();
-        let budget = self.prewalk_budget;
+        let budget = self.run_budget;
         let mut iterations = budget.map_or(0, |budget| budget.iterations);
         let mut pause_turn_continuations = budget.map_or(0, |budget| budget.pause_continuations);
         let mut warned_at_handoff_threshold = budget.is_some_and(|budget| budget.warned);
@@ -4211,7 +4231,6 @@ impl Agent {
         // Always poll the owning source: a private staged batch does not prove
         // that the exact RPC batch which triggered this continuation was fetched.
         let mut follow_up_staged = false;
-        let mut required_initial_follow_up_pending = initial_follow_up;
         if initial_follow_up {
             self.fetch_initial_follow_up_messages().await;
             follow_up_staged = self.message_queue.follow_up_batch_len() > 0;
@@ -4280,8 +4299,7 @@ impl Agent {
             let mut steering_after_tools: Option<Vec<QueuedAgentMessage>> = None;
 
             while has_more_tool_calls || !pending_messages.is_empty() {
-                if !required_initial_follow_up_pending
-                    && let Some(cap) = max_time
+                if let Some(cap) = max_time
                     && run_started.elapsed() >= cap
                 {
                     // The owning surface already acknowledged these messages.
@@ -4336,7 +4354,6 @@ impl Agent {
                     }
                     let current_follow_up = self.message_queue.pop_follow_up();
                     follow_up_staged = false;
-                    required_initial_follow_up_pending = false;
                     if current_follow_up.is_empty() {
                         // The session changed after staging and every queued
                         // job notice belonged to the previous owner. Reach the
@@ -4570,7 +4587,7 @@ impl Agent {
                 has_more_tool_calls = execute_local_tools;
                 if pause_turn {
                     pause_turn_continuations = pause_turn_continuations.saturating_add(1);
-                    if let Some(budget) = &mut self.prewalk_budget {
+                    if let Some(budget) = &mut self.run_budget {
                         budget.pause_continuations = pause_turn_continuations;
                     }
                     if pause_turn_continuations <= MAX_PAUSE_TURN_CONTINUATIONS {
@@ -4591,7 +4608,7 @@ impl Agent {
                 let mut tool_results: Vec<Arc<ToolResultMessage>> = Vec::new();
                 if execute_local_tools {
                     iterations += 1;
-                    if let Some(budget) = &mut self.prewalk_budget {
+                    if let Some(budget) = &mut self.run_budget {
                         budget.iterations = iterations;
                     }
                     // Soft handoff: at >=80% of the cap, push a one-shot
@@ -4608,6 +4625,9 @@ impl Agent {
                         )
                     {
                         warned_at_handoff_threshold = true;
+                        if let Some(budget) = &mut self.run_budget {
+                            budget.warned = true;
+                        }
                         let warning = Message::User(UserMessage {
                             content: UserContent::Text(iteration_handoff_steering_text(
                                 iterations,
@@ -4766,12 +4786,12 @@ impl Agent {
                 on_event(turn_end_event);
 
                 turn_index = turn_index.saturating_add(1);
-                if let Some(budget) = &mut self.prewalk_budget {
+                if let Some(budget) = &mut self.run_budget {
                     budget.turn_index = turn_index;
                     budget.warned = warned_at_handoff_threshold;
                 }
                 let prewalk_evidence = self.take_prewalk_evidence();
-                let handoff = if self.prewalk_budget.is_some()
+                let handoff = if self.run_budget.is_some()
                     && let Some(prewalk) = &mut self.prewalk
                 {
                     prewalk.observe(prewalk_evidence);
@@ -7876,11 +7896,11 @@ impl AdvisorTurn {
                 .map(|_| Arc::new(StdMutex::new(None))),
             started: session
                 .agent
-                .prewalk_budget
+                .run_budget
                 .map_or_else(Instant::now, |budget| budget.started),
             max_time: session
                 .agent
-                .prewalk_budget
+                .run_budget
                 .map_or(session.agent.config.max_time, |budget| budget.max_time),
         }
     }
@@ -7988,7 +8008,7 @@ struct SessionTurnPromptGuard<'a> {
     session: &'a mut AgentSession,
     base_system_prompt: Option<String>,
     base_max_time: Option<Duration>,
-    base_prewalk_max_time: Option<(Instant, Option<Duration>)>,
+    base_run_max_time: Option<(Instant, Option<Duration>)>,
 }
 
 impl<'a> SessionTurnPromptGuard<'a> {
@@ -8000,16 +8020,16 @@ impl<'a> SessionTurnPromptGuard<'a> {
             session,
             base_system_prompt,
             base_max_time,
-            base_prewalk_max_time: None,
+            base_run_max_time: None,
         }
     }
 
     fn limit_max_time(&mut self, started: Instant, max_time: Option<Duration>) {
         self.session.agent.config.max_time =
             max_time.map(|cap| cap.saturating_sub(started.elapsed()));
-        if let (Some(cap), Some(budget)) = (max_time, self.session.agent.prewalk_budget.as_mut()) {
-            self.base_prewalk_max_time = Some((budget.started, budget.max_time));
-            // Prewalk keeps its original clock through retries and handoffs.
+        if let (Some(cap), Some(budget)) = (max_time, self.session.agent.run_budget.as_mut()) {
+            self.base_run_max_time = Some((budget.started, budget.max_time));
+            // A logical run keeps its original clock through recovery.
             // Convert this wake's deadline to that clock before clamping it;
             // assigning the relative cap would count earlier work twice.
             let deadline = started
@@ -8027,8 +8047,8 @@ impl Drop for SessionTurnPromptGuard<'_> {
             .set_system_prompt(self.base_system_prompt.take());
         self.session.agent.config.max_time = self.base_max_time;
         if let (Some((started, max_time)), Some(budget)) = (
-            self.base_prewalk_max_time,
-            self.session.agent.prewalk_budget.as_mut(),
+            self.base_run_max_time,
+            self.session.agent.run_budget.as_mut(),
         ) && budget.started == started
         {
             // Restore the limit, retaining completed tool/turn accounting.
@@ -19007,6 +19027,10 @@ impl AgentSession {
     }
 
     pub fn set_model_registry(&mut self, registry: ModelRegistry) {
+        self.agent
+            .shared_tools()
+            .snapshot()
+            .set_media_model_registry(&self.media_auth_owner, Some(&registry));
         let provider = self.agent.provider();
         let entry = registry.find(provider.name(), provider.model_id());
         if let Some(entry) = &entry {
@@ -19590,6 +19614,10 @@ impl AgentSession {
                 .manager()
                 .set_current_model(Some(provider_id), Some(model_id));
         }
+        self.agent
+            .shared_tools()
+            .snapshot()
+            .set_media_model_registry(&self.media_auth_owner, registry.as_deref());
         self.model_registry = registry;
         self.refresh_extension_completion_host_state();
         if let Ok(mut state) = self.extension_ai_completion.lock() {
@@ -19620,14 +19648,15 @@ impl AgentSession {
         Ok(())
     }
 
-    /// Start the prewalk clock and capture session ownership for one logical
-    /// request. Native drivers retain this token through provider retries and
-    /// call `finish_prewalk_turn` after the final attempt. The SDK does this
-    /// automatically for its prompt/content/continuation entrypoints.
+    /// Start the logical request's shared clock and tool budget, and capture
+    /// session ownership for an optional prewalk handoff. Native drivers retain
+    /// this token through recovery attempts and call `finish_prewalk_turn`
+    /// after the final attempt. The SDK does this automatically for its
+    /// prompt/content/continuation entrypoints, even without an armed prewalk.
     #[must_use]
     pub fn begin_prewalk_turn(&mut self) -> crate::prewalk::PrewalkTurn {
         let origin = self.session_action_admission.capture_origin();
-        self.agent.begin_prewalk_run();
+        self.agent.begin_logical_run();
         crate::prewalk::PrewalkTurn { origin }
     }
 
@@ -19671,7 +19700,7 @@ impl AgentSession {
     /// Release the logical request's shared budgets. Errors and cancellation
     /// disarm an unfinished prewalk; a read-only completed request keeps it.
     pub fn finish_prewalk_turn(&mut self, interrupted: bool) {
-        self.agent.finish_prewalk_run(interrupted);
+        self.agent.finish_logical_run(interrupted);
     }
 
     /// A prewalk keeps provider and session-action authority from provenance
@@ -19960,7 +19989,7 @@ impl AgentSession {
         // No await may separate durable source installation from the arm.
         // On a failed save, the previous arm and live model remain untouched.
         self.agent.prewalk = next;
-        self.agent.prewalk_budget = None;
+        self.agent.run_budget = None;
         if let Some(policy) = &mut self.child_fallback_policy {
             policy.use_default_role();
         }
@@ -20274,13 +20303,11 @@ impl AgentSession {
     /// its absence means the caller's model of the turn is wrong rather than
     /// that there is nothing to do.
     ///
-    /// Print mode and the RPC server each had their own copy of this, down to
-    /// the same error prose (bd-u2qv4). `admission` is what was genuinely
-    /// RPC's: the gate is blocked for the window between persistence and live
-    /// installation, so a crash in between leaves provider re-entry quarantined
-    /// rather than silently resumed. Surfaces without such a gate pass `None`.
-    /// It is taken here rather than wrapped around the call so the lock order —
-    /// inner session first, admission permit second — stays exactly as it was.
+    /// Every caller uses the session's provider-admission authority. A dropped
+    /// persistence future or failed save quarantines later provider requests,
+    /// including print mode and embedders that drive recovery directly.
+    /// Provider admission precedes Session-action and store locks so an active
+    /// extension completion can finish its Session callbacks while we wait.
     pub async fn restore_retry_tail(
         &mut self,
         cx: &crate::agent_cx::AgentCx,
@@ -20299,6 +20326,12 @@ impl AgentSession {
         require_incomplete_tail: bool,
         admission: Option<&ProviderAdmissionGate>,
     ) -> Result<()> {
+        let admission = admission
+            .cloned()
+            .unwrap_or_else(|| self.provider_admission.clone());
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = session_actions.acquire(cx.cx()).await?;
         let session_store = Arc::clone(&self.session);
         let mut inner = OwnedMutexGuard::lock(session_store, cx)
             .await
@@ -20318,17 +20351,13 @@ impl AgentSession {
 
         let restored_messages = candidate.to_messages_for_current_path();
         let save_enabled = self.save_enabled();
-        let _provider_transition = match admission {
-            Some(gate) => Some(
-                gate.begin_transition(
-                    "retry restoration persistence was interrupted before live installation completed"
-                        .to_string(),
-                    cx,
-                )
-                .await?,
-            ),
-            None => None,
-        };
+        let _provider_transition = ProviderSwapAdmission::Held(&authority)
+            .begin_transition(
+                "retry restoration persistence was interrupted before live installation completed"
+                    .to_string(),
+                cx,
+            )
+            .await?;
         if save_enabled
             && let Err(first_err) = candidate.save().await
             && let Err(retry_err) = candidate.save().await
@@ -20336,9 +20365,7 @@ impl AgentSession {
             let reason = format!(
                 "retry restoration persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
             );
-            if let Some(gate) = admission {
-                gate.block(reason.clone());
-            }
+            admission.block(reason.clone());
             return Err(Error::session_persistence(reason));
         }
 
@@ -20350,9 +20377,7 @@ impl AgentSession {
         self.invalidate_background_compaction();
         *inner = candidate;
         self.agent.replace_messages(restored_messages);
-        if let Some(gate) = admission {
-            gate.clear();
-        }
+        admission.clear();
         Ok(())
     }
 
@@ -20440,7 +20465,13 @@ impl AgentSession {
         request: &PrimaryRestoreRequest<'_>,
         admission: Option<&ProviderAdmissionGate>,
     ) -> Result<Option<RestoredPrimary>> {
-        self.restore_primary_swap_admitted(cx, request, admission.map(ProviderSwapAdmission::Gate))
+        let admission = admission
+            .cloned()
+            .unwrap_or_else(|| self.provider_admission.clone());
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = session_actions.acquire(cx.cx()).await?;
+        self.restore_primary_with_authority(cx, request, &authority)
             .await
     }
 
@@ -20569,10 +20600,9 @@ impl AgentSession {
             if let Some(gate) = gate {
                 gate.block(reason.clone());
             }
-            if request.strict_invariants {
-                return Err(Error::session_persistence(reason));
-            }
-            return Ok(None);
+            // Leniency applies to unavailable or stale destinations. Once a
+            // save has started, uncertainty is terminal on every surface.
+            return Err(Error::session_persistence(reason));
         }
 
         // No fallible operation remains after installing the candidate.
@@ -20784,7 +20814,13 @@ impl AgentSession {
         attempt: &FailoverSwapAttempt<'_>,
         admission: Option<&ProviderAdmissionGate>,
     ) -> Result<FailoverSwapOutcome> {
-        self.try_failover_swap_admitted(cx, attempt, admission.map(ProviderSwapAdmission::Gate))
+        let admission = admission
+            .cloned()
+            .unwrap_or_else(|| self.provider_admission.clone());
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = session_actions.acquire(cx.cx()).await?;
+        self.try_failover_with_authority(cx, attempt, &authority)
             .await
     }
 
@@ -21035,9 +21071,19 @@ impl AgentSession {
         request: &FailoverSwapRequest<'_>,
         admission: Option<&ProviderAdmissionGate>,
     ) -> Result<crate::model::ThinkingLevel> {
-        self.commit_failover_swap_admitted(cx, request, admission.map(ProviderSwapAdmission::Gate))
-            .await
-            .map(|(thinking_level, _)| thinking_level)
+        let admission = admission
+            .cloned()
+            .unwrap_or_else(|| self.provider_admission.clone());
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = session_actions.acquire(cx.cx()).await?;
+        self.commit_failover_swap_admitted(
+            cx,
+            request,
+            Some(ProviderSwapAdmission::Held(&authority)),
+        )
+        .await
+        .map(|(thinking_level, _)| thinking_level)
     }
 
     async fn commit_failover_swap_admitted(
@@ -24458,19 +24504,15 @@ impl AgentSession {
     ) -> Result<AssistantMessage> {
         self.ensure_provider_reentry_allowed()?;
         let started = Instant::now();
-        let prewalk_remaining = self.agent.prewalk_budget.and_then(|budget| {
+        let run_remaining = self.agent.run_budget.and_then(|budget| {
             budget
                 .max_time
                 .map(|cap| cap.saturating_sub(started.saturating_duration_since(budget.started)))
         });
-        let max_time = [
-            self.agent.config.max_time,
-            remaining_time,
-            prewalk_remaining,
-        ]
-        .into_iter()
-        .flatten()
-        .min();
+        let max_time = [self.agent.config.max_time, remaining_time, run_remaining]
+            .into_iter()
+            .flatten()
+            .min();
         if abort.as_ref().is_some_and(AbortSignal::is_aborted)
             || max_time.is_some_and(|remaining| remaining.is_zero())
         {

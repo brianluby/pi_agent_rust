@@ -383,7 +383,7 @@ mod tests {
                     .await,
                 Err(Error::Aborted)
             ));
-            let expired = PrewalkRunBudget {
+            let expired = LogicalRunBudget {
                 started: Instant::now()
                     .checked_sub(Duration::from_secs(2))
                     .expect("the clock origin is over 2 s ago"),
@@ -393,7 +393,7 @@ mod tests {
                 turn_index: 4,
                 warned: false,
             };
-            session.agent.prewalk_budget = Some(expired);
+            session.agent.run_budget = Some(expired);
             assert!(
                 matches!(
                     session
@@ -432,7 +432,7 @@ mod tests {
                 ..AgentConfig::default()
             },
         );
-        agent.prewalk_budget = Some(PrewalkRunBudget {
+        agent.run_budget = Some(LogicalRunBudget {
             started,
             max_time,
             iterations: 3,
@@ -463,7 +463,7 @@ mod tests {
             );
             let mut scope = SessionTurnPromptGuard::new(&mut session, None);
             scope.limit_max_time(wake_started, Some(Duration::from_secs(10)));
-            let budget = scope.session.agent.prewalk_budget.expect("active prewalk");
+            let budget = scope.session.agent.run_budget.expect("active run");
             assert_eq!(budget.started, prewalk_started);
             assert_eq!(budget.max_time, Some(Duration::from_secs(expected_cap)));
             let advisor = AdvisorTurn::new(scope.session, Arc::new(|_| {}));
@@ -473,12 +473,12 @@ mod tests {
             scope
                 .session
                 .agent
-                .prewalk_budget
+                .run_budget
                 .as_mut()
                 .unwrap()
                 .iterations += 1;
             drop(scope);
-            let restored = session.agent.prewalk_budget.expect("surviving prewalk");
+            let restored = session.agent.run_budget.expect("surviving run");
             assert_eq!(restored.started, prewalk_started);
             assert_eq!(restored.max_time, original_cap);
             assert_eq!(
@@ -538,7 +538,7 @@ mod tests {
             .await
             .expect("wake must retain time for its second provider request");
             drop(wake);
-            let restored = session.agent.prewalk_budget.expect("surviving prewalk");
+            let restored = session.agent.run_budget.expect("surviving run");
             assert_eq!(restored.started, started);
             assert_eq!(restored.max_time, Some(Duration::from_secs(600)));
             assert_eq!(
@@ -3038,6 +3038,116 @@ mod tests {
             assert_eq!(recorded_calls[0].messages.len(), 2);
             assert_user_text(&recorded_calls[0].messages[0], "older staged follow-up");
             assert_user_text(&recorded_calls[0].messages[1], "new owning follow-up");
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn required_initial_follow_up_retains_accepted_batch_after_shared_time_cap() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = CapturingProvider::new("openai-responses");
+            let calls = provider.calls();
+            let mut agent = Agent::new(
+                Arc::new(provider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig {
+                    max_time: Some(Duration::from_secs(60)),
+                    ..AgentConfig::default()
+                },
+            );
+            agent.set_queue_modes(QueueMode::All, QueueMode::All);
+            let expected = [
+                "older staged follow-up",
+                "owning follow-up one",
+                "owning follow-up two",
+            ];
+            agent.queue_follow_up(user_message(expected[0]));
+
+            let owning_source_fetched = StdArc::new(AtomicBool::new(false));
+            let fetched_for_source = StdArc::clone(&owning_source_fetched);
+            let queued_owning = StdArc::new(StdTestMutex::new(Some(
+                expected[1..]
+                    .iter()
+                    .map(|text| queued_user_message(text))
+                    .collect::<Vec<_>>(),
+            )));
+            let queued_for_source = StdArc::clone(&queued_owning);
+            let follow_up_fetcher =
+                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
+                    fetched_for_source.store(true, Ordering::SeqCst);
+                    let queued_for_source = StdArc::clone(&queued_for_source);
+                    Box::pin(async move {
+                        queued_for_source
+                            .lock()
+                            .expect("owning follow-up queue")
+                            .take()
+                            .unwrap_or_default()
+                    })
+                };
+            agent.register_initial_follow_up_fetcher(Arc::new(follow_up_fetcher));
+            agent.begin_logical_run();
+            agent.run_budget.as_mut().expect("active logical run").started = Instant::now()
+                .checked_sub(Duration::from_secs(120))
+                .expect("the clock origin is over 120 s ago");
+
+            let ready_checked = StdArc::new(AtomicBool::new(false));
+            let ready_for_callback = StdArc::clone(&ready_checked);
+            let fetched_for_callback = StdArc::clone(&owning_source_fetched);
+            let capped = agent
+                .run_continue_with_follow_up_on_ready_with_abort(
+                    None,
+                    move || {
+                        ready_for_callback.store(true, Ordering::SeqCst);
+                        fetched_for_callback.load(Ordering::SeqCst)
+                    },
+                    |_| {},
+                )
+                .await
+                .expect("time-capped initial follow-up");
+            assert!(assistant_text_content(&capped.content).contains("time cap reached"));
+            assert!(
+                ready_checked.load(Ordering::SeqCst),
+                "the owning-source handshake must still complete before the cap stop"
+            );
+            assert!(
+                calls.lock().expect("provider calls").is_empty(),
+                "a required initial follow-up must not restart the shared clock"
+            );
+            assert_eq!(agent.message_queue.follow_up.len(), expected.len());
+            for (entry, text) in agent.message_queue.follow_up.iter().zip(&expected) {
+                assert_user_text(&entry.delivery.message, text);
+            }
+
+            agent.finish_logical_run(false);
+            agent.begin_logical_run();
+            agent
+                .run_continue_with_follow_up_with_abort(None, |_| {})
+                .await
+                .expect("a fresh logical run resumes the retained batch");
+            agent.finish_logical_run(false);
+            assert!(agent.message_queue.follow_up.is_empty());
+            let recorded_calls = calls.lock().expect("provider calls").clone();
+            assert_eq!(recorded_calls.len(), 1);
+            let user_texts = recorded_calls[0]
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User(UserMessage {
+                        content: UserContent::Text(text),
+                        ..
+                    }) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                user_texts,
+                expected.to_vec(),
+                "each accepted follow-up must reach the provider exactly once"
+            );
         });
     }
 
@@ -6395,6 +6505,322 @@ mod tests {
         });
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum PublicRecovery {
+        Retry,
+        CommitFailover,
+        WalkFailover,
+        RestorePrimary,
+    }
+
+    async fn invoke_public_recovery(
+        session: &mut AgentSession,
+        operation: PublicRecovery,
+        models: &[ModelEntry],
+        auth: &AuthStorage,
+    ) -> Result<()> {
+        let cx = AgentCx::for_current_or_request();
+        let target = &models[1];
+        let active = (
+            session.agent.provider().name().to_string(),
+            session.agent.provider().model_id().to_string(),
+        );
+        match operation {
+            PublicRecovery::Retry => session.restore_retry_tail(&cx, true).await,
+            PublicRecovery::CommitFailover => {
+                let request = FailoverSwapRequest {
+                    entry: target,
+                    api_key: target.api_key.clone(),
+                    provider: crate::providers::create_provider(target, None)?,
+                    from_provider: &active.0,
+                    from_model: &active.1,
+                    class: crate::failover::FailoverClass::Transient,
+                    chain_position: 1,
+                    thinking_level_to_clamp: crate::model::ThinkingLevel::Off,
+                    require_incomplete_tail: true,
+                    primary: None,
+                    cooldown_secs: Some(0),
+                    lifecycle_id: Some("public-recovery-test"),
+                };
+                session.commit_failover(&cx, &request).await.map(|_| ())
+            }
+            PublicRecovery::WalkFailover => {
+                let chain = crate::failover::FailoverChain {
+                    entries: vec![format!("{}/{}", target.model.provider, target.model.id)],
+                };
+                let attempt = FailoverSwapAttempt {
+                    chain: &chain,
+                    start_position: 0,
+                    available_models: models,
+                    auth,
+                    cli_api_key: None,
+                    class: crate::failover::FailoverClass::Transient,
+                    thinking_level_to_clamp: crate::model::ThinkingLevel::Off,
+                    require_incomplete_tail: true,
+                    primary: None,
+                    cooldown_secs: Some(0),
+                    lifecycle_id: Some("public-recovery-test"),
+                };
+                let outcome = session.try_failover(&cx, &attempt).await?;
+                assert!(outcome.committed.is_some(), "fixture target must be usable");
+                Ok(())
+            }
+            PublicRecovery::RestorePrimary => {
+                let primary = crate::failover::FailoverPrimary {
+                    provider: target.model.provider.clone(),
+                    model_id: target.model.id.clone(),
+                    requested_thinking_level: crate::model::ThinkingLevel::Off,
+                };
+                let request = PrimaryRestoreRequest {
+                    primary: &primary,
+                    active: &active,
+                    cooldown_elapsed: true,
+                    available_models: models,
+                    auth,
+                    cli_api_key: None,
+                    strict_invariants: false,
+                    invalidate_background_compaction: true,
+                };
+                assert!(
+                    session.restore_primary(&cx, &request).await?.is_some(),
+                    "fixture primary must be restorable"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn public_recovery_fixture(
+        root: &Path,
+    ) -> (AgentSession, Arc<CapturingProvider>, Vec<ModelEntry>) {
+        let provider = Arc::new(CapturingProvider::new("openai-completions"));
+        let models = vec![
+            extension_switch_entry(provider.name(), provider.model_id()),
+            extension_switch_entry("recovery-target", "next-model"),
+        ];
+        let mut stored = Session::create_with_dir(Some(root.to_path_buf()));
+        stored.path = Some(root.join("session.jsonl"));
+        stored.select_model(provider.name().to_string(), provider.model_id().to_string());
+        stored.append_message(user_message("accepted input").into());
+        let mut failed = assistant_message("partial response");
+        failed.provider = provider.name().to_string();
+        failed.model = provider.model_id().to_string();
+        failed.stop_reason = StopReason::Error;
+        failed.error_message = Some("server error".to_string());
+        stored.append_message(crate::session::SessionMessage::Assistant { message: failed });
+        let mut agent = Agent::new(
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            ToolRegistry::new(&[], root, None),
+            AgentConfig::default(),
+        );
+        agent.replace_messages(stored.to_messages_for_current_path());
+        let session = AgentSession::new(
+            agent,
+            Arc::new(Mutex::new(stored)),
+            true,
+            ResolvedCompactionSettings::default(),
+        )
+        .with_model_registry(ModelRegistry::from_entries_for_tests(models.clone()));
+        (session, provider, models)
+    }
+
+    #[test]
+    fn public_recovery_save_failures_fence_later_provider_requests() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for operation in [
+                PublicRecovery::Retry,
+                PublicRecovery::CommitFailover,
+                PublicRecovery::WalkFailover,
+                PublicRecovery::RestorePrimary,
+            ] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let (mut session, provider, models) = public_recovery_fixture(dir.path());
+                let auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+                let blocked = dir.path().join("blocked.jsonl");
+                std::fs::create_dir(&blocked).expect("directory cannot hold a session");
+                let store = Arc::clone(&session.session);
+                store.try_lock().expect("session").path = Some(blocked);
+                let before = SessionEditSnapshot::capture(&store.try_lock().expect("session"))
+                    .expect("source snapshot");
+                let messages = serde_json::to_value(session.agent.messages()).expect("messages");
+
+                let error = invoke_public_recovery(&mut session, operation, &models, &auth)
+                    .await
+                    .expect_err("indeterminate persistence is never a declined candidate");
+                assert!(error.is_session_persistence(), "{operation:?}: {error}");
+                assert!(
+                    SessionEditSnapshot::capture(&store.try_lock().expect("session"))
+                        .expect("live snapshot")
+                        == before,
+                    "{operation:?}: live history must remain unchanged"
+                );
+                assert_eq!(session.agent.provider().name(), provider.name());
+                assert_eq!(
+                    serde_json::to_value(session.agent.messages()).expect("messages"),
+                    messages
+                );
+
+                // Repairing the path does not establish what an interrupted
+                // earlier save committed. Only reopening creates a new owner.
+                store.try_lock().expect("session").path = Some(dir.path().join("repaired.jsonl"));
+                let error = session
+                    .run_text("must not reach the provider".to_string(), |_| {})
+                    .await
+                    .expect_err("the existing owner remains quarantined");
+                assert!(error.is_session_persistence(), "{operation:?}: {error}");
+                assert!(provider.calls().lock().expect("calls").is_empty());
+                assert!(
+                    invoke_public_recovery(&mut session, operation, &models, &auth)
+                        .await
+                        .is_err_and(|error| error.is_session_persistence()),
+                    "another recovery operation cannot clear an existing quarantine"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn public_recovery_waits_before_locking_session_and_cancels_without_quarantine() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for operation in [
+                PublicRecovery::Retry,
+                PublicRecovery::CommitFailover,
+                PublicRecovery::WalkFailover,
+                PublicRecovery::RestorePrimary,
+            ] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let (mut session, provider, models) = public_recovery_fixture(dir.path());
+                let auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+                let store = Arc::clone(&session.session);
+                let gate = session.provider_admission_gate();
+                let actions = session.session_action_admission_gate();
+                let cx = AgentCx::for_current_or_request();
+                let in_flight = gate
+                    .acquire(cx.cx())
+                    .await
+                    .expect("active provider request");
+                let mut recovery = Box::pin(invoke_public_recovery(
+                    &mut session,
+                    operation,
+                    &models,
+                    &auth,
+                ));
+                assert!(
+                    futures::poll!(recovery.as_mut()).is_pending(),
+                    "{operation:?}"
+                );
+                assert!(
+                    store.try_lock().is_ok(),
+                    "provider callbacks need the store"
+                );
+                let mut callback_action = Box::pin(actions.acquire(cx.cx()));
+                let std::task::Poll::Ready(Ok(permit)) = futures::poll!(callback_action.as_mut())
+                else {
+                    panic!("waiting {operation:?} must not block active provider callbacks");
+                };
+                drop(permit);
+                drop(callback_action);
+                drop(recovery);
+                gate.ensure_allowed().expect("cancelled before persistence");
+                drop(in_flight);
+
+                let action = actions
+                    .acquire(cx.cx())
+                    .await
+                    .expect("active Session callback");
+                let mut recovery = Box::pin(invoke_public_recovery(
+                    &mut session,
+                    operation,
+                    &models,
+                    &auth,
+                ));
+                assert!(
+                    futures::poll!(recovery.as_mut()).is_pending(),
+                    "{operation:?}"
+                );
+                assert!(store.try_lock().is_ok());
+                drop(recovery);
+                gate.ensure_allowed()
+                    .expect("waiting on a callback made no change");
+                drop(action);
+
+                invoke_public_recovery(&mut session, operation, &models, &auth)
+                    .await
+                    .expect("cancelled preparation released both permits");
+                gate.ensure_allowed()
+                    .expect("successful installation clears quarantine");
+                assert!(provider.calls().lock().expect("calls").is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn public_recovery_dropped_during_save_keeps_live_state_and_quarantines() {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            for operation in [
+                PublicRecovery::Retry,
+                PublicRecovery::CommitFailover,
+                PublicRecovery::WalkFailover,
+                PublicRecovery::RestorePrimary,
+            ] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let (mut session, provider, models) = public_recovery_fixture(dir.path());
+                let auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+                let store = Arc::clone(&session.session);
+                let gate = session.provider_admission_gate();
+                let before = SessionEditSnapshot::capture(&store.try_lock().expect("session"))
+                    .expect("source snapshot");
+                // Hold the real persistence lock so the blocking writer cannot
+                // finish before we cancel, even on a fast filesystem.
+                let disk_lock =
+                    crate::session::lock_session_persistence(&dir.path().join("session.jsonl"))
+                        .expect("hold persistence lock");
+                let mut recovery = Box::pin(invoke_public_recovery(
+                    &mut session,
+                    operation,
+                    &models,
+                    &auth,
+                ));
+                assert!(
+                    futures::poll!(recovery.as_mut()).is_pending(),
+                    "{operation:?}"
+                );
+                assert!(
+                    gate.reason().is_some(),
+                    "{operation:?}: the real persistence boundary must have been entered"
+                );
+                drop(recovery);
+                assert!(
+                    gate.ensure_allowed()
+                        .is_err_and(|error| error.is_session_persistence())
+                );
+                assert!(
+                    SessionEditSnapshot::capture(&store.try_lock().expect("session"))
+                        .expect("live snapshot")
+                        == before
+                );
+                assert_eq!(session.agent.provider().name(), provider.name());
+                assert!(
+                    session
+                        .run_text("must remain fenced".to_string(), |_| {})
+                        .await
+                        .is_err_and(|error| error.is_session_persistence())
+                );
+                assert!(provider.calls().lock().expect("calls").is_empty());
+                drop(disk_lock);
+                // Drain the one-worker pool before the temporary store goes
+                // away; cancellation may leave its earlier write in flight.
+                asupersync::runtime::spawn_blocking(|| {}).await;
+            }
+        });
+    }
+
     #[test]
     fn compaction_runtime_handle_creates_fallback_runtime() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -9460,7 +9886,7 @@ mod tests {
                 AgentConfig::default(),
             );
             agent.prewalk = Some(native_prewalk_state(true));
-            agent.begin_prewalk_run();
+            agent.begin_logical_run();
             let (abort, signal) = AbortHandle::new();
             let _ = agent.run_with_abort("Implement", Some(signal), move |event| {
                 if matches!(event, AgentEvent::ToolExecutionEnd { tool_name, .. } if tool_name == "write") {
@@ -9471,7 +9897,7 @@ mod tests {
             assert_eq!(std::fs::read_to_string(root.path().join("project.txt")).unwrap(), "committed");
             assert!(!root.path().join("too-late.txt").exists());
             assert!(!agent.prewalk.as_ref().expect("armed").yielded());
-            agent.finish_prewalk_run(true);
+            agent.finish_logical_run(true);
             assert!(agent.prewalk.is_none());
         });
     }
@@ -9500,7 +9926,7 @@ mod tests {
                 assert!(tools.is_discoverable("ast_edit"));
                 let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
                 agent.prewalk = Some(native_prewalk_state(true));
-                agent.begin_prewalk_run();
+                agent.begin_logical_run();
                 let mut state = native_prewalk_state(true);
                 for (replacement, expected_stage) in [
                     ("$EXPR.unwrap()", false),
@@ -9604,7 +10030,7 @@ mod tests {
                 AgentConfig::default(),
             );
             agent.prewalk = Some(native_prewalk_state(true));
-            agent.begin_prewalk_run();
+            agent.begin_logical_run();
             agent.run("Implement", |_| {}).await.unwrap();
             assert!(!agent.prewalk.as_ref().unwrap().ready());
             assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
