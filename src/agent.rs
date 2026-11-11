@@ -7790,10 +7790,37 @@ struct CompactionInstallGuard {
     require_policy_fit: bool,
 }
 
+/// An acknowledged source stays active across turns, but neither a new account
+/// nor a replacement Session may inherit that source's initialization receipt.
+struct InitializedCostJournal {
+    account_id: String,
+    session_id: String,
+    path: Option<PathBuf>,
+}
+
+/// An explicit provider default is different from an untouched model default.
+/// Keep this process-local choice when a selection refreshes stream options.
+#[derive(Clone, Copy, Default)]
+enum MaxTokensOverride {
+    #[default]
+    RegistryDefault,
+    Explicit(Option<u32>),
+}
+
+impl MaxTokensOverride {
+    const fn resolve(self, model_max_tokens: u32) -> Option<u32> {
+        match self {
+            Self::RegistryDefault => Some(model_max_tokens),
+            Self::Explicit(max_tokens) => max_tokens,
+        }
+    }
+}
+
 pub struct AgentSession {
     pub agent: Agent,
     pub session: Arc<Mutex<Session>>,
     save_enabled: bool,
+    initialized_cost_journal: Option<InitializedCostJournal>,
     input_source: InputSource,
     /// Extension lifecycle region — ensures the JS runtime thread is shut
     /// down when the session ends.
@@ -7821,6 +7848,7 @@ pub struct AgentSession {
     runtime_handle: Option<RuntimeHandle>,
     compaction_worker: CompactionWorkerState,
     model_registry: Option<Arc<ModelRegistry>>,
+    max_tokens_override: MaxTokensOverride,
     auth_storage: Option<AuthStorage>,
     /// Distinguishes this owner from sessions reusing the same registry snapshots.
     media_auth_owner: Arc<()>,
@@ -18920,6 +18948,7 @@ impl AgentSession {
             agent,
             session,
             save_enabled,
+            initialized_cost_journal: None,
             input_source: InputSource::Interactive,
             extensions: None,
             extension_startup_timeout_ms: EXTENSION_STARTUP_EVENT_TIMEOUT_MS,
@@ -18938,6 +18967,7 @@ impl AgentSession {
             runtime_handle: None,
             compaction_worker: CompactionWorkerState::new(CompactionQuota::default()),
             model_registry: None,
+            max_tokens_override: MaxTokensOverride::default(),
             auth_storage: None,
             media_auth_owner,
             api_key_override: None,
@@ -18952,6 +18982,14 @@ impl AgentSession {
 
     pub const fn set_input_source(&mut self, source: InputSource) {
         self.input_source = source;
+    }
+
+    /// Override the active request cap without persisting it in Session metadata.
+    /// `None` explicitly selects provider defaults, even after a model switch.
+    pub(crate) fn set_max_tokens_override(&mut self, max_tokens: Option<u32>) {
+        self.max_tokens_override = MaxTokensOverride::Explicit(max_tokens);
+        self.agent.stream_options_mut().max_tokens = max_tokens;
+        self.refresh_extension_completion_host_state();
     }
 
     /// Configure project memory learning without opening a store or making a request.
@@ -19595,7 +19633,8 @@ impl AgentSession {
                 let stream_options = self.agent.stream_options_mut();
                 stream_options.api_key = resolved_key;
                 stream_options.headers.clone_from(&entry.headers);
-                stream_options.max_tokens = Some(entry.model.max_tokens);
+                stream_options.max_tokens =
+                    self.max_tokens_override.resolve(entry.model.max_tokens);
                 stream_options.thinking_level = Some(thinking_level);
             }
             self.set_compaction_context_window(if entry.model.context_window == 0 {
@@ -19758,7 +19797,26 @@ impl AgentSession {
         automatic: bool,
     ) -> Result<bool> {
         self.ensure_provider_reentry_allowed()?;
-        let cx = crate::agent_cx::AgentCx::for_request();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        // An extension completion owns provider admission while its callbacks
+        // may still need Session actions and the store. Wait for that request
+        // before taking either Session lock. Automatic selections already own
+        // both permits and must not acquire them recursively.
+        let provider_authority = match admission {
+            ProviderSwapAdmission::Gate(gate) => {
+                Some(gate.acquire_transition_authority(cx.cx()).await?)
+            }
+            ProviderSwapAdmission::Held(_) => None,
+        };
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = if provider_authority.is_some() {
+            Some(session_actions.acquire(cx.cx()).await?)
+        } else {
+            None
+        };
+        let admission = provider_authority
+            .as_ref()
+            .map_or(admission, ProviderSwapAdmission::Held);
         let save_enabled = self.save_enabled;
         let session_store = Arc::clone(&self.session);
         let mut session = OwnedMutexGuard::lock(session_store, cx.cx())
@@ -20006,7 +20064,11 @@ impl AgentSession {
     /// which holds an `AgentSession` rather than an SDK handle).
     pub async fn set_thinking_level(&mut self, level: crate::model::ThinkingLevel) -> Result<()> {
         self.ensure_provider_reentry_allowed()?;
-        let cx = crate::agent_cx::AgentCx::for_request();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.provider_admission.clone();
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = session_actions.acquire(cx.cx()).await?;
         let save_enabled = self.save_enabled;
         let session_store = Arc::clone(&self.session);
         let mut session = OwnedMutexGuard::lock(session_store, cx.cx())
@@ -20033,15 +20095,13 @@ impl AgentSession {
             candidate.append_thinking_level_change(level_string);
         }
         let _provider_transition = if changed {
-            Some(
-                self.provider_admission
-                    .begin_transition(
-                        "thinking-level persistence was interrupted before live installation completed"
-                            .to_string(),
-                        cx.cx(),
-                    )
-                    .await?,
-            )
+            ProviderSwapAdmission::Held(&authority)
+                .begin_transition(
+                    "thinking-level persistence was interrupted before live installation completed"
+                        .to_string(),
+                    cx.cx(),
+                )
+                .await?
         } else {
             None
         };
@@ -20131,7 +20191,11 @@ impl AgentSession {
 
     pub(crate) async fn sync_runtime_selection_from_session_header(&mut self) -> Result<()> {
         self.ensure_provider_reentry_allowed()?;
-        let cx = crate::agent_cx::AgentCx::for_request();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.provider_admission.clone();
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = session_actions.acquire(cx.cx()).await?;
         let session_store = Arc::clone(&self.session);
         let mut session = OwnedMutexGuard::lock(session_store, cx.cx())
             .await
@@ -20211,8 +20275,7 @@ impl AgentSession {
         if runtime_model_changed {
             self.invalidate_background_compaction();
         }
-        let _provider_transition = self
-            .provider_admission
+        let _provider_transition = ProviderSwapAdmission::Held(&authority)
             .begin_transition(
                 "Session-header synchronization persistence was interrupted before live installation completed"
                     .to_string(),
@@ -20775,7 +20838,7 @@ impl AgentSession {
             let stream_options = self.agent.stream_options_mut();
             stream_options.api_key = key;
             stream_options.headers.clone_from(&entry.headers);
-            stream_options.max_tokens = Some(entry.model.max_tokens);
+            stream_options.max_tokens = self.max_tokens_override.resolve(entry.model.max_tokens);
             stream_options.thinking_level = Some(target_thinking);
         }
         self.set_compaction_context_window(context_window_tokens_for_entry(entry));
@@ -21152,7 +21215,7 @@ impl AgentSession {
             let stream_options = self.agent.stream_options_mut();
             stream_options.api_key.clone_from(&request.api_key);
             stream_options.headers.clone_from(&entry.headers);
-            stream_options.max_tokens = Some(entry.model.max_tokens);
+            stream_options.max_tokens = self.max_tokens_override.resolve(entry.model.max_tokens);
             stream_options.thinking_level = Some(target_thinking);
         }
         self.set_compaction_context_window(context_window_tokens_for_entry(entry));
@@ -21550,6 +21613,7 @@ impl AgentSession {
             .map(ExtensionRegion::manager)
             .ok_or_else(|| Error::extension("Extensions are disabled"))?
             .clone();
+        self.initialize_cost_journal().await?;
         let on_event: AgentEventHandler = Arc::new(on_event);
 
         self.run_pending_idle_actions_with_abort(abort.clone(), Arc::clone(&on_event))
@@ -22400,6 +22464,7 @@ impl AgentSession {
         if abort.is_some_and(AbortSignal::is_aborted) {
             return Err(Error::Aborted);
         }
+        self.initialize_cost_journal().await?;
         let overflow = overflow_abort.is_some();
 
         let (entries, preparation, source_snapshot, install_guard) = {
@@ -22785,6 +22850,10 @@ impl AgentSession {
             return Ok(());
         }
 
+        // Factories and startup hooks can make model requests. Their bills
+        // need an acknowledged source before any extension code is loaded.
+        self.initialize_cost_journal().await?;
+
         // Extensions may key durable state by getSessionFile() during their
         // factory or session_start hook. Reserve the eventual transcript name
         // after the host has selected its cwd, without creating an empty file.
@@ -23128,6 +23197,59 @@ impl AgentSession {
         Ok(())
     }
 
+    /// Activate durable final-bill accounting before startup hooks or the first
+    /// provider dispatch. Saved sessions with a cost account must acknowledge
+    /// their initial checkpoint; a failed or interrupted save fences re-entry.
+    /// Later calls for the same account and saved Session are read-only.
+    pub async fn initialize_cost_journal(&mut self) -> Result<()> {
+        if !self.save_enabled {
+            return Ok(());
+        }
+        let Some(budget) = self.agent.cost_budget().cloned() else {
+            return Ok(());
+        };
+        self.ensure_provider_reentry_allowed()?;
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
+            .await
+            .map_err(|error| Error::session(error.to_string()))?;
+        self.ensure_provider_reentry_allowed()?;
+        let account_id = budget.account_id();
+        if self
+            .initialized_cost_journal
+            .as_ref()
+            .is_some_and(|initialized| {
+                initialized.account_id == account_id
+                    && initialized.session_id == session.header.id
+                    && initialized.path == session.path
+            })
+        {
+            return Ok(());
+        }
+        let persist_result = flush_turn_autosave(
+            &mut session,
+            &self.provider_admission,
+            AutosaveFlushTrigger::Periodic,
+            Some((&budget, cx.cx())),
+        )
+        .await;
+        finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
+        self.ensure_provider_reentry_allowed()?;
+        self.remember_initialized_cost_journal(&session);
+        Ok(())
+    }
+
+    fn remember_initialized_cost_journal(&mut self, session: &Session) {
+        self.initialized_cost_journal =
+            self.agent
+                .cost_budget()
+                .map(|budget| InitializedCostJournal {
+                    account_id: budget.account_id(),
+                    session_id: session.header.id.clone(),
+                    path: session.path.clone(),
+                });
+    }
+
     pub async fn save_and_index(&mut self) -> Result<()> {
         if self.save_enabled {
             let cx = crate::agent_cx::AgentCx::for_request();
@@ -23142,6 +23264,7 @@ impl AgentSession {
             )
             .await;
             finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
+            self.remember_initialized_cost_journal(&session);
         }
         Ok(())
     }
@@ -23161,7 +23284,9 @@ impl AgentSession {
             self.agent.cost_budget().map(|budget| (budget, cx.cx())),
         )
         .await;
-        finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)
+        finish_turn_persistence(&self.provider_admission, Ok(()), persist_result)?;
+        self.remember_initialized_cost_journal(&session);
+        Ok(())
     }
 
     pub async fn run_text(
@@ -23437,6 +23562,7 @@ impl AgentSession {
         handoff_input: impl FnOnce(&mut Agent) + Send,
     ) -> Result<AssistantMessage> {
         self.ensure_provider_reentry_allowed()?;
+        self.initialize_cost_journal().await?;
         let _turn_active = AtomicBoolGuard::activate(&self.extensions_turn_active);
         async {
             handoff_input(&mut self.agent);
@@ -23550,6 +23676,7 @@ impl AgentSession {
                 self.agent.set_magic_keyword_scan_override(None);
                 return Err(error);
             }
+            self.initialize_cost_journal().await?;
             handoff_input(&mut self.agent);
             // See the text path above: provenance is one-shot even when an
             // input extension blocks before the Agent loop starts.
@@ -24632,6 +24759,7 @@ impl AgentSession {
         advisor_turn: Option<&AdvisorTurn>,
     ) -> Result<AssistantMessage> {
         self.ensure_provider_reentry_allowed()?;
+        self.initialize_cost_journal().await?;
         self.sync_runtime_selection_from_session_header().await?;
 
         // Rehydrate the agent transcript from the (already reverted) session

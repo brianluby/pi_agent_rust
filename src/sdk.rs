@@ -1414,6 +1414,24 @@ impl RpcControlHandle {
         self.send("follow_up", payload)
     }
 
+    /// Dispatch ordered text, image, audio, and video blocks as steering input
+    /// while another RPC operation owns stdout. Native text stays in its
+    /// authored position and is not interpreted as a slash command or template.
+    ///
+    /// Content is validated before allocating an ID or writing to the pipe.
+    /// The returned ID confirms dispatch, not server admission; the server
+    /// still applies its configured media limits and queue policy.
+    pub fn steer_with_content(&self, content: Vec<ContentBlock>) -> Result<String> {
+        self.send("steer", rpc_native_content_payload(content)?)
+    }
+
+    /// Dispatch ordered native content for a follow-up model turn without
+    /// borrowing the running operation's response reader. This has the same
+    /// validation and dispatch-only acknowledgement as [`Self::steer_with_content`].
+    pub fn follow_up_with_content(&self, content: Vec<ContentBlock>) -> Result<String> {
+        self.send("follow_up", rpc_native_content_payload(content)?)
+    }
+
     pub fn abort(&self) -> Result<String> {
         self.send("abort", Map::new())
     }
@@ -1427,6 +1445,21 @@ impl RpcControlHandle {
     pub fn abort_bash(&self) -> Result<String> {
         self.send("abort_bash", Map::new())
     }
+}
+
+/// Native prompts and queued inputs share one transport admission boundary.
+/// Validate before allocating a request ID, including normalized JSON size:
+/// payload bounds must not depend on which RPC control lane sends the input.
+fn rpc_native_content_payload(content: Vec<ContentBlock>) -> Result<Map<String, Value>> {
+    AgentSession::validate_user_content_blocks(&content)?;
+    let content = serde_json::to_value(content).map_err(|err| Error::Json(Box::new(err)))?;
+    let content = crate::rpc::parse_native_prompt_content(&content, 64 * 1024 * 1024)?;
+    let mut payload = Map::new();
+    payload.insert(
+        "content".to_string(),
+        serde_json::to_value(content).map_err(|err| Error::Json(Box::new(err)))?,
+    );
+    Ok(payload)
 }
 
 /// Unified adapter over in-process and subprocess-backed session control.
@@ -1750,6 +1783,24 @@ impl RpcTransportClient {
         let mut payload = Map::new();
         payload.insert("message".to_string(), Value::String(message.into()));
         self.request_no_data("follow_up", payload).await
+    }
+
+    /// Queue ordered native text, image, audio, and video steering input and
+    /// await the server's admission response. Content is validated before any
+    /// request ID is consumed; native text is not parsed as a command/template.
+    /// Use [`RpcControlHandle::steer_with_content`] while a prompt borrows this
+    /// client and owns its response reader.
+    pub async fn steer_with_content(&mut self, content: Vec<ContentBlock>) -> Result<()> {
+        self.request_no_data("steer", rpc_native_content_payload(content)?)
+            .await
+    }
+
+    /// Queue ordered native content for a follow-up turn and await server
+    /// admission. Validation and queue semantics match [`Self::steer_with_content`].
+    /// Use [`RpcControlHandle::follow_up_with_content`] during a live prompt.
+    pub async fn follow_up_with_content(&mut self, content: Vec<ContentBlock>) -> Result<()> {
+        self.request_no_data("follow_up", rpc_native_content_payload(content)?)
+            .await
     }
 
     pub async fn abort(&mut self) -> Result<()> {
@@ -2133,14 +2184,7 @@ impl RpcTransportClient {
         streaming_behavior: Option<&str>,
         on_event: impl FnMut(Value),
     ) -> Result<Vec<Value>> {
-        AgentSession::validate_user_content_blocks(&content)?;
-        let content = serde_json::to_value(content).map_err(|err| Error::Json(Box::new(err)))?;
-        let content = crate::rpc::parse_native_prompt_content(&content, 64 * 1024 * 1024)?;
-        let mut payload = Map::new();
-        payload.insert(
-            "content".to_string(),
-            serde_json::to_value(content).map_err(|err| Error::Json(Box::new(err)))?,
-        );
+        let payload = rpc_native_content_payload(content)?;
         self.prompt_payload_streaming(payload, streaming_behavior, on_event)
             .await
     }
@@ -3557,10 +3601,11 @@ impl AgentSessionHandle {
     /// Override the per-prompt `max_tokens` cap.
     ///
     /// Persists for the lifetime of the in-process handle only; not written
-    /// to session metadata. Pass `None` to fall back to the provider's
-    /// default cap.
-    pub const fn set_max_tokens(&mut self, max_tokens: Option<u32>) {
-        self.session.agent.stream_options_mut().max_tokens = max_tokens;
+    /// to session metadata. Model switches, retries and primary restoration
+    /// retain the override. Pass `None` to use the provider's default cap,
+    /// including after a model switch.
+    pub fn set_max_tokens(&mut self, max_tokens: Option<u32>) {
+        self.session.set_max_tokens_override(max_tokens);
     }
 
     /// `/add-dir` driver (bd-cv653.3.12): validate + add an additional
@@ -4657,6 +4702,8 @@ pub(crate) async fn create_agent_session_deferred_mcp(
                 approval_state.clone(),
             )));
     }
+
+    agent_session.initialize_cost_journal().await?;
 
     if has_extensions {
         let extension_paths = options
@@ -11413,6 +11460,190 @@ printf sdk-owned-command-key
         }
     }
 
+    struct StartupCostProbe {
+        budget: crate::cost::CostBudget,
+        observed: Mutex<Vec<PathBuf>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExtensionUiHandler for StartupCostProbe {
+        async fn request_ui(
+            &self,
+            request: ExtensionUiRequest,
+        ) -> Result<Option<ExtensionUiResponse>> {
+            let path = request.payload["message"]
+                .as_str()
+                .ok_or_else(|| Error::session("startup did not expose a saved session"))?;
+            let saved = Session::open(path).await?;
+            let before = crate::cost::recorded_spend(&saved)?;
+            // Settle startup work through the actual shared account while no
+            // user turn, shutdown, or explicit SDK save has occurred.
+            self.budget.record(0.25)?;
+            let after = crate::cost::recorded_spend(&saved)?;
+            if (after - before - 0.25).abs() > f64::EPSILON {
+                return Err(Error::session("startup bill has no durable cost journal"));
+            }
+            self.observed.lock().unwrap().push(PathBuf::from(path));
+            Ok(Some(ExtensionUiResponse {
+                id: request.id,
+                value: Some(Value::Bool(true)),
+                cancelled: false,
+            }))
+        }
+    }
+
+    #[test]
+    fn saved_sdk_startup_activates_cost_journal_before_extensions_or_first_prompt() {
+        for with_extension in [false, true] {
+            let tmp = tempdir().expect("tempdir");
+            let budget = crate::cost::CostBudget::new(None, Some(5.0), 0.0).unwrap();
+            let probe = Arc::new(StartupCostProbe {
+                budget: budget.clone(),
+                observed: Mutex::new(Vec::new()),
+            });
+            let mut options = SessionOptions {
+                no_session: false,
+                session_dir: Some(tmp.path().join("sessions")),
+                enabled_tools: Some(Vec::new()),
+                no_context_files: true,
+                cost_budget: Some(budget.clone()),
+                ..hermetic_session_options(tmp.path())
+            };
+            if with_extension {
+                let extension = tmp.path().join("startup-cost.mjs");
+                std::fs::write(
+                    &extension,
+                    r#"
+export default function init(pi) {
+    pi.on("startup", async (_event, ctx) => {
+        await ctx.ui.confirm("Inspect startup cost source", ctx.sessionManager.getSessionFile());
+    });
+}
+"#,
+                )
+                .unwrap();
+                options.extension_paths = vec![extension];
+                options.extension_ui_handler = Some(probe.clone());
+                options.persist_extension_permissions = false;
+            }
+            run_async(async {
+                let handle = create_agent_session(options).await.unwrap();
+                let store = handle.session_store();
+                let (path, session_id, provider, model) = {
+                    let stored = store.try_lock().unwrap();
+                    assert!(stored.to_messages_for_current_path().is_empty());
+                    (
+                        stored.path.clone().expect("startup checkpoint path"),
+                        stored.header.id.clone(),
+                        stored.header.provider.clone(),
+                        stored.header.model_id.clone(),
+                    )
+                };
+                assert!(path.is_file());
+                let checkpoint_bytes = std::fs::read(&path).unwrap();
+                if with_extension {
+                    assert_eq!(probe.observed.lock().unwrap().as_slice(), &[path.clone()]);
+                } else {
+                    budget.record(0.25).unwrap();
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), checkpoint_bytes);
+                let saved = Session::open(path.to_str().unwrap()).await.unwrap();
+                assert!((crate::cost::recorded_spend(&saved).unwrap() - 0.25).abs() < f64::EPSILON);
+                assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+
+                // A resumed handle installs its own writer without changing
+                // the selected model or losing pre-prompt startup charges.
+                let resumed = create_agent_session(SessionOptions {
+                    no_session: false,
+                    session_path: Some(path.clone()),
+                    session_dir: Some(tmp.path().join("sessions")),
+                    max_cost: Some(5.0),
+                    no_context_files: true,
+                    ..hermetic_session_options(tmp.path())
+                })
+                .await
+                .unwrap();
+                let resumed_budget = resumed.session().agent.cost_budget().unwrap();
+                assert!(!resumed_budget.same_tree(&budget));
+                resumed_budget.record(0.5).unwrap();
+                let saved = Session::open(path.to_str().unwrap()).await.unwrap();
+                assert!((crate::cost::recorded_spend(&saved).unwrap() - 0.75).abs() < f64::EPSILON);
+                assert_eq!(saved.header.id, session_id);
+                assert_eq!(saved.header.provider, provider);
+                assert_eq!(saved.header.model_id, model);
+                assert!(resumed.shutdown_owned_resources().await.completed_cleanly());
+            });
+        }
+    }
+
+    #[test]
+    fn failed_sdk_startup_checkpoint_prevents_extension_dispatch() {
+        let tmp = tempdir().expect("tempdir");
+        let blocked = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked, "retain this file").unwrap();
+        let extension = tmp.path().join("must-not-start.mjs");
+        std::fs::write(
+            &extension,
+            r#"
+export default function init(pi) {
+    pi.on("startup", async (_event, ctx) => {
+        await ctx.ui.confirm("Unexpected startup", "The initial checkpoint should fail first");
+    });
+}
+"#,
+        )
+        .unwrap();
+        for with_extension in [false, true] {
+            let budget = crate::cost::CostBudget::new(None, Some(5.0), 0.0).unwrap();
+            let handler = Arc::new(SdkRecordingUiHandler {
+                prompts: Mutex::new(Vec::new()),
+            });
+            let options = SessionOptions {
+                no_session: false,
+                session_dir: Some(blocked.clone()),
+                no_context_files: true,
+                enabled_tools: Some(Vec::new()),
+                cost_budget: Some(budget.clone()),
+                extension_paths: if with_extension {
+                    vec![extension.clone()]
+                } else {
+                    Vec::new()
+                },
+                extension_ui_handler: Some(handler.clone()),
+                persist_extension_permissions: false,
+                ..hermetic_session_options(tmp.path())
+            };
+            let result = run_async(create_agent_session(options));
+            assert!(matches!(result, Err(ref error) if error.is_session_persistence()));
+            assert!(handler.prompts.lock().unwrap().is_empty());
+            assert!(matches!(budget.admit(), Err(Error::Session(_))));
+            assert_eq!(
+                std::fs::read_to_string(&blocked).unwrap(),
+                "retain this file"
+            );
+        }
+    }
+
+    #[test]
+    fn sdk_startup_keeps_unbudgeted_and_ephemeral_sessions_unsaved() {
+        for (no_session, budgeted) in [(false, false), (true, true)] {
+            let tmp = tempdir().expect("tempdir");
+            let sessions = tmp.path().join("sessions");
+            let options = SessionOptions {
+                no_session,
+                session_dir: Some(sessions.clone()),
+                no_context_files: true,
+                max_cost: budgeted.then_some(5.0),
+                ..hermetic_session_options(tmp.path())
+            };
+            let handle = run_async(create_agent_session(options)).unwrap();
+            assert!(handle.session_store().try_lock().unwrap().path.is_none());
+            assert!(!sessions.exists());
+            assert_eq!(handle.session().agent.cost_budget().is_some(), budgeted);
+            assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+        }
+    }
+
     #[test]
     fn create_agent_session_wires_extension_ui_handler_before_startup() {
         let tmp = tempdir().expect("tempdir");
@@ -11654,6 +11885,167 @@ export default function init(pi) {
         handle.set_max_tokens(None);
         assert_eq!(handle.max_tokens(), None);
     }
+
+    /// Keep registry identity while observing the options at the request boundary.
+    struct MaxTokensRecordingProvider {
+        identity: Arc<dyn Provider>,
+        requests: Arc<Mutex<Vec<Option<u32>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for MaxTokensRecordingProvider {
+        fn name(&self) -> &str {
+            self.identity.name()
+        }
+
+        fn api(&self) -> &str {
+            self.identity.api()
+        }
+
+        fn model_id(&self) -> &str {
+            self.identity.model_id()
+        }
+
+        async fn stream(
+            &self,
+            _context: &ProviderContext<'_>,
+            options: &StreamOptions,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>>
+        {
+            self.requests.lock().unwrap().push(options.max_tokens);
+            let message = crate::model::AssistantMessage {
+                content: vec![crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new("recorded request cap"),
+                )],
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                stop_reason: crate::model::StopReason::Stop,
+                ..Default::default()
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                StreamEvent::Done {
+                    reason: crate::model::StopReason::Stop,
+                    message,
+                },
+            )])))
+        }
+    }
+
+    fn record_max_tokens(handle: &mut AgentSessionHandle) -> Arc<Mutex<Vec<Option<u32>>>> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = MaxTokensRecordingProvider {
+            identity: handle.session.agent.provider(),
+            requests: Arc::clone(&requests),
+        };
+        handle.session.agent.set_provider(Arc::new(provider));
+        requests
+    }
+
+    #[test]
+    fn max_tokens_override_reaches_prompts_continuations_and_model_changes() {
+        // The untouched case must follow registry updates; explicit None must
+        // remain a provider-default request rather than become a registry cap.
+        for (explicit, cap) in [(false, None), (true, Some(32_000)), (true, None)] {
+            let dir = tempdir().expect("tempdir");
+            run_async(async {
+                let mut handle = create_agent_session(hermetic_session_options(dir.path()))
+                    .await
+                    .expect("create session");
+                if explicit {
+                    handle.set_max_tokens(cap);
+                }
+                let expected_initial = handle.max_tokens();
+                let requests = record_max_tokens(&mut handle);
+                handle.continue_turn(|_| {}).await.expect("continue");
+                handle.prompt("first prompt", |_| {}).await.expect("prompt");
+                assert_eq!(
+                    *requests.lock().unwrap(),
+                    vec![expected_initial, expected_initial],
+                    "every public turn must retain the configured request cap"
+                );
+
+                let mut registry = handle.session.model_registry().unwrap().clone();
+                let mut current = registry.find("openai", "gpt-4o").unwrap();
+                current.model.max_tokens = 1_536;
+                let mut next = registry.find("openai", "gpt-4o-mini").unwrap();
+                next.model.max_tokens = 3_072;
+                registry.merge_entries(vec![current, next]);
+                handle.session.set_model_registry(registry);
+                handle
+                    .prompt("refreshed catalog", |_| {})
+                    .await
+                    .expect("refresh");
+                let expected_refreshed = if explicit { cap } else { Some(1_536) };
+                assert_eq!(requests.lock().unwrap().last(), Some(&expected_refreshed));
+                assert_eq!(handle.max_tokens(), expected_refreshed);
+
+                handle
+                    .set_model("openai", "gpt-4o-mini")
+                    .await
+                    .expect("switch model");
+                let expected_switched = if explicit { cap } else { Some(3_072) };
+                assert_eq!(handle.max_tokens(), expected_switched);
+                let switched_requests = record_max_tokens(&mut handle);
+                handle
+                    .prompt("new model", |_| {})
+                    .await
+                    .expect("switched prompt");
+                assert_eq!(*switched_requests.lock().unwrap(), vec![expected_switched]);
+
+                handle.set_max_tokens(Some(64_000));
+                handle
+                    .prompt("updated cap", |_| {})
+                    .await
+                    .expect("updated prompt");
+                assert_eq!(
+                    switched_requests.lock().unwrap().last(),
+                    Some(&Some(64_000))
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn max_tokens_override_survives_failover_and_primary_restoration() {
+        for cap in [Some(32_000), None] {
+            let (handle, _calls) =
+                flaky_handle_as(usize::MAX, "anthropic", "claude-3-5-haiku-latest");
+            let mut handle = with_chain_cooldown(
+                handle.with_retry(Some(crate::failover::RetryPolicy {
+                    max_retries: 1,
+                    max_failovers_per_turn: 1,
+                    model_fallback: true,
+                    fallback_on: crate::failover::FallbackOn::Any,
+                    base_delay_ms: 1,
+                    max_delay_ms: 1,
+                })),
+                "openai/gpt-4o-mini",
+                0,
+            );
+            handle.set_max_tokens(cap);
+            let _ = run_async(handle.prompt("trigger failover", |_| {}));
+            assert_eq!(handle.model().1, "gpt-4o-mini");
+            assert_eq!(
+                handle.max_tokens(),
+                cap,
+                "fallback retains the host override"
+            );
+
+            let (_seen, shared) = restore_recorder();
+            run_async(handle.maybe_restore_primary(&shared)).expect("restore primary");
+            assert_eq!(handle.model().1, "claude-3-5-haiku-latest");
+            assert_eq!(
+                handle.max_tokens(),
+                cap,
+                "restoration retains the host override"
+            );
+            let requests = record_max_tokens(&mut handle);
+            run_async(handle.prompt("restored primary", |_| {})).expect("restored prompt");
+            assert_eq!(*requests.lock().unwrap(), vec![cap]);
+        }
+    }
+
     #[test]
     fn empty_default_tool_registry_disables_configured_builtins() {
         let tmp = tempdir().expect("tempdir"); // ubs:ignore[rust.ownership.unwrap-expect] -- Fixture setup must succeed.

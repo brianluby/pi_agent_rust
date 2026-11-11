@@ -5615,30 +5615,31 @@ fn resolve_extension_root_for_base<'a>(base: &str, roots: &'a [PathBuf]) -> Opti
         .max_by_key(|root| root.components().count())
 }
 
-fn is_proxy_blocklisted_package(spec: &str) -> bool {
-    if spec.starts_with("node:") {
-        return true;
-    }
+// Shared by the ESM resolver and node:module.createRequire. Missing system
+// modules must fail so callers can select a real implementation or report the
+// unsupported operation; a callable proxy would silently fabricate success.
+const PROXY_BLOCKLISTED_PACKAGE_ROOTS: &[&str] = &[
+    "fs",
+    "path",
+    "child_process",
+    "net",
+    "http",
+    "https",
+    "crypto",
+    "tls",
+    "dgram",
+    "dns",
+    "vm",
+    "worker_threads",
+    "cluster",
+    "module",
+    "os",
+    "process",
+];
 
-    let top = spec.split('/').next().unwrap_or(spec);
-    matches!(
-        top,
-        "fs" | "path"
-            | "child_process"
-            | "net"
-            | "http"
-            | "https"
-            | "crypto"
-            | "tls"
-            | "dgram"
-            | "dns"
-            | "vm"
-            | "worker_threads"
-            | "cluster"
-            | "module"
-            | "os"
-            | "process"
-    )
+fn is_proxy_blocklisted_package(spec: &str) -> bool {
+    spec.starts_with("node:")
+        || PROXY_BLOCKLISTED_PACKAGE_ROOTS.contains(&spec.split('/').next().unwrap_or(spec))
 }
 
 fn is_proxy_allowlisted_package(spec: &str) -> bool {
@@ -11556,6 +11557,8 @@ export default nativePath;
     modules.insert(
         "node:child_process".to_string(),
         compressed_js_literal!(r#"
+import { StringDecoder } from "node:string_decoder";
+
 const __pi_child_process_state = {
   // Native process IDs are u32. Provisional handles must never collide with
   // an admitted child's PID while another spawn is still awaiting admission.
@@ -11753,9 +11756,17 @@ function __spawnPersistent(cmd, argv, opts) {
   child.stderr = opts.stdio[2] === "pipe" ? __makeEmitter() : null;
   child.stdin = opts.stdio[0] === "pipe" ? __makeEmitter() : null;
   const streams = [child.stdout, child.stderr];
+  const decoders = new Map();
   for (const stream of streams) {
     if (!stream) continue;
-    stream.setEncoding = (encoding) => { stream.encoding = String(encoding); return stream; };
+    stream.setEncoding = (encoding) => {
+      // Validate before replacing the decoder so a rejected encoding does not
+      // discard a partially received character. Successful calls start fresh.
+      const decoder = new StringDecoder(encoding || "utf8");
+      decoders.set(stream, decoder);
+      stream.encoding = decoder.encoding;
+      return stream;
+    };
   }
   let handle = null;
   let timer = null;
@@ -11807,7 +11818,16 @@ function __spawnPersistent(cmd, argv, opts) {
       child.stdin.destroyed = true;
       child.stdin.closed = true;
     }
-    for (const stream of streams) if (stream) stream.emit("end");
+    for (const stream of streams) {
+      if (!stream) continue;
+      const decoder = decoders.get(stream);
+      decoders.delete(stream);
+      if (decoder) {
+        const tail = decoder.end();
+        if (tail.length > 0) stream.emit("data", tail);
+      }
+      stream.emit("end");
+    }
     if (error) child.emit("error", pipeError(error));
     if (spawned) {
       __emitCloseOnce(child, code, signal);
@@ -11840,7 +11860,9 @@ function __spawnPersistent(cmd, argv, opts) {
           const stream = frame.stream === "stdout" ? child.stdout : child.stderr;
           if (stream) {
             const bytes = Buffer.from(frame.data, "base64");
-            stream.emit("data", stream.encoding ? bytes.toString(stream.encoding) : bytes);
+            const decoder = decoders.get(stream);
+            const chunk = decoder ? decoder.write(bytes) : bytes;
+            if (chunk.length > 0) stream.emit("data", chunk);
           }
         } else if (frame.writeId !== undefined) {
           const error = frame.error ? pipeError(frame.error) : null;
@@ -12707,6 +12729,18 @@ const __builtinModules = {
 };
 
 const __missingRequireCache = Object.create(null);
+// Populated from the Rust resolver's denylist when this module is assembled.
+const __proxyBlocklistedPackageRoots = new Set("__PIJS_PROXY_BLOCKLISTED_PACKAGE_ROOTS__".split(","));
+
+function __isProxyBlocklistedRequire(spec) {
+  return spec.startsWith("node:") || __proxyBlocklistedPackageRoots.has(spec.split("/")[0]);
+}
+
+function __missingRequireError(spec) {
+  const error = new Error(`Cannot find module '${spec}' in PiJS require()`);
+  error.code = "MODULE_NOT_FOUND";
+  return error;
+}
 
 function __isBarePackageSpecifier(spec) {
   return (
@@ -12758,27 +12792,33 @@ function __makeMissingRequireStub(spec) {
 
 export function createRequire(_path) {
   function require(id) {
-    const normalized = __normalizeBuiltin(id);
-    const builtIn = __builtinModules[normalized];
-    if (builtIn) {
+    const raw = String(id ?? "");
+    const normalized = __normalizeBuiltin(raw);
+    if (Object.prototype.hasOwnProperty.call(__builtinModules, normalized)) {
+      const builtIn = __builtinModules[normalized];
       if (normalized === "bun:sqlite") return builtIn;
       if (builtIn && Object.prototype.hasOwnProperty.call(builtIn, "default") && builtIn.default !== undefined) {
         return builtIn.default;
       }
       return builtIn;
     }
-    const raw = String(id ?? "");
-    if (raw.startsWith("node:") || __isBarePackageSpecifier(raw)) {
+    if (!__isProxyBlocklistedRequire(raw) && __isBarePackageSpecifier(raw)) {
       return __makeMissingRequireStub(raw);
     }
-    throw new Error(`Cannot find module '${raw}' in PiJS require()`);
+    throw __missingRequireError(raw);
   }
   require.resolve = function resolve(id) {
+    const raw = String(id ?? "unknown");
+    if (!Object.prototype.hasOwnProperty.call(__builtinModules, __normalizeBuiltin(raw)) &&
+        __isProxyBlocklistedRequire(raw)) {
+      throw __missingRequireError(raw);
+    }
     // Return a synthetic path for the requested module.  This satisfies
     // extensions that call require.resolve() to locate a binary entry
     // point (e.g. @sourcegraph/scip-python) without actually needing the
-    // real node_modules tree.
-    return `/pijs-virtual/${String(id ?? "unknown")}`;
+    // real node_modules tree. Unsupported system modules must still fail
+    // feature detection instead of advertising a nonexistent implementation.
+    return `/pijs-virtual/${raw}`;
   };
   require.resolve.paths = function() { return []; };
   return require;
@@ -12787,7 +12827,10 @@ export function createRequire(_path) {
 export default { createRequire };
 "#)
         .trim()
-        .to_string(),
+        .replace(
+            "__PIJS_PROXY_BLOCKLISTED_PACKAGE_ROOTS__",
+            &PROXY_BLOCKLISTED_PACKAGE_ROOTS.join(","),
+        ),
     );
 
     modules.insert(
@@ -14878,7 +14921,23 @@ export default { inspect, promisify, stripVTControlCharacters, deprecate, inheri
         "node:readline".to_string(),
         compressed_js_literal!(
             r"
-// Readline shim backed by pi.ui('input') when UI is available.
+import EventEmitter from 'node:events';
+import { StringDecoder } from 'node:string_decoder';
+
+// Importing node:buffer replaces the bridge constructor; preserve its identity
+// just as the subprocess and StringDecoder shims do.
+const Buffer = globalThis.Buffer;
+
+// Nonterminal protocol lines share the persistent subprocess output budget.
+// An event consumer never accumulates an unused async-iterator queue.
+const MAX_LINE_BYTES = 4 * 1024 * 1024;
+const MAX_QUEUED_LINES = 1024;
+
+function readlineError(code, message, Type = Error) {
+  const error = new Type(message);
+  error.code = code;
+  return error;
+}
 
 function __pi_readline_prompt(query) {
   const message = String(query === undefined || query === null ? '' : query);
@@ -14896,37 +14955,291 @@ function __pi_readline_prompt(query) {
   return Promise.resolve('');
 }
 
-export function createInterface(_opts) {
-  return {
-    question: (query, optionsOrCb, maybeCb) => {
-      const cb = typeof optionsOrCb === 'function' ? optionsOrCb : maybeCb;
-      if (typeof cb !== 'function') {
-        void __pi_readline_prompt(query);
-        return;
+export class Interface extends EventEmitter {
+  constructor(options = {}, output) {
+    super();
+    if (options && typeof options.on === 'function') options = { input: options, output };
+    if (!options || typeof options !== 'object') throw new TypeError('readline options must be an object');
+    this.input = options.input;
+    this.output = options.output;
+    this.closed = false;
+    this.paused = false;
+    this.terminal = false;
+    this.line = '';
+    this._lineBytes = 0;
+    this._decoder = new StringDecoder('utf8');
+    this._crAt = null;
+    this._crlfDelay = options.crlfDelay === Infinity ? Infinity
+      : Math.max(100, Number(options.crlfDelay) || 100);
+    this._failure = null;
+    this._question = null;
+    this._iterator = null;
+    if (this.input === undefined || this.input === null) return;
+    // The host's console stdin is a prompt facade, not a readable OS stream.
+    // Keep terminal questions on pi.ui without pretending it emits data.
+    if (this.input === globalThis.process?.stdin && typeof this.input.removeListener !== 'function') return;
+    if (typeof this.input.on !== 'function' || typeof this.input.removeListener !== 'function') {
+      throw new TypeError('readline input must be a readable event stream');
+    }
+    this._onData = (chunk) => {
+      if (this.closed) return;
+      this._consume(this._decoder.write(Buffer.from(chunk)));
+    };
+    this._onEnd = () => {
+      if (this.closed) return;
+      try {
+        this._consume(this._decoder.end());
+        if (!this.closed && this.line.length > 0) this._emitLine();
+      } finally { this.close(); }
+    };
+    this._onError = (error) => this._fail(error);
+    this._onClose = () => this.close();
+    this.input.on('data', this._onData);
+    this.input.on('end', this._onEnd);
+    this.input.on('error', this._onError);
+    this.input.on('close', this._onClose);
+    // A readable that already ended cannot produce another end notification.
+    if (this.input.readableEnded || this.input.destroyed) {
+      Promise.resolve().then(() => this.close());
+    } else if (typeof this.input.resume === 'function') {
+      this.input.resume();
+    }
+  }
+
+  _append(text) {
+    const bytes = Buffer.byteLength(text, 'utf8');
+    if (this._lineBytes + bytes > MAX_LINE_BYTES) {
+      this._fail(readlineError('ERR_PI_READLINE_LIMIT', 'readline line exceeds 4 MiB', RangeError));
+      return false;
+    }
+    this.line += text;
+    this._lineBytes += bytes;
+    return true;
+  }
+
+  _emitLine() {
+    const line = this.line;
+    this.line = '';
+    this._lineBytes = 0;
+    if (this._question) {
+      const question = this._question;
+      this._question = null;
+      question.cleanup();
+      question.resolve(line);
+    } else {
+      this.emit('line', line);
+    }
+  }
+
+  _consume(text) {
+    if (this.closed || text.length === 0) return;
+    let start = 0;
+    if (this._crAt !== null) {
+      if (text[0] === '\n' && Date.now() - this._crAt <= this._crlfDelay) start = 1;
+      this._crAt = null;
+    }
+    const separators = /[\r\n]/g;
+    separators.lastIndex = start;
+    let match;
+    while (!this.closed && (match = separators.exec(text))) {
+      if (!this._append(text.slice(start, match.index))) return;
+      let end = match.index + 1;
+      if (match[0] === '\r') {
+        if (text[end] === '\n') end++;
+        else if (end === text.length) this._crAt = Date.now();
       }
-      if (!globalThis.pi || typeof globalThis.pi.ui !== 'function') {
-        cb('');
-        return;
-      }
+      start = end;
+      separators.lastIndex = end;
+      this._emitLine();
+    }
+    if (!this.closed) this._append(text.slice(start));
+  }
+
+  _fail(error) {
+    if (this.closed) return;
+    this._failure = error instanceof Error ? error : new Error(String(error));
+    try { this.emit('error', this._failure); }
+    finally { this.close(); }
+  }
+
+  pause() {
+    if (this.closed || this.paused) return this;
+    this.paused = true;
+    if (typeof this.input?.pause === 'function') this.input.pause();
+    this.emit('pause');
+    return this;
+  }
+
+  resume() {
+    if (this.closed || !this.paused) return this;
+    this.paused = false;
+    if (typeof this.input?.resume === 'function') this.input.resume();
+    this.emit('resume');
+    return this;
+  }
+
+  close() {
+    if (this.closed) return this;
+    this.closed = true;
+    this.line = '';
+    this._lineBytes = 0;
+    this._crAt = null;
+    if (this._onData) {
+      this.input.removeListener('data', this._onData);
+      this.input.removeListener('end', this._onEnd);
+      this.input.removeListener('error', this._onError);
+      this.input.removeListener('close', this._onClose);
+      if (typeof this.input.pause === 'function') this.input.pause();
+    }
+    if (this._question) {
+      const question = this._question;
+      this._question = null;
+      question.cleanup();
+      question.reject(this._failure || readlineError('ERR_USE_AFTER_CLOSE', 'readline was closed'));
+    }
+    this.emit('close');
+    return this;
+  }
+
+  _ask(query, options, resolve, reject) {
+    if (this.closed) {
+      reject(readlineError('ERR_USE_AFTER_CLOSE', 'readline was closed'));
+      return;
+    }
+    if (this._question) {
+      reject(readlineError('ERR_INVALID_STATE', 'a readline question is already pending'));
+      return;
+    }
+    const signal = options?.signal;
+    const abort = () => {
+      if (this._question !== question) return;
+      this._question = null;
+      question.cleanup();
+      const error = readlineError('ABORT_ERR', 'The operation was aborted');
+      error.name = 'AbortError';
+      reject(error);
+    };
+    const question = { resolve, reject, cleanup: () => signal?.removeEventListener('abort', abort) };
+    this._question = question;
+    if (signal?.aborted) { abort(); return; }
+    signal?.addEventListener('abort', abort, { once: true });
+    if (!this._onData) {
       void __pi_readline_prompt(query).then((answer) => {
-        cb(answer);
+        if (this._question !== question) return;
+        this._question = null;
+        question.cleanup();
+        resolve(answer);
       });
-    },
-    close: () => {},
-    on: () => {},
-    once: () => {},
-  };
+      return;
+    }
+    try {
+      if (typeof this.output?.write === 'function') this.output.write(String(query ?? ''));
+      this.resume();
+    } catch (error) {
+      if (this._question === question) {
+        this._question = null;
+        question.cleanup();
+        reject(error);
+      }
+    }
+  }
+
+  question(query, optionsOrCb, maybeCb) {
+    const cb = typeof optionsOrCb === 'function' ? optionsOrCb : maybeCb;
+    if (typeof cb !== 'function') return;
+    this._ask(query, typeof optionsOrCb === 'object' ? optionsOrCb : undefined, cb, () => {});
+  }
+
+  [Symbol.asyncIterator]() {
+    if (this._iterator) return this._iterator;
+    const queue = [];
+    const waiters = [];
+    let queuedBytes = 0;
+    let done = this.closed;
+    let failure = this._failure;
+    const cleanup = () => {
+      this.removeListener('line', onLine);
+      this.removeListener('close', onClose);
+      this.removeListener('error', onError);
+    };
+    const onClose = () => {
+      done = true;
+      cleanup();
+      while (waiters.length) waiters.shift().resolve({ value: undefined, done: true });
+    };
+    const onError = (error) => {
+      failure = error;
+      queue.length = 0;
+      queuedBytes = 0;
+      while (waiters.length) waiters.shift().reject(error);
+    };
+    const onLine = (line) => {
+      if (done) return;
+      if (waiters.length) {
+        waiters.shift().resolve({ value: line, done: false });
+      } else {
+        const size = Buffer.byteLength(line, 'utf8');
+        if (queue.length >= MAX_QUEUED_LINES || queuedBytes + size > MAX_LINE_BYTES) {
+          this._fail(readlineError('ERR_PI_READLINE_LIMIT', 'readline iterator backlog exceeds its limit', RangeError));
+          return;
+        }
+        queue.push({ line, size });
+        queuedBytes += size;
+      }
+      // Native child pipes may not support pause; the hard backlog cap still
+      // prevents a producer from retaining unbounded lines in that case.
+      if (!waiters.length) this.pause();
+    };
+    if (!done) {
+      this.on('line', onLine);
+      this.on('close', onClose);
+      this.on('error', onError);
+    }
+    const iterator = {
+      next: async () => {
+        if (failure) throw failure;
+        if (queue.length) {
+          const item = queue.shift();
+          queuedBytes -= item.size;
+          if (!queue.length && !done) this.resume();
+          return { value: item.line, done: false };
+        }
+        if (done) return { value: undefined, done: true };
+        if (waiters.length >= MAX_QUEUED_LINES) {
+          throw readlineError('ERR_PI_READLINE_LIMIT', 'too many pending readline iterator reads', RangeError);
+        }
+        const pending = new Promise((resolve, reject) => waiters.push({ resolve, reject }));
+        this.resume();
+        return await pending;
+      },
+      return: async () => {
+        queue.length = 0;
+        queuedBytes = 0;
+        this.close();
+        onClose();
+        return { value: undefined, done: true };
+      },
+      [Symbol.asyncIterator]() { return this; },
+    };
+    this._iterator = iterator;
+    return iterator;
+  }
+}
+
+export function createInterface(options, output) { return new Interface(options, output); }
+
+class PromiseInterface extends Interface {
+  question(query, options) {
+    return new Promise((resolve, reject) => this._ask(query, options, resolve, reject));
+  }
 }
 
 export const promises = {
-  createInterface: (_opts) => ({
-    question: async (query) => __pi_readline_prompt(query),
-    close: () => {},
-    [Symbol.asyncIterator]: async function* () {},
-  }),
+  Interface: PromiseInterface,
+  createInterface: (options) => new PromiseInterface(options),
 };
 
-export default { createInterface, promises };
+export default { Interface, createInterface, promises };
 "
         )
         .trim()
@@ -14939,7 +15252,8 @@ export default { createInterface, promises };
 import { promises as readlinePromises } from "node:readline";
 
 export const createInterface = readlinePromises.createInterface;
-export default { createInterface };
+export const Interface = readlinePromises.Interface;
+export default { Interface, createInterface };
 "#
         .trim()
         .to_string(),
@@ -16646,7 +16960,9 @@ export default {
     modules.insert(
         "node:string_decoder".to_string(),
         r"
-import { Buffer } from 'node:buffer';
+// The runtime bridge installs Buffer before loading modules. Reuse that
+// constructor without importing node:buffer, which replaces the global Buffer.
+const Buffer = globalThis.Buffer;
 
 export class StringDecoder {
   constructor(encoding = 'utf8') {
@@ -28617,10 +28933,13 @@ mod tests {
             8_189,
             "a4b25b282d3a8d4dea5b22a12cb790975691a3202390827385680c2d9000652e",
         ),
+        // Fail-closed createRequire/resolve adds 917 assembled source bytes.
+        // Main already contained 8_060 bytes versus the old 7_418-byte receipt;
+        // only this reviewed module is re-pinned, including that prior drift.
         (
             "node:module",
-            7_418,
-            "0f16b8ba098a98bf96d6ef19ff1222a7e29a820211ed7703a925157066144fd7",
+            8_977,
+            "0e7c7448477f35fb78e80b4bd2e28fdff0d27661bc0f592174a45ddb6fbd534e",
         ),
         (
             "jsonwebtoken",
@@ -36837,6 +37156,101 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
     }
 
     #[test]
+    fn pijs_create_require_rejects_missing_system_modules() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+            let mut denied = vec![
+                "node:sqlite".to_string(),
+                "node:pijs-unsupported".to_string(),
+                "node:fs/pijs-unsupported".to_string(),
+                "dns".to_string(),
+                "dns/promises".to_string(),
+                "dgram".to_string(),
+                "cluster".to_string(),
+            ];
+            denied.extend(
+                PROXY_BLOCKLISTED_PACKAGE_ROOTS
+                    .iter()
+                    .map(|root| format!("{root}/pijs-unsupported")),
+            );
+            runtime
+                .eval(&format!(
+                    "globalThis.deniedRequireSpecifiers = {};",
+                    serde_json::to_string(&denied).expect("specifier JSON")
+                ))
+                .await
+                .expect("set denied specifiers");
+            runtime
+                .eval(
+                    r"
+                    globalThis.deniedRequireResult = null;
+                    import('node:module').then(({ createRequire }) => {
+                        const require = createRequire('/fixture/extension.mjs');
+                        const failures = [];
+                        for (const specifier of globalThis.deniedRequireSpecifiers) {
+                            for (const operation of ['require', 'resolve']) {
+                                try {
+                                    if (operation === 'require') require(specifier);
+                                    else require.resolve(specifier);
+                                    failures.push({ specifier, operation, succeeded: true });
+                                } catch (error) {
+                                    failures.push({ specifier, operation, code: error.code,
+                                        message: error.message });
+                                }
+                            }
+                        }
+                        globalThis.deniedRequireResult = { failures,
+                            pathAlias: require('path') === require('node:path'),
+                            fsAlias: require('fs') === require('node:fs'),
+                            fsPromisesAlias: require('fs/promises') === require('node:fs/promises'),
+                            pathJoin: require('path').join('a', 'b'),
+                            pathResolution: require.resolve('node:path'),
+                            utilityResolution: require.resolve('@sourcegraph/scip-python'),
+                            utilityStub: typeof require('left-pad').anyNestedProperty,
+                            prototypeNameIsUtilityStub: typeof require('__proto__') === 'function',
+                            constructorIsNotObject: require('constructor') !== Object,
+                        };
+                    }).catch(error => {
+                        globalThis.deniedRequireResult = { error: String(error.stack || error) };
+                    });
+                    ",
+                )
+                .await
+                .expect("evaluate require policy");
+
+            let result = get_global_json(&runtime, "deniedRequireResult").await;
+            assert!(result.get("error").is_none(), "{result}");
+            let failures = result["failures"].as_array().expect("require failures");
+            assert_eq!(failures.len(), denied.len() * 2);
+            for failure in failures {
+                assert_eq!(failure["code"], "MODULE_NOT_FOUND", "{failure}");
+                assert_eq!(
+                    failure["message"],
+                    format!(
+                        "Cannot find module '{}' in PiJS require()",
+                        failure["specifier"].as_str().expect("specifier")
+                    ),
+                    "{failure}"
+                );
+            }
+            assert_eq!(result["pathAlias"], true);
+            assert_eq!(result["fsAlias"], true);
+            assert_eq!(result["fsPromisesAlias"], true);
+            assert_eq!(result["pathJoin"], "a/b");
+            assert_eq!(result["pathResolution"], "/pijs-virtual/node:path");
+            assert_eq!(
+                result["utilityResolution"],
+                "/pijs-virtual/@sourcegraph/scip-python"
+            );
+            assert_eq!(result["utilityStub"], "function");
+            assert_eq!(result["prototypeNameIsUtilityStub"], true);
+            assert_eq!(result["constructorIsNotObject"], true);
+        });
+    }
+
+    #[test]
     fn pijs_create_require_supports_node_builtins() {
         futures::executor::block_on(async {
             let clock = Arc::new(DeterministicClock::new(0));
@@ -36939,6 +37353,229 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(r["done"], serde_json::json!(true));
             assert_eq!(r["readText"], serde_json::json!("value"));
             assert_eq!(r["names"], serde_json::json!(["value.txt"]));
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_child_process_decodes_across_native_pipe_frames() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock_and_config(
+                DeterministicClock::new(0),
+                PiJsRuntimeConfig {
+                    disk_cache_dir: None,
+                    ..PiJsRuntimeConfig::default()
+                },
+            )
+            .await
+            .expect("create runtime");
+            {
+                let mut state = runtime.module_state.borrow_mut();
+                let source = state
+                    .static_virtual_modules
+                    .get("node:child_process")
+                    .expect("built-in child-process module")
+                    .clone();
+                // Lexical fixture hooks control exact native byte boundaries.
+                // The actual module, Buffer, and StringDecoder run unchanged;
+                // production native globals remain sealed and no process starts.
+                let fixture = r"
+                    let __fixture_next_poll = null;
+                    let __fixture_batch = { frames: [] };
+                    let __fixture_closed = 0;
+                    export function feed(batch) {
+                      if (typeof __fixture_next_poll !== 'function') throw new Error('No pending pipe poll');
+                      __fixture_batch = batch;
+                      const poll = __fixture_next_poll;
+                      __fixture_next_poll = null;
+                      poll();
+                    }
+                    export function closedSessions() { return __fixture_closed; }
+                    const setTimeout = (callback) => { __fixture_next_poll = callback; return 1; };
+                    const clearTimeout = () => { __fixture_next_poll = null; };
+                    const __pi_process_session_poll_native = () => {
+                      const batch = __fixture_batch;
+                      __fixture_batch = { frames: [] };
+                      return JSON.stringify(batch);
+                    };
+                    const __pi_process_session_close_native = () => { __fixture_closed++; };
+                    const __pi_process_session_kill_native = () => true;
+                    const globalThis = {
+                      pi: { exec: () => Promise.resolve({ session: 'decoder-peer', pid: 1 }) },
+                    };
+";
+                state.dynamic_virtual_modules.insert(
+                    "pijs://pipe-decoder-fixture".to_string(),
+                    format!("{fixture}\n{source}"),
+                );
+            }
+            runtime
+                .eval(
+                    r"
+                    const originalBuffer = Buffer;
+                    globalThis.__pipe_decoder_result = null;
+                    globalThis.__pipe_decoder_results = () => globalThis.__pipe_decoder_result;
+                    import('pijs://pipe-decoder-fixture').then(async ({ spawn, feed, closedSessions }) => {
+                      const result = { bufferConstructorPreserved: Buffer === originalBuffer };
+                      function frame(stream, bytes) {
+                        return { stream, data: Buffer.from(bytes).toString('base64') };
+                      }
+                      async function start(encoding) {
+                        const child = spawn('decoder-peer');
+                        const events = [];
+                        const trace = { child, events, stdout: [], stderr: [] };
+                        for (const name of ['stdout', 'stderr']) {
+                          const stream = child[name];
+                          if (encoding !== false) stream.setEncoding(encoding);
+                          stream.on('data', chunk => {
+                            const value = typeof chunk === 'string' ? chunk : Array.from(chunk);
+                            trace[name].push(value);
+                            events.push([name, 'data', value]);
+                          });
+                          stream.on('end', () => events.push([name, 'end']));
+                        }
+                        child.on('exit', (code, signal) => events.push(['exit', code, signal]));
+                        child.on('close', (code, signal) => events.push(['close', code, signal]));
+                        child.on('error', error => events.push(['error', String(error)]));
+                        await Promise.resolve();
+                        return trace;
+                      }
+                      function finish(trace, frames = []) {
+                        feed({ frames, terminal: { code: 0 } });
+                        return {
+                          stdout: trace.stdout,
+                          stderr: trace.stderr,
+                          events: trace.events,
+                          killedAfterClose: trace.child.kill(),
+                        };
+                      }
+
+                      const utf8 = await start('utf-8');
+                      feed({ frames: [frame('stdout', [0x41, 0xe2]), frame('stderr', [0xf0, 0x9f])] });
+                      feed({ frames: [frame('stdout', [0x82]), frame('stderr', [0x9a])] });
+                      result.utf8 = finish(utf8, [
+                        frame('stdout', [0xac, 0x42]),
+                        frame('stderr', [0x80, 0xe2]),
+                      ]);
+
+                      const utf16 = await start('ucs-2');
+                      feed({ frames: [frame('stdout', [0x41])] });
+                      feed({ frames: [frame('stdout', [0x00, 0xac, 0x20, 0x3d, 0xd8])] });
+                      feed({ frames: [frame('stdout', [0x80])] });
+                      result.utf16 = finish(utf16, [frame('stdout', [0xde, 0x21, 0x00])]);
+
+                      const base64 = await start('base64');
+                      feed({ frames: [frame('stdout', [1])] });
+                      feed({ frames: [frame('stdout', [2])] });
+                      feed({ frames: [frame('stdout', [3, 4])] });
+                      result.base64 = finish(base64, [frame('stdout', [5])]);
+
+                      const base64url = await start('base64url');
+                      feed({ frames: [frame('stdout', [251])] });
+                      feed({ frames: [frame('stdout', [255])] });
+                      feed({ frames: [frame('stdout', [255, 251])] });
+                      result.base64url = finish(base64url, [frame('stdout', [255])]);
+
+                      const raw = await start(false);
+                      result.raw = finish(raw, [frame('stdout', [0, 255, 128])]);
+
+                      const rejected = await start('utf8');
+                      feed({ frames: [frame('stdout', [0xe2])] });
+                      let invalidEncoding = false;
+                      try { rejected.child.stdout.setEncoding('not-an-encoding'); }
+                      catch (error) { invalidEncoding = error instanceof TypeError; }
+                      result.rejected = finish(rejected, [frame('stdout', [0x82, 0xac])]);
+                      result.rejected.invalidEncoding = invalidEncoding;
+
+                      const replaced = await start('utf8');
+                      feed({ frames: [frame('stdout', [0xe2])] });
+                      result.sameStream = replaced.child.stdout.setEncoding('hex') === replaced.child.stdout;
+                      result.replaced = finish(replaced, [frame('stdout', [0x82, 0xac])]);
+
+                      const reset = await start('utf8');
+                      feed({ frames: [frame('stdout', [0xe2])] });
+                      reset.child.stdout.setEncoding('utf8');
+                      result.reset = finish(reset, [frame('stdout', [0x82, 0xac])]);
+
+                      for (const [name, encoding] of [['default', undefined], ['null', null], ['empty', '']]) {
+                        const defaults = await start(encoding);
+                        feed({ frames: [frame('stdout', [0xe2])] });
+                        result[name] = finish(defaults, [frame('stdout', [0x82, 0xac])]);
+                      }
+                      result.closedSessions = closedSessions();
+                      globalThis.__pipe_decoder_result = result;
+                    }).catch(error => {
+                      globalThis.__pipe_decoder_result = { error: String(error.stack || error) };
+                    });
+",
+                )
+                .await
+                .expect("run child-process decoder fixture");
+
+            let actual = call_global_fn_json(&runtime, "__pipe_decoder_results").await;
+            assert!(actual.get("error").is_none(), "{actual}");
+            assert_eq!(actual["bufferConstructorPreserved"], true);
+            assert_eq!(
+                actual["utf8"]["events"],
+                serde_json::json!([
+                    ["stdout", "data", "A"],
+                    ["stdout", "data", "€B"],
+                    ["stderr", "data", "🚀"],
+                    ["stdout", "end"],
+                    ["stderr", "data", "\u{fffd}"],
+                    ["stderr", "end"],
+                    ["exit", 0, null],
+                    ["close", 0, null]
+                ])
+            );
+            assert_eq!(actual["utf16"]["stdout"], serde_json::json!(["A€", "🚀!"]));
+            assert_eq!(
+                actual["base64"]["events"],
+                serde_json::json!([
+                    ["stdout", "data", "AQID"],
+                    ["stdout", "data", "BAU="],
+                    ["stdout", "end"],
+                    ["stderr", "end"],
+                    ["exit", 0, null],
+                    ["close", 0, null]
+                ])
+            );
+            assert_eq!(
+                actual["base64url"]["stdout"],
+                serde_json::json!(["-___", "-_8"])
+            );
+            assert_eq!(actual["raw"]["stdout"], serde_json::json!([[0, 255, 128]]));
+            assert_eq!(actual["rejected"]["invalidEncoding"], true);
+            assert_eq!(actual["rejected"]["stdout"], serde_json::json!(["€"]));
+            assert_eq!(actual["sameStream"], true);
+            assert_eq!(actual["replaced"]["stdout"], serde_json::json!(["82ac"]));
+            assert_eq!(
+                actual["reset"]["stdout"],
+                serde_json::json!(["\u{fffd}\u{fffd}"])
+            );
+            for name in ["default", "null", "empty"] {
+                assert_eq!(actual[name]["stdout"], serde_json::json!(["€"]), "{name}");
+            }
+            for name in [
+                "utf8", "utf16", "base64", "base64url", "raw", "rejected", "replaced", "reset",
+                "default", "null", "empty",
+            ] {
+                let events = actual[name]["events"].as_array().expect("stream events");
+                assert!(
+                    !events.iter().any(|event| event[0] == "error"),
+                    "{name}: {events:?}"
+                );
+                assert_eq!(
+                    &events[events.len() - 2..],
+                    &[
+                        serde_json::json!(["exit", 0, null]),
+                        serde_json::json!(["close", 0, null]),
+                    ],
+                    "{name}"
+                );
+                assert_eq!(actual[name]["killedAfterClose"], false, "{name}");
+            }
+            assert_eq!(actual["closedSessions"], 11);
         });
     }
 
@@ -40086,7 +40723,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
     }
 
     #[test]
-    fn pijs_node_readline_stub_exports() {
+    fn pijs_node_readline_exports() {
         futures::executor::block_on(async {
             let clock = Arc::new(DeterministicClock::new(0));
             let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
@@ -40110,6 +40747,271 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(r["done"], serde_json::json!(true));
             assert_eq!(r["hasCreateInterface"], serde_json::json!(true));
         });
+    }
+
+    fn evaluate_readline_fixture(source: &str) -> serde_json::Value {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create readline runtime");
+            runtime
+                .eval(source)
+                .await
+                .expect("evaluate readline fixture");
+            drain_until_idle(&runtime, &clock).await;
+            get_global_json(&runtime, "readlineResult").await
+        })
+    }
+
+    #[test]
+    fn pijs_readline_decodes_chunked_protocol_lines_and_releases_input() {
+        let result = evaluate_readline_fixture(
+            r"
+            globalThis.readlineResult = {};
+            void (async () => {
+                const originalBuffer = globalThis.Buffer;
+                const { createInterface } = await import('node:readline');
+                const { EventEmitter } = await import('node:events');
+                const input = new EventEmitter();
+                let inputPauses = 0, inputResumes = 0;
+                input.pause = () => { inputPauses++; };
+                input.resume = () => { inputResumes++; };
+                const reader = createInterface({ input, terminal: false, crlfDelay: Infinity });
+                const lines = [];
+                let once = 0, removed = 0, closes = 0, pauses = 0, resumes = 0;
+                const removedListener = () => { removed++; };
+                reader.on('line', line => lines.push(line)).once('line', () => { once++; });
+                reader.on('line', removedListener).removeListener('line', removedListener);
+                reader.on('close', () => { closes++; });
+                reader.on('pause', () => { pauses++; }).on('resume', () => { resumes++; });
+                reader.pause().pause().resume().resume();
+                const packet = JSON.stringify({ id: 7, text: 'λ🚀\\n' });
+                for (const byte of Buffer.from(packet + '\r\n\r\nmiddle\rtail')) {
+                    input.emit('data', Buffer.from([byte]));
+                    input.emit('data', Buffer.alloc(0));
+                }
+                input.emit('data', Buffer.from([0xe2, 0x82]));
+                input.emit('end');
+                input.emit('end');
+                reader.close();
+                input.emit('data', 'ignored\n');
+                globalThis.readlineResult = {
+                    message: JSON.parse(lines[0]), rest: lines.slice(1), once, removed, closes,
+                    pauses, resumes, inputPauses, inputResumes, closed: reader.closed,
+                    detached: ['data', 'end', 'error', 'close'].every(event => input.listenerCount(event) === 0),
+                    bufferPreserved: originalBuffer === globalThis.Buffer,
+                };
+            })().catch(error => { globalThis.readlineResult = { error: String(error) }; });
+            ",
+        );
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "message": {"id": 7, "text": "λ🚀\\n"}, "rest": ["", "middle", "tail�"],
+                "once": 1, "removed": 0, "closes": 1, "pauses": 1, "resumes": 1,
+                "inputPauses": 2, "inputResumes": 2, "closed": true,
+                "detached": true, "bufferPreserved": true,
+            })
+        );
+    }
+
+    #[test]
+    fn pijs_readline_promises_iterates_buffered_lines_and_final_tail() {
+        let result = evaluate_readline_fixture(
+            r"
+            globalThis.readlineResult = {};
+            void (async () => {
+                const { createInterface, Interface } = await import('node:readline/promises');
+                const { EventEmitter } = await import('node:events');
+                const input = new EventEmitter();
+                const reader = createInterface({ input, terminal: false });
+                const iterator = reader[Symbol.asyncIterator]();
+                const first = iterator.next();
+                input.emit('data', Buffer.from('one\ntwo\nlast'));
+                input.emit('end');
+                const values = [(await first).value];
+                for await (const line of iterator) values.push(line);
+                globalThis.readlineResult = {
+                    values, done: (await iterator.next()).done, closed: reader.closed,
+                    instance: reader instanceof Interface, listeners: input.listenerCount('data'),
+                };
+            })().catch(error => { globalThis.readlineResult = { error: String(error) }; });
+            ",
+        );
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "values": ["one", "two", "last"], "done": true, "closed": true,
+                "instance": true, "listeners": 0,
+            })
+        );
+    }
+
+    #[test]
+    fn pijs_readline_iterator_break_detaches_without_destroying_supplied_stream() {
+        let result = evaluate_readline_fixture(
+            r"
+            globalThis.readlineResult = {};
+            void (async () => {
+                const { createInterface } = await import('node:readline');
+                const { EventEmitter } = await import('node:events');
+                const input = new EventEmitter();
+                let destroyed = 0, closes = 0, peerLines = 0;
+                input.destroy = () => { destroyed++; };
+                input.on('data', () => { peerLines++; });
+                const reader = createInterface({ input });
+                reader.on('close', () => { closes++; });
+                const consumed = (async () => {
+                    for await (const line of reader) { return line; }
+                    return 'missing';
+                })();
+                input.emit('data', 'first\nqueued\n');
+                const first = await consumed;
+                input.emit('data', 'peer-still-owns-input\n');
+                reader.close();
+                globalThis.readlineResult = {
+                    first, destroyed, closes, peerLines, closed: reader.closed,
+                    dataListeners: input.listenerCount('data'), endListeners: input.listenerCount('end'),
+                };
+            })().catch(error => { globalThis.readlineResult = { error: String(error) }; });
+            ",
+        );
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "first": "first", "destroyed": 0, "closes": 1, "peerLines": 2,
+                "closed": true, "dataListeners": 1, "endListeners": 0,
+            })
+        );
+    }
+
+    #[test]
+    fn pijs_readline_errors_reject_waiters_and_close_without_emitting_partial_protocol() {
+        let result = evaluate_readline_fixture(
+            r"
+            globalThis.readlineResult = {};
+            void (async () => {
+                const { createInterface } = await import('node:readline');
+                const { EventEmitter } = await import('node:events');
+                const input = new EventEmitter();
+                const reader = createInterface({ input });
+                let lines = 0, closes = 0;
+                reader.on('line', () => { lines++; }).on('close', () => { closes++; });
+                const iterator = reader[Symbol.asyncIterator]();
+                const first = iterator.next().catch(error => error.message);
+                const second = iterator.next().catch(error => error.message);
+                input.emit('data', '{partial');
+                input.emit('error', new Error('protocol input failed'));
+                input.emit('end');
+                const later = await iterator.next().catch(error => error.message);
+                globalThis.readlineResult = {
+                    errors: [await first, await second, later], lines, closes,
+                    detached: ['data', 'end', 'error', 'close'].every(event => input.listenerCount(event) === 0),
+                };
+            })().catch(error => { globalThis.readlineResult = { error: String(error) }; });
+            ",
+        );
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "errors": ["protocol input failed", "protocol input failed", "protocol input failed"],
+                "lines": 0, "closes": 1, "detached": true,
+            })
+        );
+    }
+
+    #[test]
+    fn pijs_readline_bounds_individual_lines_and_only_active_iterator_backlogs() {
+        let result = evaluate_readline_fixture(
+            r"
+            globalThis.readlineResult = {};
+            void (async () => {
+                const { createInterface } = await import('node:readline');
+                const { EventEmitter } = await import('node:events');
+                const input = new EventEmitter();
+                const reader = createInterface({ input });
+                let count = 0, bytes = 0, lineError = null;
+                reader.on('line', line => { count++; bytes += Buffer.byteLength(line); });
+                reader.on('error', error => { lineError = error.code; });
+                // Event-only consumption must not fill an unused iterator queue.
+                input.emit('data', 'x\n'.repeat(2048));
+                const chunk = 'λ'.repeat(32768);
+                for (let index = 0; index < 8; index++) input.emit('data', chunk);
+                input.emit('data', '\n');
+                // Exactly 4 MiB is admitted; one additional UTF-8 byte is not.
+                for (let index = 0; index < 64; index++) input.emit('data', chunk);
+                input.emit('data', '\n');
+                for (let index = 0; index < 64; index++) input.emit('data', chunk);
+                input.emit('data', 'x');
+                const queueInput = new EventEmitter();
+                const queued = createInterface({ input: queueInput });
+                const iterator = queued[Symbol.asyncIterator]();
+                queueInput.emit('data', '\n'.repeat(1025));
+                const queueError = await iterator.next().catch(error => error.code);
+                globalThis.readlineResult = {
+                    count, bytes, lineError, lineClosed: reader.closed,
+                    queueError, queueClosed: queued.closed, listeners: queueInput.listenerCount('data'),
+                };
+            })().catch(error => { globalThis.readlineResult = { error: String(error) }; });
+            ",
+        );
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "count": 2050, "bytes": 2048 + 512 * 1024 + 4 * 1024 * 1024,
+                "lineError": "ERR_PI_READLINE_LIMIT", "lineClosed": true,
+                "queueError": "ERR_PI_READLINE_LIMIT", "queueClosed": true, "listeners": 0,
+            })
+        );
+    }
+
+    #[test]
+    fn pijs_readline_stream_questions_and_terminal_fallback_keep_distinct_lifecycles() {
+        let result = evaluate_readline_fixture(
+            r"
+            globalThis.readlineResult = {};
+            void (async () => {
+                const readline = await import('node:readline');
+                const { EventEmitter } = await import('node:events');
+                const input = new EventEmitter();
+                const prompts = [];
+                const reader = readline.promises.createInterface({ input, output: { write: text => prompts.push(text) } });
+                const answer = reader.question('name?');
+                input.emit('data', 'answer\n');
+                const controller = new AbortController();
+                const aborted = reader.question('abort?', { signal: controller.signal }).catch(error => error.name);
+                controller.abort();
+                const final = reader.question('closed?').catch(error => error.code);
+                reader.close();
+                globalThis.pi = { ui: async (_op, options) => 'ui:' + options.title };
+                const terminal = readline.promises.createInterface({ input: process.stdin });
+                const ui = await terminal.question('terminal?');
+                terminal.close();
+                const brokenInput = new EventEmitter();
+                const broken = readline.promises.createInterface({ input: brokenInput,
+                    output: { write() { throw new Error('output failed'); } } });
+                const outputError = await broken.question('first?').catch(error => error.message);
+                broken.output = null;
+                const recovered = broken.question('second?');
+                brokenInput.emit('data', 'recovered\n');
+                const recoveredAnswer = await recovered;
+                broken.close();
+                globalThis.readlineResult = {
+                    answer: await answer, aborted: await aborted, closed: await final, prompts, ui,
+                    outputError, recoveredAnswer,
+                };
+            })().catch(error => { globalThis.readlineResult = { error: String(error) }; });
+            ",
+        );
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "answer": "answer", "aborted": "AbortError", "closed": "ERR_USE_AFTER_CLOSE",
+                "prompts": ["name?", "abort?", "closed?"], "ui": "ui:terminal?",
+                "outputError": "output failed", "recoveredAnswer": "recovered",
+            })
+        );
     }
 
     #[test]

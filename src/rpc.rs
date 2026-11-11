@@ -3159,7 +3159,7 @@ pub async fn run(
         // A rejected attachment must never advance the durable session, and an
         // extension command has no native attachment delivery path.
         let attachments = if matches!(command_type, "prompt" | "steer" | "follow_up") {
-            match parse_prompt_attachments(&parsed, &options.config) {
+            match parse_prompt_attachments(&parsed, &options.config, Some(&output.attachments)) {
                 Ok(attachments) => {
                     if !attachments.is_empty()
                         && parsed
@@ -7432,6 +7432,7 @@ async fn run_prompt_with_retry_owned(
             stream_can_retry: true,
         };
         let recovery_decision;
+        let mut call_error = None;
         let rate_limited = crate::failover::is_credential_rate_limit(match &result {
             Ok(message) => crate::failover::TurnOutcome::Completed(message),
             Err(error) => crate::failover::TurnOutcome::Failed(error),
@@ -7545,6 +7546,7 @@ async fn run_prompt_with_retry_owned(
                 );
                 final_error = Some(err_str.clone());
                 final_error_hints = Some(error_hints_value(&err));
+                call_error = Some(err);
             }
         }
 
@@ -7600,6 +7602,7 @@ async fn run_prompt_with_retry_owned(
                     &recovery_events,
                     &options,
                     final_error.as_deref(),
+                    call_error.as_ref(),
                     require_incomplete_tail,
                     (retry_count > 0).then_some(retry_count),
                     failovers_this_turn,
@@ -8027,6 +8030,7 @@ async fn try_failover_to_next_chain_entry(
     recovery_events: &crate::failover::RecoveryEventStream,
     options: &RpcOptions,
     error_text: Option<&str>,
+    call_error: Option<&Error>,
     require_incomplete_tail: bool,
     retry_attempt_to_end: Option<u32>,
     swaps_so_far: u32,
@@ -8040,7 +8044,11 @@ async fn try_failover_to_next_chain_entry(
     {
         return Ok(false);
     }
-    let Some(class) = crate::failover::classify_failover(error_text) else {
+    let class = call_error.map_or_else(
+        || crate::failover::classify_failover(error_text),
+        crate::failover::classify_call_failover,
+    );
+    let Some(class) = class else {
         return Ok(false); // auth/loud errors never fail over
     };
     let Some(chains) = options
@@ -9755,6 +9763,7 @@ mod retry_tests {
         contexts: std::sync::Mutex<Vec<Vec<Message>>>,
         prompts: std::sync::Mutex<Vec<Option<String>>>,
         transport_error: bool,
+        transport_kind: Option<std::io::ErrorKind>,
     }
 
     impl FlakyProvider {
@@ -9764,6 +9773,7 @@ mod retry_tests {
                 contexts: std::sync::Mutex::new(Vec::new()),
                 prompts: std::sync::Mutex::new(Vec::new()),
                 transport_error: false,
+                transport_kind: None,
             }
         }
     }
@@ -9833,6 +9843,11 @@ mod retry_tests {
                 .expect("capture retry system prompt")
                 .push(context.system_prompt.as_deref().map(str::to_string));
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0
+                && let Some(kind) = self.transport_kind
+            {
+                return Err(Error::Io(Box::new(std::io::Error::new(kind, "wire"))));
+            }
             if call == 0 && self.transport_error {
                 return Err(Error::api("server error"));
             }
@@ -10099,6 +10114,144 @@ mod retry_tests {
     }
 
     #[test]
+    fn rpc_failover_preserves_typed_transport_evidence_through_the_swap() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async move {
+            for (kind, expected_swaps) in [
+                (std::io::ErrorKind::ConnectionReset, 1),
+                (std::io::ErrorKind::InvalidInput, 0),
+            ] {
+                let provider = Arc::new(FlakyProvider {
+                    transport_kind: Some(kind),
+                    ..FlakyProvider::new()
+                });
+                let agent = Agent::new(
+                    Arc::clone(&provider) as Arc<dyn Provider>,
+                    ToolRegistry::new(&[], Path::new("."), None),
+                    AgentConfig::default(),
+                );
+                let temp = tempfile::tempdir().expect("typed failover fixture");
+                let store = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                    temp.path().join("sessions"),
+                ))));
+                let session = Arc::new(Mutex::new(AgentSession::new(
+                    agent,
+                    Arc::clone(&store),
+                    true,
+                    crate::compaction::ResolvedCompactionSettings::default(),
+                )));
+                let config = Config {
+                    retry: Some(crate::config::RetrySettings {
+                        enabled: Some(true),
+                        max_retries: Some(0),
+                        max_failovers_per_turn: Some(1),
+                        fallback_chains: Some(HashMap::from([(
+                            "default".to_string(),
+                            vec!["openai/typed-fallback".to_string()],
+                        )])),
+                        ..Default::default()
+                    }),
+                    ..Config::default()
+                };
+                let mut shared = RpcSharedState::new(&config);
+                shared.auto_compaction_enabled = false;
+                let shared = Arc::new(Mutex::new(shared));
+                let mut fallback = crate::models::ad_hoc_model_entry("openai", "typed-fallback")
+                    .expect("fallback model");
+                fallback.model.base_url = "http://127.0.0.1:0/v1".to_string();
+                fallback.api_key = Some("fixture-key".to_string());
+                let options = RpcOptions {
+                    config,
+                    working_directory: None,
+                    resources: ResourceLoader::empty(false),
+                    available_models: vec![fallback],
+                    scoped_models: Vec::new(),
+                    cli_api_key: None,
+                    auth: AuthStorage::empty_at(temp.path().join("auth.json")),
+                    runtime_handle: runtime_handle.clone(),
+                    ask_tool: None,
+                };
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+                run_prompt_with_retry(
+                    Arc::clone(&session),
+                    Arc::clone(&shared),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(std::sync::Mutex::new(())),
+                    Arc::new(Mutex::new(None)),
+                    out_tx,
+                    Arc::new(AtomicBool::new(false)),
+                    options,
+                    "one authored input".to_string(),
+                    None,
+                    Vec::new(),
+                    AgentCx::for_request(),
+                )
+                .await;
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                let cx = AgentCx::for_request();
+                let guard = session.lock(&cx).await.expect("session");
+                let expected_model = if expected_swaps == 1 {
+                    "typed-fallback"
+                } else {
+                    "test-model"
+                };
+                assert_eq!(guard.agent.provider().model_id(), expected_model);
+                drop(guard);
+                let stored = store.lock(cx.cx()).await.expect("stored session");
+                let path = stored.path.clone().expect("saved session path");
+                drop(stored);
+                let reopened = Session::open(&path.display().to_string())
+                    .await
+                    .expect("reopen durable result");
+                let persisted_swaps = reopened
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry,
+                            SessionEntry::ModelChange(change)
+                                if change.role.as_deref() == Some("failover")
+                        )
+                    })
+                    .count();
+                assert_eq!(
+                    persisted_swaps, expected_swaps,
+                    "{kind:?}: the fallback decision must reach persistence"
+                );
+                let events: Vec<Value> = out_rx
+                    .try_iter()
+                    .map(|line| serde_json::from_str(&line).expect("RPC event"))
+                    .collect();
+                let lifecycle: Vec<&str> = events
+                    .iter()
+                    .filter_map(|event| {
+                        let kind = event["type"].as_str()?;
+                        if kind == "failover_start" {
+                            assert_eq!(event["class"], "transient");
+                        }
+                        matches!(
+                            kind,
+                            "agent_start" | "failover_start" | "failover_end" | "agent_end"
+                        )
+                        .then_some(kind)
+                    })
+                    .collect();
+                let expected = if expected_swaps == 1 {
+                    vec!["agent_start", "failover_start", "failover_end", "agent_end"]
+                } else {
+                    vec!["agent_start", "agent_end"]
+                };
+                assert_eq!(lifecycle, expected, "{kind:?}");
+            }
+        });
+    }
+
+    #[test]
     #[allow(clippy::await_holding_lock)]
     fn rpc_auto_retry_retries_then_succeeds_with_native_media() {
         let runtime = asupersync::runtime::RuntimeBuilder::new()
@@ -10165,6 +10318,7 @@ mod retry_tests {
                     {"type": "media", "data": "Yg", "mimeType": "video/mp4"}
                 ]}),
                 &options.config,
+                None,
             )
             .expect("parse retry attachments");
             let expected = serde_json::to_value(UserContent::Blocks(
@@ -10720,6 +10874,7 @@ mod retry_tests {
                             &rpc_recovery_events(out_tx),
                             &options,
                             Some("503 service unavailable"),
+                            None,
                             false,
                             None,
                             0,
@@ -10858,6 +11013,7 @@ mod retry_tests {
                     &rpc_recovery_events(out_tx),
                     &options,
                     Some("server error"),
+                    None,
                     false,
                     None,
                     0,
@@ -10910,6 +11066,7 @@ mod retry_tests {
                     &rpc_recovery_events(exhausted_tx),
                     &options,
                     Some("server error"),
+                    None,
                     false,
                     None,
                     0,
@@ -11029,6 +11186,7 @@ mod retry_tests {
                     &rpc_recovery_events(out_tx.clone()),
                     &options,
                     Some("server error"),
+                    None,
                     false,
                     None,
                     0,
@@ -11047,6 +11205,7 @@ mod retry_tests {
                     &rpc_recovery_events(out_tx),
                     &options,
                     Some("server error"),
+                    None,
                     false,
                     None,
                     0,
@@ -11166,6 +11325,7 @@ mod retry_tests {
                 &rpc_recovery_events(out_tx.clone()),
                 &options,
                 Some("server error"),
+                None,
                 true,
                 None,
                 0,
@@ -11263,6 +11423,7 @@ mod retry_tests {
                     &recovery_events,
                     &options,
                     Some("server error"),
+                    None,
                     true,
                     Some(2),
                     0,
@@ -11809,6 +11970,7 @@ mod retry_tests {
                     &rpc_recovery_events(out_tx),
                     &fixture.options,
                     Some("503 service unavailable"),
+                    None,
                     false,
                     None,
                     0,
@@ -11897,6 +12059,7 @@ mod retry_tests {
                     &rpc_recovery_events(out_tx.clone()),
                     &fixture.options,
                     Some("503 service unavailable"),
+                    None,
                     false,
                     None,
                     0,
@@ -12157,6 +12320,7 @@ mod retry_tests {
                     &rpc_recovery_events(out_tx.clone()),
                     &options,
                     Some("server error"),
+                    None,
                     true,
                     None,
                     0,
@@ -12224,6 +12388,7 @@ mod retry_tests {
                     &rpc_recovery_events(out_tx.clone()),
                     &options,
                     Some("server error"),
+                    None,
                     true,
                     None,
                     1,
@@ -12549,6 +12714,7 @@ mod retry_tests {
                         &rpc_recovery_events(out_tx),
                         &options,
                         Some("server error"),
+                        None,
                         true,
                         None,
                         0,
@@ -12870,6 +13036,7 @@ mod retry_tests {
                         &rpc_recovery_events(out_tx),
                         &options,
                         Some("server error"),
+                        None,
                         true,
                         None,
                         0,
@@ -16723,7 +16890,11 @@ fn rpc_media_max_bytes(config: &Config) -> u64 {
         .min(MAX_RPC_MEDIA_BYTES)
 }
 
-fn parse_prompt_attachments(parsed: &Value, config: &Config) -> Result<Vec<ContentBlock>> {
+fn parse_prompt_attachments(
+    parsed: &Value,
+    config: &Config,
+    catalog: Option<&AttachmentCatalog>,
+) -> Result<Vec<ContentBlock>> {
     if let Some(content) = parsed.get("content") {
         if ["message", "images", "media"]
             .iter()
@@ -16733,7 +16904,11 @@ fn parse_prompt_attachments(parsed: &Value, config: &Config) -> Result<Vec<Conte
                 "content cannot be combined with message, images, or media",
             ));
         }
-        return parse_native_prompt_content(content, rpc_media_max_bytes(config));
+        return parse_native_prompt_content_with_catalog(
+            content,
+            rpc_media_max_bytes(config),
+            catalog,
+        );
     }
     // Validate media before cloning legacy image payloads from the same input.
     let media = parse_prompt_media(parsed.get("media"), config)?;
@@ -16752,6 +16927,17 @@ pub(crate) fn parse_native_prompt_content(
     value: &Value,
     max_media_bytes: u64,
 ) -> Result<Vec<ContentBlock>> {
+    parse_native_prompt_content_with_catalog(value, max_media_bytes, None)
+}
+
+/// Only the receiving connection can resolve compact attachment references.
+/// Pin and budget every payload before expanding any reference; the normal
+/// native validator still owns MIME, decoded-size, authorship and wire limits.
+fn parse_native_prompt_content_with_catalog(
+    value: &Value,
+    max_media_bytes: u64,
+    catalog: Option<&AttachmentCatalog>,
+) -> Result<Vec<ContentBlock>> {
     let items = value
         .as_array()
         .ok_or_else(|| Error::validation("content must be an array"))?;
@@ -16760,34 +16946,81 @@ pub(crate) fn parse_native_prompt_content(
             "content must contain 1..={MAX_RPC_CONTENT_BLOCKS} user content blocks"
         )));
     }
-    let mut content = Vec::with_capacity(items.len());
+    let mut references = Vec::with_capacity(items.len());
     let mut media_count = 0;
     let mut encoded_bytes = 0_u64;
     for (index, item) in items.iter().enumerate() {
         let invalid = |reason: &str| Error::validation(format!("content[{index}]: {reason}"));
-        // Count payloads before cloning or decoding; the whole native command
-        // is bounded even when it mixes many individually acceptable blocks.
-        let payload = match item.get("type").and_then(Value::as_str) {
+        let kind = item.get("type").and_then(Value::as_str);
+        let payload = match kind {
             Some("text") => item.get("text"),
             Some("image" | "media") => item.get("data"),
             _ => return Err(invalid("user content must be text, image, or media")),
         }
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid("content payload must be a string"))?;
-        encoded_bytes = encoded_bytes.saturating_add(payload.len() as u64);
+        .ok_or_else(|| invalid("content payload is required"))?;
+        let (reference, payload_len) = if let Some(payload) = payload.as_str() {
+            (None, payload.len())
+        } else if matches!(kind, Some("image" | "media")) && payload.is_object() {
+            let catalog = catalog.ok_or_else(|| {
+                invalid("attachment references require the receiving RPC connection")
+            })?;
+            let reference = catalog
+                .resolve_input(payload)
+                .map_err(|error| invalid(&error.to_string()))?;
+            let payload_len = reference.encoded_len();
+            (Some(reference), payload_len)
+        } else {
+            return Err(invalid(
+                "content payload must be a string or an issued attachment reference",
+            ));
+        };
+        // Charge repeated references repeatedly: one retained blob can still
+        // expand into many provider/session payloads. No base64 allocation has
+        // happened yet, even when a later item exceeds the aggregate budget.
+        encoded_bytes = encoded_bytes.saturating_add(payload_len as u64);
         if encoded_bytes > MAX_RPC_MEDIA_BYTES {
             return Err(invalid(
                 "combined text and encoded attachments exceed 64 MiB",
             ));
         }
+        if kind == Some("media") {
+            media_count += 1;
+            if media_count > MAX_RPC_MEDIA_ATTACHMENTS {
+                return Err(invalid("more than 32 media attachments"));
+            }
+            if payload_len as u64
+                > max_media_bytes.min(MAX_RPC_MEDIA_BYTES).saturating_add(2) / 3 * 4
+            {
+                return Err(invalid(&format!(
+                    "decoded payload exceeds media.maxBytes ({max_media_bytes} bytes)"
+                )));
+            }
+        }
+        if kind == Some("image")
+            && payload_len as u64
+                > crate::media_tools::MAX_IMAGE_FILE_SIZE_BYTES.saturating_add(2) / 3 * 4
+        {
+            return Err(invalid("native image exceeds the 20 MiB decoded limit"));
+        }
+        references.push(reference);
+    }
+
+    let mut content = Vec::with_capacity(items.len());
+    for (item, reference) in items.iter().zip(references) {
+        let mut expanded;
+        let item = if let Some(reference) = reference {
+            expanded = item.clone();
+            expanded["data"] = Value::String(reference.into_base64());
+            &expanded
+        } else {
+            item
+        };
         let block = match item.get("type").and_then(Value::as_str) {
-            Some("text") => ContentBlock::Text(TextContent::new(payload)),
+            Some("text") => ContentBlock::Text(TextContent::new(
+                item["text"].as_str().expect("text payload was validated"),
+            )),
             Some("image") => ContentBlock::Image(parse_native_prompt_image(item)?),
             Some("media") => {
-                media_count += 1;
-                if media_count > MAX_RPC_MEDIA_ATTACHMENTS {
-                    return Err(invalid("more than 32 media attachments"));
-                }
                 let mut media = parse_prompt_media_items(
                     std::slice::from_ref(item),
                     max_media_bytes.min(MAX_RPC_MEDIA_BYTES),
@@ -24878,6 +25111,157 @@ export default function init(pi) {
     }
 
     #[test]
+    fn rpc_reuses_issued_attachments_in_prompts_and_live_queue_routes() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(Box::pin(async move {
+            for (command, behavior) in [
+                ("steer", None),
+                ("follow_up", None),
+                ("prompt", Some("steer")),
+                ("prompt", Some("follow-up")),
+            ] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let (entered, mut wait_for_entry) = asupersync::channel::oneshot::channel();
+                let (release, gate) = asupersync::channel::oneshot::channel();
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let provider: Arc<dyn Provider> = Arc::new(GatedQueuedKeywordProvider {
+                    first_call_entered: Mutex::new(Some(entered)),
+                    first_call_gate: Mutex::new(Some(gate)),
+                    calls: Arc::clone(&calls),
+                });
+                let content = rpc_compact_fixture_content();
+                let mut source = Session::in_memory();
+                source.append_message(SessionMessage::User {
+                    content: UserContent::Blocks(content.clone()),
+                    timestamp: Some(0),
+                });
+                let agent_session = build_test_agent_session_with_provider(source, provider);
+                let inner_session = Arc::clone(&agent_session.session);
+                let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+                let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+                let out_rx = Arc::new(Mutex::new(out_rx));
+                let server = runtime_handle.spawn(async move {
+                    Box::pin(run(agent_session, options, in_rx, out_tx)).await
+                });
+                let mode = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"set_output_mode","mode":"compact"}"#,
+                    "negotiate references",
+                )
+                .await;
+                assert_ok(&mode, "set_output_mode");
+                let history = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    r#"{"type":"get_messages"}"#,
+                    "receive real connection references",
+                )
+                .await;
+                assert_ok(&history, "get_messages");
+                let mut reused = history["data"]["messages"][0]["content"].clone();
+                assert!(reused[1]["data"].is_object());
+                assert!(reused[2]["data"].is_object());
+                reused[0]["text"] = json!("/model literal attached content\n");
+                let mut expected = serde_json::to_value(content).unwrap();
+                expected[0]["text"] = reused[0]["text"].clone();
+                if command == "follow_up" {
+                    let mode = send_recv(
+                        &in_tx,
+                        &out_rx,
+                        r#"{"type":"set_output_mode","mode":"full"}"#,
+                        "issued inputs remain valid in full output mode",
+                    )
+                    .await;
+                    assert_ok(&mode, "set_output_mode");
+                }
+                let initial = json!({"id": "initial", "type": "prompt", "content": reused});
+                assert!(initial.to_string().len() < 4096);
+                let accepted = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &initial.to_string(),
+                    "prompt using issued references",
+                )
+                .await;
+                assert_ok(&accepted, "prompt");
+                wait_for_entry
+                    .recv(AgentCx::for_request().cx())
+                    .await
+                    .expect("reference-backed prompt reaches provider");
+
+                let mut queued = json!({"id": "queued", "type": command, "content": reused});
+                if let Some(behavior) = behavior {
+                    queued["streamingBehavior"] = json!(behavior);
+                }
+                let mut invalid = queued.clone();
+                invalid["id"] = json!("rejected");
+                invalid["content"][1]["data"]["sizeBytes"] = json!(1);
+                let rejected = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &invalid.to_string(),
+                    "reject tampered reference before queue admission",
+                )
+                .await;
+                assert_err(&rejected, command);
+                assert!(rejected["error"].as_str().unwrap().contains("metadata"));
+                let accepted = send_recv(
+                    &in_tx,
+                    &out_rx,
+                    &queued.to_string(),
+                    "queue issued references during the live prompt",
+                )
+                .await;
+                assert_ok(&accepted, command);
+                release
+                    .send(AgentCx::for_request().cx(), ())
+                    .expect("release provider");
+                loop {
+                    let line = recv_line(&out_rx, "reference-backed turn completion")
+                        .await
+                        .expect("turn event");
+                    let event = parse_response(&line);
+                    if event["type"] == "agent_end" {
+                        assert!(event.get("error").is_none_or(Value::is_null), "{event}");
+                        break;
+                    }
+                }
+                drop(in_tx);
+                server.await.expect("RPC server run");
+                let captured = calls.lock().expect("captured provider calls");
+                assert_eq!(captured.len(), 2, "{command} {behavior:?}");
+                let users: Vec<_> = captured[1]
+                    .messages
+                    .iter()
+                    .filter_map(|message| match message {
+                        Message::User(user) => Some(serde_json::to_value(&user.content).unwrap()),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(users.ends_with(&[expected.clone(), expected.clone()]));
+                drop(captured);
+                let cx = AgentCx::for_request();
+                let saved = inner_session.lock(&cx).await.expect("native session contents");
+                let users: Vec<_> = saved
+                    .to_messages_for_current_path()
+                    .into_iter()
+                    .filter_map(|message| match message {
+                        Message::User(user) => Some(serde_json::to_value(user.content).unwrap()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(users.len(), 3, "rejected reference must not append input");
+                assert!(users.ends_with(&[expected.clone(), expected]));
+            }
+        }));
+    }
+
+    #[test]
     fn rpc_native_media_streaming_routes_validate_before_queue_and_preserve_content() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -28661,7 +29045,7 @@ export default function init(pi) {
                 {"type": "media", "data": "Yw==", "mimeType": "video/mp4"}
             ]
         });
-        let attachments = parse_prompt_attachments(&payload, &Config::default()).unwrap();
+        let attachments = parse_prompt_attachments(&payload, &Config::default(), None).unwrap();
         let Message::User(user) = build_user_message("compare", &attachments) else {
             panic!("expected user message");
         };
@@ -28674,7 +29058,7 @@ export default function init(pi) {
         assert!(matches!(&blocks[2], ContentBlock::Media(media) if media.data == "Yg=="));
         assert!(matches!(&blocks[3], ContentBlock::Media(media) if media.data == "Yw=="));
         for payload in [json!({}), json!({"images": [], "media": []})] {
-            let empty = parse_prompt_attachments(&payload, &Config::default()).unwrap();
+            let empty = parse_prompt_attachments(&payload, &Config::default(), None).unwrap();
             assert!(matches!(
                 build_user_message("text only", &empty),
                 Message::User(UserMessage {
@@ -28696,7 +29080,7 @@ export default function init(pi) {
             {"type": "media", "data": "Yw==", "mimeType": "video/mp4"}
         ]);
         let payload = json!({"content": content});
-        let attachments = parse_prompt_attachments(&payload, &config).unwrap();
+        let attachments = parse_prompt_attachments(&payload, &config, None).unwrap();
         let Message::User(user) =
             build_user_message(rpc_prompt_message(&payload).unwrap(), &attachments)
         else {
@@ -28707,7 +29091,7 @@ export default function init(pi) {
             let mut ambiguous = payload.clone();
             ambiguous[field] = Value::Null;
             assert!(
-                parse_prompt_attachments(&ambiguous, &config)
+                parse_prompt_attachments(&ambiguous, &config, None)
                     .unwrap_err()
                     .to_string()
                     .contains("cannot be combined")
@@ -28727,7 +29111,7 @@ export default function init(pi) {
             json!([{"type": "media", "data": "YQ==", "mimeType": "image/png"}]),
         ] {
             assert!(
-                parse_prompt_attachments(&json!({"content": content}), &config).is_err(),
+                parse_prompt_attachments(&json!({"content": content}), &config, None).is_err(),
                 "malformed native content was accepted: {content}"
             );
         }
@@ -28743,22 +29127,94 @@ export default function init(pi) {
             ..Config::default()
         };
         let valid = json!({"type": "media", "data": "YQ==", "mimeType": "audio/wav"});
-        assert!(parse_prompt_attachments(&json!({"content": [valid]}), &config).is_ok());
+        assert!(parse_prompt_attachments(&json!({"content": [valid]}), &config, None).is_ok());
         assert!(
             parse_prompt_attachments(
                 &json!({"content": [
                     {"type": "media", "data": "YWE=", "mimeType": "audio/wav"}
                 ]}),
-                &config
+                &config,
+                None,
             )
             .is_err()
         );
         let media_overflow = json!({"content": vec![valid; MAX_RPC_MEDIA_ATTACHMENTS + 1]});
-        assert!(parse_prompt_attachments(&media_overflow, &config).is_err());
+        assert!(parse_prompt_attachments(&media_overflow, &config, None).is_err());
         let block_overflow = json!({"content": vec![
             json!({"type": "text", "text": "x"}); MAX_RPC_CONTENT_BLOCKS + 1
         ]});
-        assert!(parse_prompt_attachments(&block_overflow, &config).is_err());
+        assert!(parse_prompt_attachments(&block_overflow, &config, None).is_err());
+    }
+
+    #[test]
+    fn rpc_native_reference_inputs_preserve_payloads_and_existing_validation() {
+        let catalog = AttachmentCatalog::default();
+        let native = rpc_compact_fixture_content();
+        let compact = serde_json::to_value(ContentBlocks::new(&native, &catalog)).unwrap();
+        let request = json!({"content": compact});
+        let resolved =
+            parse_prompt_attachments(&request, &Config::default(), Some(&catalog)).unwrap();
+        assert_eq!(
+            serde_json::to_value(resolved).unwrap(),
+            serde_json::to_value(&native).unwrap(),
+            "padding, MIME, names, text and block order must survive reference reuse"
+        );
+        assert!(
+            parse_native_prompt_content(&compact, MAX_RPC_MEDIA_BYTES).is_err(),
+            "a typed client without the receiving catalog must not accept references"
+        );
+
+        let bounded = Config {
+            media: Some(crate::media_tools::MediaSettings {
+                max_bytes: Some(1),
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let short = catalog.register("YWE=").unwrap();
+        let short = json!({"content": [{
+            "type": "media", "mimeType": "audio/wav", "data": short
+        }]});
+        let error = parse_prompt_attachments(&short, &bounded, Some(&catalog)).unwrap_err();
+        assert!(error.to_string().contains("media.maxBytes"));
+
+        for (index, mime) in [(1, "video/mp4"), (2, "image/png")] {
+            let mut invalid = request.clone();
+            invalid["content"][index]["mimeType"] = json!(mime);
+            assert!(
+                parse_prompt_attachments(&invalid, &Config::default(), Some(&catalog)).is_err()
+            );
+        }
+        let mut ambiguous = request.clone();
+        ambiguous["images"] = json!([]);
+        assert!(
+            parse_prompt_attachments(&ambiguous, &Config::default(), Some(&catalog)).is_err()
+        );
+        catalog.clear();
+        let error =
+            parse_prompt_attachments(&request, &Config::default(), Some(&catalog)).unwrap_err();
+        assert!(error.to_string().contains("unknown or expired"));
+    }
+
+    #[test]
+    fn rpc_native_repeated_references_are_charged_at_expanded_size() {
+        use base64::Engine as _;
+
+        let catalog = AttachmentCatalog::default();
+        let data = base64::engine::general_purpose::STANDARD.encode(vec![42; 512 * 1024]);
+        let reference = catalog.register(&data).unwrap();
+        let count = usize::try_from(MAX_RPC_MEDIA_BYTES).unwrap() / data.len() + 1;
+        assert!(count < MAX_RPC_CONTENT_BLOCKS);
+        let request = json!({"content": vec![json!({
+            "type": "image", "mimeType": "image/png", "data": reference
+        }); count]});
+        assert!(request.to_string().len() < 64 * 1024);
+        let error =
+            parse_prompt_attachments(&request, &Config::default(), Some(&catalog)).unwrap_err();
+        assert!(
+            error.to_string().contains("encoded attachments exceed 64 MiB"),
+            "small references must not evade native payload admission: {error}"
+        );
     }
 
     #[test]

@@ -111,11 +111,46 @@ be established. An explicit media API key does not bypass this check. Each
 invocation retains the account it started with; a retained tool uses the
 current account on its next invocation.
 
-The adapters do not yet add their own inspection, image, or speech charges to
-the session ledger. They enforce admission against spend already recorded by
-the rest of the session, so `--warn-cost` and `--max-cost` totals do not include
-media charges and do not cap cumulative media spending. No media USD price is
-inferred from token counts or image/audio sizes. An admitted request is never
+Inspection, supported image generation, and supported OpenAI speech also
+increase the shared balance. Inspection uses the selected model's catalog
+token prices or an explicit provider bill. Generation and editing use their
+own billing units:
+
+| Provider/model | Image charge used by the budget |
+|---|---|
+| OpenAI `gpt-image-1.5` and `gpt-image-1.5-2025-12-16` | Provider token counts partitioned into text/image input and output, using the published image-model prices |
+| Gemini `gemini-3.1-flash-image` | Prompt tokens plus separate text, thinking and image output counts, using standard image-model prices |
+| xAI image models | The actual billed total in `usage.cost_in_usd_ticks` |
+| OpenAI-compatible image gateways | An explicit `usage.cost` USD total, including zero, overrides token estimates |
+
+Image-model prices are a snapshot of the [OpenAI model pricing](https://developers.openai.com/api/docs/models/gpt-image-1.5)
+and [Gemini standard pricing](https://ai.google.dev/gemini-api/docs/pricing/)
+checked on November 10, 2026. xAI's [cost-tracking field](https://docs.x.ai/developers/cost-tracking)
+reports the actual charge after discounts. Image tokens never use the ordinary
+text-model price, and output size or pixel count is not used to invent a bill.
+
+OpenAI speech requests for `gpt-4o-mini-tts`, `gpt-4o-mini-tts-2025-03-20`,
+and `gpt-4o-mini-tts-2025-12-15` use SSE to receive both audio and a terminal
+usage receipt. The receipt's input text tokens cost $0.60 per million and its
+output audio tokens cost $12 per million, using the [speech-model prices](https://developers.openai.com/api/docs/models/gpt-4o-mini-tts)
+checked on November 10, 2026. An explicit `usage.cost` USD total, including zero,
+takes precedence. Audio duration and character counts are not used to estimate
+a charge.
+
+Received charges are retained even when the provider refuses an image, returns
+invalid image or audio bytes, or the output file cannot be published. A request
+that finishes after a session switch still charges its original session.
+Malformed explicit bills, duplicate billing fields, or inconsistent token
+partitions block further spending on that account.
+
+An unknown image model, missing billing evidence, or an unsupported Gemini
+cache, tool or service-tier pricing dimension remains unpriced. Legacy and
+custom OpenAI speech models and xAI speech keep their binary audio responses
+and do not add a charge without usable billing evidence. An unfamiliar speech
+usage dimension also remains unpriced. Those requests still check the shared
+cap before dispatch, but their unknown costs are excluded from the total.
+Cancellation before billing arrives can also leave the final cost unknown.
+Already-admitted work can finish above the cap; no admitted media request is
 automatically replayed.
 
 ## Image inspection
@@ -243,6 +278,14 @@ OpenAI uses `/audio/speech`, defaults to `gpt-4o-mini-tts` and `alloy`, and
 accepts WAV, MP3, Opus, AAC, or FLAC. `speed` is 0.25 through 4.0. Delivery
 `instructions` require the `gpt-4o-mini-tts` family. Model and voice IDs can be
 overridden; the provider validates their availability.
+
+The supported `gpt-4o-mini-tts` models above request `stream_format: "sse"`.
+Audio chunks are decoded in order, and the terminal `speech.audio.done` usage
+receipt is charged before audio validation or file publication. Truncated streams,
+invalid chunks, and missing terminal receipts fail without publishing partial
+audio. A gateway that does not support the requested SSE protocol must use an
+appropriate custom or legacy model; the tool does not replay a paid request
+to fall back to binary audio.
 
 ```json
 {
