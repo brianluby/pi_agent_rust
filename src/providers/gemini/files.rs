@@ -998,11 +998,80 @@ fn files_error(message: &str) -> Error {
     Error::provider("google", format!("Gemini Files API: {message}"))
 }
 
+/// Upload URLs are credentials, and transport diagnostics can contain them.
+/// Classify before discarding those diagnostics so staging retains both the
+/// same-provider retry policy, fallback class and usage-limit filter. The
+/// existing markers also survive conversion to an assistant error message.
+fn request_error(message: &str, error: Error) -> Error {
+    if error.is_session_persistence() {
+        return Error::session_persistence(format!("Gemini Files API: {message}"));
+    }
+    match error {
+        Error::Aborted => Error::Aborted,
+        Error::CostCap { spent, cap } => Error::CostCap { spent, cap },
+        Error::Auth(_) => Error::auth(format!("Gemini Files API: {message}")),
+        error => {
+            use crate::failover::{FailoverClass, FallbackOn};
+
+            let retryable = crate::failover::call_error_is_retryable(&error);
+            let usage_limit = FallbackOn::UsageLimit.allows(&error.to_string());
+            let marker = match (
+                crate::failover::classify_call_failover(&error),
+                retryable,
+                usage_limit,
+            ) {
+                (Some(FailoverClass::Quota), true, true) => "rate limit; usage limit",
+                (Some(FailoverClass::Quota), true, false) => "rate limit",
+                (Some(FailoverClass::Quota), false, true) => "quota exhausted",
+                (Some(FailoverClass::Quota), false, false) => "quota unavailable",
+                (Some(FailoverClass::Overload), true, _) => "service unavailable",
+                (Some(FailoverClass::Overload), false, _) => "capacity unavailable",
+                (Some(FailoverClass::Transient), _, _) => "transient connection drop",
+                (None, _, _) => return files_error(message),
+            };
+            files_error(&format!("{message} ({marker})"))
+        }
+    }
+}
+
+/// Provider error bodies can echo filenames, media and upload capabilities.
+/// Classify only a complete bounded body, then retain the shared recovery
+/// policy's safe markers. A failed body read cannot override the HTTP status
+/// with a transport retry; local cancellation and terminal errors still win.
+async fn response_error(message: &str, response: Response) -> Error {
+    let status = response.status();
+    let body = match response.text_limited(MAX_METADATA_BYTES).await {
+        Ok(body) => body,
+        Err(error)
+            if error.is_session_persistence()
+                || matches!(
+                    &error,
+                    Error::Aborted | Error::Auth(_) | Error::CostCap { .. }
+                ) =>
+        {
+            return request_error(message, error);
+        }
+        Err(_) => String::new(),
+    };
+    // Retain existing permanent-status diagnostics without letting a 429 or
+    // 5xx status reopen a body-level authentication or context refusal.
+    let cause = Error::api(format!("HTTP {status}: {body}"));
+    let message = if (400..=499).contains(&status)
+        && !matches!(status, 408 | 429)
+        && crate::failover::classify_call_failover(&cause).is_none()
+    {
+        format!("{message} (HTTP {status})")
+    } else {
+        message.to_string()
+    };
+    request_error(&message, cause)
+}
+
 async fn metadata_body(response: Response) -> Result<Value> {
     let body = response
         .text_limited(MAX_METADATA_BYTES)
         .await
-        .map_err(|_| files_error("failed to read bounded file metadata"))?;
+        .map_err(|error| request_error("failed to read bounded file metadata", error))?;
     serde_json::from_str(&body).map_err(|_| files_error("invalid file metadata JSON"))
 }
 
@@ -1017,15 +1086,13 @@ async fn get_metadata(
     let request = context.auth.apply(context.client.get(url.as_str()));
     let response = Box::pin(request.send())
         .await
-        .map_err(|_| files_error("file metadata request failed"))?;
+        .map_err(|error| request_error("file metadata request failed", error))?;
     let status = response.status();
     if status == 404 {
         return Ok(None);
     }
     if !(200..300).contains(&status) {
-        return Err(files_error(&format!(
-            "file metadata request failed (HTTP {status})"
-        )));
+        return Err(response_error("file metadata request failed", response).await);
     }
     let value = metadata_body(response).await?;
     let file = RemoteFile::parse(&value, context.endpoint, mime, size)?;
@@ -1055,12 +1122,10 @@ async fn upload(context: &UploadContext<'_>, mime: &str, bytes: Vec<u8>) -> Resu
         .json(&json!({"file": {"displayName": display_name}}))?;
     let response = Box::pin(request.send())
         .await
-        .map_err(|_| files_error("upload initialization failed"))?;
+        .map_err(|error| request_error("upload initialization failed", error))?;
     let status = response.status();
     if !(200..300).contains(&status) {
-        return Err(files_error(&format!(
-            "upload initialization failed (HTTP {status})"
-        )));
+        return Err(response_error("upload initialization failed", response).await);
     }
     let upload_url = response
         .headers()
@@ -1082,12 +1147,10 @@ async fn upload(context: &UploadContext<'_>, mime: &str, bytes: Vec<u8>) -> Resu
         .body(bytes);
     let response = Box::pin(request.send())
         .await
-        .map_err(|_| files_error("media transfer failed"))?;
+        .map_err(|error| request_error("media transfer failed", error))?;
     let status = response.status();
     if !(200..300).contains(&status) {
-        return Err(files_error(&format!(
-            "media transfer failed (HTTP {status})"
-        )));
+        return Err(response_error("media transfer failed", response).await);
     }
     let value = metadata_body(response).await?;
     RemoteFile::parse(&value, context.endpoint, mime, size)
@@ -1219,10 +1282,19 @@ mod tests {
         recover_files(&context, prepared.policy, cache, &mut prepared.files, body).await
     }
 
+    #[derive(Clone, Copy)]
+    enum ReplyDelivery {
+        Complete,
+        CloseBeforeHeaders,
+        TruncatedBody,
+        OversizedBody,
+    }
+
     struct Reply {
         status: u16,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
+        delivery: ReplyDelivery,
     }
 
     impl Reply {
@@ -1231,6 +1303,7 @@ mod tests {
                 status: 200,
                 headers: Vec::new(),
                 body: serde_json::to_vec(body).unwrap(),
+                delivery: ReplyDelivery::Complete,
             }
         }
 
@@ -1242,6 +1315,7 @@ mod tests {
                     format!("{}?upload_id=test-capability", endpoint.upload),
                 )],
                 body: b"{}".to_vec(),
+                delivery: ReplyDelivery::Complete,
             }
         }
 
@@ -1250,6 +1324,21 @@ mod tests {
                 status,
                 headers: Vec::new(),
                 body: b"{}".to_vec(),
+                delivery: ReplyDelivery::Complete,
+            }
+        }
+
+        fn disconnect() -> Self {
+            Self {
+                delivery: ReplyDelivery::CloseBeforeHeaders,
+                ..Self::status(200)
+            }
+        }
+
+        fn truncated_json(body: &Value) -> Self {
+            Self {
+                delivery: ReplyDelivery::TruncatedBody,
+                ..Self::json(body)
             }
         }
 
@@ -1273,6 +1362,7 @@ mod tests {
                 status: 200,
                 headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
                 body: format!("data: {chunk}\n\n").into_bytes(),
+                delivery: ReplyDelivery::Complete,
             }
         }
     }
@@ -1413,6 +1503,9 @@ mod tests {
                         }
                     };
                     captured.push(read_request(&mut stream));
+                    if matches!(reply.delivery, ReplyDelivery::CloseBeforeHeaders) {
+                        continue;
+                    }
                     let mut wire = Vec::new();
                     write!(
                         wire,
@@ -1432,8 +1525,23 @@ mod tests {
                         write!(wire, "{name}: {value}\r\n").unwrap();
                     }
                     wire.extend_from_slice(b"\r\n");
-                    wire.extend_from_slice(&reply.body);
-                    stream.write_all(&wire).unwrap();
+                    let delivered_bytes = match reply.delivery {
+                        ReplyDelivery::TruncatedBody => reply.body.len() / 2,
+                        _ => reply.body.len(),
+                    };
+                    wire.extend_from_slice(&reply.body[..delivered_bytes]);
+                    match stream.write_all(&wire) {
+                        Ok(()) => {}
+                        Err(error)
+                            if matches!(reply.delivery, ReplyDelivery::OversizedBody)
+                                && matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::BrokenPipe
+                                        | std::io::ErrorKind::ConnectionReset
+                                        | std::io::ErrorKind::ConnectionAborted
+                                ) => {}
+                        Err(error) => panic!("fixture response write: {error}"),
+                    }
                 }
                 captured
             });
@@ -1545,6 +1653,533 @@ mod tests {
             assert_eq!(
                 request.headers.get(header).map(String::as_str),
                 Some(expected)
+            );
+        }
+    }
+
+    fn failed_turn(error: &Error) -> crate::model::AssistantMessage {
+        crate::model::AssistantMessage {
+            content: Vec::new(),
+            api: "google-generative-ai".to_string(),
+            provider: "google".to_string(),
+            model: "gemini-2.0-flash".to_string(),
+            usage: crate::model::Usage::default(),
+            stop_reason: crate::model::StopReason::Error,
+            stop_details: None,
+            error_message: Some(error.to_string()),
+            timestamp: 0,
+        }
+    }
+
+    fn assert_transient_file_error(error: &Error) {
+        assert!(crate::failover::call_error_is_retryable(error), "{error}");
+        assert_eq!(
+            crate::failover::classify_call_failover(error),
+            Some(crate::failover::FailoverClass::Transient),
+            "{error}"
+        );
+        assert!(
+            crate::failover::error_result_is_retryable(&failed_turn(error), None),
+            "flattening the provider failure must retain retry admission: {error}"
+        );
+    }
+
+    fn assert_terminal_file_error(error: &Error) {
+        assert!(!crate::failover::call_error_is_retryable(error), "{error}");
+        assert_eq!(
+            crate::failover::classify_call_failover(error),
+            None,
+            "{error}"
+        );
+        assert!(
+            !crate::failover::error_result_is_retryable(&failed_turn(error), None),
+            "flattening a refusal must not reopen retry admission: {error}"
+        );
+    }
+
+    fn assert_file_recovery_policy(
+        error: &Error,
+        retryable: bool,
+        class: Option<crate::failover::FailoverClass>,
+        usage_limit: bool,
+    ) {
+        use crate::failover::{
+            FallbackOn, RetryPolicy, TurnDecision, TurnOutcome, TurnProgress,
+        };
+
+        assert_eq!(
+            crate::failover::call_error_is_retryable(error),
+            retryable,
+            "{error}"
+        );
+        assert_eq!(
+            crate::failover::classify_call_failover(error),
+            class,
+            "{error}"
+        );
+        let flattened = failed_turn(error);
+        assert_eq!(
+            crate::failover::error_result_is_retryable(&flattened, None),
+            retryable,
+            "{error}"
+        );
+        if class.is_some() {
+            assert_eq!(FallbackOn::UsageLimit.allows(&error.to_string()), usage_limit);
+            assert_eq!(
+                FallbackOn::ExceptUsageLimit.allows(&error.to_string()),
+                !usage_limit
+            );
+        }
+        let progress = TurnProgress {
+            retry_count: 0,
+            failovers_this_turn: 0,
+            stream_can_retry: true,
+        };
+        for (fallback_on, filter_allows) in [
+            (FallbackOn::Any, true),
+            (FallbackOn::UsageLimit, usage_limit),
+            (FallbackOn::ExceptUsageLimit, !usage_limit),
+        ] {
+            let policy = RetryPolicy {
+                model_fallback: true,
+                fallback_on,
+                max_retries: 0,
+                max_failovers_per_turn: 1,
+                base_delay_ms: 1,
+                max_delay_ms: 1,
+            };
+            let expected = if class.is_some() && filter_allows {
+                TurnDecision::FailOver
+            } else {
+                TurnDecision::Finish { success: false }
+            };
+            assert_eq!(
+                crate::failover::decide(TurnOutcome::Failed(error), &progress, &policy, None),
+                expected,
+                "typed {fallback_on:?}: {error}"
+            );
+            assert_eq!(
+                crate::failover::decide(
+                    TurnOutcome::Completed(&flattened),
+                    &progress,
+                    &policy,
+                    None,
+                ),
+                expected,
+                "flattened {fallback_on:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn redacted_quota_failures_retain_usage_limit_filtering() {
+        use crate::failover::FailoverClass;
+
+        for (diagnostic, retryable, usage_limit) in [
+            ("HTTP 429: quota exceeded; GenerateRequestsPerDay", true, true),
+            (
+                "HTTP 429: quota exceeded; GenerateRequestsPerMinute",
+                true,
+                false,
+            ),
+            ("HTTP 402: insufficient_quota", false, true),
+            ("HTTP 400: quota exceeded; concurrent requests", false, false),
+        ] {
+            let cause = Error::api(format!("{diagnostic}; private-upload-capability"));
+            assert_file_recovery_policy(
+                &cause,
+                retryable,
+                Some(FailoverClass::Quota),
+                usage_limit,
+            );
+            let error = request_error("media transfer failed", cause);
+            assert_file_recovery_policy(
+                &error,
+                retryable,
+                Some(FailoverClass::Quota),
+                usage_limit,
+            );
+            assert!(!format!("{error:?} {error}").contains("private-upload-capability"));
+        }
+    }
+
+    #[test]
+    fn redacted_transport_errors_keep_recovery_policy_without_private_diagnostics() {
+        let private = "https://upload.invalid/?upload_id=private-capability&key=private-key";
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            // An opaque inner diagnostic proves classification uses the typed
+            // source before replacing it, including nested I/O wrappers.
+            let cause = std::io::Error::other(std::io::Error::new(kind, private));
+            let error = request_error("media transfer failed", cause.into());
+            assert_transient_file_error(&error);
+            assert!(!format!("{error:?} {error}").contains("private-"));
+        }
+        let timeout = request_error(
+            "upload initialization failed",
+            Error::api(format!("Request timed out for {private}")),
+        );
+        assert_transient_file_error(&timeout);
+        assert!(!format!("{timeout:?} {timeout}").contains("private-"));
+
+        // Scoped HTTP transports can return provider refusals directly.
+        // Preserve both retry eligibility and the fallbackOn class: capacity
+        // and exhausted quota may permit failover without same-provider retry.
+        for cause in [
+            Error::api(format!("HTTP 429: {private}")),
+            Error::api(format!("HTTP 503: {private}")),
+            Error::api(format!("quota exhausted at {private}")),
+            Error::api(format!("capacity unavailable at {private}")),
+        ] {
+            let retryable = crate::failover::call_error_is_retryable(&cause);
+            let class = crate::failover::classify_call_failover(&cause);
+            assert!(class.is_some(), "{cause}");
+            let error = request_error("media transfer failed", cause);
+            assert_eq!(crate::failover::call_error_is_retryable(&error), retryable);
+            assert_eq!(crate::failover::classify_call_failover(&error), class);
+            assert_eq!(
+                crate::failover::error_result_is_retryable(&failed_turn(&error), None),
+                retryable
+            );
+            assert!(!format!("{error:?} {error}").contains("private-"));
+        }
+
+        for cause in [
+            Error::Aborted,
+            Error::auth(format!("invalid credential; connection reset at {private}")),
+            Error::api(format!("HTTP 401: connection reset at {private}")),
+            Error::api(format!("HTTP 422: timeout at {private}")),
+            Error::validation(format!("invalid header; connection reset at {private}")),
+            Error::session_persistence(format!("failed save: HTTP 503 {private}")),
+            Error::CostCap {
+                spent: 1.0,
+                cap: 1.0,
+            },
+            std::io::Error::new(std::io::ErrorKind::InvalidData, private).into(),
+        ] {
+            let aborted = matches!(&cause, Error::Aborted);
+            let auth = matches!(&cause, Error::Auth(_));
+            let persistence = cause.is_session_persistence();
+            let cost_cap = matches!(&cause, Error::CostCap { .. });
+            let error = request_error("media transfer failed", cause);
+            assert_terminal_file_error(&error);
+            assert_eq!(matches!(&error, Error::Aborted), aborted);
+            assert_eq!(matches!(&error, Error::Auth(_)), auth);
+            assert_eq!(error.is_session_persistence(), persistence);
+            assert_eq!(matches!(&error, Error::CostCap { .. }), cost_cap);
+            assert!(!format!("{error:?} {error}").contains("private-"));
+        }
+    }
+
+    #[test]
+    fn files_http_failures_preserve_recovery_policy_without_echoing_private_bodies() {
+        use crate::failover::FailoverClass::{Overload, Quota, Transient};
+
+        for (boundary, expected_requests) in [
+            ("upload-start", 1),
+            ("upload-transfer", 2),
+            ("metadata", 3),
+        ] {
+            for (status, message, retryable, class, usage_limit) in [
+                (
+                    429,
+                    "quota exceeded; GenerateRequestsPerDay",
+                    true,
+                    Some(Quota),
+                    true,
+                ),
+                (
+                    429,
+                    "quota exceeded; GenerateRequestsPerMinute",
+                    true,
+                    Some(Quota),
+                    false,
+                ),
+                (
+                    400,
+                    "quota exceeded; concurrent requests",
+                    false,
+                    Some(Quota),
+                    false,
+                ),
+                (402, "insufficient_quota", false, Some(Quota), true),
+                (401, "quota exceeded; retry delay", false, None, false),
+                (403, "service unavailable; retry delay", false, None, false),
+                (503, "invalid_api_key; retry delay", false, None, false),
+                (503, "prompt is too long", false, None, false),
+                (503, "service unavailable", true, Some(Overload), false),
+                (504, "request timed out", true, Some(Transient), false),
+            ] {
+                let server = Server::start(|endpoint| {
+                    let failure = Reply::generation_error(
+                        status,
+                        "FIXTURE_ERROR",
+                        &format!(
+                            "{message}; private-file-name.wav; key=private-key; upload_id=private-capability"
+                        ),
+                    );
+                    match boundary {
+                        "upload-start" => vec![failure],
+                        "upload-transfer" => vec![Reply::start(endpoint), failure],
+                        _ => vec![
+                            Reply::start(endpoint),
+                            Reply::json(&json!({
+                                "file": file_metadata(endpoint, "one", "PROCESSING", 3)
+                            })),
+                            failure,
+                        ],
+                    }
+                });
+                let provider = fixture_provider(&server);
+                let context = fixture_context();
+                let original = serde_json::to_value(context.messages.as_ref()).unwrap();
+                let error = run_async(fixture_events(&provider, &context, &fixture_options()))
+                    .expect_err("staging must return the provider refusal without replaying it");
+                assert_file_recovery_policy(&error, retryable, class, usage_limit);
+                let diagnostic = format!("{error:?} {error}");
+                for secret in [
+                    "private-",
+                    "request-key",
+                    "request-token",
+                    "test-capability",
+                    "YWJj",
+                ] {
+                    assert!(!diagnostic.contains(secret), "{boundary}: {diagnostic}");
+                }
+                assert_eq!(
+                    serde_json::to_value(context.messages.as_ref()).unwrap(),
+                    original
+                );
+                let requests = server.finish();
+                assert_eq!(requests.len(), expected_requests, "{boundary}: HTTP {status}");
+                for request in &requests {
+                    assert!(!request.path.contains(":streamGenerateContent"));
+                    if request
+                        .headers
+                        .get("x-goog-upload-command")
+                        .map(String::as_str)
+                        == Some("upload, finalize")
+                    {
+                        assert!(!request.headers.contains_key("x-goog-api-key"));
+                        assert!(!request.headers.contains_key("authorization"));
+                        assert!(!request.headers.contains_key("x-goog-user-project"));
+                        assert_eq!(request.body.as_slice(), b"abc");
+                    } else {
+                        assert_request_credentials(request);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_files_error_bodies_fall_back_to_the_response_status() {
+        use crate::failover::FailoverClass::{Overload, Quota};
+
+        for status in [401, 403, 422, 429, 503] {
+            for delivery in [ReplyDelivery::TruncatedBody, ReplyDelivery::OversizedBody] {
+                let server = Server::start(|_| {
+                    let repetitions = if matches!(delivery, ReplyDelivery::OversizedBody) {
+                        MAX_METADATA_BYTES / 16 + 1
+                    } else {
+                        2
+                    };
+                    vec![Reply {
+                        status,
+                        headers: Vec::new(),
+                        body: "private-error-body; retry delay; ".repeat(repetitions).into_bytes(),
+                        delivery,
+                    }]
+                });
+                let provider = fixture_provider(&server);
+                let error = run_async(fixture_events(
+                    &provider,
+                    &fixture_context(),
+                    &fixture_options(),
+                ))
+                .expect_err("the HTTP refusal must survive a bounded-body read failure");
+                match status {
+                    429 => assert_file_recovery_policy(&error, true, Some(Quota), true),
+                    503 => assert_file_recovery_policy(&error, true, Some(Overload), false),
+                    _ => assert_terminal_file_error(&error),
+                }
+                let diagnostic = format!("{error:?} {error}");
+                assert!(!diagnostic.contains("private-error-body"));
+                assert!(!diagnostic.contains("response body too large"));
+                assert!(!diagnostic.contains("test-capability"));
+                if matches!(status, 401 | 403 | 422) {
+                    assert!(diagnostic.contains(&format!("HTTP {status}")));
+                }
+                assert_eq!(server.finish().len(), 1, "no upload or generation replay");
+            }
+        }
+    }
+
+    #[test]
+    fn disconnected_and_truncated_staging_requests_can_recover_on_the_next_provider_attempt() {
+        for boundary in [
+            "upload-start",
+            "upload-transfer",
+            "upload-body",
+            "lookup-headers",
+            "lookup-body",
+        ] {
+            let server = Server::start(|endpoint| {
+                let active = file_metadata(endpoint, "one", "ACTIVE", 3);
+                let uploaded = json!({"file": active});
+                let mut replies = match boundary {
+                    "upload-start" => vec![Reply::disconnect()],
+                    "upload-transfer" => vec![Reply::start(endpoint), Reply::disconnect()],
+                    "upload-body" => {
+                        vec![Reply::start(endpoint), Reply::truncated_json(&uploaded)]
+                    }
+                    _ => vec![
+                        Reply::start(endpoint),
+                        Reply::json(&json!({
+                            "file": file_metadata(endpoint, "one", "PROCESSING", 3)
+                        })),
+                        if boundary == "lookup-headers" {
+                            Reply::disconnect()
+                        } else {
+                            Reply::truncated_json(&active)
+                        },
+                    ],
+                };
+                if boundary.starts_with("lookup-") {
+                    // The first upload is already known. Its next metadata
+                    // read must recover it without creating another resource.
+                    replies.push(Reply::json(&active));
+                } else {
+                    replies.extend([Reply::start(endpoint), Reply::json(&uploaded)]);
+                }
+                replies.push(Reply::sse("recovered recording"));
+                replies
+            });
+            let provider = fixture_provider(&server);
+            let context = fixture_context();
+            let options = fixture_options();
+            let original_messages = serde_json::to_value(context.messages.as_ref()).unwrap();
+            run_async(async {
+                let error = fixture_events(&provider, &context, &options)
+                    .await
+                    .expect_err("staging must expose the transport failure without replaying it");
+                assert_transient_file_error(&error);
+                let diagnostic = format!("{error:?} {error}");
+                for secret in [
+                    "request-key",
+                    "request-token",
+                    "test-capability",
+                    "upload_id=",
+                    "YWJj",
+                ] {
+                    assert!(!diagnostic.contains(secret), "{boundary}: {diagnostic}");
+                }
+                // This is a fresh provider attempt admitted by the shared
+                // recovery policy, not Files API's missing-resource retry.
+                let events = fixture_events(&provider, &context, &options).await.unwrap();
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    StreamEvent::TextDelta { delta, .. } if delta == "recovered recording"
+                )));
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, StreamEvent::Done { .. }))
+                        .count(),
+                    1
+                );
+            });
+            assert_eq!(
+                serde_json::to_value(context.messages.as_ref()).unwrap(),
+                original_messages
+            );
+            let requests = server.finish();
+            let expected = if boundary == "upload-start" { 4 } else { 5 };
+            assert_eq!(requests.len(), expected, "{boundary}");
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.path.contains(":streamGenerateContent"))
+                    .count(),
+                1,
+                "no generation before successful staging: {boundary}"
+            );
+            let uploads = requests
+                .iter()
+                .filter(|request| {
+                    request
+                        .headers
+                        .get("x-goog-upload-command")
+                        .is_some_and(|command| command == "start")
+                })
+                .count();
+            assert_eq!(
+                uploads,
+                if boundary.starts_with("lookup-") {
+                    1
+                } else {
+                    2
+                },
+                "{boundary}"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_invalid_or_oversized_metadata_stays_terminal() {
+        for failure in [
+            "invalid-json",
+            "oversized",
+            "wrong-identity",
+            "forbidden",
+            "failed",
+        ] {
+            let server = Server::start(|endpoint| {
+                let mut reply = match failure {
+                    "oversized" => Reply {
+                        delivery: ReplyDelivery::OversizedBody,
+                        ..Reply::json(&json!({
+                            "private-body": "connection reset secret-file-data".repeat(MAX_METADATA_BYTES / 16)
+                        }))
+                    },
+                    "forbidden" => Reply::status(403),
+                    _ => Reply::json(&json!({
+                        "file": file_metadata(endpoint, "one", "ACTIVE", 3)
+                    })),
+                };
+                if failure == "invalid-json" {
+                    reply.body = b"connection reset secret-file-data: not JSON".to_vec();
+                } else if failure == "wrong-identity" {
+                    let mut wrong = file_metadata(endpoint, "one", "ACTIVE", 3);
+                    wrong["uri"] = json!("https://invalid.test/secret-file-data");
+                    reply = Reply::json(&json!({"file": wrong}));
+                } else if failure == "failed" {
+                    reply = Reply::json(&json!({
+                        "file": file_metadata(endpoint, "one", "FAILED", 3)
+                    }));
+                }
+                vec![Reply::start(endpoint), reply]
+            });
+            let provider = fixture_provider(&server);
+            let error = run_async(fixture_events(
+                &provider,
+                &fixture_context(),
+                &fixture_options(),
+            ))
+            .expect_err("complete unusable metadata must not be treated as transport loss");
+            assert_terminal_file_error(&error);
+            let diagnostic = format!("{error:?} {error}");
+            assert!(!diagnostic.contains("secret-file-data"));
+            assert!(!diagnostic.contains("test-capability"));
+            assert_eq!(
+                server.finish().len(),
+                2,
+                "no generation or replay: {failure}"
             );
         }
     }
@@ -2953,6 +3588,7 @@ mod tests {
                     "https://attacker.test/upload/v1beta/files?upload_id=secret".into(),
                 )],
                 body: b"{}".to_vec(),
+                delivery: ReplyDelivery::Complete,
             }]
         });
         let mut body = media_body(b"abc");

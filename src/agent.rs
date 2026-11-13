@@ -4984,7 +4984,14 @@ impl Agent {
         })
     }
 
-    async fn dispatch_context_event(&self, messages: &[Message]) -> Option<Vec<Message>> {
+    async fn dispatch_context_event(
+        &self,
+        messages: &[Message],
+        abort: Option<&AbortSignal>,
+    ) -> Option<Vec<Message>> {
+        if abort.is_some_and(AbortSignal::is_aborted) {
+            return None;
+        }
         let Some(extensions) = &self.extensions else {
             return None;
         };
@@ -5001,10 +5008,27 @@ impl Agent {
                 window,
             )
         });
-        let response = extensions
-            .dispatch_context_with_usage(payload, usage, EXTENSION_EVENT_TIMEOUT_MS)
-            .await
-            .ok()?;
+        let response =
+            extensions.dispatch_context_with_usage(payload, usage, EXTENSION_EVENT_TIMEOUT_MS);
+        // Context hooks run before provider admission, but can own pending
+        // hostcalls just like input and readiness hooks. Dropping the dispatch
+        // cancels that actor work; the caller then finalizes the aborted turn.
+        let response = if let Some(signal) = abort {
+            let cancelled = signal.wait();
+            futures::pin_mut!(response, cancelled);
+            match futures::future::select(cancelled, response).await {
+                futures::future::Either::Left(_) => return None,
+                futures::future::Either::Right((result, _)) => {
+                    if signal.is_aborted() {
+                        return None;
+                    }
+                    result
+                }
+            }
+        } else {
+            response.await
+        }
+        .ok()?;
 
         let value = response?;
 
@@ -5403,7 +5427,7 @@ impl Agent {
             )
         };
         let mut messages = self
-            .dispatch_context_event(&base_messages)
+            .dispatch_context_event(&base_messages, abort.as_ref())
             .await
             .unwrap_or(base_messages);
         // Context hooks can return new native image blocks. Enforce the active
@@ -17329,6 +17353,145 @@ mod abort_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // Exercise native and SDK cancellation through real hostcalls.
+    fn context_cancellation_releases_hostcalls_before_provider_admission() {
+        for via_sdk in [false, true] {
+            for return_after_abort in [false, true] {
+                let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+                runtime.block_on(async {
+                    let directory = tempfile::tempdir().expect("extension directory");
+                    let entry = directory.path().join("context-abort.mjs");
+                    std::fs::write(
+                        &entry,
+                        r#"
+                        export default function init(pi) {
+                          pi.on("context", async (event) => {
+                            await pi.tool("read", {});
+                            return { messages: [...event.messages, {
+                              role: "user", content: "late context transformation", timestamp: 17
+                            }] };
+                          });
+                        }
+                        "#,
+                    )
+                    .expect("write context extension");
+                    let (abort_handle, abort_signal) = AbortHandle::new();
+                    let entered = Arc::new(AtomicUsize::new(0));
+                    let dropped = Arc::new(AtomicBool::new(false));
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let tools = ToolRegistry::from_tools(vec![Box::new(StartupAbortTool {
+                        abort: abort_handle,
+                        return_after_abort,
+                        entered: Arc::clone(&entered),
+                        dropped: Arc::clone(&dropped),
+                    })]);
+                    let agent = Agent::new(
+                        Arc::new(CountingProvider {
+                            calls: Arc::clone(&calls),
+                        }),
+                        tools,
+                        AgentConfig::default(),
+                    );
+                    let store = Arc::new(Mutex::new(Session::in_memory()));
+                    let mut session = AgentSession::new(
+                        agent,
+                        Arc::clone(&store),
+                        false,
+                        ResolvedCompactionSettings::default(),
+                    );
+                    let mut policy = ExtensionPolicy::default();
+                    policy.default_caps.push("tool".to_string());
+                    session
+                        .enable_extensions_with_policy(
+                            &[],
+                            directory.path(),
+                            None,
+                            &[entry],
+                            Some(policy),
+                            Some(RepairPolicyMode::Off),
+                            None,
+                            ExtensionHostConfiguration::default(),
+                        )
+                        .await
+                        .expect("enable context extension");
+                    let manager = session.agent.extensions.clone().expect("extension manager");
+                    let mut sdk = crate::sdk::AgentSessionHandle::from_session_with_listeners(
+                        session,
+                        crate::sdk::EventListeners::default(),
+                    );
+                    let events = Arc::new(StdMutex::new(Vec::new()));
+                    let observed = Arc::clone(&events);
+                    let on_event = move |event| observed.lock().unwrap().push(event);
+                    let run = async {
+                        if via_sdk {
+                            sdk.prompt_with_abort("accepted input", abort_signal, on_event)
+                                .await
+                        } else {
+                            sdk.session_mut()
+                                .run_text_with_abort(
+                                    "accepted input".to_string(),
+                                    Some(abort_signal),
+                                    on_event,
+                                )
+                                .await
+                        }
+                    };
+                    // Shorter than the five-second hook timeout: the hostcall
+                    // itself signals cancellation, without a timer race.
+                    let message = asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        Duration::from_secs(2),
+                        run,
+                    )
+                    .await
+                    .expect("context cancellation must not wait for the hook timeout")
+                    .expect("cooperative abort must finalize the accepted turn");
+                    assert_eq!(message.stop_reason, StopReason::Aborted);
+                    assert_eq!(entered.load(Ordering::SeqCst), 1);
+                    assert_eq!(calls.load(Ordering::SeqCst), 0);
+                    let history = store.try_lock().unwrap().to_messages_for_current_path();
+                    assert_eq!(
+                        history
+                            .iter()
+                            .filter(|message| matches!(message, Message::User(_)))
+                            .count(),
+                        1,
+                        "accepted input remains present exactly once"
+                    );
+                    assert!(matches!(history.first(), Some(Message::User(user))
+                        if matches!(&user.content, UserContent::Text(text) if text == "accepted input")));
+                    assert!(matches!(history.last(), Some(Message::Assistant(message))
+                        if message.stop_reason == StopReason::Aborted));
+                    sdk.session()
+                        .ensure_provider_reentry_allowed()
+                        .expect("cooperative context cancellation is not abandoned persistence");
+                    assert_eq!(
+                        events
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|event| matches!(event, AgentEvent::AgentEnd { .. }))
+                            .count(),
+                        1,
+                        "the accepted turn has one terminal lifecycle event"
+                    );
+                    let actor = manager.js_runtime().expect("native JS runtime");
+                    asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        Duration::from_secs(5),
+                        actor.get_registered_tools(),
+                    )
+                    .await
+                    .expect("cancelled context must release the actor")
+                    .expect("actor barrier");
+                    assert!(dropped.load(Ordering::SeqCst), "context hostcall was released");
+                    assert!(manager.shutdown(Duration::from_secs(5)).await);
+                });
+            }
+        }
+    }
+
+    #[test]
     fn abort_then_resume_preserves_session_history() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -18764,41 +18927,76 @@ impl Drop for TurnPersistenceGuard<'_> {
     }
 }
 
-async fn flush_turn_autosave(
+pub(crate) async fn flush_turn_autosave(
     session: &mut Session,
     admission: &ProviderAdmissionGate,
     trigger: AutosaveFlushTrigger,
     cost_account: Option<(&crate::cost::CostBudget, &asupersync::Cx)>,
 ) -> Result<()> {
-    if let Some((budget, _)) = cost_account {
-        budget
-            .checkpoint(session)
-            .inspect_err(|error| budget.quarantine(&error.to_string()))?;
-    }
     let mut guard = TurnPersistenceGuard {
         admission,
         cost_budget: cost_account.map(|(budget, _)| budget),
         completed: false,
     };
-    let result = session
-        .flush_autosave(trigger)
-        .await
-        .inspect_err(|error| {
-            if let Some((budget, _)) = cost_account {
-                budget.quarantine(&error.to_string());
-            }
-        })
-        .and_then(|()| {
-            // The source and its exact accounting receipt must already be saved.
-            // Finalized requests can then persist their bills independently of
-            // the next transcript checkpoint, while this session is still live.
-            if let Some((budget, owner)) = cost_account {
-                budget.acknowledge_saved_session(session, owner)?;
-            }
-            Ok(())
-        });
+    let result = async {
+        if let Some((budget, _)) = cost_account {
+            // Retained provider and tool handles share this account but do not
+            // consult the Session gate. Fence first registration before either
+            // transcript save can yield to those handles.
+            budget.begin_saved_registration();
+            budget.checkpoint(session)?;
+        }
+        session.flush_autosave(trigger).await?;
+        if let Some((budget, owner)) = cost_account {
+            acknowledge_saved_cost(session, admission, budget, owner).await?;
+        }
+        Ok(())
+    }
+    .await
+    .inspect_err(|error: &Error| {
+        if let Some((budget, _)) = cost_account {
+            budget.quarantine(&error.to_string());
+        }
+    });
     // The caller handles an observed error with its original turn failure.
     // Never clear admission here: another operation may own its quarantine.
+    guard.completed = true;
+    result
+}
+
+/// Register the saved account and durably record that its journal is required.
+/// The first save precedes journal registration, so its checkpoint alone cannot
+/// distinguish an abandoned preparation from a writer that must survive resume.
+/// Keep cancellation guarded through the registration receipt's own save.
+async fn acknowledge_saved_cost(
+    session: &mut Session,
+    admission: &ProviderAdmissionGate,
+    budget: &crate::cost::CostBudget,
+    owner: &asupersync::Cx,
+) -> Result<()> {
+    let mut guard = TurnPersistenceGuard {
+        admission,
+        cost_budget: Some(budget),
+        completed: false,
+    };
+    let result = async {
+        budget.acknowledge_saved_session(session, owner)?;
+        if budget.registration_checkpoint_needed(session)? {
+            budget.checkpoint(session)?;
+            // This receipt gates further billable work even when ordinary
+            // transcript autosave uses a coalesced or best-effort policy.
+            session.save().await?;
+            budget.acknowledge_saved_session(session, owner)?;
+            if budget.registration_checkpoint_needed(session)? {
+                return Err(Error::session(
+                    "model cost journal registration receipt was not durably saved",
+                ));
+            }
+        }
+        Ok(())
+    }
+    .await
+    .inspect_err(|error: &Error| budget.quarantine(&error.to_string()));
     guard.completed = true;
     result
 }
@@ -21442,7 +21640,15 @@ impl AgentSession {
     ) -> Result<()> {
         admission.ensure_allowed()?;
         let save_enabled = self.save_enabled();
+        let mut persistence = save_enabled.then(|| TurnPersistenceGuard {
+            admission,
+            cost_budget: self.agent.cost_budget(),
+            completed: false,
+        });
         if let Some(budget) = self.agent.cost_budget() {
+            if save_enabled {
+                budget.begin_saved_registration();
+            }
             budget.checkpoint(&mut candidate)?;
         }
         if save_enabled {
@@ -21458,7 +21664,16 @@ impl AgentSession {
                 admission.block(reason.clone());
                 return Err(Error::session_persistence(reason));
             }
+            if let Some(budget) = self.agent.cost_budget() {
+                let accounting =
+                    acknowledge_saved_cost(&mut candidate, admission, budget, owner).await;
+                finish_turn_persistence(admission, Ok(()), accounting)?;
+            }
         }
+        if let Some(persistence) = persistence.as_mut() {
+            persistence.completed = true;
+        }
+        drop(persistence);
         // Save reconciles IDs, navigation and the persisted header. Project
         // from the accepted candidate, not the view prepared before that I/O.
         let messages = replace_context.then(|| candidate.to_messages_for_current_path());
@@ -21468,10 +21683,6 @@ impl AgentSession {
             self.agent.replace_messages(messages);
         }
         if save_enabled {
-            let accounting = self.agent.cost_budget().map_or(Ok(()), |budget| {
-                budget.acknowledge_saved_session(live, owner)
-            });
-            finish_turn_persistence(admission, Ok(()), accounting)?;
             admission.clear();
         }
         Ok(())
@@ -22398,7 +22609,15 @@ impl AgentSession {
             tokens_after
         };
 
+        let mut persistence = self.save_enabled.then(|| TurnPersistenceGuard {
+            admission: &self.provider_admission,
+            cost_budget: self.agent.cost_budget(),
+            completed: false,
+        });
         if let Some(budget) = self.agent.cost_budget() {
+            if self.save_enabled {
+                budget.begin_saved_registration();
+            }
             budget.checkpoint(&mut candidate)?;
         }
         if self.save_enabled {
@@ -22415,7 +22634,21 @@ impl AgentSession {
                 self.provider_admission.block(reason.clone());
                 return Err(Error::session_persistence(reason));
             }
+            if let Some(budget) = self.agent.cost_budget() {
+                let accounting = acknowledge_saved_cost(
+                    &mut candidate,
+                    &self.provider_admission,
+                    budget,
+                    cx.cx(),
+                )
+                .await;
+                finish_turn_persistence(&self.provider_admission, Ok(()), accounting)?;
+            }
         }
+        if let Some(persistence) = persistence.as_mut() {
+            persistence.completed = true;
+        }
+        drop(persistence);
 
         let compaction_entry = candidate.get_entry(&entry_id).and_then(|entry| {
             if let crate::session::SessionEntry::Compaction(compaction) = entry {
@@ -22426,10 +22659,6 @@ impl AgentSession {
         });
         *session = candidate;
         if self.save_enabled {
-            let accounting = self.agent.cost_budget().map_or(Ok(()), |budget| {
-                budget.acknowledge_saved_session(&session, cx.cx())
-            });
-            finish_turn_persistence(&self.provider_admission, Ok(()), accounting)?;
             self.provider_admission.clear();
         }
         drop(session);
