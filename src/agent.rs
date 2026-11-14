@@ -1795,7 +1795,7 @@ impl Drop for ManualCompactionProgress {
 /// Cancel only admission/read waits, never an admitted persistence transaction.
 /// If completion and cancellation race, refuse the newly acquired resource
 /// before publishing it to the caller.
-async fn await_compaction_admission<T>(
+pub(crate) async fn await_session_preparation<T>(
     abort: Option<&AbortSignal>,
     operation: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
@@ -8202,6 +8202,7 @@ impl ProviderAdmissionGate {
         Ok(ProviderTransitionAuthority {
             gate: self.clone(),
             _permit: permit,
+            abort: None,
         })
     }
 
@@ -8223,6 +8224,17 @@ impl ProviderAdmissionGate {
 pub(crate) struct ProviderTransitionAuthority {
     gate: ProviderAdmissionGate,
     _permit: OwnedMutexGuard<()>,
+    abort: Option<AbortSignal>,
+}
+
+impl ProviderTransitionAuthority {
+    /// Cancellation controls preparation only. Once the transition starts,
+    /// persistence and live installation must settle together.
+    #[must_use]
+    pub(crate) fn with_abort(mut self, abort: Option<&AbortSignal>) -> Self {
+        self.abort = abort.cloned();
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -8239,6 +8251,13 @@ impl<'a> ProviderSwapAdmission<'a> {
         }
     }
 
+    fn abort(self) -> Option<&'a AbortSignal> {
+        match self {
+            Self::Gate(_) => None,
+            Self::Held(authority) => authority.abort.as_ref(),
+        }
+    }
+
     async fn begin_transition(
         self,
         reason: String,
@@ -8248,6 +8267,9 @@ impl<'a> ProviderSwapAdmission<'a> {
             Self::Gate(gate) => gate.begin_transition(reason, cx).await.map(Some),
             Self::Held(authority) => {
                 authority.gate.ensure_allowed()?;
+                if authority.abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+                    return Err(Error::Aborted);
+                }
                 authority.gate.block(reason);
                 Ok(None)
             }
@@ -19796,10 +19818,20 @@ impl AgentSession {
         model_id: &str,
         requested_thinking: crate::model::ThinkingLevel,
     ) -> Result<PreparedModelSelection> {
+        self.prepare_model_selection_resolving(provider_id, model_id, requested_thinking, false)
+    }
+
+    fn prepare_model_selection_resolving(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        requested_thinking: crate::model::ThinkingLevel,
+        allow_unlisted_native_model: bool,
+    ) -> Result<PreparedModelSelection> {
         let active_provider = self.agent.provider();
         let requested_matches_active =
             active_provider.name().eq(provider_id) && active_provider.model_id().eq(model_id);
-        let (registry, extension_revision, active_extension_model, active_provider_revision) =
+        let (mut registry, extension_revision, active_extension_model, active_provider_revision) =
             if self.extensions.is_some() {
                 let catalog = self.extension_model_catalog().snapshot()?;
                 (
@@ -19811,9 +19843,13 @@ impl AgentSession {
             } else {
                 (self.model_registry.clone(), None, false, None)
             };
-        let entry = registry
-            .as_ref()
-            .and_then(|registry| registry.find(provider_id, model_id));
+        let entry = registry.as_ref().and_then(|registry| {
+            if allow_unlisted_native_model {
+                registry.resolve(provider_id, model_id)
+            } else {
+                registry.find(provider_id, model_id)
+            }
+        });
 
         let Some(entry) = entry else {
             if !requested_matches_active
@@ -19851,6 +19887,14 @@ impl AgentSession {
             });
         };
 
+        // A terminal command may explicitly select an unlisted native model.
+        // Retain the resolved entry only in this prepared registry; a failed
+        // save must not publish it or revive a retired extension namespace.
+        if let Some(registry) = registry.as_mut()
+            && registry.find(&entry.model.provider, &entry.model.id).is_none()
+        {
+            Arc::make_mut(registry).merge_missing_entries(vec![entry.clone()]);
+        }
         let canonical_provider_id = entry.model.provider.clone();
         let canonical_model_id = entry.model.id.clone();
         let already_active = active_provider.name().eq(&canonical_provider_id)
@@ -19917,10 +19961,35 @@ impl AgentSession {
             provider_id,
             model_id,
             thinking_level,
-            registry,
+            mut registry,
             extension_revision,
             extension_model,
         } = prepared;
+        // Native ad-hoc selection adds a host row only after its Session save
+        // commits. Extension-enabled readers use this shared catalog rather
+        // than self.model_registry. Merge into its newest snapshot instead of
+        // replacing registrations that may have changed during persistence.
+        if !extension_model
+            && let Some(entry) = entry.as_ref()
+            && let Some(region) = &self.extensions
+            && let Ok(mut state) = self.extension_ai_completion.lock()
+            && let Some(live_registry) = state.compaction_models.registry.as_mut()
+        {
+            let admit = !live_registry
+                .extension_provider_was_registered(&entry.model.provider)
+                && live_registry
+                    .find(&entry.model.provider, &entry.model.id)
+                    .is_none();
+            if admit {
+                Arc::make_mut(live_registry).merge_missing_entries(vec![entry.clone()]);
+            }
+            registry = Some(Arc::clone(live_registry));
+            if admit {
+                let models = pi_ai_model_registry_values(live_registry);
+                state.models = models.clone();
+                region.manager().set_extension_models(models);
+            }
+        }
         if let Some(provider) = provider {
             tracing::info!("Updating agent provider to {provider_id}/{model_id}");
             self.agent.set_provider(provider);
@@ -19984,6 +20053,43 @@ impl AgentSession {
             current_thinking,
             ProviderSwapAdmission::Gate(&admission),
             false,
+            false,
+        )
+        .await?;
+        self.agent.disarm_prewalk();
+        if let Some(policy) = &mut self.child_fallback_policy {
+            policy.use_default_role();
+        }
+        Ok(())
+    }
+
+    /// Keep an admitted terminal selection bound to its original Session even
+    /// when provider completion or session-action admission makes it wait.
+    pub(crate) async fn set_provider_model_from_origin(
+        &mut self,
+        provider_id: &str,
+        model_id: &str,
+        origin: &SessionActionOrigin,
+        allow_unlisted_native_model: bool,
+    ) -> Result<()> {
+        self.ensure_provider_reentry_allowed()?;
+        let current_thinking = self
+            .agent
+            .stream_options()
+            .thinking_level
+            .unwrap_or_default();
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let admission = self.provider_admission.clone();
+        let authority = admission.acquire_transition_authority(cx.cx()).await?;
+        let session_actions = self.session_action_admission.clone();
+        let _session_action = session_actions.acquire_origin(origin).await?;
+        self.set_provider_model_selection(
+            provider_id,
+            model_id,
+            current_thinking,
+            ProviderSwapAdmission::Held(&authority),
+            false,
+            allow_unlisted_native_model,
         )
         .await?;
         self.agent.disarm_prewalk();
@@ -20087,6 +20193,7 @@ impl AgentSession {
             thinking,
             ProviderSwapAdmission::Held(&authority),
             true,
+            false,
         )
         .await
     }
@@ -20101,6 +20208,7 @@ impl AgentSession {
         thinking: crate::model::ThinkingLevel,
         admission: ProviderSwapAdmission<'_>,
         automatic: bool,
+        allow_unlisted_native_model: bool,
     ) -> Result<bool> {
         self.ensure_provider_reentry_allowed()?;
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
@@ -20160,7 +20268,12 @@ impl AgentSession {
         }
         // Respect a newer explicit selection before refreshing credentials for
         // an automatic destination that will no longer be used.
-        let prepared = self.prepare_model_selection(provider_id, model_id, thinking)?;
+        let prepared = self.prepare_model_selection_resolving(
+            provider_id,
+            model_id,
+            thinking,
+            allow_unlisted_native_model,
+        )?;
         let target_provider_id = prepared.provider_id.clone();
         let target_model_id = prepared.model_id.clone();
         let next_thinking = prepared.thinking_level;
@@ -20347,6 +20460,7 @@ impl AgentSession {
             &source.model_id,
             source.thinking_level,
             ProviderSwapAdmission::Held(&authority),
+            false,
             false,
         )
         .await?;
@@ -20701,12 +20815,29 @@ impl AgentSession {
         let authority = admission.acquire_transition_authority(cx.cx()).await?;
         let session_actions = self.session_action_admission.clone();
         let _session_action = session_actions.acquire(cx.cx()).await?;
-        let session_store = Arc::clone(&self.session);
-        let mut inner = OwnedMutexGuard::lock(session_store, cx)
+        self.restore_retry_tail_with_authority(cx, require_incomplete_tail, &authority)
             .await
-            .map_err(|err| {
-                Error::session(format!("retry restoration session lock failed: {err}"))
-            })?;
+    }
+
+    /// Restore a failed tail under authority already held by a recovery driver.
+    /// Its optional abort signal can cancel the store wait or preparation,
+    /// never the ensuing durable save and installation.
+    pub(crate) async fn restore_retry_tail_with_authority(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        require_incomplete_tail: bool,
+        authority: &ProviderTransitionAuthority,
+    ) -> Result<()> {
+        let admission = &authority.gate;
+        let session_store = Arc::clone(&self.session);
+        let mut inner = await_session_preparation(authority.abort.as_ref(), async {
+            OwnedMutexGuard::lock(session_store, cx)
+                .await
+                .map_err(|err| {
+                    Error::session(format!("retry restoration session lock failed: {err}"))
+                })
+        })
+        .await?;
         let mut candidate = inner.clone();
         let reverted = candidate.revert_incomplete_response();
         if require_incomplete_tail && !reverted {
@@ -20720,7 +20851,7 @@ impl AgentSession {
 
         let restored_messages = candidate.to_messages_for_current_path();
         let save_enabled = self.save_enabled();
-        let _provider_transition = ProviderSwapAdmission::Held(&authority)
+        let _provider_transition = ProviderSwapAdmission::Held(authority)
             .begin_transition(
                 "retry restoration persistence was interrupted before live installation completed"
                     .to_string(),
@@ -20893,9 +21024,15 @@ impl AgentSession {
         }
 
         let session_store = Arc::clone(&self.session);
-        let mut inner = OwnedMutexGuard::lock(session_store, cx)
-            .await
-            .map_err(|err| Error::session(format!("primary restore inner lock failed: {err}")))?;
+        let mut inner = await_session_preparation(
+            admission.and_then(ProviderSwapAdmission::abort),
+            async {
+                OwnedMutexGuard::lock(session_store, cx)
+                    .await
+                    .map_err(|err| Error::session(format!("primary restore inner lock failed: {err}")))
+            },
+        )
+        .await?;
         let session_matches_active = inner.effective_model_for_current_path().is_some_and(
             |(session_provider, session_model)| {
                 crate::models::model_identities_match(
@@ -20942,9 +21079,6 @@ impl AgentSession {
             Self::prepare_restore_candidate(&inner, &entry, request.primary);
 
         let save_enabled = self.save_enabled();
-        if request.invalidate_background_compaction {
-            self.invalidate_background_compaction();
-        }
         let _provider_transition = match admission {
             Some(admission) => {
                 admission
@@ -20957,6 +21091,12 @@ impl AgentSession {
             }
             None => None,
         };
+        // Preparation can still be cancelled without changing live work.
+        // After the transition starts, the save and installation settle even
+        // if the user requests an abort while filesystem work is pending.
+        if request.invalidate_background_compaction {
+            self.invalidate_background_compaction();
+        }
         if save_enabled
             && let Err(first_err) = candidate.save().await
             && let Err(retry_err) = candidate.save().await
@@ -21466,9 +21606,15 @@ impl AgentSession {
     )> {
         let gate = admission.map(ProviderSwapAdmission::gate);
         let session_store = Arc::clone(&self.session);
-        let mut inner = OwnedMutexGuard::lock(session_store, cx)
-            .await
-            .map_err(|err| Error::session(format!("failover session lock failed: {err}")))?;
+        let mut inner = await_session_preparation(
+            admission.and_then(ProviderSwapAdmission::abort),
+            async {
+                OwnedMutexGuard::lock(session_store, cx)
+                    .await
+                    .map_err(|err| Error::session(format!("failover session lock failed: {err}")))
+            },
+        )
+        .await?;
         let (mut candidate, restored_messages, target_thinking) =
             Self::prepare_failover_candidate(&inner, request)?;
         let entry = request.entry;
@@ -21476,7 +21622,6 @@ impl AgentSession {
         let to_model = entry.model.id.clone();
 
         let save_enabled = self.save_enabled();
-        self.invalidate_background_compaction();
         let _provider_transition = match admission {
             Some(admission) => {
                 admission
@@ -21489,6 +21634,7 @@ impl AgentSession {
             }
             None => None,
         };
+        self.invalidate_background_compaction();
         if save_enabled
             && let Err(first_err) = candidate.save().await
             && let Err(retry_err) = candidate.save().await
@@ -22497,13 +22643,13 @@ impl AgentSession {
         let abort = source.map(|(_, abort)| abort);
         let session_action_permit = if source.is_some() || install_guard.is_some() {
             Some(
-                await_compaction_admission(abort, self.session_action_admission.acquire(cx.cx()))
+                await_session_preparation(abort, self.session_action_admission.acquire(cx.cx()))
                     .await?,
             )
         } else {
             None
         };
-        let mut session = await_compaction_admission(abort, async {
+        let mut session = await_session_preparation(abort, async {
             OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))
@@ -22806,7 +22952,7 @@ impl AgentSession {
 
         let (entries, preparation, source_snapshot, install_guard) = {
             let cx = crate::agent_cx::AgentCx::for_request();
-            let mut session = await_compaction_admission(abort, async {
+            let mut session = await_session_preparation(abort, async {
                 self.session
                     .lock(cx.cx())
                     .await
@@ -22930,7 +23076,7 @@ impl AgentSession {
                     return Err(error);
                 }
                 let cx = crate::agent_cx::AgentCx::for_current_or_request();
-                let provider_admission = match await_compaction_admission(
+                let provider_admission = match await_session_preparation(
                     abort,
                     self.provider_admission.acquire(cx.cx()),
                 )
@@ -23000,7 +23146,7 @@ impl AgentSession {
             self.invalidate_background_compaction();
             let cx = crate::agent_cx::AgentCx::for_current_or_request();
             let provider_admission =
-                match await_compaction_admission(abort, self.provider_admission.acquire(cx.cx()))
+                match await_session_preparation(abort, self.provider_admission.acquire(cx.cx()))
                     .await
                 {
                     Ok(provider_admission) => provider_admission,

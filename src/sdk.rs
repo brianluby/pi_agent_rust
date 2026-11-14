@@ -3193,6 +3193,21 @@ impl AgentSessionHandle {
         Ok(())
     }
 
+    /// A terminal's explicit selection also permits its existing native
+    /// ad-hoc model syntax, without broadening the public SDK contract.
+    pub(crate) async fn set_model_from_origin(
+        &mut self,
+        provider: &str,
+        model_id: &str,
+        origin: &crate::extensions::SessionActionOrigin,
+    ) -> Result<()> {
+        self.session
+            .set_provider_model_from_origin(provider, model_id, origin, true)
+            .await?;
+        self.failover_state.clear();
+        Ok(())
+    }
+
     /// The terminal's plan role is an automatic temporary selection. Preserve
     /// prewalk, but retire an older fallback cycle only after durable install:
     /// its cooldown must not silently replace the newly selected planner.
@@ -7638,7 +7653,7 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
         assert_eq!(captured.model_id, "claude-3-5-haiku-latest");
 
         let (seen, shared) = restore_recorder();
-        run_async(handle.maybe_restore_primary(&shared)).expect("restore primary");
+        run_async(handle.maybe_restore_primary(&shared, None)).expect("restore primary");
 
         assert_eq!(
             handle.session.agent.provider().model_id(),
@@ -7670,7 +7685,7 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
         let mut handle = handle_after_one_failover(300);
 
         let (seen, shared) = restore_recorder();
-        run_async(handle.maybe_restore_primary(&shared)).expect("cooldown check");
+        run_async(handle.maybe_restore_primary(&shared, None)).expect("cooldown check");
 
         assert_eq!(
             handle.session.agent.provider().model_id(),
@@ -12159,7 +12174,7 @@ export default function init(pi) {
             );
 
             let (_seen, shared) = restore_recorder();
-            run_async(handle.maybe_restore_primary(&shared)).expect("restore primary");
+            run_async(handle.maybe_restore_primary(&shared, None)).expect("restore primary");
             assert_eq!(handle.model().1, "claude-3-5-haiku-latest");
             assert_eq!(
                 handle.max_tokens(),

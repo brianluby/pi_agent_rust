@@ -42,6 +42,21 @@ blocking system call. Inspect `TurnDeadlineError::completion()` for the actual
 native result, including a possible session-persistence error. A cooperatively
 aborted turn whose persistence succeeds does not acquire an abandonment fence.
 
+Recovery preparation observes the same abort signal while waiting for provider
+admission, session-action admission, and the session store. This includes
+fallback selection, return to the primary model after its cooldown, and the
+failed-response rewind for same-provider retries and context-overflow recovery.
+Waiting for admission to rotate a rate-limited credential also observes abort.
+Cancellation during these waits does not begin a new transcript or model change
+or make the session's persistence indeterminate. A provider or extension holding
+the contended resource does not need to finish before the waiting turn can stop.
+
+Once a recovery transition begins saving its candidate session, cancellation
+waits for that save and the matching runtime installation to settle. The abort
+then prevents another provider attempt. This boundary keeps the durable session,
+live messages, and active model consistent; it does not promise to interrupt
+filesystem operations or undo a transition whose persistence has already started.
+
 ## Dropped futures require explicit recovery
 
 Once the SDK has admitted the turn, dropping its future skips any remaining

@@ -1733,6 +1733,171 @@ fn saving_fallback_selection_handle(dir: &Path) -> AgentSessionHandle {
 }
 
 #[test]
+fn terminal_model_selection_refuses_an_origin_replaced_while_waiting() {
+    let directory = tempdir().unwrap();
+    let mut handle = saving_fallback_selection_handle(directory.path());
+    let original = handle.model();
+    let path = handle
+        .session_store()
+        .try_lock()
+        .unwrap()
+        .path
+        .clone()
+        .unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let gate = handle.session.session_action_admission_gate();
+    let origin = gate.capture_origin();
+    run_async(async {
+        let cx = asupersync::Cx::for_testing();
+        let held = gate.acquire(&cx).await.unwrap();
+        let mut selection =
+            Box::pin(handle.set_model_from_origin(&original.0, &original.1, &origin));
+        assert!(futures::poll!(selection.as_mut()).is_pending());
+        gate.advance_generation();
+        drop(held);
+        selection
+            .await
+            .expect_err("replaced origin must be refused");
+    });
+    assert_eq!(handle.model(), original);
+    assert_eq!(
+        handle.failover_state.lifecycle_id(),
+        Some("selection-fixture")
+    );
+    assert_eq!(handle.failover_state.chain_position(), 2);
+    assert!(handle.session.ensure_provider_reentry_allowed().is_ok());
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn terminal_native_selection_publishes_extension_catalog_only_after_durable_save() {
+    for fail_save in [false, true] {
+        let directory = tempdir().unwrap();
+        let extension = directory.path().join("manual-selection-catalog.mjs");
+        std::fs::write(
+            &extension,
+            r#"export default function init(pi) {
+  pi.registerCommand("inspect-manual-selection", {
+    description: "Inspect the live native model catalog",
+    handler: (_args, ctx) =>
+      ctx.modelRegistry.find("ollama", "manual-selection-unlisted") ?? null
+  });
+}
+"#,
+        )
+        .unwrap();
+        let mut handle = saving_handle(directory.path());
+        handle
+            .session
+            .set_model_registry(crate::models::ModelRegistry::from_entries_for_tests(
+                Vec::new(),
+            ));
+        run_async(async {
+            handle
+                .session
+                .enable_extensions(&[], directory.path(), None, &[extension])
+                .await
+                .unwrap();
+            handle.session.persist_session().await.unwrap();
+            let manager = handle
+                .session
+                .extensions
+                .as_ref()
+                .unwrap()
+                .manager()
+                .clone();
+            let catalog = handle.session.extension_model_catalog();
+            let original = handle.model();
+            let path = handle
+                .session_store()
+                .try_lock()
+                .unwrap()
+                .path
+                .clone()
+                .unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(
+                catalog
+                    .snapshot()
+                    .unwrap()
+                    .find("ollama", "manual-selection-unlisted")
+                    .is_none()
+            );
+            assert!(
+                manager
+                    .execute_command("inspect-manual-selection", "", 5_000)
+                    .await
+                    .unwrap()
+                    .is_null()
+            );
+            handle
+                .set_model("ollama", "manual-selection-unlisted")
+                .await
+                .expect_err("public SDK selection remains registered-only");
+            if fail_save {
+                let blocked = directory.path().join("blocked-native-selection.jsonl");
+                std::fs::create_dir(&blocked).unwrap();
+                handle.session_store().try_lock().unwrap().path = Some(blocked);
+            }
+            let origin = handle
+                .session
+                .session_action_admission_gate()
+                .capture_origin();
+            let result = handle
+                .set_model_from_origin("ollama", "manual-selection-unlisted", &origin)
+                .await;
+            let shared = catalog
+                .snapshot()
+                .unwrap()
+                .find("ollama", "manual-selection-unlisted");
+            let context_model = manager
+                .execute_command("inspect-manual-selection", "", 5_000)
+                .await
+                .unwrap();
+            if fail_save {
+                assert!(result.as_ref().is_err_and(Error::is_session_persistence));
+                assert_eq!(handle.model(), original);
+                assert!(shared.is_none());
+                assert!(context_model.is_null());
+                assert!(
+                    handle
+                        .session
+                        .model_registry_snapshot()
+                        .unwrap()
+                        .unwrap()
+                        .find("ollama", "manual-selection-unlisted")
+                        .is_none()
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            } else {
+                result.unwrap();
+                let selected = handle
+                    .session
+                    .current_model_entry()
+                    .expect("selected native metadata");
+                assert_eq!(selected.model.provider, "ollama");
+                assert_eq!(selected.model.id, "manual-selection-unlisted");
+                let shared = shared.expect("native entry published to shared catalog");
+                assert_eq!(shared.model.base_url, selected.model.base_url);
+                assert_eq!(shared.model.context_window, selected.model.context_window);
+                assert_eq!(context_model["provider"], "ollama");
+                assert_eq!(context_model["id"], "manual-selection-unlisted");
+                assert_eq!(context_model["contextWindow"], selected.model.context_window);
+                let reopened = Session::open(&path.display().to_string()).await.unwrap();
+                assert_eq!(
+                    reopened.effective_model_for_current_path(),
+                    Some((
+                        "ollama".to_string(),
+                        "manual-selection-unlisted".to_string()
+                    ))
+                );
+            }
+            assert!(handle.shutdown_owned_resources().await.completed_cleanly());
+        });
+    }
+}
+
+#[test]
 fn explicitly_selecting_the_fallback_cancels_restoration_durably() {
     let dir = tempdir().unwrap();
     let mut handle = saving_fallback_selection_handle(dir.path());
@@ -1957,7 +2122,7 @@ fn failover_save_failure_preserves_source_state_and_quarantines_reentry() {
             .unwrap()
             .push(serde_json::to_value(event).unwrap());
     });
-    let result = run_async(handle.try_chain_failover(&Ok(first), true, None, 1, &callback));
+    let result = run_async(handle.try_chain_failover(&Ok(first), true, None, 1, &callback, None));
     assert!(result.as_ref().is_err_and(Error::is_session_persistence));
     assert_eq!(handle.model().1, "claude-3-5-haiku-latest");
     assert!(handle.failover_state.primary().is_none());
@@ -4715,7 +4880,7 @@ fn extension_selection_of_the_current_fallback_cancels_restoration() {
     );
 
     let (events, callback) = event_log();
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     assert_eq!(handle.model(), selected);
     assert!(handle.failover_state.primary().is_none());
     assert!(events.lock().unwrap().is_empty());
@@ -4752,7 +4917,7 @@ fn extension_selection_starts_the_next_failover_from_its_own_primary_and_cursor(
     let (events, callback) = event_log();
     let failure = Err(Error::provider(&selected.0, "503 service unavailable"));
     assert!(
-        run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap(),
+        run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap(),
         "the retired cycle's cursor cannot skip the new primary's first fallback"
     );
     let primary = handle.failover_state.primary().unwrap();
@@ -4795,8 +4960,8 @@ fn an_old_provider_error_cannot_fail_over_an_extension_model_selection() {
     let entries_before = serde_json::to_value(&store.try_lock().unwrap().entries).unwrap();
     let (events, callback) = event_log();
     let failure = Err(Error::provider(&old_runtime.0, "503 service unavailable"));
-    assert!(!run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    assert!(!run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap());
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     assert_eq!(
         handle.model(),
         old_runtime,
@@ -4869,7 +5034,7 @@ fn sdk_failover_policies_use_full_catalog_ownership_and_destination_metadata() {
             let (events, callback) = event_log();
             let failure = Err(Error::provider(current, "503 service unavailable"));
             assert!(
-                !run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap(),
+                !run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap(),
                 "{current} cannot use {other}'s policy (reverse={reverse})"
             );
             assert_eq!(
@@ -4888,7 +5053,7 @@ fn sdk_failover_policies_use_full_catalog_ownership_and_destination_metadata() {
             );
             handle = handle.with_failover(Some(options));
             assert!(
-                run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap()
+                run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap()
             );
             assert_eq!(
                 handle.model(),
@@ -5011,14 +5176,14 @@ fn sdk_recovery_preserves_pending_declared_alias_selection_and_native_aliases() 
                     let (events, callback) = event_log();
                     let failure = Err(Error::provider(current, "503 service unavailable"));
                     let swapped =
-                        run_async(handle.try_chain_failover(&failure, false, None, 1, &callback))
+                        run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None))
                             .unwrap();
                     assert_eq!(
                         swapped, !separately_declared,
                         "current={current}, selected={selected}, full registry={with_registry}, reverse={reverse}"
                     );
                     if separately_declared {
-                        run_async(handle.maybe_restore_primary(&callback)).unwrap();
+                        run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
                         assert!(Arc::ptr_eq(
                             &original_runtime,
                             &handle.session.agent.provider()
@@ -5103,7 +5268,7 @@ fn unchanged_failover_provenance_keeps_its_running_monotonic_cooldown() {
     let started = handle.failover_state.cooldown().unwrap().failed_at();
     let (events, callback) = event_log();
     for _ in 0..2 {
-        run_async(handle.maybe_restore_primary(&callback)).unwrap();
+        run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
         assert_eq!(
             handle.failover_state.cooldown().unwrap().failed_at(),
             started
@@ -5140,7 +5305,7 @@ fn changed_branch_provenance_refreshes_only_the_affected_failover_cycle() {
         }
         install_reconciliation_provenance(&mut handle, provenance.clone());
         let (events, callback) = event_log();
-        run_async(handle.maybe_restore_primary(&callback)).unwrap();
+        run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
         let primary = handle.failover_state.primary().expect(changed);
         assert_eq!(primary.provider, provenance.primary_provider, "{changed}");
         assert_eq!(primary.model_id, provenance.primary_model_id, "{changed}");
@@ -5189,10 +5354,10 @@ fn recovery_waits_for_provider_callbacks_before_claiming_session_actions() {
             let failure = Err(Error::provider("test-provider", "503 service unavailable"));
             let recovery = async {
                 if restore {
-                    handle.maybe_restore_primary(&callback).await.map(|()| true)
+                    handle.maybe_restore_primary(&callback, None).await.map(|()| true)
                 } else {
                     handle
-                        .try_chain_failover(&failure, false, None, 1, &callback)
+                        .try_chain_failover(&failure, false, None, 1, &callback, None)
                         .await
                 }
             };
@@ -5268,7 +5433,7 @@ fn another_branch_deadline_cannot_reuse_an_expired_cooldown() {
     install_reconciliation_provenance(&mut handle, provenance);
     let selected = handle.model();
     let (events, callback) = event_log();
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     assert_eq!(handle.model(), selected);
     assert!(
         !handle
@@ -5301,13 +5466,13 @@ fn distinct_legacy_failover_entries_have_independent_cooldowns() {
     let old_started = handle.failover_state.cooldown().unwrap().failed_at();
     install_reconciliation_provenance(&mut handle, provenance);
     let (events, callback) = event_log();
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     let new_started = handle.failover_state.cooldown().unwrap().failed_at();
     assert_ne!(
         old_started, new_started,
         "the other entry starts its own interval"
     );
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     assert_eq!(
         handle.failover_state.cooldown().unwrap().failed_at(),
         new_started
@@ -5421,7 +5586,7 @@ fn bound_cli_key_cannot_admit_an_unready_foreign_fallback_and_survives_restorati
     );
     let (_, callback) = event_log();
     let failure = Err(Error::provider("bound-primary", "503 service unavailable"));
-    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap());
     assert_eq!(
         handle.model(),
         ("ready-other".to_string(), "fallback".to_string())
@@ -5434,7 +5599,7 @@ fn bound_cli_key_cannot_admit_an_unready_foreign_fallback_and_survives_restorati
     // A temporary planning role may remove the SDK's active-provider pin.
     // The native execution binding still admits its otherwise unready primary.
     Arc::make_mut(handle.failover.as_mut().unwrap()).cli_api_key = None;
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     assert_eq!(
         handle.model(),
         ("bound-primary".to_string(), "execution".to_string())
@@ -5469,7 +5634,7 @@ fn planner_fallback_recovers_original_pin_without_reusing_it_for_planner_restore
         "separate-planner",
         "503 service unavailable",
     ));
-    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap());
     assert_eq!(
         handle.model(),
         ("bound-executor".to_string(), "execution".to_string())
@@ -5481,7 +5646,7 @@ fn planner_fallback_recovers_original_pin_without_reusing_it_for_planner_restore
 
     Arc::make_mut(handle.failover.as_mut().unwrap()).cli_api_key =
         Some("bound-execution-pin".to_string());
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     assert_eq!(
         handle.model(),
         ("separate-planner".to_string(), "planning".to_string())
@@ -5516,7 +5681,7 @@ fn recovery_without_a_native_key_binding_preserves_explicit_embedder_override() 
         "embedder-primary",
         "503 service unavailable",
     ));
-    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap());
     assert_eq!(
         handle.model(),
         ("embedder-fallback".to_string(), "fallback".to_string())
@@ -5525,7 +5690,7 @@ fn recovery_without_a_native_key_binding_preserves_explicit_embedder_override() 
         handle.session.agent.stream_options().api_key.as_deref(),
         Some("explicit-embedder-pin")
     );
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     assert_eq!(
         handle.model(),
         ("embedder-primary".to_string(), "primary".to_string())
@@ -5597,7 +5762,7 @@ fn child_role_policy_controls_native_multi_hop_failover_effort_and_exclusions() 
         )));
     let (_, callback) = event_log();
     let failure = Err(Error::provider("child-primary", "503 service unavailable"));
-    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap());
     assert_eq!(
         handle.model(),
         ("child-first".to_string(), "first".to_string())
@@ -5606,7 +5771,7 @@ fn child_role_policy_controls_native_multi_hop_failover_effort_and_exclusions() 
         handle.session.agent.stream_options().thinking_level,
         Some(ThinkingLevel::Low)
     );
-    assert!(run_async(handle.try_chain_failover(&failure, false, None, 2, &callback)).unwrap());
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 2, &callback, None)).unwrap());
     assert_eq!(
         handle.model(),
         ("child-second".to_string(), "second".to_string())
@@ -5623,7 +5788,7 @@ fn child_role_policy_controls_native_multi_hop_failover_effort_and_exclusions() 
             .requested_thinking_level,
         ThinkingLevel::High
     );
-    run_async(handle.maybe_restore_primary(&callback)).unwrap();
+    run_async(handle.maybe_restore_primary(&callback, None)).unwrap();
     assert_eq!(
         handle.model(),
         ("child-primary".to_string(), "primary".to_string())
@@ -5695,12 +5860,422 @@ fn explicit_model_selection_retires_child_role_but_automatic_changes_preserve_it
     run_async(handle.session.sync_runtime_selection_from_session_header()).unwrap();
     let (events, callback) = event_log();
     let failure = Err(Error::provider("role-automatic", "503 service unavailable"));
-    assert!(!run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert!(!run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap());
     assert!(events.lock().unwrap().is_empty());
     run_async(handle.set_model("role-automatic", "automatic")).unwrap();
-    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback)).unwrap());
+    assert!(run_async(handle.try_chain_failover(&failure, false, None, 1, &callback, None)).unwrap());
     assert_eq!(
         handle.model(),
         ("role-fallback".to_string(), "fallback".to_string())
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn recovery_cancellation_releases_admission_without_changing_history() {
+    use crate::extensions::ExtensionSession as _;
+
+    for mode in ["restore", "fallback", "retry"] {
+        for blocked_on in ["provider", "action", "session"] {
+            let dir = tempdir().unwrap();
+            let mut handle = if mode == "retry" {
+                let (mut handle, _) = saving_recovery_handle(dir.path());
+                let failed = run_async(handle.prompt("saved input", |_| {})).unwrap();
+                assert_eq!(failed.stop_reason, StopReason::Error);
+                handle
+            } else {
+                saving_fallback_selection_handle(dir.path())
+            };
+            let store = handle.session_store();
+            if mode == "fallback" {
+                let selected = handle.model();
+                let extension = crate::session::SessionHandle(Arc::clone(&store));
+                run_async(extension.set_model(selected.0, selected.1, None)).unwrap();
+            }
+            let model_before = handle.model();
+            let provider_before = handle.session.agent.provider();
+            let recovery_before = format!("{:?}", handle.failover_state);
+            let (path, entries_before) = {
+                let session = store.try_lock().unwrap();
+                (
+                    session.path.clone().unwrap(),
+                    serde_json::to_value(&session.entries).unwrap(),
+                )
+            };
+            let disk_before = std::fs::read(&path).unwrap();
+            let provider_gate = handle.session.provider_admission_gate();
+            let action_gate = handle.session.session_action_admission_gate();
+            let (abort, signal) = AbortHandle::new();
+            let (events, callback) = event_log();
+            run_async(async {
+                let cx = crate::agent_cx::AgentCx::for_current_or_request();
+                let provider_held = if blocked_on == "provider" {
+                    Some(provider_gate.acquire(cx.cx()).await.unwrap())
+                } else {
+                    None
+                };
+                let action_held = if blocked_on == "action" {
+                    Some(action_gate.acquire(cx.cx()).await.unwrap())
+                } else {
+                    None
+                };
+                let session_held = if blocked_on == "session" {
+                    Some(
+                        asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&store), cx.cx())
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let failure = Err(Error::provider("test-provider", "503 service unavailable"));
+                {
+                    let recovery = async {
+                        if mode == "restore" {
+                            // Exercise the public preflight, not only the
+                            // internal helper's optional cancellation argument.
+                            handle
+                                .prompt_with_abort(
+                                    "must not be appended",
+                                    signal,
+                                    move |event| callback(event),
+                                )
+                                .await
+                                .map(|_| ())
+                        } else if mode == "fallback" {
+                            handle
+                                .try_chain_failover(
+                                    &failure,
+                                    false,
+                                    None,
+                                    1,
+                                    &callback,
+                                    Some(&signal),
+                                )
+                                .await
+                                .map(|_| ())
+                        } else {
+                            handle.restore_recovery_tail(true, &signal).await
+                        }
+                    };
+                    futures::pin_mut!(recovery);
+                    assert!(
+                        futures::poll!(recovery.as_mut()).is_pending(),
+                        "{mode}/{blocked_on}: the operation must reach the held resource"
+                    );
+                    abort.abort();
+                    let outcome = asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        std::time::Duration::from_secs(5),
+                        recovery,
+                    )
+                    .await
+                    .expect("abort must settle without releasing the unrelated owner");
+                    assert!(matches!(outcome, Err(Error::Aborted)));
+                }
+                provider_gate.ensure_allowed().unwrap();
+                drop(session_held);
+                drop(action_held);
+                drop(provider_held);
+                let released = async {
+                    let _provider = provider_gate.acquire(cx.cx()).await.unwrap();
+                    let _action = action_gate.acquire(cx.cx()).await.unwrap();
+                    let _session =
+                        asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&store), cx.cx())
+                            .await
+                            .unwrap();
+                };
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    std::time::Duration::from_secs(5),
+                    released,
+                )
+                .await
+                .expect("aborted preparation must release every acquired permit");
+            });
+            assert_eq!(handle.model(), model_before);
+            assert!(Arc::ptr_eq(&handle.session.agent.provider(), &provider_before));
+            assert_eq!(format!("{:?}", handle.failover_state), recovery_before);
+            assert_eq!(
+                serde_json::to_value(&store.try_lock().unwrap().entries).unwrap(),
+                entries_before
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+            assert!(events.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn admitted_recovery_can_abort_the_actual_transaction_store_wait() {
+    for restore in [false, true] {
+        let dir = tempdir().unwrap();
+        let mut handle = saving_fallback_selection_handle(dir.path());
+        let store = handle.session_store();
+        let model_before = handle.model();
+        let provider_before = handle.session.agent.provider();
+        let options = Arc::clone(handle.failover.as_ref().unwrap());
+        let primary = handle.failover_state.primary().cloned().unwrap();
+        let chain = crate::failover::FailoverChain {
+            entries: vec!["openai/gpt-4o-mini".to_string()],
+        };
+        let (path, entries_before) = {
+            let session = store.try_lock().unwrap();
+            (
+                session.path.clone().unwrap(),
+                serde_json::to_value(&session.entries).unwrap(),
+            )
+        };
+        let disk_before = std::fs::read(&path).unwrap();
+        let provider_gate = handle.session.provider_admission_gate();
+        let action_gate = handle.session.session_action_admission_gate();
+        let (abort, signal) = AbortHandle::new();
+        run_async(async {
+            let cx = crate::agent_cx::AgentCx::for_current_or_request();
+            let authority = provider_gate
+                .acquire_transition_authority(cx.cx())
+                .await
+                .unwrap()
+                .with_abort(Some(&signal));
+            let _action = action_gate.acquire(cx.cx()).await.unwrap();
+            let held_store =
+                asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&store), cx.cx())
+                    .await
+                    .unwrap();
+            {
+                let transition = async {
+                    if restore {
+                        let request = crate::agent::PrimaryRestoreRequest {
+                            primary: &primary,
+                            active: &model_before,
+                            cooldown_elapsed: true,
+                            available_models: &options.available_models,
+                            auth: &options.auth,
+                            cli_api_key: options.cli_api_key.as_deref(),
+                            strict_invariants: false,
+                            invalidate_background_compaction: true,
+                        };
+                        handle
+                            .session
+                            .restore_primary_with_authority(&cx, &request, &authority)
+                            .await
+                            .map(|_| ())
+                    } else {
+                        let attempt = crate::agent::FailoverSwapAttempt {
+                            chain: &chain,
+                            start_position: 0,
+                            available_models: &options.available_models,
+                            auth: &options.auth,
+                            cli_api_key: options.cli_api_key.as_deref(),
+                            class: crate::failover::FailoverClass::Transient,
+                            thinking_level_to_clamp: crate::model::ThinkingLevel::Off,
+                            require_incomplete_tail: false,
+                            primary: Some(&primary),
+                            cooldown_secs: Some(0),
+                            lifecycle_id: Some("cancelled-transaction"),
+                        };
+                        handle
+                            .session
+                            .try_failover_with_authority(&cx, &attempt, &authority)
+                            .await
+                            .map(|_| ())
+                    }
+                };
+                futures::pin_mut!(transition);
+                assert!(futures::poll!(transition.as_mut()).is_pending());
+                abort.abort();
+                let outcome = asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    std::time::Duration::from_secs(5),
+                    transition,
+                )
+                .await
+                .expect("the inner pre-save lock must observe cancellation");
+                assert!(matches!(outcome, Err(Error::Aborted)));
+            }
+            provider_gate.ensure_allowed().unwrap();
+            assert_eq!(
+                serde_json::to_value(&held_store.entries).unwrap(),
+                entries_before
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+        });
+        assert_eq!(handle.model(), model_before);
+        assert!(Arc::ptr_eq(&handle.session.agent.provider(), &provider_before));
+        provider_gate.ensure_allowed().unwrap();
+    }
+}
+
+#[test]
+fn aborting_retry_admission_closes_the_logical_turn_without_quarantine() {
+    use futures::FutureExt as _;
+
+    let dir = tempdir().unwrap();
+    let (handle, calls) = saving_recovery_handle(dir.path());
+    let mut handle = handle.with_retry(Some(fast_retry_policy(1)));
+    let store = handle.session_store();
+    let gate = handle.session.provider_admission_gate();
+    let callback_gate = gate.clone();
+    let held = Arc::new(Mutex::new(None));
+    let callback_held = Arc::clone(&held);
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let callback_started = Arc::clone(&started);
+    let (abort, signal) = AbortHandle::new();
+    let (events, callback) = event_log();
+    let on_event = move |event| {
+        if matches!(&event, AgentEvent::AutoRetryStart { .. }) {
+            let cx = crate::agent_cx::AgentCx::for_current_or_request();
+            let permit = callback_gate
+                .acquire(cx.cx())
+                .now_or_never()
+                .expect("the completed attempt released provider admission")
+                .unwrap();
+            *callback_held.lock().unwrap() = Some(permit);
+            callback_started.store(true, Ordering::SeqCst);
+        }
+        callback(event);
+    };
+    let (result, path, disk_before) = run_async(async {
+        let turn = handle.prompt_with_abort("persist once", signal, on_event);
+        futures::pin_mut!(turn);
+        futures::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(turn.as_mut(), cx).is_pending());
+            if started.load(Ordering::SeqCst) {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+        let path = store.try_lock().unwrap().path.clone().unwrap();
+        let disk_before = std::fs::read(&path).unwrap();
+        abort.abort();
+        let result = asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            std::time::Duration::from_secs(5),
+            turn,
+        )
+        .await
+        .expect("abort must close recovery while the unrelated provider owner remains held");
+        assert!(held.lock().unwrap().is_some());
+        (result, path, disk_before)
+    });
+    assert!(matches!(result, Err(Error::Aborted)));
+    gate.ensure_allowed().unwrap();
+    drop(held.lock().unwrap().take());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+    assert_eq!(
+        lifecycle_names(&events.lock().unwrap()),
+        [
+            "agent_start",
+            "retry_start:1",
+            "retry_end:1:false",
+            "agent_end",
+        ]
+    );
+    let messages = run_async(handle.messages()).unwrap();
+    assert!(matches!(messages.first(), Some(Message::User(_))));
+    assert!(matches!(
+        messages.last(),
+        Some(Message::Assistant(message)) if message.stop_reason == StopReason::Error
+    ));
+}
+
+#[test]
+fn retry_rewind_cancels_at_its_shared_session_store_wait() {
+    let dir = tempdir().unwrap();
+    let (mut handle, calls) = saving_recovery_handle(dir.path());
+    let failed = run_async(handle.prompt("keep this input", |_| {})).unwrap();
+    assert_eq!(failed.stop_reason, StopReason::Error);
+    let messages_before = serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap();
+    let store = handle.session_store();
+    let path = store.try_lock().unwrap().path.clone().unwrap();
+    let disk_before = std::fs::read(&path).unwrap();
+    let gate = handle.session.provider_admission_gate();
+    let actions = handle.session.session_action_admission_gate();
+    let (abort, signal) = AbortHandle::new();
+    run_async(async {
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let authority = gate
+            .acquire_transition_authority(cx.cx())
+            .await
+            .unwrap()
+            .with_abort(Some(&signal));
+        let _action = actions.acquire(cx.cx()).await.unwrap();
+        let _store = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&store), cx.cx())
+            .await
+            .unwrap();
+        let rewind = handle
+            .session
+            .restore_retry_tail_with_authority(&cx, true, &authority);
+        futures::pin_mut!(rewind);
+        assert!(futures::poll!(rewind.as_mut()).is_pending());
+        abort.abort();
+        let result = asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            std::time::Duration::from_secs(5),
+            rewind,
+        )
+        .await
+        .expect("the shared rewind must observe cancellation before persistence");
+        assert!(matches!(result, Err(Error::Aborted)));
+        gate.ensure_allowed().unwrap();
+    });
+    assert_eq!(
+        serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap(),
+        messages_before
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn retry_abort_after_save_begins_finishes_the_durable_rewind() {
+    let dir = tempdir().unwrap();
+    let (mut handle, calls) = saving_recovery_handle(dir.path());
+    let failed = run_async(handle.prompt("retain the accepted input", |_| {})).unwrap();
+    assert_eq!(failed.stop_reason, StopReason::Error);
+    let store = handle.session_store();
+    let path = store.try_lock().unwrap().path.clone().unwrap();
+    let disk_before = std::fs::read(&path).unwrap();
+    let gate = handle.session.provider_admission_gate();
+    let (abort, signal) = AbortHandle::new();
+    run_async_with_blocking_pool(async {
+        let disk_lock = crate::session::lock_session_persistence(&path).unwrap();
+        let rewind = handle.restore_recovery_tail(true, &signal);
+        futures::pin_mut!(rewind);
+        assert!(futures::poll!(rewind.as_mut()).is_pending());
+        assert!(
+            gate.ensure_allowed().unwrap_err().is_session_persistence(),
+            "the transition has crossed its persistence boundary"
+        );
+        abort.abort();
+        assert!(
+            futures::poll!(rewind.as_mut()).is_pending(),
+            "an abort must not abandon an already-started save"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), disk_before);
+        drop(disk_lock);
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            std::time::Duration::from_secs(10),
+            rewind,
+        )
+        .await
+        .expect("the admitted save must settle")
+        .expect("a settled rewind keeps the handle reusable");
+    });
+    gate.ensure_allowed().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let messages = run_async(handle.messages()).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert!(matches!(&messages[0], Message::User(_)));
+    let saved = run_async(Session::open(&path.display().to_string())).unwrap();
+    assert_eq!(
+        serde_json::to_value(saved.to_messages_for_current_path()).unwrap(),
+        serde_json::to_value(messages).unwrap()
+    );
+    assert_ne!(std::fs::read(&path).unwrap(), disk_before);
 }
