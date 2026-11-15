@@ -265,7 +265,7 @@ struct CacheState {
 /// Per-provider, bounded metadata-only cache. A per-content async lock prevents
 /// concurrent foreground/background requests from uploading the same blob twice.
 #[derive(Default)]
-pub(super) struct FileCache {
+pub struct FileCache {
     state: Mutex<CacheState>,
     policy: StagingPolicy,
     #[cfg(test)]
@@ -288,6 +288,7 @@ struct Candidate {
 /// Request-owned recovery data, never persisted or kept in the shared cache.
 /// The original encoded bytes are moved out of each staged part, once per
 /// distinct blob, rather than cloning the complete pre-upload request body.
+/// Retaining a prepared request does not pin idle metadata cache entries.
 pub(super) struct PreparedFiles {
     endpoint: Endpoint,
     owner: AgentCx,
@@ -298,7 +299,6 @@ pub(super) struct PreparedFiles {
 }
 
 struct PreparedFile {
-    slot: FileSlot,
     remote: RemoteFile,
     mime: String,
     encoded: String,
@@ -308,7 +308,6 @@ struct PreparedFile {
 }
 
 struct StagedFile {
-    slot: FileSlot,
     remote: RemoteFile,
     replacement_used: bool,
 }
@@ -320,6 +319,27 @@ struct UploadInput<'a> {
 }
 
 impl FileCache {
+    /// Native vision uses the same credential-scoped staging as chat, while
+    /// retaining its own generation billing and no-replay policy. The caller
+    /// owns the enclosing cancellation/deadline race and installs its captured
+    /// request context before polling this future.
+    pub(crate) async fn prepare_native_inline(
+        &self,
+        client: &Client,
+        base: &str,
+        api_key: &str,
+        body: &mut Value,
+    ) -> Result<()> {
+        let auth = UploadAuth {
+            headers: vec![("x-goog-api-key".to_string(), api_key.to_string())],
+        };
+        // Native tools never replay a potentially billable generation. Drop
+        // the request-only recovery payload after preflight; the bounded
+        // cache still retains the validated remote resource for later calls.
+        self.prepare(client, base, &auth, body).await?;
+        Ok(())
+    }
+
     pub(super) async fn prepare(
         &self,
         client: &Client,
@@ -467,7 +487,6 @@ impl FileCache {
                 prepared.insert(
                     key,
                     PreparedFile {
-                        slot: staged.slot,
                         remote: staged.remote,
                         mime: mime.clone(),
                         encoded,
@@ -586,7 +605,6 @@ impl FileCache {
         )
         .await?;
         Ok(StagedFile {
-            slot,
             remote,
             replacement_used,
         })
@@ -681,7 +699,7 @@ async fn recover_files(
     body: &mut Value,
 ) -> Result<bool> {
     let mut changed = false;
-    for file in files.values_mut() {
+    for (key, file) in files.iter_mut() {
         checkpoint(context.owner)?;
         for pointer in &file.pointers {
             let part = body.pointer(pointer).and_then(|part| part.get("fileData"));
@@ -693,9 +711,14 @@ async fn recover_files(
                 return Err(files_error("staged media changed before recovery"));
             }
         }
-        // Pin the same slot used at preparation. An older generation must not
-        // evict or overwrite a newer request's replacement for this content.
-        let mut cached = OwnedMutexGuard::lock(Arc::clone(&file.slot), context.owner.cx())
+        // Completed uploads are evictable even while their generation is in
+        // flight: pinning every prepared file would make one request larger
+        // than the metadata cache permanently fail on its 65th upload. Recover
+        // through the current content slot, which may have been recreated, so
+        // an older generation observes a newer request's replacement instead
+        // of writing into an obsolete slot. Only active I/O pins the slot.
+        let slot = cache.slot(*key)?;
+        let mut cached = OwnedMutexGuard::lock(slot, context.owner.cx())
             .await
             .map_err(|_| {
                 files_error("media recovery cancelled while waiting for its content lock")
@@ -715,6 +738,14 @@ async fn recover_files(
         if !stale {
             // A still-live input does not turn a model/prompt failure into a
             // media retry. In particular, FAILED is not a replacement signal.
+            // Refill an evicted slot from this authenticated observation, but
+            // never replace a newer request's different remote resource.
+            if cached
+                .as_ref()
+                .is_none_or(|current| current.uri == file.remote.uri)
+            {
+                *cached = observed;
+            }
             continue;
         }
         if file.replacement_used {
@@ -1164,6 +1195,7 @@ mod tests {
         ContentBlock, MediaContent, Message, StreamEvent, TextContent, UserContent, UserMessage,
     };
     use crate::provider::{BeforeProviderRequestHook, Context, Provider};
+    use crate::tools::Tool as _;
     use asupersync::runtime::RuntimeBuilder;
     use futures::StreamExt;
     use std::collections::HashMap;
@@ -1591,6 +1623,243 @@ mod tests {
         provider
     }
 
+    fn native_vision_image() -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==",
+            )
+            .unwrap()
+    }
+
+    fn native_vision_metadata(endpoint: &Endpoint, id: &str) -> Value {
+        let mut metadata = file_metadata(endpoint, id, "ACTIVE", native_vision_image().len());
+        metadata["mimeType"] = json!("image/png");
+        metadata
+    }
+
+    fn native_vision_response() -> Value {
+        json!({
+            "candidates": [{"finishReason":"STOP", "content":{"parts":[{"text":"A staged diagram."}]}}],
+            "usageMetadata": {"promptTokenCount":1_000_000, "candidatesTokenCount":0}
+        })
+    }
+
+    fn native_vision_tool(
+        directory: &std::path::Path,
+        server: &Server,
+        files: FileCache,
+        budget: &crate::cost::CostBudget,
+    ) -> crate::media_tools::InspectImageTool {
+        let mut tool = crate::media_tools::InspectImageTool::with_defaults(
+            directory,
+            Some("gemini".to_string()),
+            Some("fixture-vision".to_string()),
+        )
+        .with_mock(false)
+        .with_api_key(Some("native-vision-key".to_string()))
+        .with_base_url(server.endpoint.base.as_str())
+        .with_gemini_files(files);
+        let scope = crate::cost::CostScope::default();
+        scope.set(Some(budget.clone()));
+        tool.bind_cost_scope(scope);
+        let catalog =
+            crate::models::ModelRegistry::from_entries_for_tests(vec![crate::models::ModelEntry {
+                model: crate::provider::Model {
+                    id: "fixture-vision".to_string(),
+                    name: "Fixture vision".to_string(),
+                    provider: "gemini".to_string(),
+                    api: "google-generative-ai".to_string(),
+                    base_url: server.endpoint.base.to_string(),
+                    reasoning: false,
+                    input: vec![
+                        crate::provider::InputType::Text,
+                        crate::provider::InputType::Image,
+                    ],
+                    cost: crate::provider::ModelCost {
+                        input: 1.0,
+                        ..crate::provider::ModelCost::default()
+                    },
+                    context_window: 128_000,
+                    max_tokens: 4096,
+                    headers: HashMap::new(),
+                },
+                api_key: None,
+                headers: HashMap::new(),
+                auth_header: true,
+                compat: None,
+                oauth_config: None,
+            }]);
+        let auth = crate::media_tools::MediaAuthScope::default();
+        auth.set_models(&Arc::new(()), Some(&catalog));
+        tool.bind_media_auth_scope(auth);
+        tool
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Each generation has an exact one-dollar fixture bill.
+    fn native_vision_stages_reuses_and_replaces_files_without_duplicate_charges() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = native_vision_image();
+        let image_path = directory.path().join("input.png");
+        std::fs::write(&image_path, &image).unwrap();
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": native_vision_metadata(endpoint, "one")})),
+                Reply::json(&native_vision_response()),
+                Reply::json(&native_vision_metadata(endpoint, "one")),
+                Reply::json(&native_vision_response()),
+                Reply::status(404),
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": native_vision_metadata(endpoint, "two")})),
+                Reply::json(&native_vision_response()),
+            ]
+        });
+        let files = FileCache {
+            test_endpoint: Some(server.endpoint.clone()),
+            // Scale only the threshold: Tool::execute, credentials, uploads,
+            // metadata validation, generation and billing all run normally.
+            ..cache()
+        };
+        let budget = crate::cost::CostBudget::new(None, Some(3.0), 0.0).unwrap();
+        let tool = native_vision_tool(directory.path(), &server, files, &budget);
+        run_async(async {
+            for id in ["upload", "reuse", "replace-missing"] {
+                let output = tool
+                    .execute(
+                        id,
+                        json!({"path":"input.png", "prompt":"Read the diagram"}),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(&output.content[0], ContentBlock::Text(text) if text.text == "A staged diagram.")
+                );
+                assert!(!output.is_error);
+            }
+            assert!(matches!(
+                tool.execute("capped", json!({"path":"input.png"}), None)
+                    .await,
+                Err(Error::CostCap { .. })
+            ));
+        });
+        assert_eq!(budget.spent(), 3.0);
+        assert_eq!(budget.snapshot().pending, 0.0);
+        assert_eq!(std::fs::read(&image_path).unwrap(), image);
+        let one = server
+            .endpoint
+            .metadata_url("files/one")
+            .unwrap()
+            .to_string();
+        let two = server
+            .endpoint
+            .metadata_url("files/two")
+            .unwrap()
+            .to_string();
+        let requests = server.finish();
+        assert_eq!(
+            requests.len(),
+            9,
+            "cap refuses before a metadata check or upload"
+        );
+        assert_eq!(requests[0].path, "/upload/v1beta/files");
+        assert_eq!(requests[6].path, "/upload/v1beta/files");
+        for index in [1, 7] {
+            assert_eq!(requests[index].body, image);
+            assert!(!requests[index].headers.contains_key("x-goog-api-key"));
+        }
+        assert_eq!(requests[3].method, "GET");
+        assert_eq!(requests[5].method, "GET");
+        for (index, uri) in [(2, one.as_str()), (4, one.as_str()), (8, two.as_str())] {
+            let request = &requests[index];
+            assert_eq!(
+                request.path,
+                "/v1beta/models/fixture-vision:generateContent"
+            );
+            assert_eq!(request.headers["x-goog-api-key"], "native-vision-key");
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let part = &body["contents"][0]["parts"][0];
+            assert!(part.get("inlineData").is_none());
+            assert_eq!(
+                part["fileData"],
+                json!({"mimeType":"image/png", "fileUri":uri})
+            );
+            assert_eq!(body["contents"][0]["parts"][1]["text"], "Read the diagram");
+            assert_eq!(body["generationConfig"]["maxOutputTokens"], 4096);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // Upload refusal is free; the rejected generation reports one dollar.
+    fn native_vision_staging_refusal_and_generation_error_never_replay_generation() {
+        for refuse_upload in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("input.png"), native_vision_image()).unwrap();
+            let server = Server::start(|endpoint| {
+                let failure = Reply {
+                    status: if refuse_upload { 401 } else { 503 },
+                    ..Reply::json(&json!({
+                        "error":{"code":503, "status":"UNAVAILABLE", "message":"private-upload-body"},
+                        "usageMetadata":{"promptTokenCount":1_000_000, "candidatesTokenCount":0}
+                    }))
+                };
+                let mut replies = if refuse_upload {
+                    vec![failure]
+                } else {
+                    vec![
+                        Reply::start(endpoint),
+                        Reply::json(&json!({"file":native_vision_metadata(endpoint, "one")})),
+                        failure,
+                    ]
+                };
+                // A replay would receive success and make expect_err fail.
+                replies.push(Reply::json(&native_vision_response()));
+                replies
+            });
+            let files = FileCache {
+                test_endpoint: Some(server.endpoint.clone()),
+                ..cache()
+            };
+            let budget = crate::cost::CostBudget::new(None, Some(10.0), 0.0).unwrap();
+            let tool = native_vision_tool(directory.path(), &server, files, &budget);
+            let error = run_async(tool.execute("refused", json!({"path":"input.png"}), None))
+                .expect_err("native vision must not replay a failed request");
+            if refuse_upload {
+                assert!(!error.to_string().contains("private-upload-body"));
+            } else {
+                assert!(error.to_string().contains("HTTP 503"));
+            }
+            assert_eq!(budget.spent(), if refuse_upload { 0.0 } else { 1.0 });
+            assert_eq!(budget.snapshot().pending, 0.0);
+            assert_eq!(server.finish().len(), if refuse_upload { 1 } else { 3 });
+        }
+    }
+
+    #[test]
+    fn native_vision_custom_gateway_keeps_inline_media() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = native_vision_image();
+        std::fs::write(directory.path().join("input.png"), &image).unwrap();
+        let server = Server::start(|_| vec![Reply::json(&native_vision_response())]);
+        let budget = crate::cost::CostBudget::new(None, Some(10.0), 0.0).unwrap();
+        // Deliberately omit the fixture origin override. A configured gateway
+        // must not acquire Google's Files API routes or send credentials there.
+        let tool = native_vision_tool(directory.path(), &server, cache(), &budget);
+        run_async(tool.execute("gateway", json!({"path":"input.png"}), None)).unwrap();
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let inline = &body["contents"][0]["parts"][0]["inlineData"];
+        assert_eq!(inline["mimeType"], "image/png");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(inline["data"].as_str().unwrap())
+                .unwrap(),
+            image
+        );
+    }
+
     fn fixture_options() -> StreamOptions {
         StreamOptions {
             api_key: Some("unused-fallback".to_string()),
@@ -1703,9 +1972,7 @@ mod tests {
         class: Option<crate::failover::FailoverClass>,
         usage_limit: bool,
     ) {
-        use crate::failover::{
-            FallbackOn, RetryPolicy, TurnDecision, TurnOutcome, TurnProgress,
-        };
+        use crate::failover::{FallbackOn, RetryPolicy, TurnDecision, TurnOutcome, TurnProgress};
 
         assert_eq!(
             crate::failover::call_error_is_retryable(error),
@@ -1724,7 +1991,10 @@ mod tests {
             "{error}"
         );
         if class.is_some() {
-            assert_eq!(FallbackOn::UsageLimit.allows(&error.to_string()), usage_limit);
+            assert_eq!(
+                FallbackOn::UsageLimit.allows(&error.to_string()),
+                usage_limit
+            );
             assert_eq!(
                 FallbackOn::ExceptUsageLimit.allows(&error.to_string()),
                 !usage_limit
@@ -1776,29 +2046,27 @@ mod tests {
         use crate::failover::FailoverClass;
 
         for (diagnostic, retryable, usage_limit) in [
-            ("HTTP 429: quota exceeded; GenerateRequestsPerDay", true, true),
+            (
+                "HTTP 429: quota exceeded; GenerateRequestsPerDay",
+                true,
+                true,
+            ),
             (
                 "HTTP 429: quota exceeded; GenerateRequestsPerMinute",
                 true,
                 false,
             ),
             ("HTTP 402: insufficient_quota", false, true),
-            ("HTTP 400: quota exceeded; concurrent requests", false, false),
+            (
+                "HTTP 400: quota exceeded; concurrent requests",
+                false,
+                false,
+            ),
         ] {
             let cause = Error::api(format!("{diagnostic}; private-upload-capability"));
-            assert_file_recovery_policy(
-                &cause,
-                retryable,
-                Some(FailoverClass::Quota),
-                usage_limit,
-            );
+            assert_file_recovery_policy(&cause, retryable, Some(FailoverClass::Quota), usage_limit);
             let error = request_error("media transfer failed", cause);
-            assert_file_recovery_policy(
-                &error,
-                retryable,
-                Some(FailoverClass::Quota),
-                usage_limit,
-            );
+            assert_file_recovery_policy(&error, retryable, Some(FailoverClass::Quota), usage_limit);
             assert!(!format!("{error:?} {error}").contains("private-upload-capability"));
         }
     }
@@ -1880,11 +2148,9 @@ mod tests {
     fn files_http_failures_preserve_recovery_policy_without_echoing_private_bodies() {
         use crate::failover::FailoverClass::{Overload, Quota, Transient};
 
-        for (boundary, expected_requests) in [
-            ("upload-start", 1),
-            ("upload-transfer", 2),
-            ("metadata", 3),
-        ] {
+        for (boundary, expected_requests) in
+            [("upload-start", 1), ("upload-transfer", 2), ("metadata", 3)]
+        {
             for (status, message, retryable, class, usage_limit) in [
                 (
                     429,
@@ -1956,7 +2222,11 @@ mod tests {
                     original
                 );
                 let requests = server.finish();
-                assert_eq!(requests.len(), expected_requests, "{boundary}: HTTP {status}");
+                assert_eq!(
+                    requests.len(),
+                    expected_requests,
+                    "{boundary}: HTTP {status}"
+                );
                 for request in &requests {
                     assert!(!request.path.contains(":streamGenerateContent"));
                     if request
@@ -1992,7 +2262,9 @@ mod tests {
                     vec![Reply {
                         status,
                         headers: Vec::new(),
-                        body: "private-error-body; retry delay; ".repeat(repetitions).into_bytes(),
+                        body: "private-error-body; retry delay; "
+                            .repeat(repetitions)
+                            .into_bytes(),
                         delivery,
                     }]
                 });
@@ -2461,6 +2733,125 @@ mod tests {
             &state.entries.get(&retained_key).unwrap().slot,
         ));
         drop(state);
+    }
+
+    /// Admit unrelated idle entries through the ordinary bounded LRU rather
+    /// than removing the slot by hand. No upload is in flight while evicting.
+    fn evict_file_slot(cache: &FileCache, key: ContentKey) {
+        for index in 0..MAX_CACHE_ENTRIES {
+            let mut unrelated = key;
+            unrelated[0] ^= 1;
+            unrelated[1] = u8::try_from(index).unwrap();
+            drop(cache.slot(unrelated).unwrap());
+        }
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.entries.len(), MAX_CACHE_ENTRIES);
+        assert!(!state.entries.contains_key(&key));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn provider_stages_more_files_than_cache_capacity_and_reuses_recent_content() {
+        let count = MAX_CACHE_ENTRIES + 1;
+        let payloads: Vec<_> = (0..count)
+            .map(|index| vec![u8::try_from(index).unwrap(), 42, 255])
+            .collect();
+        let server = Server::start(|endpoint| {
+            let mut replies = Vec::new();
+            for index in 0..count {
+                replies.extend([
+                    Reply::start(endpoint),
+                    Reply::json(&json!({"file": file_metadata(
+                        endpoint, &format!("item-{index}"), "ACTIVE", 3
+                    )})),
+                ]);
+            }
+            replies.extend([
+                Reply::sse("all recordings accepted"),
+                Reply::json(&file_metadata(
+                    endpoint,
+                    &format!("item-{}", count - 1),
+                    "ACTIVE",
+                    3,
+                )),
+                Reply::sse("recent recording reused"),
+            ]);
+            replies
+        });
+        let provider = fixture_provider(&server);
+        let options = fixture_options();
+        let context = Context::owned(
+            None,
+            vec![Message::User(UserMessage {
+                content: UserContent::Blocks(
+                    payloads
+                        .iter()
+                        .map(|bytes| {
+                            ContentBlock::Media(MediaContent {
+                                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                                mime_type: "audio/wav".to_string(),
+                                name: None,
+                            })
+                        })
+                        .collect(),
+                ),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+        run_async(async {
+            let events = fixture_events(&provider, &context, &options).await.unwrap();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                StreamEvent::TextDelta { delta, .. } if delta == "all recordings accepted"
+            )));
+            assert_eq!(
+                provider.files.state.lock().unwrap().entries.len(),
+                MAX_CACHE_ENTRIES
+            );
+            let recent = Context::owned(
+                None,
+                vec![Message::User(UserMessage {
+                    content: UserContent::Blocks(vec![ContentBlock::Media(MediaContent {
+                        data: base64::engine::general_purpose::STANDARD
+                            .encode(payloads.last().unwrap()),
+                        mime_type: "audio/wav".to_string(),
+                        name: None,
+                    })]),
+                    timestamp: 1,
+                })],
+                Vec::new(),
+            );
+            let events = fixture_events(&provider, &recent, &options).await.unwrap();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                StreamEvent::TextDelta { delta, .. } if delta == "recent recording reused"
+            )));
+        });
+        let requests = server.finish();
+        assert_eq!(requests.len(), count * 2 + 3);
+        for (index, bytes) in payloads.iter().enumerate() {
+            assert_eq!(requests[index * 2].path, "/upload/v1beta/files");
+            assert_request_credentials(&requests[index * 2]);
+            assert_eq!(&requests[index * 2 + 1].body, bytes);
+        }
+        let generation: Value = serde_json::from_slice(&requests[count * 2].body).unwrap();
+        let parts = generation["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), count);
+        for (index, part) in parts.iter().enumerate() {
+            assert!(part.get("inlineData").is_none());
+            assert!(
+                part["fileData"]["fileUri"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&format!("/item-{index}"))
+            );
+        }
+        assert_eq!(requests[count * 2 + 1].method, "GET");
+        assert_eq!(
+            requests[count * 2 + 1].path,
+            format!("/v1beta/files/item-{}", count - 1)
+        );
     }
 
     #[test]
@@ -2945,6 +3336,9 @@ mod tests {
             assert_eq!(file.encoded, "YWJj");
             assert_eq!(file.pointers.len(), 2);
             assert!(!body.to_string().contains("YWJj"));
+            let key = content_key(&server.endpoint, &auth, "audio/wav", b"abc");
+            evict_file_slot(&cache, key);
+            let slot = cache.slot(key).unwrap();
             let concurrent = RemoteFile::parse(
                 &file_metadata(&server.endpoint, "concurrent", "ACTIVE", 3),
                 &server.endpoint,
@@ -2952,7 +3346,7 @@ mod tests {
                 3,
             )
             .unwrap();
-            *file.slot.lock(prepared.owner.cx()).await.unwrap() = Some(concurrent.clone());
+            *slot.lock(prepared.owner.cx()).await.unwrap() = Some(concurrent.clone());
             assert!(
                 recover_fixture(&mut prepared, &cache, &client, &auth, &mut body)
                     .await
@@ -2962,8 +3356,7 @@ mod tests {
             assert!(file.replacement_used);
             assert_eq!(file.remote.uri, concurrent.uri);
             assert_eq!(
-                file.slot
-                    .lock(prepared.owner.cx())
+                slot.lock(prepared.owner.cx())
                     .await
                     .unwrap()
                     .as_ref()
@@ -2997,6 +3390,136 @@ mod tests {
                     .map(String::as_str),
                 Some("a")
             );
+        }
+    }
+
+    #[test]
+    fn concurrent_generation_recovery_recreates_one_slot_and_replaces_only_once() {
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": file_metadata(endpoint, "old", "ACTIVE", 3)})),
+                Reply::json(&file_metadata(endpoint, "old", "ACTIVE", 3)),
+                Reply::status(404),
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": file_metadata(endpoint, "replacement", "ACTIVE", 3)})),
+                Reply::status(404),
+                Reply::json(&file_metadata(endpoint, "replacement", "ACTIVE", 3)),
+                Reply::status(404),
+            ]
+        });
+        let cache = cache();
+        let client = Client::new();
+        let auth = auth("a");
+        let key = content_key(&server.endpoint, &auth, "audio/wav", b"abc");
+        let mut left = media_body(b"abc");
+        let mut right = left.clone();
+        run_async(async {
+            let (a, b) = futures::join!(
+                stage_for_recovery(&cache, &client, &server.endpoint, &auth, &mut left),
+                stage_for_recovery(&cache, &client, &server.endpoint, &auth, &mut right),
+            );
+            let mut a = a.unwrap();
+            let mut b = b.unwrap();
+            assert_eq!(left, right);
+            evict_file_slot(&cache, key);
+
+            let (a_recovered, b_recovered) = futures::join!(
+                recover_fixture(&mut a, &cache, &client, &auth, &mut left),
+                recover_fixture(&mut b, &cache, &client, &auth, &mut right),
+            );
+            assert!(a_recovered.unwrap());
+            assert!(b_recovered.unwrap());
+            assert_eq!(left, right);
+            for prepared in [&a, &b] {
+                let file = prepared.files.get(&key).unwrap();
+                assert!(file.replacement_used);
+                assert!(file.remote.uri.ends_with("/replacement"));
+            }
+            let current = cache.slot(key).unwrap();
+            assert!(
+                current
+                    .lock(a.owner.cx())
+                    .await
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .uri
+                    .ends_with("/replacement")
+            );
+            drop(current);
+
+            // Cache eviction cannot reset this request's one-replacement bit.
+            // Exercise the shared recovery core after a second disappearance;
+            // the provider's outer lifecycle separately prohibits a third try.
+            evict_file_slot(&cache, key);
+            let before = left.clone();
+            let error = recover_fixture(&mut a, &cache, &client, &auth, &mut left)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("after one replacement"));
+            assert_eq!(left, before);
+        });
+        let requests = server.finish();
+        assert_eq!(requests.len(), 9);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "POST")
+                .count(),
+            4,
+            "one cold upload and one shared replacement"
+        );
+        assert_eq!(requests[1].body, b"abc");
+        assert_eq!(requests[5].body, b"abc");
+        assert_eq!(requests[3].path, "/v1beta/files/old");
+        assert_eq!(requests[6].path, "/v1beta/files/old");
+        assert_eq!(requests[7].path, "/v1beta/files/replacement");
+        assert_eq!(requests[8].path, "/v1beta/files/replacement");
+    }
+
+    #[test]
+    fn recovery_repopulates_evicted_live_metadata_without_retrying_or_reuploading() {
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(&json!({"file": file_metadata(endpoint, "live", "ACTIVE", 3)})),
+                Reply::json(&file_metadata(endpoint, "live", "ACTIVE", 3)),
+                Reply::json(&file_metadata(endpoint, "live", "ACTIVE", 3)),
+            ]
+        });
+        let cache = cache();
+        let client = Client::new();
+        let auth = auth("a");
+        let key = content_key(&server.endpoint, &auth, "audio/wav", b"abc");
+        let mut body = media_body(b"abc");
+        run_async(async {
+            let mut prepared =
+                stage_for_recovery(&cache, &client, &server.endpoint, &auth, &mut body)
+                    .await
+                    .unwrap();
+            let original = body.clone();
+            evict_file_slot(&cache, key);
+            assert!(
+                !recover_fixture(&mut prepared, &cache, &client, &auth, &mut body)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(body, original);
+            assert!(!prepared.files[&key].replacement_used);
+
+            let mut next_turn = media_body(b"abc");
+            stage(&cache, &client, &server.endpoint, &auth, &mut next_turn)
+                .await
+                .unwrap();
+            assert_eq!(next_turn, original);
+            assert_eq!(cache.state.lock().unwrap().entries.len(), MAX_CACHE_ENTRIES);
+        });
+        let requests = server.finish();
+        assert_eq!(requests.len(), 4, "an observed live file is still reusable");
+        for request in &requests[2..] {
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.path, "/v1beta/files/live");
         }
     }
 
@@ -3628,8 +4151,7 @@ mod tests {
             let error = cache
                 .prepare_inner(&context, &mut body, plan, &mut prepared)
                 .await
-                .err()
-                .expect("cancelled staging");
+                .expect_err("cancelled staging");
             assert!(error.to_string().contains("cancelled"));
             assert!(cache.state.lock().unwrap().entries.is_empty());
         });

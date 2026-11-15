@@ -269,16 +269,60 @@ their closed handle is evicted. Existing filesystem effects are not rolled back.
   and notices, and observations are screened again under the caller's current
   policy. A canceled or closing job cannot accept another turn or a late result.
 - `worker_start` accepts `agent`, `task`, `model`, `cwd`, `scope`, `timeoutSeconds`
-  and `isolation: "none"` on Unix and Windows. Follow-ups cannot change frozen
-  launch options. An `outputSchema` or the definition's `output_schema` freezes
-  a strict contract for every turn: answers must be bare JSON that validates,
-  with no corrective retry. `schemaMode`, when supplied, must be `"strict"`.
-  Worktree isolation and historical `seance` consultation remain on the ordinary
+  and `isolation: "none" | "worktree"` on Unix and Windows. Isolated workers
+  accept only `isoApply: "keep"`, which is also their default. Follow-ups cannot
+  change frozen launch options. An `outputSchema` or the definition's
+  `output_schema` freezes a strict contract for every turn: answers must be bare
+  JSON that validates, with no corrective retry. `schemaMode`, when supplied,
+  must be `"strict"`. Historical `seance` consultation remains on the ordinary
   delegation path.
+
+### Keep an isolated reusable workspace
+
+Use `isolation: "worktree"` to keep reusable workers' edits separate from the
+parent and from other pool members:
+
+```json
+{"operation":"worker_start","agent":"task","task":"Implement the parser correction","cwd":"packages/parser","isolation":"worktree","isoApply":"keep"}
+```
+
+The launch captures the parent's tracked changes and non-ignored untracked
+files before acknowledgment, including staged and unstaged edits. A nested
+`cwd` keeps its corresponding location in the isolated tree. Each worker
+retains its worktree for all turns. A pool captures one baseline for the whole
+launch and creates a separate worktree for each member; later parent or sibling
+edits cannot change that baseline. The existing snapshot limits and source
+validation still apply.
+
+Retained workers always keep their worktrees. Omit `isoApply` or set it to
+`"keep"`; `"apply"` and `"drop"` are rejected before launch. Closing,
+cancellation, timeout, failure and session shutdown reap processes without
+applying or deleting the workspace. Review and reconcile the retained edits
+explicitly.
+
+Worker snapshots expose `workspace` with schema
+`pi.subagent.worker.workspace.v1`, `mode: "worktree"`, `worktreePath`,
+`branch`, `baseline`, `cwd`, `applyMode: "keep"` and `applied: false`.
+Before materialization, or without isolation, it is null. Pool manifests and
+drain pages expose `workerWorkspaces` rows of
+`{workerIndex, workspace, closed}`; each item carries the same 1-based
+`workerIndex`. The descriptor remains available after that member closes.
+
+A completed turn's native result carries `iso` with the cumulative patch
+against the original captured baseline. Later turns on the same member include
+earlier edits: these are successive snapshots, so do not apply them as
+independent patches. Different pool members retain separate worktrees and
+patches. A cancelled or failed turn may have only its workspace descriptor;
+inspect the retained files rather than assuming no changes occurred. Existing
+result-size limits still apply. Privacy projection cannot rewrite an actionable
+workspace identity or patch while retaining its original contract.
 
 The native regression suite includes a controlled RPC child that remembers a
 first prompt in its second response while keeping one PID, queued turn ordering,
 the post-turn streaming/compaction barrier, idle cancellation and session ownership.
+Worktree regressions cover a shared dirty baseline, distinct member paths,
+nested working directories, cumulative turns, unchanged parent HEAD/index,
+prelaunch refusal and preservation of interrupted edits.
 Rust acceptance remains the DSR quality lane; guest-language diagnostics alone
 do not establish native execution correctness.
 
@@ -306,8 +350,10 @@ interpreter is not needed to keep them running.
 The acknowledgment has `details.schema: "pi.subagent.pool.v1"`, a stable
 `poolId`, a carrier `jobId`, and `admittedItemIds` in input order. Item IDs are
 1-based, never reused and independent of internal worker/turn assignments.
-The `items` manifest retains admission order. Internal member worker handles
-are not published and cannot be used to cancel a shared carrier accidentally.
+The `items` manifest retains admission order and exposes each item's stable
+`workerIndex` for association with `workerContexts` and `workerWorkspaces`.
+Internal member worker handles are not published and cannot be used to cancel
+a shared carrier accidentally.
 
 Later batches use the existing pool identity:
 
@@ -340,12 +386,13 @@ All controls use the `subagent` tool with an explicit `operation` field:
 
 | Operation | Fields and behavior |
 | --- | --- |
-| `pool_start` | Requires `agent`; accepts `tasks` (default empty), `concurrency` (default 4), `cwd`, `scope`, `timeoutSeconds`, and `isolation: "none"`. Returns the new identity and admitted item IDs. |
+| `pool_start` | Requires `agent`; accepts `tasks` (default empty), `concurrency` (default 4), `cwd`, `scope`, `timeoutSeconds`, `isolation: "none" \| "worktree"`, and keep-only `isoApply`. Returns the new identity and admitted item IDs. |
 | `pool_push` | Requires `poolId` and a nonempty `tasks` array. Returns all newly admitted item IDs; cannot change launch settings. |
 | `pool_status` | Requires `poolId`. Returns one bounded manifest with status, counts, ordered summaries and result references. |
 | `pool_result` | Requires `poolId` and `itemId`. Adds the selected item's status and full native result to the manifest. |
 | `pool_wait` | Requires `poolId`; accepts `itemId` and `timeoutMs`. Waits for that item, or for terminal pool state when `itemId` is omitted. Does not seal admission. |
 | `pool_drain` | Requires `poolId`; accepts `cursor`, `maxItems` (1–4, default 4) and `timeoutMs` (default 0). Returns newly settled full results and a replayable acknowledgment cursor. Does not seal or consume results. |
+| `pool_exchange` | Requires an existing `poolId`; accepts optional `tasks`, `seal` (default false), `cursor`, `maxItems` (1–4, default 4) and `timeoutMs` (default 0). Atomically admits a batch and optionally seals, then returns one drain page plus `admittedItemIds` and a `snapshot` manifest. |
 | `pool_finish` | Requires `poolId`. Seals admission and acknowledges immediately; accepted items continue draining. Repeated finish is safe. |
 | `pool_close` | Requires `poolId`. Cancels running and queued work and waits for owned child cleanup. Repeated close is safe. |
 
@@ -356,7 +403,7 @@ includes `concurrency`, `admittedItems`, `queuedItems`, `runningItems`,
 cancelled items. Each manifest entry has this shape:
 
 ```json
-{"id":1,"status":"completed","summary":"Bounded task summary…","resultRef":{"poolId":"pool-…","itemId":1}}
+{"id":1,"workerIndex":1,"status":"completed","summary":"Bounded task summary…","resultRef":{"poolId":"pool-…","itemId":1}}
 ```
 
 The summary is an excerpt, not a replacement for the task's native output.
@@ -366,7 +413,7 @@ Fetch one exact result with:
 {"operation":"pool_result","poolId":"pool-…","itemId":1}
 ```
 
-This adds `details.itemId` and `details.item: {id, status, result}`. Pending
+This adds `details.itemId` and `details.item: {id, workerIndex, status, result}`. Pending
 items have status `queued` or `running` and `result: null`; terminal items have
 status `completed`, `failed` or `cancelled` and a non-null native `ToolOutput`.
 That output preserves content, native details, error status, child PID and hub
@@ -391,7 +438,7 @@ full results per page:
 ```
 
 The returned `details.schema` is `pi.subagent.pool.drain.v1`. Its `items` are
-`{id, status, result}` records in ascending item order among currently settled
+`{id, workerIndex, status, result}` records in ascending item order among currently settled
 results. `result` is the full native `ToolOutput`. The page includes pool/job/
 agent identity, pool `status`, `sealed`, and `admittedItems`, `settledItems` and
 `pendingItems` counts.
@@ -423,6 +470,48 @@ available after shutdown, and each read reapplies captured and current privacy
 policy. Later pushes retain earlier item IDs and remain compatible with a saved
 cursor. The cursor carries no permission and can be used after a kernel reset
 only through the owning session's permitted native tool path.
+
+### Admit a batch and observe results in one operation
+
+`pool_exchange` combines admission, optional sealing and a bounded drain page
+for an established pool. A pipeline can submit its next batch and observe
+completed work with one native operation:
+
+```json
+{
+  "operation":"pool_exchange",
+  "poolId":"pool-…",
+  "tasks":["Review the remaining parser edge cases."],
+  "seal":true,
+  "timeoutMs":10000,
+  "maxItems":4
+}
+```
+
+The response keeps `details.schema: "pi.subagent.pool.drain.v1"`, including
+ordinary drain cursors, results, workspace descriptors and lifecycle fields.
+It adds `admittedItemIds` for exactly this accepted batch and `snapshot`
+containing the ordinary `pi.subagent.pool.v1` manifest. The result page may
+include previously accepted items as well as the new batch. Its observation
+follows the manifest, so page counts can be newer if another caller submits
+work concurrently.
+
+`tasks` may be omitted or empty. A nonempty batch follows the same lifetime
+capacity, task validation and atomic admission rules as `pool_push`.
+`seal: true` commits with that batch, preventing later admission while already
+accepted work continues. An empty exchange may seal without submitting work,
+or collect a page from a terminal pool. The command never creates a pool.
+`timeoutMs` accepts 0 through 600,000 and covers admission plus observation
+without renewing the pool deadline; expiry does not undo accepted tasks.
+
+Cursor membership, settled state, options and the projected response are
+checked before admission. An invalid cursor cannot consume capacity or seal
+the pool. The read phase never repeats the mutation. Because acknowledgment
+can still be lost after a successful commit, **never replay an uncertain
+exchange**. Recover the actual membership with `pool_status`; use
+`pool_drain` and the last acknowledged cursor to read results again. The
+`nextCursor` acknowledgment still belongs to the reader and advances only
+after that reader successfully processes a page.
 
 ### Finish, cancellation and aggregate delivery
 
@@ -467,11 +556,11 @@ runtime's error result rather than a successful aggregate manifest.
   time. The host limit defaults to 900 seconds; `timeoutSeconds` may shorten it.
   Push, finish and observation waits never renew the deadline.
 - Children use the definition, model selection, tools and working directory
-  captured at startup. Pools support Unix and Windows with `isolation: "none"`.
-  A launch-time `outputSchema` or schema-bearing definition applies one strict
-  output contract to every member and turn, without corrective retries.
-  Worktree isolation and historical `seance` consultation remain on the ordinary
-  delegation path.
+  captured at startup. Pools support Unix and Windows with `isolation: "none"`
+  or `"worktree"`; isolated members preserve their worktrees with keep-only
+  disposition. A launch-time `outputSchema` or schema-bearing definition applies
+  one strict output contract to every member and turn, without corrective retries.
+  Historical `seance` consultation remains on the ordinary delegation path.
 - Every native operation checks the current owning session and cancellation
   state. An eval request also passes its active Agent's current tool, approval,
   plan and extension policy. Captured IDs grant no permission in another
@@ -506,5 +595,6 @@ resume or reconstruction of child conversations from job artifacts.
 
 See [eval workpool examples](eval-structured-results.md#reusable-workpools) for
 JavaScript and Python handles, aggregate jobs and mixed waits. Native regression
-coverage lives in `src/subagents/worker/pool.rs`; the authoritative acceptance
-entry point remains `dsr quality --tool pi_agent_rust`.
+coverage lives in `src/subagents/worker/pool.rs` and its `pool/exchange.rs`
+module; the authoritative acceptance entry point remains
+`dsr quality --tool pi_agent_rust`.

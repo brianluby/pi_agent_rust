@@ -6795,6 +6795,20 @@ impl ToolRegistry {
         }
     }
 
+    pub(crate) fn reuse_generated_dispatcher_from(&mut self, other: &Self) {
+        if let (Some(self_gen), Some(other_gen)) = (
+            self.generated_dispatcher.as_ref(),
+            other.generated_dispatcher.as_ref(),
+        ) && self_gen.discoverable() == other_gen.discoverable()
+        {
+            let owned: Arc<dyn Tool> = self_gen.clone();
+            if let Some(index) = self.tools.iter().position(|tool| Arc::ptr_eq(tool, &owned)) {
+                self.tools[index] = other_gen.clone();
+                self.generated_dispatcher = Some(other_gen.clone());
+            }
+        }
+    }
+
     /// Names + one-liners of currently discoverable tools (for the
     /// system-prompt index).
     #[must_use]
@@ -7722,6 +7736,12 @@ fn notebook_source_read_output(
     mut details: serde_json::Value,
 ) -> Result<ToolOutput> {
     if source.len() > crate::notebook::MAX_NOTEBOOK_BYTES {
+        if input.rendered {
+            return Err(Error::tool(
+                "read",
+                "[DOCUMENT_TOO_LARGE] Document input exceeds the 10 MiB conversion limit; use raw=true to inspect source text",
+            ));
+        }
         return Err(Error::tool(
             "read",
             "[NOTEBOOK_EDIT] Notebook exceeds the 10 MiB limit",
@@ -8179,6 +8199,12 @@ impl Tool for ReadTool {
         if !input.raw && crate::notebook::is_notebook_path(&path) {
             let bound = crate::notebook::MAX_NOTEBOOK_BYTES;
             if meta.len() > bound as u64 {
+                if input.rendered {
+                    return Err(Error::tool(
+                        "read",
+                        "[DOCUMENT_TOO_LARGE] Document input exceeds the 10 MiB conversion limit; use raw=true to inspect source text",
+                    ));
+                }
                 return Err(Error::tool(
                     "read",
                     "[NOTEBOOK_EDIT] Notebook exceeds the 10 MiB limit; use raw=true to inspect the JSON source",
@@ -10424,9 +10450,62 @@ impl Tool for BashTool {
         options: &serde_json::Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        validate_builtin_factory_options("bash", options, &["commandPrefix"])?;
+        validate_builtin_factory_options(
+            "bash",
+            options,
+            &["commandPrefix", "spawnEnv", "spawnEnvUnset"],
+        )?;
         let mut tool = self.clone();
         tool.cwd = builtin_factory_cwd("bash", cwd, &self.cwd, &WorkspaceHandle::default())?;
+        let valid_shell_ident = |name: &str| {
+            !name.is_empty()
+                && name.bytes().enumerate().all(|(i, b)| {
+                    b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit())
+                })
+        };
+        let mut env_preamble = String::new();
+        if let Some(unset_list) = options.get("spawnEnvUnset") {
+            let arr = unset_list
+                .as_array()
+                .ok_or_else(|| Error::validation("bash factory spawnEnvUnset must be an array"))?;
+            for item in arr {
+                let key = item.as_str().ok_or_else(|| {
+                    Error::validation("bash factory spawnEnvUnset entries must be strings")
+                })?;
+                if !crate::extensions_js::process_session::safe_environment_name(key)
+                    || !valid_shell_ident(key)
+                {
+                    return Err(Error::validation(format!(
+                        "bash factory spawnHook cannot unset restricted or invalid env variable '{key}'"
+                    )));
+                }
+                let _ = writeln!(env_preamble, "unset {key}");
+            }
+        }
+        if let Some(spawn_env) = options.get("spawnEnv") {
+            let obj = spawn_env
+                .as_object()
+                .ok_or_else(|| Error::validation("bash factory spawnEnv must be an object"))?;
+            for (key, raw_val) in obj {
+                let val = raw_val.as_str().ok_or_else(|| {
+                    Error::validation("bash factory spawnEnv values must be strings")
+                })?;
+                if !crate::extensions_js::process_session::safe_environment_name(key)
+                    || !valid_shell_ident(key)
+                {
+                    return Err(Error::validation(format!(
+                        "bash factory spawnHook cannot set restricted or invalid env variable '{key}'"
+                    )));
+                }
+                if val.contains('\0') {
+                    return Err(Error::validation(format!(
+                        "bash factory spawnHook env '{key}' contains NUL"
+                    )));
+                }
+                let escaped = val.replace('\'', "'\\''");
+                let _ = writeln!(env_preamble, "export {key}='{escaped}'");
+            }
+        }
         if let Some(prefix) = options.get("commandPrefix") {
             let prefix = prefix
                 .as_str()
@@ -10439,6 +10518,11 @@ impl Tool for BashTool {
                 let command = format!("{prefix}\n{command}");
                 input["command"] = serde_json::Value::String(command);
             }
+        }
+        if !env_preamble.is_empty()
+            && let Some(command) = input.get("command").and_then(serde_json::Value::as_str)
+        {
+            input["command"] = serde_json::Value::String(format!("{env_preamble}{command}"));
         }
         // The factory contract returns the completed command. Background
         // promotion would end streaming and abandon the supplied AbortSignal.
@@ -11420,12 +11504,13 @@ impl Tool for HubTool {
          MUST use hub, not bash. Ops: `start` (spawn with optional readiness \
          gates: ready.log regex AND ready.port TCP accept, both must pass \
          within ready.timeoutSecs — start returns only after readiness is \
-         observed), `ps` (list services), `logs` (tail/grep/incremental \
+         observed), `ps` (list this session's services), `logs` (tail/grep/incremental \
          cursor reads with bounded wait; raw logs retain the first 16 MiB \
          per run, live tails keep streaming, and logCapture reports loss \
          and I/O errors), `send` (PTY stdin: text, named \
          keys, signals), `stop` (graceful tree termination), `restart` \
-         (retained launch spec), `describe` (full descriptor), `jobs` \
+         (retained launch spec; a resumed detached service is relaunched under \
+         this live session), `describe` (full descriptor), `jobs` \
          (background bash jobs: list/wait/cancel), `agent` (subagent children: \
          roster/transcript/steer/kill/revive/send/inbox/wait; revive executes a \
          settled native child's original assignment with its retained launch \
@@ -11800,10 +11885,11 @@ impl HubTool {
                     ready,
                     detached: input.detached.unwrap_or(false),
                 };
-                let snapshot = crate::hub::run_service_request(move |request| {
-                    crate::hub::start_for_request(&spec, request)
-                })
-                .await?;
+                let snapshot =
+                    crate::hub::run_service_request(&self.job_session_scope, move |request| {
+                        crate::hub::start_for_request(&spec, request)
+                    })
+                    .await?;
                 let details = serde_json::to_value(&snapshot)?;
                 let mut text = format!(
                     "Service '{name}' is running (pid {}, log: {}).",
@@ -11816,7 +11902,11 @@ impl HubTool {
                 (text, details)
             }
             "ps" => {
-                let services = crate::hub::run_service_request(|_| crate::hub::ps()).await?;
+                let services =
+                    crate::hub::run_service_request(&self.job_session_scope, |request| {
+                        crate::hub::ps(request.service_owner())
+                    })
+                    .await?;
                 let details = serde_json::json!({
                     "schema": crate::hub::SERVICE_SCHEMA,
                     "services": services,
@@ -11850,17 +11940,18 @@ impl HubTool {
                 let tail = input.tail;
                 let grep = input.grep.clone();
                 let wait_ms = input.wait_ms.unwrap_or(0);
-                let page = crate::hub::run_service_request(move |request| {
-                    crate::hub::logs_for_request(
-                        &name,
-                        cursor,
-                        tail,
-                        grep.as_deref(),
-                        wait_ms,
-                        request,
-                    )
-                })
-                .await?;
+                let page =
+                    crate::hub::run_service_request(&self.job_session_scope, move |request| {
+                        crate::hub::logs_for_request(
+                            &name,
+                            cursor,
+                            tail,
+                            grep.as_deref(),
+                            wait_ms,
+                            request,
+                        )
+                    })
+                    .await?;
                 let details = serde_json::to_value(&page)?;
                 let mut text = page.lines.join("\n");
                 if text.is_empty() {
@@ -11880,7 +11971,10 @@ impl HubTool {
                 let name = name_required("stop")?;
                 let stop_name = name.clone();
                 let snapshot =
-                    crate::hub::run_service_request(move |_| crate::hub::stop(&stop_name)).await?;
+                    crate::hub::run_service_request(&self.job_session_scope, move |request| {
+                        crate::hub::stop_for_request(&stop_name, request)
+                    })
+                    .await?;
                 let details = serde_json::to_value(&snapshot)?;
                 let mut text = format!("Service '{name}' stopped (status: {}).", snapshot.status);
                 Self::append_log_capture_notice(&mut text, &snapshot.log_capture);
@@ -11889,10 +11983,11 @@ impl HubTool {
             "restart" => {
                 let name = name_required("restart")?;
                 let restart_name = name.clone();
-                let snapshot = crate::hub::run_service_request(move |request| {
-                    crate::hub::restart_for_request(&restart_name, request)
-                })
-                .await?;
+                let snapshot =
+                    crate::hub::run_service_request(&self.job_session_scope, move |request| {
+                        crate::hub::restart_for_request(&restart_name, request)
+                    })
+                    .await?;
                 let details = serde_json::to_value(&snapshot)?;
                 let mut text = format!("Service '{name}' restarted (status: {}).", snapshot.status);
                 Self::append_log_capture_notice(&mut text, &snapshot.log_capture);
@@ -11901,7 +11996,10 @@ impl HubTool {
             "describe" => {
                 let name = name_required("describe")?;
                 let snapshot =
-                    crate::hub::run_service_request(move |_| crate::hub::describe(&name)).await?;
+                    crate::hub::run_service_request(&self.job_session_scope, move |request| {
+                        crate::hub::describe(request.service_owner(), &name)
+                    })
+                    .await?;
                 let details = serde_json::to_value(&snapshot)?;
                 (
                     serde_json::to_string_pretty(&snapshot).unwrap_or_default(),
@@ -11914,7 +12012,7 @@ impl HubTool {
                 let enter = input.enter.unwrap_or(true);
                 let keys = input.keys.clone();
                 let signal = input.signal.clone();
-                crate::hub::run_service_request(move |request| {
+                crate::hub::run_service_request(&self.job_session_scope, move |request| {
                     let mut actions = Vec::new();
                     if let Some(text) = text.as_deref() {
                         request.check()?;
@@ -11943,7 +12041,7 @@ impl HubTool {
                             }
                         };
                         request.check()?;
-                        crate::hub::send_signal(&name, mapped)?;
+                        crate::hub::send_signal_for_request(&name, mapped, request)?;
                         actions.push(format!("sent {}", signal.to_ascii_uppercase()));
                     }
                     if actions.is_empty() {
@@ -13643,10 +13741,12 @@ impl Tool for EditTool {
         .await
         .map_err(|e| Error::tool("edit", format!("Failed to write file: {e}")));
         if let Some(recorder) = &self.mutation_recorder {
-            if persisted.is_ok() {
-                recorder.commit(tool_call_id);
-            } else {
-                recorder.abort(tool_call_id);
+            match &persisted {
+                Ok(()) => recorder.commit(tool_call_id),
+                Err(err) if err.to_string().contains("after rename") => {
+                    recorder.abort(tool_call_id);
+                }
+                Err(_) => recorder.discard(tool_call_id),
             }
         }
         persisted?;
@@ -19715,10 +19815,12 @@ impl Tool for HashlineEditTool {
         .await
         .map_err(|e| Error::tool("hashline_edit", format!("Failed to write file: {e}")));
         if let Some(recorder) = &self.mutation_recorder {
-            if persisted.is_ok() {
-                recorder.commit(tool_call_id);
-            } else {
-                recorder.abort(tool_call_id);
+            match &persisted {
+                Ok(()) => recorder.commit(tool_call_id),
+                Err(err) if err.to_string().contains("after rename") => {
+                    recorder.abort(tool_call_id);
+                }
+                Err(_) => recorder.discard(tool_call_id),
             }
         }
         persisted?;

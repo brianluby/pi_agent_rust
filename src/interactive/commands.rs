@@ -198,6 +198,7 @@ pub enum SlashCommand {
     Crash,
     Btw,
     Tan,
+    Web,
 }
 
 impl SlashCommand {
@@ -264,6 +265,7 @@ impl SlashCommand {
             Self::Crash => "/crash",
             Self::Omfg => "/omfg",
             Self::Commit => "/commit",
+            Self::Web => "/web",
         }
     }
 
@@ -325,6 +327,7 @@ impl SlashCommand {
         Self::Crash,
         Self::Omfg,
         Self::Commit,
+        Self::Web,
     ];
 
     /// Parse a slash command from input.
@@ -387,6 +390,7 @@ impl SlashCommand {
             "/crash" => Self::Crash,
             "/omfg" => Self::Omfg,
             "/commit" => Self::Commit,
+            "/web" => Self::Web,
             _ => return None,
         };
 
@@ -445,6 +449,7 @@ impl SlashCommand {
   /undo [n] [force]  - Roll back the last n agent file edits (force: skip external-change guard)
   /redo [n] [force]  - Re-apply previously undone file edits
   /usage [refresh]   - Show provider usage/quota state
+  /web               - Browser companion (requires FrankenTUI; run without --classic)
   /exit, /quit, /q   - Exit Pi
 
   Tips:
@@ -1542,29 +1547,35 @@ impl PiApp {
         let model = next.model.id.clone();
         let event_tx = self.event_tx.clone();
         self.model_selection = Some(request);
-        if let Err(error) = self.runtime_handle.try_spawn_with_cx(move |_task_cx| async move {
-            let error = agent
-                .handle
-                .set_model_from_origin(&provider, &model, &origin)
-                .await
-                .err()
-                .map(|error| error.to_string());
-            if error.is_none() {
-                // An explicit choice also retires plan-mode restoration.
-                agent.plan_state().take_previous_model();
-            }
-            drop(agent);
-            enqueue_pi_event(
-                &event_tx,
-                &Cx::for_request(),
-                PiMsg::ModelSelectionFinished { request_id, error },
-            )
-            .await;
-        }) {
+        if let Err(error) = self
+            .runtime_handle
+            .try_spawn_with_cx(move |_task_cx| async move {
+                let error = agent
+                    .handle
+                    .set_model_from_origin(&provider, &model, &origin)
+                    .await
+                    .err()
+                    .map(|error| error.to_string());
+                if error.is_none() {
+                    // An explicit choice also retires plan-mode restoration.
+                    agent.plan_state().take_previous_model();
+                }
+                drop(agent);
+                enqueue_pi_event(
+                    &event_tx,
+                    &Cx::for_request(),
+                    PiMsg::ModelSelectionFinished { request_id, error },
+                )
+                .await;
+            })
+        {
             self.model_selection = None;
             return Err(format!("Could not start model selection: {error}"));
         }
-        self.status_message = Some(format!("Switching model to {}...", next.model.display_label()));
+        self.status_message = Some(format!(
+            "Switching model to {}...",
+            next.model.display_label()
+        ));
         Ok(())
     }
 
@@ -2324,6 +2335,19 @@ impl PiApp {
             SlashCommand::Thinking => self.handle_slash_thinking(args),
             SlashCommand::Fast => self.handle_slash_fast(args),
             SlashCommand::ScopedModels => self.handle_slash_scoped_models(args),
+            SlashCommand::Web => {
+                let msg = "Browser companion (/web) requires FrankenTUI; restart without --classic (`pi web`)"
+                    .to_string();
+                self.status_message = Some(msg.clone());
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: msg,
+                    thinking: None,
+                    collapsed: false,
+                });
+                self.scroll_to_bottom();
+                None
+            }
             SlashCommand::Exit => Some(self.quit_cmd()),
             SlashCommand::History => {
                 self.messages.push(ConversationMessage {
@@ -2354,7 +2378,8 @@ impl PiApp {
                     match session_guard.export_snapshot() {
                         Ok(snapshot) => (output_path, snapshot),
                         Err(error) => {
-                            self.status_message = Some(format!("Failed to export session: {error}"));
+                            self.status_message =
+                                Some(format!("Failed to export session: {error}"));
                             return None;
                         }
                     }
@@ -2521,6 +2546,8 @@ impl PiApp {
                         return None;
                     };
                     let reset_thinking = self.new_session_thinking_level();
+                    let departing_services =
+                        agent_guard.service_owner(session_guard.header.id.clone());
                     let session_dir = session_guard.session_dir.clone();
                     *session_guard = Session::create_with_dir(session_dir);
                     session_guard.header.cwd = self.cwd.display().to_string();
@@ -2531,9 +2558,10 @@ impl PiApp {
                     agent_guard.replace_messages(Vec::new());
                     agent_guard.stream_options_mut().thinking_level = Some(reset_thinking);
                     agent_guard.session_was_replaced(crate::plan::PlanMode::Off);
+                    self.session_action_admission.advance_generation();
+                    let shutdown = crate::hub::begin_session_shutdown(&departing_services);
                     drop(session_guard);
                     drop(agent_guard);
-                    self.session_action_admission.advance_generation();
 
                     self.messages.clear();
                     self.message_render_cache.clear();
@@ -2552,7 +2580,7 @@ impl PiApp {
                     self.title_cancellation = None;
                     self.title_requested = false;
                     self.role_model_overrides.clear();
-                    self.displayed_session_id = Some(new_session_id);
+                    self.displayed_session_id = Some(new_session_id.clone());
                     self.session_picker = None;
                     self.tree_ui = None;
                     self.drain_capability_prompts_for_session_reset();
@@ -2565,6 +2593,33 @@ impl PiApp {
                     ));
                     self.scroll_to_bottom();
                     self.input.focus();
+                    let event_tx = self.event_tx.clone();
+                    if let Err(error) =
+                        self.runtime_handle.try_spawn_with_cx(move |cx| async move {
+                            if let Some(message) = Self::finish_departing_services(shutdown).await {
+                                let _ = crate::interactive::enqueue_pi_event(
+                                    &event_tx,
+                                    &cx,
+                                    PiMsg::SessionSystemNote {
+                                        owner_session_id: new_session_id,
+                                        message,
+                                    },
+                                )
+                                .await;
+                            }
+                        })
+                    {
+                        tracing::warn!(%error, "could not await previous session service cleanup");
+                        self.messages.push(ConversationMessage {
+                            role: MessageRole::System,
+                            content: format!(
+                                "Session changed, but completion of previous session service cleanup could not be awaited: {error}"
+                            ),
+                            thinking: None,
+                            collapsed: false,
+                        });
+                        self.scroll_to_bottom();
+                    }
                     return None;
                 }
 
@@ -2623,7 +2678,7 @@ impl PiApp {
                     new_session.header.model_id = Some(model_id);
                     new_session.header.thinking_level = Some(reset_thinking.to_string());
                     let new_session_id = new_session.header.id.clone();
-                    if let Err(err) = Self::try_install_session(
+                    let service_warning = match Self::try_install_session(
                         &session,
                         &agent,
                         &admission,
@@ -2634,14 +2689,17 @@ impl PiApp {
                     )
                     .await
                     {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::AgentError(err.to_string()),
-                        )
-                        .await;
-                        return;
-                    }
+                        Ok(warning) => warning,
+                        Err(err) => {
+                            let _ = crate::interactive::enqueue_pi_event(
+                                &event_tx,
+                                &task_cx,
+                                PiMsg::AgentError(err.to_string()),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
 
                     let _ = crate::interactive::enqueue_pi_event(
                         &event_tx,
@@ -2656,6 +2714,18 @@ impl PiApp {
                         },
                     )
                     .await;
+
+                    if let Some(message) = service_warning {
+                        let _ = crate::interactive::enqueue_pi_event(
+                            &event_tx,
+                            &task_cx,
+                            PiMsg::SessionSystemNote {
+                                owner_session_id: new_session_id.clone(),
+                                message,
+                            },
+                        )
+                        .await;
+                    }
 
                     if let Some(extensions) = extensions {
                         let _ = extensions
@@ -5840,6 +5910,388 @@ mod tests {
             .clone()
     }
 
+    #[cfg(unix)]
+    struct ClassicServiceFixture {
+        owner: crate::hub::ServiceOwner,
+        name: String,
+        pid: u32,
+        detached: bool,
+    }
+
+    #[cfg(unix)]
+    impl ClassicServiceFixture {
+        fn start(owner: crate::hub::ServiceOwner, cwd: &Path, name: &str, detached: bool) -> Self {
+            let snapshot = crate::hub::start(
+                &owner,
+                &crate::hub::LaunchSpec {
+                    name: name.to_string(),
+                    program: "sh".to_string(),
+                    args: vec![
+                        "-c".to_string(),
+                        "printf 'ready\\n'; exec sleep 60".to_string(),
+                    ],
+                    cwd: cwd.to_path_buf(),
+                    env: Vec::new(),
+                    ready: Some(crate::hub::ReadySpec {
+                        log: Some("ready".to_string()),
+                        timeout_secs: Some(10),
+                        ..crate::hub::ReadySpec::default()
+                    }),
+                    detached,
+                },
+            )
+            .expect("start classic transition service");
+            assert_eq!(snapshot.status, "running");
+            Self {
+                owner,
+                name: name.to_string(),
+                pid: snapshot.pid.expect("running service PID"),
+                detached,
+            }
+        }
+
+        fn assert_live(&self) {
+            let snapshot = crate::hub::describe(&self.owner, &self.name).unwrap();
+            assert_eq!(snapshot.status, "running");
+            assert_eq!(snapshot.pid, Some(self.pid));
+        }
+
+        fn assert_stopped(&self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+            loop {
+                let snapshot = crate::hub::describe(&self.owner, &self.name).unwrap();
+                if matches!(snapshot.status.as_str(), "killed" | "exited") {
+                    assert!(snapshot.pid.is_none());
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "committed transition must reap its departing service"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let pid = rustix::process::Pid::from_raw(i32::try_from(self.pid).unwrap()).unwrap();
+            assert!(rustix::process::test_kill_process(pid).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ClassicServiceFixture {
+        fn drop(&mut self) {
+            let _ = crate::hub::send_signal(&self.owner, &self.name, sysinfo::Signal::Kill);
+            let _ = crate::hub::stop(&self.owner, &self.name);
+            if self.detached {
+                // A retired driver cannot manage even its accepted detached
+                // services. Resume only that durable session's detached
+                // fixture through a fresh live registry for final cleanup.
+                let scope = crate::jobs::JobSessionScope::fixed(self.owner.session_id());
+                let resumed_owner = scope.service_owner(self.owner.session_id());
+                let _ = crate::hub::send_signal(&resumed_owner, &self.name, sysinfo::Signal::Kill);
+                let _ = crate::hub::stop(&resumed_owner, &self.name);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_classic_service_registry_retired(owner: &crate::hub::ServiceOwner, cwd: &Path) {
+        let error = crate::hub::start(
+            owner,
+            &crate::hub::LaunchSpec {
+                name: "late-driver-service".to_string(),
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), "exit 0".to_string()],
+                cwd: cwd.to_path_buf(),
+                env: Vec::new(),
+                ready: None,
+                detached: false,
+            },
+        )
+        .expect_err("a consumed classic driver must permanently close service admission");
+        assert!(error.to_string().contains("PI_HUB_SESSION_RETIRED"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classic_driver_drop_during_initial_session_lock_reaps_owned_services() {
+        let _hub_guard = crate::hub::test_lock();
+        let temp = TempDir::new().unwrap();
+        runtime().block_on(async {
+            let source = Session::in_memory();
+            let session_id = source.header.id.clone();
+            let agent = Agent::new(
+                Arc::new(DummyProvider),
+                ToolRegistry::new(&[], temp.path(), None),
+                AgentConfig::default(),
+            );
+            let owner = agent.service_owner(session_id.clone());
+            let owned =
+                ClassicServiceFixture::start(owner.clone(), temp.path(), "driver-owned", false);
+            let detached =
+                ClassicServiceFixture::start(owner.clone(), temp.path(), "driver-detached", true);
+            let foreign_scope = crate::jobs::JobSessionScope::fixed(session_id);
+            let foreign = ClassicServiceFixture::start(
+                foreign_scope.service_owner(owner.session_id()),
+                temp.path(),
+                "driver-owned",
+                false,
+            );
+            let store = Arc::new(Mutex::new(source));
+            let agent_session = crate::agent::AgentSession::new(
+                agent,
+                Arc::clone(&store),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let cx = Cx::for_request();
+            let held_session = store.lock(&cx).await.unwrap();
+            let model = test_model_entry("dummy", "dummy-model");
+            let mut driver = Box::pin(crate::interactive::run_interactive(
+                agent_session,
+                Config::default(),
+                model.clone(),
+                Vec::new(),
+                vec![model],
+                None,
+                Vec::new(),
+                false,
+                ResourceLoader::empty(false),
+                ResourceCliOptions {
+                    no_skills: true,
+                    no_prompt_templates: true,
+                    no_extensions: true,
+                    no_themes: true,
+                    skill_paths: Vec::new(),
+                    prompt_paths: Vec::new(),
+                    extension_paths: Vec::new(),
+                    theme_paths: Vec::new(),
+                },
+                PackageManager::new(temp.path().to_path_buf()),
+                None,
+                temp.path().to_path_buf(),
+                runtime().handle(),
+                crate::workspace::WorkspaceHandle::single(temp.path()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ));
+            assert!(futures::poll!(driver.as_mut()).is_pending());
+            drop(driver);
+            assert_classic_service_registry_retired(&owner, temp.path());
+            // Observe the original Drop request while the store remains
+            // locked; a rescue shutdown would hide a missing driver guard.
+            owned.assert_stopped();
+            detached.assert_live();
+            foreign.assert_live();
+            drop(held_session);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classic_driver_explicit_retirement_settles_every_session_in_its_registry() {
+        let _hub_guard = crate::hub::test_lock();
+        let temp = TempDir::new().unwrap();
+        let scope = crate::jobs::JobSessionScope::fixed("classic-exit");
+        let owner = scope.service_owner("classic-exit");
+        let next_owner = scope.service_owner("classic-next");
+        let owned = ClassicServiceFixture::start(owner.clone(), temp.path(), "driver-owned", false);
+        let next =
+            ClassicServiceFixture::start(next_owner.clone(), temp.path(), "driver-next", false);
+        let detached =
+            ClassicServiceFixture::start(owner.clone(), temp.path(), "driver-detached", true);
+        let foreign_scope = crate::jobs::JobSessionScope::fixed("classic-exit");
+        let foreign = ClassicServiceFixture::start(
+            foreign_scope.service_owner("classic-exit"),
+            temp.path(),
+            "driver-owned",
+            false,
+        );
+        let mut guard =
+            crate::interactive::ClassicServiceRegistryGuard(Some(scope.service_owner("")));
+        let shutdown = guard.retire();
+        assert_classic_service_registry_retired(&owner, temp.path());
+        assert_classic_service_registry_retired(&next_owner, temp.path());
+        runtime()
+            .block_on(crate::interactive::finish_classic_service_cleanup(shutdown))
+            .unwrap();
+        drop(guard);
+        owned.assert_stopped();
+        next.assert_stopped();
+        detached.assert_live();
+        foreign.assert_live();
+        assert_classic_service_registry_retired(&owner, temp.path());
+        assert_classic_service_registry_retired(&next_owner, temp.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classic_new_fork_and_resume_stop_only_departing_owned_services() {
+        let _hub_guard = crate::hub::test_lock();
+        for operation in ["new-sync", "new-async", "fork", "resume"] {
+            let temp = TempDir::new().unwrap();
+            let mut initial = Session::create_with_dir(Some(temp.path().join("sessions")));
+            initial.header.cwd = temp.path().display().to_string();
+            initial.append_model_message(ModelMessage::User(UserMessage {
+                content: UserContent::Text("forkable source prompt".to_string()),
+                timestamp: 0,
+            }));
+            runtime().block_on(initial.save()).unwrap();
+            let session = Arc::new(Mutex::new(initial));
+            let (mut app, mut events) = build_bash_test_app(session, temp.path());
+            let original_id = current_session_id(&app);
+            let owner = app
+                .agent
+                .try_lock()
+                .unwrap()
+                .service_owner(original_id.clone());
+            let owned =
+                ClassicServiceFixture::start(owner.clone(), temp.path(), "classic-owned", false);
+            let detached =
+                ClassicServiceFixture::start(owner, temp.path(), "classic-detached", true);
+            let foreign_scope = crate::jobs::JobSessionScope::fixed(original_id.clone());
+            let foreign = ClassicServiceFixture::start(
+                foreign_scope.service_owner(original_id.clone()),
+                temp.path(),
+                "classic-owned",
+                false,
+            );
+            if operation == "new-async" {
+                app.extensions = Some(crate::extensions::ExtensionManager::default());
+            }
+            match operation {
+                "new-sync" | "new-async" => {
+                    let _ = app.handle_slash_command(SlashCommand::New, "");
+                }
+                "fork" => {
+                    let _ = app.handle_slash_fork("1");
+                }
+                "resume" => {
+                    let mut target = Session::create_with_dir(Some(temp.path().join("sessions")));
+                    target.header.cwd = temp.path().display().to_string();
+                    runtime().block_on(target.save()).unwrap();
+                    let _ =
+                        app.load_session_from_path(target.path.as_ref().unwrap().to_str().unwrap());
+                }
+                _ => unreachable!(),
+            }
+            if operation == "new-sync" {
+                assert!(matches!(app.agent_state, AgentState::Idle));
+                assert!(
+                    matches!(
+                        crate::hub::describe(&owned.owner, &owned.name)
+                            .unwrap()
+                            .status
+                            .as_str(),
+                        "stopping" | "killed" | "exited"
+                    ),
+                    "the synchronous transition must request stop before returning"
+                );
+            } else {
+                let terminal = runtime().block_on(async {
+                    let cx = Cx::for_testing();
+                    asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        std::time::Duration::from_secs(20),
+                        events.recv(&cx),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                });
+                assert!(
+                    matches!(terminal, PiMsg::ConversationReset { .. }),
+                    "{operation}: {terminal:?}"
+                );
+                let _ = app.handle_pi_message(terminal);
+            }
+            assert_ne!(current_session_id(&app), original_id, "{operation}");
+            owned.assert_stopped();
+            detached.assert_live();
+            foreign.assert_live();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classic_rejected_candidate_and_same_id_reload_retain_services() {
+        let _hub_guard = crate::hub::test_lock();
+        let temp = TempDir::new().unwrap();
+        let mut initial = Session::create_with_dir(Some(temp.path().join("sessions")));
+        initial.header.cwd = temp.path().display().to_string();
+        let session = Arc::new(Mutex::new(initial));
+        let (app, _events) = build_bash_test_app(Arc::clone(&session), temp.path());
+        let original_id = current_session_id(&app);
+        let owner = app
+            .agent
+            .try_lock()
+            .unwrap()
+            .service_owner(original_id.clone());
+        let service =
+            ClassicServiceFixture::start(owner.clone(), temp.path(), "classic-retained", false);
+        app.agent.try_lock().unwrap().set_cost_budget(Some(
+            crate::cost::CostBudget::new(None, Some(2.0), 0.25).unwrap(),
+        ));
+        let blocked = temp.path().join("not-a-session-directory");
+        std::fs::write(&blocked, "candidate must fail before service shutdown").unwrap();
+        let result = runtime().block_on(PiApp::try_install_session(
+            &session,
+            &app.agent,
+            &app.session_action_admission,
+            Session::create_with_dir(Some(blocked)),
+            Vec::new(),
+            None,
+            false,
+        ));
+        assert!(result.is_err());
+        assert_eq!(current_session_id(&app), original_id);
+        service.assert_live();
+        let still_admitted =
+            ClassicServiceFixture::start(owner, temp.path(), "classic-still-admitted", false);
+
+        let same_session = session.try_lock().unwrap().clone();
+        let warning = runtime()
+            .block_on(PiApp::try_install_session(
+                &session,
+                &app.agent,
+                &app.session_action_admission,
+                same_session,
+                Vec::new(),
+                None,
+                false,
+            ))
+            .unwrap();
+        assert!(warning.is_none());
+        assert_eq!(current_session_id(&app), original_id);
+        service.assert_live();
+        still_admitted.assert_live();
+    }
+
+    #[test]
+    fn classic_service_cleanup_warning_keeps_the_new_foreground_turn_owned() {
+        let temp = TempDir::new().unwrap();
+        let session = Arc::new(Mutex::new(Session::in_memory()));
+        let (mut app, _events) = build_bash_test_app(session, temp.path());
+        let owner_session_id = current_session_id(&app);
+        let message = runtime()
+            .block_on(PiApp::finish_departing_services(Err(
+                crate::error::Error::tool("hub", "fixture cleanup failure"),
+            )))
+            .unwrap();
+        assert!(message.contains("Session changed"));
+        app.agent_state = AgentState::Processing;
+        let (abort, _) = crate::agent::AbortHandle::new();
+        app.abort_handle = Some(abort);
+        let _ = app.handle_pi_message(PiMsg::SessionSystemNote {
+            owner_session_id,
+            message: message.clone(),
+        });
+        assert!(matches!(app.agent_state, AgentState::Processing));
+        assert!(app.abort_handle.is_some());
+        assert!(app.messages.iter().any(|entry| entry.content == message));
+    }
+
     #[test]
     fn completed_tan_event_keeps_card_and_follow_up_bound_to_the_origin_session() {
         let temp = TempDir::new().expect("tempdir");
@@ -6169,7 +6621,7 @@ mod tests {
             .unwrap()
             .set_cost_budget(Some(original.clone()));
 
-        runtime()
+        let warning = runtime()
             .block_on(PiApp::try_install_session(
                 &session,
                 &app.agent,
@@ -6180,6 +6632,7 @@ mod tests {
                 true,
             ))
             .unwrap();
+        assert!(warning.is_none());
         assert!(
             app.agent
                 .try_lock()
@@ -6194,7 +6647,7 @@ mod tests {
         );
 
         let same_session = session.try_lock().unwrap().clone();
-        runtime()
+        let warning = runtime()
             .block_on(PiApp::try_install_session(
                 &session,
                 &app.agent,
@@ -6205,6 +6658,7 @@ mod tests {
                 false,
             ))
             .unwrap();
+        assert!(warning.is_none());
         assert!(
             app.agent
                 .try_lock()
@@ -6219,7 +6673,7 @@ mod tests {
             .unwrap()
             .checkpoint(&mut resumed)
             .unwrap();
-        runtime()
+        let warning = runtime()
             .block_on(PiApp::try_install_session(
                 &session,
                 &app.agent,
@@ -6230,6 +6684,7 @@ mod tests {
                 false,
             ))
             .unwrap();
+        assert!(warning.is_none());
         let resumed_budget = app
             .agent
             .try_lock()
@@ -6251,7 +6706,7 @@ mod tests {
                 .same_tree(&resumed_budget)
         );
 
-        runtime()
+        let warning = runtime()
             .block_on(PiApp::try_install_session(
                 &session,
                 &app.agent,
@@ -6262,6 +6717,7 @@ mod tests {
                 false,
             ))
             .unwrap();
+        assert!(warning.is_none());
         let fresh = app
             .agent
             .try_lock()
@@ -6293,7 +6749,7 @@ mod tests {
             .set_cost_budget(Some(budget.clone()));
         let mut fork = Session::create_with_dir(Some(temp.path().join("sessions")));
         fork.header.cwd = temp.path().display().to_string();
-        runtime()
+        let warning = runtime()
             .block_on(PiApp::try_install_session(
                 &session,
                 &app.agent,
@@ -6304,6 +6760,7 @@ mod tests {
                 true,
             ))
             .unwrap();
+        assert!(warning.is_none());
         let fork_path = session.try_lock().unwrap().path.clone().unwrap();
         let bytes = std::fs::read(&fork_path).unwrap();
         drop(app);
@@ -7046,8 +7503,9 @@ mod tests {
                     .block_on(app.settle_model_selection_for_test(&mut events))
                     .is_none()
             );
-            let reopened =
-                runtime().block_on(Session::open(&path.display().to_string())).unwrap();
+            let reopened = runtime()
+                .block_on(Session::open(&path.display().to_string()))
+                .unwrap();
             assert!(
                 reopened
                     .active_failover_provenance_for_current_path()
@@ -7217,7 +7675,9 @@ mod tests {
             (target.model.provider.clone(), target.model.id.clone())
         );
         let path = app.session.try_lock().unwrap().path.clone().unwrap();
-        let reopened = runtime().block_on(Session::open(&path.display().to_string())).unwrap();
+        let reopened = runtime()
+            .block_on(Session::open(&path.display().to_string()))
+            .unwrap();
         assert_eq!(
             reopened.effective_model_for_current_path(),
             Some(("dummy".to_string(), "dummy-model".to_string()))
@@ -7455,13 +7915,13 @@ mod tests {
         let extension = directory.path().join("live-model.mjs");
         std::fs::write(
             &extension,
-            r#"
+            r"
             export default function(pi) {
                 pi.registerCommand('publish-model', { handler: raw => {
                     pi.registerProvider('live-classic', JSON.parse(raw));
                 }});
             }
-            "#,
+            ",
         )
         .unwrap();
         let session = Arc::new(Mutex::new(Session::in_memory()));
@@ -7482,7 +7942,7 @@ mod tests {
             app.extensions = Some(manager.clone());
             let mut original_provider = None;
             for revision in [1, 2] {
-                let spec = json!({
+                let spec = serde_json::json!({
                     "api": "openai-completions",
                     "baseUrl": format!("https://revision-{revision}.example.test/v1"),
                     "apiKey": "classic-metadata-fixture-key",
@@ -7579,8 +8039,15 @@ mod tests {
             assert!(error.contains("unknown provider/model live-classic/chat"));
             assert_eq!(session.try_lock().unwrap().entries.len(), entries);
             assert_eq!(app.model_entry.model.name, "Revision 2");
-            let mut agent = app.agent.try_lock().unwrap();
-            assert!(Arc::ptr_eq(&rebound, &agent.provider()));
+            assert!(Arc::ptr_eq(
+                &rebound,
+                &app.agent.try_lock().unwrap().provider()
+            ));
+            let agent = Arc::try_unwrap(app.agent)
+                .ok()
+                .expect("sole InteractiveAgent owner")
+                .into_inner()
+                .expect("unpoisoned mutex");
             assert!(
                 agent
                     .handle
@@ -8249,9 +8716,24 @@ mod tests {
         app: &mut PiApp,
         auth_path: &Path,
     ) -> (String, u16, crate::agent::AbortSignal) {
+        static NEXT_CALLBACK_TEST_PORT: std::sync::atomic::AtomicU16 =
+            std::sync::atomic::AtomicU16::new(21000);
         let attempt_id = app.begin_login_attempt(auth_path).expect("login attempt");
-        let (server, redirect_uri) =
-            crate::auth::start_oauth_callback_server_random_port().expect("callback listener");
+        // Bind outside Linux's ephemeral outbound port range (32768..60999) so
+        // concurrent test clients cannot steal the released port before the
+        // immediate re-bind assertion in `login_cancel_command_quit_and_drop...`.
+        let (server, redirect_uri) = (0..2048u16)
+            .find_map(|_| {
+                let raw =
+                    NEXT_CALLBACK_TEST_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let candidate = 20000 + (raw % 10000);
+                let uri = format!("http://localhost:{candidate}/callback");
+                crate::auth::start_oauth_callback_server(&uri)
+                    .ok()
+                    .map(|srv| (srv, uri))
+            })
+            .or_else(|| crate::auth::start_oauth_callback_server_random_port().ok())
+            .expect("callback listener");
         let port = server.port;
         let attempt = app.login_attempt.as_mut().expect("login owner");
         let signal = attempt.control.signal();
@@ -8345,53 +8827,65 @@ mod tests {
     #[test]
     fn login_cancel_command_quit_and_drop_release_the_callback_owner() {
         for action in ["escape", "ctrl-c", "command", "new", "busy", "quit", "drop"] {
-            let temp = TempDir::new().expect("tempdir");
-            let session = Arc::new(Mutex::new(Session::in_memory()));
-            let (mut app, _events) = build_bash_test_app(session, temp.path());
-            let (attempt_id, port, signal) =
-                install_callback_login(&mut app, &temp.path().join("auth.json"));
-            app.input.set_value("private credential draft");
-            match action {
-                "escape" => {
-                    let _ =
-                        app.handle_action(AppAction::Interrupt, &KeyMsg::from_type(KeyType::Esc));
+            for attempt in 0..4 {
+                let temp = TempDir::new().expect("tempdir");
+                let session = Arc::new(Mutex::new(Session::in_memory()));
+                let (mut app, _events) = build_bash_test_app(session, temp.path());
+                let (attempt_id, port, signal) =
+                    install_callback_login(&mut app, &temp.path().join("auth.json"));
+                app.input.set_value("private credential draft");
+                match action {
+                    "escape" => {
+                        let _ = app
+                            .handle_action(AppAction::Interrupt, &KeyMsg::from_type(KeyType::Esc));
+                    }
+                    "ctrl-c" => {
+                        let _ =
+                            app.handle_action(AppAction::Clear, &KeyMsg::from_type(KeyType::CtrlC));
+                    }
+                    "command" => {
+                        let _ = app.submit_message("/help");
+                    }
+                    "new" => {
+                        let _ = app.submit_message("/new");
+                    }
+                    "busy" => {
+                        let session = Arc::clone(&app.session);
+                        let _guard = session.try_lock().expect("hold source session");
+                        let _ = app.handle_pi_message(PiMsg::SessionEventRetry {
+                            event: Box::new(PiMsg::OAuthCallbackPoll { attempt_id }),
+                            attempts_remaining: 0,
+                        });
+                        assert_eq!(
+                            app.status_message.as_deref(),
+                            Some(
+                                "Login cancelled because the session remained busy; run /login again"
+                            )
+                        );
+                    }
+                    "quit" => {
+                        let _ = app.quit_cmd();
+                    }
+                    "drop" => {}
+                    _ => unreachable!(),
                 }
-                "ctrl-c" => {
-                    let _ = app.handle_action(AppAction::Clear, &KeyMsg::from_type(KeyType::CtrlC));
+                if action != "drop" {
+                    assert!(app.pending_oauth.is_none());
+                    assert!(app.login_attempt.is_none());
+                    assert!(app.input.value().is_empty());
                 }
-                "command" => {
-                    let _ = app.submit_message("/help");
+                drop(app);
+                assert!(signal.is_aborted(), "{action} cancels its network exchange");
+                match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+                    Ok(_rebound) => break,
+                    Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && attempt < 3 => {}
+                    Err(err) => {
+                        panic!(
+                            "retiring login immediately releases callback port ({action}): {err}"
+                        )
+                    }
                 }
-                "new" => {
-                    let _ = app.submit_message("/new");
-                }
-                "busy" => {
-                    let session = Arc::clone(&app.session);
-                    let _guard = session.try_lock().expect("hold source session");
-                    let _ = app.handle_pi_message(PiMsg::SessionEventRetry {
-                        event: Box::new(PiMsg::OAuthCallbackPoll { attempt_id }),
-                        attempts_remaining: 0,
-                    });
-                    assert_eq!(
-                        app.status_message.as_deref(),
-                        Some("Login cancelled because the session remained busy; run /login again")
-                    );
-                }
-                "quit" => {
-                    let _ = app.quit_cmd();
-                }
-                "drop" => {}
-                _ => unreachable!(),
             }
-            if action != "drop" {
-                assert!(app.pending_oauth.is_none());
-                assert!(app.login_attempt.is_none());
-                assert!(app.input.value().is_empty());
-            }
-            drop(app);
-            assert!(signal.is_aborted(), "{action} cancels its network exchange");
-            let _rebound = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-                .expect("retiring login immediately releases callback port");
         }
     }
 

@@ -75,6 +75,15 @@ impl InspectImageTool {
         self.transport = self.transport.with_client(client);
         self
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_gemini_files(
+        mut self,
+        files: crate::providers::gemini::GeminiFileCache,
+    ) -> Self {
+        self.transport = self.transport.with_gemini_files(files);
+        self
+    }
 }
 
 #[async_trait]
@@ -268,7 +277,7 @@ impl Tool for InspectImageTool {
             ),
         };
         let response = api
-            .post_vision(model, &endpoint, &payload, 1024 * 1024)
+            .post_vision(model, &endpoint, payload, 1024 * 1024)
             .await?;
         let analysis = parse_analysis(provider, &response)?;
         let analysis = api.scrub(&analysis, MAX_ANALYSIS_BYTES);
@@ -695,8 +704,8 @@ mod tests {
                 .unwrap();
                 let mut response = json!({"choices":[{"finish_reason":"stop","message":{"content":"A diagram."}}],
                     "usage":{"prompt_tokens":1_000_000,"completion_tokens":0}});
-                if let Value::Object(bill) = bill {
-                    response["usage"].as_object_mut().unwrap().extend(bill);
+                if let Value::Object(bill_obj) = bill.clone() {
+                    response["usage"].as_object_mut().unwrap().extend(bill_obj);
                 }
                 let (endpoint, worker) = peer(
                     200,
@@ -852,7 +861,7 @@ mod tests {
             api.post_vision(
                 "fixture-vision",
                 "chat/completions",
-                &json!({"model":"fixture-vision"}),
+                json!({"model":"fixture-vision"}),
                 4096,
             )
             .await
