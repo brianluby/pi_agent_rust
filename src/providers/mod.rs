@@ -51,6 +51,34 @@ pub use model_fetch::{
     refresh_provider_model_catalog, refresh_provider_models, static_registry_models,
 };
 
+/// Return the static [`crate::provider::ProviderCapabilities`] declared by a built-in
+/// or preset provider ID without requiring live credentials or provider instantiation.
+#[must_use]
+pub fn provider_capabilities_for_id(provider_id: &str) -> crate::provider::ProviderCapabilities {
+    let canonical = canonical_provider_id(provider_id).unwrap_or_else(|| provider_id.trim());
+    if canonical.eq_ignore_ascii_case("gitlab") {
+        crate::provider::ProviderCapabilities {
+            multi_turn: true,
+            tool_use: true,
+            native_tool_wire: false,
+            streaming: false,
+            vision: false,
+            authoritative_usage: false,
+        }
+    } else if canonical.eq_ignore_ascii_case("cursor") {
+        crate::provider::ProviderCapabilities {
+            multi_turn: true,
+            tool_use: true,
+            native_tool_wire: false,
+            streaming: true,
+            vision: false,
+            authoritative_usage: true,
+        }
+    } else {
+        crate::provider::ProviderCapabilities::default()
+    }
+}
+
 /// Offer a fully built request body to the `before_provider_request`
 /// extension hook (gh #167 / bd-1q31s core, bd-dzddo breadth).
 ///
@@ -159,6 +187,41 @@ pub(super) fn apply_headers_ignoring_blank_auth_overrides<'a>(
         request = request.header(key, value);
     }
     request
+}
+
+/// Capture one case-insensitive header snapshot for a multi-request provider
+/// operation. The request layer overrides compatibility headers; blank auth
+/// overrides retain the lower layer. Conflicting aliases within one layer
+/// have no declared precedence and must not choose credentials by map order.
+pub(super) fn resolve_request_headers(
+    compatibility: Option<&HashMap<String, String>>,
+    request: &HashMap<String, String>,
+    auth_names: &[&str],
+) -> Result<HashMap<String, String>> {
+    let mut resolved = HashMap::new();
+    for headers in compatibility.into_iter().chain(std::iter::once(request)) {
+        let mut layer = HashMap::new();
+        for (name, value) in headers {
+            if auth_names
+                .iter()
+                .any(|auth| name.eq_ignore_ascii_case(auth))
+                && value.trim().is_empty()
+            {
+                continue;
+            }
+            let name = name.to_ascii_lowercase();
+            if layer.get(&name).is_some_and(|previous| previous != value) {
+                // Values may contain credentials; even this admission error
+                // must identify only the conflicting header name.
+                return Err(Error::config(format!(
+                    "Conflicting values for case-insensitive request header {name:?}"
+                )));
+            }
+            layer.insert(name, value.clone());
+        }
+        resolved.extend(layer);
+    }
+    Ok(resolved)
 }
 
 fn base_url_targets_loopback(base_url: &str) -> bool {
@@ -860,6 +923,32 @@ where
     })
 }
 
+fn create_copilot_provider(
+    entry: &ModelEntry,
+    auth: Option<&crate::auth::AuthStorage>,
+    client: crate::http::client::Client,
+) -> Result<copilot::CopilotProvider> {
+    let github_token = resolve_copilot_token(entry)?;
+    let mut provider = copilot::CopilotProvider::new(&entry.model.id, github_token)
+        .with_provider_name(&entry.model.provider)
+        .with_compat(entry.compat.clone())
+        .with_reasoning(entry.model.reasoning)
+        .with_input_types(&entry.model.input)
+        .with_model_cost(entry.model.cost.clone())
+        .with_client(client);
+    if let Some(auth) = auth {
+        provider = provider
+            .with_auth_storage(auth)?
+            .with_catalog_api_key_fallback(entry.configured_api_key_fallback());
+    }
+    if !entry.model.base_url.is_empty() {
+        // The catalog base_url is a chat endpoint, never the GitHub REST API
+        // exchange host. Enterprise deployments set PI_COPILOT_GITHUB_API_BASE.
+        provider = provider.with_chat_completions_endpoint(&entry.model.base_url);
+    }
+    Ok(provider)
+}
+
 impl ExtensionStreamSimpleProvider {
     const NEXT_TIMEOUT_MS: u64 = 600_000;
 
@@ -1411,27 +1500,7 @@ fn create_transport_provider(
             ))
         }
         ProviderRouteKind::NativeCopilot => {
-            let github_token = resolve_copilot_token(entry)?;
-            let mut provider = copilot::CopilotProvider::new(&entry.model.id, github_token)
-                .with_provider_name(&entry.model.provider)
-                .with_compat(entry.compat.clone())
-                .with_reasoning(entry.model.reasoning)
-                .with_input_types(&entry.model.input)
-                .with_model_cost(entry.model.cost.clone())
-                .with_client(client);
-            if let Some(auth) = auth {
-                provider = provider.with_auth_storage(auth)?;
-            }
-            if !entry.model.base_url.is_empty() {
-                // The catalog `base_url` is a chat-completions endpoint hint
-                // (as for every other provider), never the GitHub REST API
-                // host. Routing it into `with_github_api_base` sent the
-                // OAuth `copilot_internal/v2/token` exchange to the chat
-                // endpoint (gh #191). GHE / data-residency deployments move
-                // the exchange host via `PI_COPILOT_GITHUB_API_BASE`.
-                provider = provider.with_chat_completions_endpoint(&entry.model.base_url);
-            }
-            Ok(Arc::new(provider))
+            Ok(Arc::new(create_copilot_provider(entry, auth, client)?))
         }
         ProviderRouteKind::NativeGitlab => Ok(Arc::new(
             gitlab::GitLabProvider::new(&entry.model.id)
@@ -4157,5 +4226,44 @@ export default function init(pi) {
                 result.err()
             );
         }
+    }
+
+    #[test]
+    fn provider_capabilities_for_id_matches_all_native_provider_traits() {
+        let providers: Vec<Box<dyn Provider>> = vec![
+            Box::new(anthropic::AnthropicProvider::new("claude-sonnet-4-5")),
+            Box::new(openai::OpenAIProvider::new("gpt-4o")),
+            Box::new(openai_responses::OpenAIResponsesProvider::new("gpt-4o")),
+            Box::new(gemini::GeminiProvider::new("gemini-2.5-pro")),
+            Box::new(cohere::CohereProvider::new("command-r-plus")),
+            Box::new(azure::AzureOpenAIProvider::new("res", "dep")),
+            Box::new(bedrock::BedrockProvider::new(
+                "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            )),
+            Box::new(vertex::VertexProvider::new("gemini-2.0-flash")),
+            Box::new(copilot::CopilotProvider::new("gpt-4o", "ghu_test_token")),
+            Box::new(gitlab::GitLabProvider::new("duo-chat")),
+            Box::new(cursor::CursorProvider::new("cursor-fast")),
+        ];
+        for provider in &providers {
+            assert_eq!(
+                provider.capabilities(),
+                provider_capabilities_for_id(provider.name()),
+                "static capabilities drifted from Provider::capabilities() for {}",
+                provider.name()
+            );
+        }
+        assert_eq!(
+            provider_capabilities_for_id("gitlab-duo").summary(),
+            "multi_turn, tool_use"
+        );
+        assert_eq!(
+            provider_capabilities_for_id("cursor-agent").summary(),
+            "multi_turn, tool_use, streaming"
+        );
+        assert_eq!(
+            provider_capabilities_for_id("anthropic").summary(),
+            "multi_turn, tool_use, streaming, vision"
+        );
     }
 }

@@ -98,6 +98,25 @@ pub struct ModelEntry {
 }
 
 impl ModelEntry {
+    /// A catalog fallback is usable only while this entry retains the exact
+    /// key selected from explicit model configuration. A managed snapshot, or
+    /// a later key replacement, never gains fallback authority from its value.
+    pub(crate) fn configured_api_key_fallback(&self) -> Option<&str> {
+        let key = self.api_key.as_deref()?.trim();
+        let provenance = self.compat.as_ref()?.configured_api_key_fallback.as_ref()?;
+        (!key.is_empty() && provenance.matches(key)).then_some(key)
+    }
+
+    fn set_configured_api_key_fallback(&mut self, provenance: Option<ConfiguredApiKeyFallback>) {
+        if let Some(provenance) = provenance {
+            self.compat
+                .get_or_insert_with(CompatConfig::default)
+                .configured_api_key_fallback = Some(provenance);
+        } else if let Some(compat) = &mut self.compat {
+            compat.configured_api_key_fallback = None;
+        }
+    }
+
     /// Explicit model-scoped service-tier capabilities from discovery or
     /// operator configuration. They never change the selected request tier.
     pub fn service_tiers(&self) -> Option<&[ServiceTier]> {
@@ -1137,9 +1156,43 @@ pub struct ModelConfig {
     pub service_tiers: Option<Vec<ServiceTier>>,
 }
 
+/// Runtime proof that a key was selected from an explicit catalog fallback.
+/// Its contents stay opaque so ordinary route metadata cannot manufacture it.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ConfiguredApiKeyFallback {
+    identity: [u8; 32],
+}
+
+impl ConfiguredApiKeyFallback {
+    fn new(key: &str) -> Self {
+        Self {
+            identity: Sha256::digest(key.trim().as_bytes()).into(),
+        }
+    }
+
+    fn matches(&self, key: &str) -> bool {
+        let identity: [u8; 32] = Sha256::digest(key.trim().as_bytes()).into();
+        // ubs:ignore[rust.security.constant-time-compare] Local provenance identity, not authentication verification.
+        self.identity == identity
+    }
+}
+
+impl std::fmt::Debug for ConfiguredApiKeyFallback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ConfiguredApiKeyFallback([REDACTED])")
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompatConfig {
+    /// Internal catalog-key provenance for native credential-source binding.
+    /// This cannot be supplied by models.json or serialized into route metadata.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub configured_api_key_fallback: Option<ConfiguredApiKeyFallback>,
+
     // ── Capability flags ────────────────────────────────────────────────
     pub supports_store: Option<bool>,
     pub supports_developer_role: Option<bool>,
@@ -1714,7 +1767,6 @@ pub(crate) fn normalize_api_key_opt(api_key: Option<String>) -> Option<String> {
 ///
 /// Precedence: CLI `--api-key` > stored auth credentials > the entry's
 /// inline key. Lifted to the public surface for the print-mode failover.
-#[must_use]
 pub fn resolve_model_key(
     cli_api_key: Option<&str>,
     auth: &crate::auth::AuthStorage,
@@ -1795,6 +1847,7 @@ pub(crate) fn refresh_entries_stored_credentials(
         // ubs:ignore[rust.security.constant-time-compare] Local credential cache synchronization, not authentication verification.
         if current.is_none() || current == prev_resolved {
             entry.api_key = next_resolved;
+            entry.set_configured_api_key_fallback(None);
         }
     }
 }
@@ -3884,13 +3937,24 @@ fn apply_custom_models_with_provider_headers(
                 || candidate_canonical.eq_ignore_ascii_case(provider_id_str)
                 || candidate_canonical.eq_ignore_ascii_case(canonical_provider)
         };
-        let provider_key = normalize_api_key_opt(auth.resolve_api_key(canonical_provider, None))
-            .or_else(|| {
-                provider_cfg
-                    .api_key
-                    .as_deref()
-                    .and_then(|value| resolve_value_with_base(value, base_dir))
-            });
+        let managed_key = normalize_api_key_opt(auth.resolve_api_key(canonical_provider, None));
+        let configured_key = if managed_key.is_none() {
+            provider_cfg
+                .api_key
+                .as_deref()
+                .and_then(|value| resolve_value_with_base(value, base_dir))
+        } else {
+            None
+        };
+        // Only the configuration resolution point can establish this origin.
+        // Copilot's native token exchange needs it to distinguish a catalog
+        // fallback from a captured login credential after logout or rotation.
+        let configured_api_key_fallback = if canonical_provider == "github-copilot" {
+            configured_key.as_deref().map(ConfiguredApiKeyFallback::new)
+        } else {
+            None
+        };
+        let provider_key = managed_key.or(configured_key);
 
         if provider_defaults.is_some() {
             tracing::debug!(
@@ -3934,6 +3998,7 @@ fn apply_custom_models_with_provider_headers(
                 }
                 if provider_key.is_some() {
                     entry.api_key.clone_from(&provider_key);
+                    entry.set_configured_api_key_fallback(configured_api_key_fallback.clone());
                 }
                 if provider_cfg.compat.is_some() {
                     // Field by field, as `modelOverrides` does: an unrelated
@@ -4036,6 +4101,11 @@ fn apply_custom_models_with_provider_headers(
             };
 
             let mut compat = merge_compat(provider_cfg.compat.as_ref(), model_cfg.compat.as_ref());
+            if let Some(provenance) = configured_api_key_fallback.clone() {
+                compat
+                    .get_or_insert_with(CompatConfig::default)
+                    .configured_api_key_fallback = Some(provenance);
+            }
             if let Some(tiers) = model_cfg.service_tiers.clone() {
                 compat
                     .get_or_insert_with(CompatConfig::default)
@@ -4075,6 +4145,7 @@ fn apply_custom_models_with_provider_headers(
             entry.api_key.clone_from(&provider_key);
             entry.auth_header = auth_header;
             entry.compat.clone_from(&provider_cfg.compat);
+            entry.set_configured_api_key_fallback(configured_api_key_fallback.clone());
             models.push(entry);
         }
         apply_model_override_patches(
@@ -4252,15 +4323,15 @@ pub(crate) fn merge_compat(
                 (None, None) => None,
                 (Some(headers), None) | (None, Some(headers)) => Some(headers.clone()),
                 (Some(provider_headers), Some(model_headers)) => {
-                    let mut merged = provider_headers.clone();
-                    for (key, value) in model_headers {
-                        merged.insert(key.clone(), value.clone());
-                    }
-                    Some(merged)
+                    Some(merge_headers(provider_headers, model_headers.clone()))
                 }
             };
 
             Some(CompatConfig {
+                configured_api_key_fallback: model
+                    .configured_api_key_fallback
+                    .clone()
+                    .or_else(|| provider.configured_api_key_fallback.clone()),
                 supports_store: model.supports_store.or(provider.supports_store),
                 supports_developer_role: model
                     .supports_developer_role
@@ -4336,10 +4407,18 @@ fn merge_headers(
     base: &HashMap<String, String>,
     override_headers: HashMap<String, String>,
 ) -> HashMap<String, String> {
+    // HTTP header names are case-insensitive. Remove every lower-layer
+    // spelling before retaining the complete higher layer, so model overrides
+    // cannot leave an old credential alongside its replacement. Keep aliases
+    // within one layer together: request admission can then reject conflicting
+    // values instead of this merge choosing an identity by HashMap order.
+    let overridden_names = override_headers
+        .keys()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
     let mut merged = base.clone();
-    for (k, v) in override_headers {
-        merged.insert(k, v);
-    }
+    merged.retain(|name, _| !overridden_names.contains(&name.to_ascii_lowercase()));
+    merged.extend(override_headers);
     merged
 }
 
@@ -6348,6 +6427,130 @@ mod tests {
     }
 
     #[test]
+    fn copilot_catalog_fallback_provenance_survives_clones_and_overlays() {
+        for listed_models in [false, true] {
+            let mut config = serde_json::json!({
+                "providers": {
+                    "github-copilot": {
+                        "apiKey": "configured-fallback",
+                        "compat": {"supportsStore": true},
+                        "modelOverrides": {
+                            "extra-model": {"compat": {"supportsTools": false}}
+                        }
+                    }
+                }
+            });
+            let mut entries = if listed_models {
+                config["providers"]["github-copilot"]["models"] =
+                    serde_json::json!([{"id": "gpt-4o"}]);
+                Vec::new()
+            } else {
+                vec![ad_hoc_model_entry("github-copilot", "gpt-4o").expect("native model")]
+            };
+            let config: ModelsConfig = serde_json::from_value(config).expect("model config");
+            apply_custom_models(&|_: &str| None::<String>, &mut entries, &config, None);
+            assert_eq!(entries.len(), 2);
+            for entry in &entries {
+                assert_eq!(
+                    entry.configured_api_key_fallback(),
+                    Some("configured-fallback")
+                );
+            }
+
+            // A route-only overlay preserves both the key and its provenance,
+            // including a model-level compat merge on a synthesized row.
+            let overlay: ModelsConfig = serde_json::from_value(serde_json::json!({
+                "providers": {
+                    "github-copilot": {
+                        "baseUrl": "https://copilot.example/v1",
+                        "compat": {"supportsStreaming": true},
+                        "modelOverrides": {
+                            "extra-model": {"compat": {"supportsParallelToolCalls": true}}
+                        }
+                    }
+                }
+            }))
+            .expect("route overlay");
+            apply_custom_models(&|_: &str| None::<String>, &mut entries, &overlay, None);
+            for entry in &entries {
+                assert_eq!(
+                    entry.configured_api_key_fallback(),
+                    Some("configured-fallback")
+                );
+            }
+            let mut replaced = entries[0].clone();
+            assert_eq!(
+                replaced.configured_api_key_fallback(),
+                Some("configured-fallback")
+            );
+            replaced.api_key = Some("later-managed-snapshot".to_string());
+            assert!(replaced.configured_api_key_fallback().is_none());
+
+            apply_custom_models(
+                &|_: &str| Some("managed-token".to_string()),
+                &mut entries,
+                &overlay,
+                None,
+            );
+            for entry in &entries {
+                assert_eq!(entry.api_key.as_deref(), Some("managed-token"));
+                assert!(entry.configured_api_key_fallback().is_none());
+                assert!(
+                    entry
+                        .compat
+                        .as_ref()
+                        .unwrap()
+                        .configured_api_key_fallback
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn copilot_catalog_provenance_is_not_serializable_or_user_supplied() {
+        let mut entry = ad_hoc_model_entry("github-copilot", "gpt-4o").expect("native model");
+        entry.api_key = Some("configured-fallback".to_string());
+        entry.set_configured_api_key_fallback(Some(ConfiguredApiKeyFallback::new(
+            "configured-fallback",
+        )));
+        let compat = entry.compat.as_ref().expect("runtime metadata");
+        let serialized = serde_json::to_value(compat).expect("serialize public route metadata");
+        assert!(serialized.get("configuredApiKeyFallback").is_none());
+        let decoded: CompatConfig = serde_json::from_value(serde_json::json!({
+            "configuredApiKeyFallback": {"identity": [1, 2, 3]}
+        }))
+        .expect("ignore runtime-only metadata");
+        assert!(decoded.configured_api_key_fallback.is_none());
+        let diagnostic = format!("{:?}", compat.configured_api_key_fallback);
+        assert!(diagnostic.contains("[REDACTED]"));
+        assert!(!diagnostic.contains("configured-fallback"));
+
+        let directory = tempfile::tempdir().expect("auth snapshots");
+        let mut previous = AuthStorage::empty_at(directory.path().join("auth.json"));
+        previous.set(
+            "github-copilot",
+            crate::auth::AuthCredential::BearerToken {
+                token: "configured-fallback".to_string(),
+            },
+        );
+        let mut next = previous.clone();
+        next.set(
+            "github-copilot",
+            crate::auth::AuthCredential::BearerToken {
+                token: "managed-next".to_string(),
+            },
+        );
+        refresh_entries_stored_credentials(
+            std::slice::from_mut(&mut entry),
+            Some(&previous),
+            &next,
+        );
+        assert_eq!(entry.api_key.as_deref(), Some("managed-next"));
+        assert!(entry.compat.unwrap().configured_api_key_fallback.is_none());
+    }
+
+    #[test]
     fn apply_custom_models_overrides_provider_fields_but_not_runtime_credentials() {
         let (_dir, auth) = test_auth_storage();
         let mut models = built_in_models(&auth, ModelRegistryLoadMode::Full);
@@ -6691,6 +6894,83 @@ mod tests {
             openrouter_before + 1,
             "overrides must not drop or duplicate bundled models"
         );
+    }
+
+    #[test]
+    fn configured_header_overrides_replace_case_aliases_through_all_layers() {
+        let (_directory, auth) = test_auth_storage();
+        let config: ModelsConfig = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "custom-google": {
+                    "api": "google-generative-ai",
+                    "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+                    "headers": {
+                        "X-Goog-Api-Key": "provider-key",
+                        "X-Route": "provider-route",
+                        "X-Keep": "retained"
+                    },
+                    "compat": {"customHeaders": {
+                        "Authorization": "Bearer provider",
+                        "X-Goog-User-Project": "provider-project"
+                    }},
+                    "models": [
+                        {
+                            "id": "model",
+                            "headers": {"x-goog-api-key": "model-key", "x-route": "model-route"},
+                            "compat": {"customHeaders": {
+                                "authorization": "Bearer model",
+                                "x-goog-user-project": "model-project"
+                            }}
+                        },
+                        {
+                            "id": "patched",
+                            "headers": {"x-goog-api-key": "model-key", "x-route": "model-route"},
+                            "compat": {"customHeaders": {
+                                "authorization": "Bearer model",
+                                "x-goog-user-project": "model-project"
+                            }}
+                        }
+                    ],
+                    "modelOverrides": {"patched": {
+                        "headers": {"X-GOOG-API-KEY": "patch-key", "X-ROUTE": "patch-route"},
+                        "compat": {"customHeaders": {
+                            "AUTHORIZATION": "Bearer patch",
+                            "X-GOOG-USER-PROJECT": "patch-project"
+                        }}
+                    }}
+                }
+            }
+        }))
+        .expect("model configuration");
+        let mut models = Vec::new();
+        apply_custom_models(&auth, &mut models, &config, None);
+        assert_eq!(models.len(), 2);
+        for (id, prefix) in [("model", "model"), ("patched", "patch")] {
+            let entry = models.iter().find(|entry| entry.model.id == id).unwrap();
+            let compat_headers = entry
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.custom_headers.as_ref())
+                .expect("merged compatibility headers");
+            for (headers, name, expected) in [
+                (&entry.headers, "x-goog-api-key", format!("{prefix}-key")),
+                (&entry.headers, "x-route", format!("{prefix}-route")),
+                (&entry.headers, "x-keep", "retained".to_string()),
+                (compat_headers, "authorization", format!("Bearer {prefix}")),
+                (
+                    compat_headers,
+                    "x-goog-user-project",
+                    format!("{prefix}-project"),
+                ),
+            ] {
+                let selected = headers
+                    .iter()
+                    .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(selected, vec![expected.as_str()], "{id}: {name}");
+            }
+        }
     }
 
     /// gh #220: overrides compose with a custom `models` list (patch wins per
@@ -11860,13 +12140,18 @@ mod tests {
                 assert_eq!(merged.get(&key).unwrap(), &v2);
             }
 
-            /// `merge_headers` preserves non-overlapping keys.
+            /// Distinct names coexist, but case aliases are the same header.
             #[test]
-            fn merge_headers_preserves_both(k1 in "[a-z]{1,5}", k2 in "[A-Z]{1,5}", v1 in "[a-z]{1,5}", v2 in "[a-z]{1,5}") {
+            fn merge_headers_preserves_distinct_names(k1 in "[a-z]{1,5}", k2 in "[A-Z]{1,5}", v1 in "[a-z]{1,5}", v2 in "[a-z]{1,5}") {
                 let base = HashMap::from([(k1.clone(), v1.clone())]);
                 let over = HashMap::from([(k2.clone(), v2.clone())]);
                 let merged = merge_headers(&base, over);
-                assert_eq!(merged.get(&k1), Some(&v1));
+                if k1.eq_ignore_ascii_case(&k2) {
+                    assert_eq!(merged.len(), 1);
+                    assert!(!merged.contains_key(&k1));
+                } else {
+                    assert_eq!(merged.get(&k1), Some(&v1));
+                }
                 assert_eq!(merged.get(&k2), Some(&v2));
             }
 

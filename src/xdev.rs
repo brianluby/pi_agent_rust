@@ -181,6 +181,12 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "tts",
 ];
 
+/// Bounds of the discovery region owned by an automatically generated prompt.
+/// The Agent removes these markers before dispatch; ordinary headings in custom
+/// prompts do not opt those prompts into live catalog synchronization.
+pub(crate) const DISCOVERABLE_PROMPT_START: &str = "<!-- pi:discoverable-tools:start -->";
+pub(crate) const DISCOVERABLE_PROMPT_END: &str = "<!-- pi:discoverable-tools:end -->";
+
 pub const DISCOVERABLE_PROMPT_HEADER: &str =
     "\n\nAdditional tools are available via the `xdev` dispatcher (not in your schema):\n";
 pub const DISCOVERABLE_PROMPT_FOOTER: &str =
@@ -339,9 +345,10 @@ pub fn prompt_index_for(enabled: &[&str], config: Option<&Config>) -> Vec<(Strin
 }
 
 /// System-prompt discoverable index accounting for CLI selection policy:
-/// explicit `--tools` restricts discovery to the named slice, whereas default
-/// implicit selection also advertises settings-enabled built-in tools
-/// (`manage_skill`, memory bank, media tools, `browser`, `computer`).
+/// explicit `--tools` entries are promoted to the `Essential` schema tier and
+/// omitted from the discoverable index, while implicit settings-enabled
+/// built-in tools (`manage_skill`, memory bank, media tools, `browser`,
+/// `computer`) remain advertised as discoverable.
 #[must_use]
 pub fn prompt_index_for_cli(
     cli: &crate::cli::Cli,
@@ -354,9 +361,14 @@ pub fn prompt_index_for_cli(
     if cli.no_implicit_tools {
         return prompt_index_for(enabled, config);
     }
-    let mut combined: Vec<&str> = enabled.to_vec();
+    let explicit = cli.explicit_tools();
+    let mut combined: Vec<&str> = enabled
+        .iter()
+        .copied()
+        .filter(|name| !explicit.contains(name))
+        .collect();
     for implicit in implicit_enabled_tools(config) {
-        if !combined.contains(&implicit) {
+        if !explicit.contains(&implicit) && !combined.contains(&implicit) {
             combined.push(implicit);
         }
     }
@@ -377,24 +389,30 @@ pub fn format_discoverable_section(index: &[(String, String)]) -> String {
     out
 }
 
-/// Replace an existing discoverable-tools prompt block with the live registry
-/// snapshot's unpromoted index (including dynamically mounted MCP/extension
-/// discoverable tools, or removing promoted tools after `xdev promote`).
+/// Mark an automatically generated prompt as owning live discovery even when
+/// startup has no discoverable built-ins. Custom system prompts do not call this.
+#[must_use]
+pub(crate) fn format_managed_discoverable_section(index: &[(String, String)]) -> String {
+    let mut section = String::from(DISCOVERABLE_PROMPT_START);
+    section.push_str(&format_discoverable_section(index));
+    section.push_str(DISCOVERABLE_PROMPT_END);
+    section
+}
+
+/// Replace an automatic prompt's managed discovery region with the live
+/// registry's unpromoted index. The stored base prompt keeps its markers so
+/// tools mounted after an empty request can appear on a later request.
+/// Unmarked custom prompts remain entirely host-controlled, even when they use
+/// the same human-readable discovery heading.
 #[must_use]
 pub fn sync_discoverable_prompt_section(
     system_prompt: &str,
     live_index: &[(String, String)],
 ) -> Option<String> {
-    let (prefix, after_header) = system_prompt.split_once(DISCOVERABLE_PROMPT_HEADER)?;
-    let (body, suffix) = after_header.split_once(DISCOVERABLE_PROMPT_FOOTER)?;
+    let (prefix, after_start) = system_prompt.split_once(DISCOVERABLE_PROMPT_START)?;
+    let (_, suffix) = after_start.split_once(DISCOVERABLE_PROMPT_END)?;
     let replacement = format_discoverable_section(live_index);
-    let expected_body = replacement
-        .strip_prefix(DISCOVERABLE_PROMPT_HEADER)
-        .and_then(|s| s.strip_suffix(DISCOVERABLE_PROMPT_FOOTER));
-    if expected_body == Some(body) {
-        return None;
-    }
-    let mut updated = String::with_capacity(system_prompt.len() + replacement.len());
+    let mut updated = String::with_capacity(prefix.len() + replacement.len() + suffix.len());
     updated.push_str(prefix);
     updated.push_str(&replacement);
     updated.push_str(suffix);
@@ -738,7 +756,7 @@ mod tests {
         let registry = if cli.builtin_tools_disabled() {
             crate::tools::ToolRegistry::without_builtins(Some(config))
         } else {
-            crate::tools::ToolRegistry::with_builtin_tool_policy(
+            let mut registry = crate::tools::ToolRegistry::with_builtin_tool_policy(
                 &enabled,
                 cwd,
                 Some(config),
@@ -747,7 +765,9 @@ mod tests {
                 true,
                 None,
                 !cli.no_implicit_tools,
-            )
+            );
+            registry.promote_tools(&cli.explicit_tools());
+            registry
         };
         let prompt = crate::app::build_system_prompt(
             cli, cwd, &enabled, None, cwd, cwd, true, false, None, config,
@@ -903,7 +923,10 @@ mod tests {
             for (_, name) in OPTIONAL_TOOL_SETTINGS {
                 assert!(registry.get(name).is_some(), "{name} remains selected");
             }
-            assert!(registry.is_discoverable("eval"));
+            assert_eq!(
+                registry.is_discoverable("eval"),
+                cli.explicit_tools().is_empty()
+            );
             assert!(registry.get("xdev").is_none());
             assert!(prompt_index_for(&cli.enabled_tools(&config), Some(&config)).is_empty());
             assert!(!prompt.contains("Additional tools are available via the `xdev` dispatcher"));
@@ -986,6 +1009,34 @@ mod tests {
     }
 
     #[test]
+    fn managed_discovery_region_handles_empty_catalogs_and_preserves_host_prompts() {
+        let live = vec![(
+            "mcp__project__search".to_string(),
+            "Search project documents".to_string(),
+        )];
+        let rendered = format!("Before Ω{}After λ", format_discoverable_section(&live));
+        for initial in [&[][..], live.as_slice()] {
+            let base = format!(
+                "Before Ω{}After λ",
+                format_managed_discoverable_section(initial)
+            );
+            assert_eq!(
+                sync_discoverable_prompt_section(&base, &[]).as_deref(),
+                Some("Before ΩAfter λ")
+            );
+            let populated = sync_discoverable_prompt_section(&base, &live)
+                .expect("late discovery must fill the managed insertion point");
+            assert_eq!(populated, rendered);
+            assert!(!populated.contains(DISCOVERABLE_PROMPT_START));
+            assert!(!populated.contains(DISCOVERABLE_PROMPT_END));
+        }
+        for custom in ["", "Host-owned instructions", rendered.as_str()] {
+            assert!(sync_discoverable_prompt_section(custom, &live).is_none());
+            assert!(sync_discoverable_prompt_section(custom, &[]).is_none());
+        }
+    }
+
+    #[test]
     fn settings_gated_discoverable_tools_reach_system_prompt_and_live_registry() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config: Config = serde_json::from_value(json!({
@@ -1056,5 +1107,61 @@ mod tests {
         let synced = sync_discoverable_prompt_section(&prompt, &live).expect("prompt updated");
         assert!(synced.contains("- mcp__demo__search: Search demo catalog\n"));
         assert!(!synced.contains("- retain:"));
+    }
+
+    #[test]
+    fn explicit_cli_tools_are_promoted_to_essential_while_implicit_stay_discoverable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config: Config = serde_json::from_value(json!({
+            "memory": { "backend": "local" }
+        }))
+        .expect("memory config");
+
+        let cli = crate::cli::Cli::parse_from(["pi", "--tools", "jobs,read"]);
+        assert_eq!(cli.explicit_tools(), vec!["jobs", "read"]);
+        let (registry, prompt) = selected_registry_and_prompt(&cli, &config, temp.path());
+        assert!(
+            registry.get("jobs").is_some() && !registry.is_discoverable("jobs"),
+            "explicit --tools entry `jobs` must be promoted into the live Essential schema"
+        );
+        assert!(
+            registry.get("read").is_some() && !registry.is_discoverable("read"),
+            "explicit --tools entry `read` stays Essential"
+        );
+        assert!(
+            registry.get("manage_skill").is_some() && registry.is_discoverable("manage_skill"),
+            "implicit default `manage_skill` must remain Discoverable"
+        );
+        assert!(
+            registry.get("recall").is_some() && registry.is_discoverable("recall"),
+            "implicit settings-gated `recall` must remain Discoverable"
+        );
+        let synced = sync_discoverable_prompt_section(&prompt, &registry.discoverable_index())
+            .expect("managed discoverable section");
+        let (available_part, discoverable_part) = synced
+            .split_once("Additional tools are available via the `xdev` dispatcher")
+            .expect("prompt splits into primary tools and discoverable index");
+        assert!(
+            available_part.contains("- jobs:"),
+            "promoted `jobs` must appear in Available tools: {available_part}"
+        );
+        assert!(
+            !discoverable_part.contains("- jobs:"),
+            "promoted `jobs` must not remain in discoverable index: {discoverable_part}"
+        );
+        assert!(
+            discoverable_part.contains("- manage_skill:")
+                && discoverable_part.contains("- recall:"),
+            "implicit tools must remain in discoverable index: {discoverable_part}"
+        );
+
+        let ceiling =
+            crate::cli::Cli::parse_from(["pi", "--no-implicit-tools", "--tools", "jobs,read"]);
+        assert!(ceiling.explicit_tools().is_empty());
+        let (ceiling_reg, _) = selected_registry_and_prompt(&ceiling, &config, temp.path());
+        assert!(
+            ceiling_reg.is_discoverable("jobs"),
+            "--no-implicit-tools child ceiling must not promote discoverable tools"
+        );
     }
 }

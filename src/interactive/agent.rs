@@ -1158,7 +1158,10 @@ impl PiApp {
             | PiMsg::UserInputSubmitted { .. }
             | PiMsg::MessagePicker { .. } => {}
             #[cfg(feature = "ftui")]
-            PiMsg::Settings { .. } | PiMsg::FtuiToolProgress(_) => {}
+            PiMsg::Settings { .. }
+            | PiMsg::FtuiToolProgress(_)
+            | PiMsg::RestorePreparedInput(_)
+            | PiMsg::PreparedInputFinished { .. } => {}
             PiMsg::AutocompleteRefresh => {
                 self.autocomplete.provider.refresh_background();
                 return Self::autocomplete_refresh_cmd();
@@ -1672,7 +1675,9 @@ impl PiApp {
                 // Failed selection must not send retained work to the old model.
                 // A successful selection does not renew an exhausted turn budget.
                 self.pending_inputs_paused_by_model_selection = error.is_some();
-                self.model = format!("{provider}/{model}");
+                if error.is_none() || entry.is_some() {
+                    self.model = format!("{provider}/{model}");
+                }
                 let requested_is_current = provider
                     .eq_ignore_ascii_case(&request.selected.model.provider)
                     && model.eq_ignore_ascii_case(&request.selected.model.id);

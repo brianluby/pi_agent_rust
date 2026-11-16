@@ -1144,16 +1144,20 @@ fn e2e_cli_extension_compat_ledger_keeps_cli_extensions_with_no_extensions() {
     .expect("write ext.ts");
 
     let ext_arg = ext_path.display().to_string();
-    let result = harness.run(&[
-        "--list-models",
-        "--no-extensions",
-        "--extension",
-        ext_arg.as_str(),
-    ]);
+    for mode in ["text", "json"] {
+        let result = harness.run(&[
+            "--mode",
+            mode,
+            "--list-models",
+            "--no-extensions",
+            "--extension",
+            ext_arg.as_str(),
+        ]);
 
-    assert_exit_code(&harness.harness, &result, 0);
-    let combined = format!("{}\n{}", result.stdout, result.stderr);
-    assert_contains(&harness.harness, &combined, "pi.ext.compat_ledger.v1");
+        assert_exit_code(&harness.harness, &result, 0);
+        let combined = format!("{}\n{}", result.stdout, result.stderr);
+        assert_contains(&harness.harness, &combined, "pi.ext.compat_ledger.v1");
+    }
 
     let log_path = harness.harness.temp_path("extension-cli-log.jsonl");
     harness
@@ -5130,35 +5134,324 @@ fn e2e_cli_json_mode_stdin_emits_header_and_events() {
 }
 
 #[test]
-fn e2e_cli_json_mode_no_input_emits_header_and_exits_zero() {
-    let harness = CliTestHarness::new("e2e_cli_json_mode_no_input_emits_header_and_exits_zero");
+fn e2e_cli_print_without_input_is_a_usage_error_in_both_modes() {
+    let harness = CliTestHarness::new("e2e_cli_print_without_input_is_a_usage_error_in_both_modes");
 
-    let mut args: Vec<&str> = vec![
-        "--mode",
-        "json",
-        "--provider",
-        "anthropic",
-        "--model",
-        "claude-sonnet-4-5",
-        "--api-key",
-        "test-vcr-key",
-    ];
-    args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+    for mode in ["text", "json"] {
+        for stdin in [None, Some(b"".as_slice()), Some(b" \n".as_slice())] {
+            // No credentials are needed to diagnose missing input. This also
+            // exercises EOF and whitespace from a piped producer.
+            let mut args = vec!["--print", "--mode", mode];
+            args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+            let result = harness.run_with_stdin(&args, stdin);
+            assert_exit_code(&harness.harness, &result, 2);
+            assert_contains(&harness.harness, &result.stderr, "No input provided");
+            if mode == "json" {
+                let record = assert_single_fatal_error_record(&harness.harness, &result, "startup");
+                assert_eq!(record["code"], "usage", "{record}");
+            } else {
+                assert!(result.stdout.is_empty(), "{}", result.stdout);
+            }
+        }
+    }
+}
 
-    let result = harness.run(&args);
-    assert_exit_code(&harness.harness, &result, 0);
+/// A successful HTTP exchange may finish with an error `AssistantMessage`.
+/// Scripts need a failure status after the full lifecycle, and no later prompt
+/// may run. Exercise both the ordinary and attachment input paths, including
+/// retry exhaustion; a second success response makes continued work observable.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_cli_print_terminal_provider_error_stops_the_invocation() {
+    for (mode, attached, retries) in [
+        ("text", false, 0),
+        ("json", false, 0),
+        ("json", true, 0),
+        ("json", false, 1),
+    ] {
+        let harness = CliTestHarness::new(&format!(
+            "e2e_cli_print_terminal_provider_error_{mode}_{attached}_{retries}"
+        ));
+        let server = harness.harness.start_mock_http_server();
+        let prefix = json!({"choices": [{
+            "index": 0, "delta": {"content": "Partial answer"}, "finish_reason": null
+        }]});
+        let failure = json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+            "error": {"message": "HTTP 503: fixture unavailable"}
+        });
+        let mut responses = (0..=retries)
+            .map(|_| MockHttpResponse {
+                status: 200,
+                headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+                body: format!("data: {prefix}\n\ndata: {failure}\n\ndata: [DONE]\n\n").into_bytes(),
+            })
+            .collect::<Vec<_>>();
+        let success = json!({"choices": [{
+            "index": 0, "delta": {"content": "The second prompt must never run"},
+            "finish_reason": "stop"
+        }]});
+        responses.push(MockHttpResponse {
+            status: 200,
+            headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+            body: format!("data: {success}\n\ndata: [DONE]\n\n").into_bytes(),
+        });
+        server.add_route_queue("POST", "/v1/chat/completions", responses);
+        let agent_dir = PathBuf::from(&harness.env["PI_CODING_AGENT_DIR"]);
+        fs::create_dir_all(&agent_dir).expect("create isolated agent directory");
+        fs::write(agent_dir.join("auth.json"), b"{}").expect("write isolated auth");
+        fs::write(
+            agent_dir.join("models.json"),
+            json!({"providers": {"print-outcome-fixture": {
+                "api": "openai-completions",
+                "baseUrl": format!("{}/v1", server.base_url()),
+                "apiKey": "offline-fixture", "authHeader": true,
+                "models": [{"id": "offline", "reasoning": false,
+                    "contextWindow": 32_000, "maxTokens": 128}]
+            }}})
+            .to_string(),
+        )
+        .expect("write loopback provider");
+        fs::write(
+            &harness.env["PI_CONFIG_PATH"],
+            json!({
+                "compaction": {"enabled": false}, "checkForUpdates": false,
+                "retry": {"enabled": retries > 0, "maxRetries": retries,
+                    "baseDelayMs": 0, "maxDelayMs": 0}
+            })
+            .to_string(),
+        )
+        .expect("write isolated settings");
+        let attachment = harness
+            .harness
+            .create_file("context.txt", b"Attachment context");
+        let file_arg = format!("@{}", attachment.display());
+        let mut args = vec![
+            "--print",
+            "--mode",
+            mode,
+            "--no-session",
+            "--no-mcp",
+            "--provider",
+            "print-outcome-fixture",
+            "--model",
+            "offline",
+            "--system-prompt",
+            "Exercise terminal provider errors.",
+        ];
+        args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+        if attached {
+            args.push(&file_arg);
+        }
+        args.extend(["first prompt", "second prompt must not run"]);
 
-    let lines = parse_json_mode_stdout_lines(&result.stdout);
-    assert_eq!(
-        lines.len(),
-        1,
-        "no-input JSON mode should emit only session header, got {} lines",
-        lines.len()
-    );
-    assert_eq!(
-        lines[0]["type"], "session",
-        "first line must be session header"
-    );
+        let result = harness.run(&args);
+        assert_exit_code(&harness.harness, &result, 1);
+        assert_eq!(
+            server.requests().len(),
+            retries + 1,
+            "only the first prompt and its retries may reach the provider"
+        );
+        assert_contains(&harness.harness, &result.stderr, "fixture unavailable");
+        assert!(!result.stdout.contains("The second prompt must never run"));
+        if mode == "json" {
+            let records = parse_json_mode_stdout_lines(&result.stdout);
+            assert_eq!(records[0]["type"], "session");
+            for kind in ["agent_start", "agent_end"] {
+                assert_eq!(
+                    records
+                        .iter()
+                        .filter(|record| record["type"] == kind)
+                        .count(),
+                    1,
+                    "{kind} belongs to one logical failed prompt"
+                );
+            }
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| record["type"] == "auto_retry_start")
+                    .count(),
+                retries
+            );
+            let terminal = records
+                .len()
+                .checked_sub(2)
+                .expect("terminal and diagnostic");
+            assert_eq!(records[terminal]["type"], "agent_end");
+            assert!(records[terminal]["error"].is_string());
+            let diagnostic = records.last().expect("failure diagnostic");
+            assert_eq!(diagnostic["type"], "error");
+            assert_eq!(diagnostic["phase"], "run");
+            assert_eq!(diagnostic["exit_code"], 1);
+        } else {
+            assert_contains(&harness.harness, &result.stdout, "Partial answer");
+        }
+    }
+}
+
+/// bd-cli-clap-preparser-print-exit-codes-5dem0 (AC #3): print-mode exit codes
+/// `3` (`ApprovalSurfaceUnavailable`), `4` (explicit `--skill` load failure),
+/// and `5` (`maxCost` session cap exceeded) match across `--mode text` and
+/// `--mode json`, and headless approval denial (`3`) takes precedence over an
+/// aborted/error turn outcome (`1`).
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_cli_print_exit_codes_3_4_5_match_across_text_and_json_modes() {
+    for mode in ["text", "json"] {
+        // ── Exit 3: Headless tool-approval surface unavailable (both normal
+        // stop after denial and StopReason::Error via --max-tool-iterations 1)
+        for max_iters in [None, Some("1")] {
+            let mut harness = CliTestHarness::new(&format!(
+                "e2e_exit_3_{mode}_{}",
+                max_iters.unwrap_or("normal")
+            ));
+            setup_vcr_anthropic_sequence(
+                &mut harness,
+                &format!("e2e_exit_3_{mode}_{}", max_iters.unwrap_or("normal")),
+                &[
+                    (
+                        json!({"model": "claude-sonnet-4-5", "stream": true}),
+                        build_anthropic_tool_use_chunks("bash", &json!({"command": "echo hi"})),
+                    ),
+                    (
+                        json!({"model": "claude-sonnet-4-5", "stream": true}),
+                        build_anthropic_response_chunks("I could not run that command."),
+                    ),
+                ],
+            );
+            let mut args = vec![
+                "--print",
+                "--mode",
+                mode,
+                "--no-session",
+                "--provider",
+                "anthropic",
+                "--model",
+                "claude-sonnet-4-5",
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--thinking",
+                "off",
+                "--tools",
+                "bash,ask",
+                "--system-prompt",
+                "You are a test harness model.",
+            ];
+            if let Some(limit) = max_iters {
+                args.extend(["--max-tool-iterations", limit]);
+            }
+            args.push("Run echo hi.");
+            let result = harness.run(&args);
+            assert_exit_code(&harness.harness, &result, 3);
+            assert_contains_case_insensitive(&harness.harness, &result.stderr, "approval");
+            if mode == "json" {
+                let records = parse_json_mode_stdout_lines(&result.stdout);
+                assert_eq!(records[0]["type"], "session");
+                let fatal = records.last().expect("fatal error record");
+                assert_eq!(fatal["type"], "error", "{fatal}");
+                assert_eq!(fatal["phase"], "run", "{fatal}");
+                assert_eq!(fatal["code"], "approval.surface_unavailable", "{fatal}");
+                assert_eq!(fatal["exit_code"], 3, "{fatal}");
+            } else {
+                assert!(
+                    !result.stdout.contains("\"type\":\"error\""),
+                    "text mode must not emit JSON fatal records: {}",
+                    result.stdout
+                );
+            }
+        }
+
+        // ── Exit 4: Explicit --skill missing resource path
+        {
+            let harness = CliTestHarness::new(&format!("e2e_exit_4_{mode}"));
+            let missing_skill = harness.harness.temp_path("missing-skill/SKILL.md");
+            let missing_skill_str = missing_skill.to_str().expect("utf8 path");
+            let result = harness.run(&[
+                "--print",
+                "--mode",
+                mode,
+                "--no-session",
+                "--no-extensions",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--skill",
+                missing_skill_str,
+                "hello",
+            ]);
+            assert_exit_code(&harness.harness, &result, 4);
+            assert_contains(
+                &harness.harness,
+                &result.stderr,
+                "Warning: Failed to load skills/prompts/themes/extensions:",
+            );
+            if mode == "json" {
+                let record = assert_single_fatal_error_record(&harness.harness, &result, "startup");
+                assert_eq!(record["code"], "resource.load_failed", "{record}");
+                assert_eq!(record["exit_code"], 4, "{record}");
+            } else {
+                assert!(result.stdout.trim().is_empty(), "{}", result.stdout);
+            }
+        }
+
+        // ── Exit 5: Session maxCost cap exceeded before second prompt
+        {
+            let mut harness = CliTestHarness::new(&format!("e2e_exit_5_{mode}"));
+            setup_vcr_anthropic_sequence(
+                &mut harness,
+                &format!("e2e_exit_5_{mode}"),
+                &[
+                    (
+                        json!({"model": "claude-sonnet-4-5", "stream": true}),
+                        build_anthropic_response_chunks("First prompt settled."),
+                    ),
+                    (
+                        json!({"model": "claude-sonnet-4-5", "stream": true}),
+                        build_anthropic_response_chunks("Second prompt must be blocked."),
+                    ),
+                ],
+            );
+            let mut args = vec![
+                "--print",
+                "--mode",
+                mode,
+                "--no-session",
+                "--provider",
+                "anthropic",
+                "--model",
+                "claude-sonnet-4-5",
+                "--max-cost",
+                "0.000001",
+            ];
+            args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+            args.extend([
+                "--system-prompt",
+                "Cost cap parity test.",
+                "first prompt",
+                "second prompt",
+            ]);
+            let result = harness.run(&args);
+            assert_exit_code(&harness.harness, &result, 5);
+            assert!(
+                !result.stdout.contains("Second prompt must be blocked."),
+                "cost cap must refuse second prompt admission: {}",
+                result.stdout
+            );
+            if mode == "json" {
+                let records = parse_json_mode_stdout_lines(&result.stdout);
+                assert_eq!(records[0]["type"], "session");
+                let fatal = records.last().expect("cost cap fatal record");
+                assert_eq!(fatal["type"], "error", "{fatal}");
+                assert_eq!(fatal["phase"], "run", "{fatal}");
+                assert_eq!(fatal["code"], "cost_cap", "{fatal}");
+                assert_eq!(fatal["exit_code"], 5, "{fatal}");
+            } else {
+                assert_contains(&harness.harness, &result.stdout, "First prompt settled.");
+            }
+        }
+    }
 }
 
 #[test]
@@ -7862,10 +8155,10 @@ fn e2e_cli_startup_migrations_run_by_default() {
     let export_entry = json!({
         "type": "message",
         "id": "m1",
-        "parentId": "root",
+        "parentId": null,
         "timestamp": "2026-02-14T00:05:01.000Z",
         "message": {
-            "type": "user",
+            "role": "user",
             "content": "migration smoke"
         }
     });
@@ -7961,10 +8254,10 @@ fn e2e_cli_no_migrations_skips_startup_migrations() {
     let export_entry = json!({
         "type": "message",
         "id": "m1",
-        "parentId": "root",
+        "parentId": null,
         "timestamp": "2026-02-14T00:05:01.000Z",
         "message": {
-            "type": "user",
+            "role": "user",
             "content": "migration skip smoke"
         }
     });

@@ -27,6 +27,7 @@
 </p>
 
 ```bash
+# Requires Minisign: brew install minisign (macOS), sudo apt install minisign (Debian/Ubuntu)
 # Install latest release
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash
 ```
@@ -289,6 +290,9 @@ The terminal UI uses rich_rust for all output formatting, providing the same vis
 
 ### 1. Install
 
+Install Minisign first (`brew install minisign` on macOS, or `sudo apt install minisign`
+on Debian/Ubuntu). The installer uses it to authenticate project releases.
+
 ```bash
 # Install latest release binary
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash
@@ -482,7 +486,7 @@ remains reachable. The tier table and default enabled list live in
 | `browser` | Headless Chromium automation over CDP (navigate, snapshot, click, type, screenshot) with a domain allowlist; settings-gated |
 | `computer` | Desktop automation (displays, windows, screenshots, mouse/keyboard, clipboard); mutating actions require approval; settings-gated |
 | `inspect_image` / `generate_image` / `tts` | Vision analysis of local images, image generation/editing, and text-to-speech through provider adapters; settings-gated |
-| `read_media` | Attaches a local video/audio file (mp4, webm, mov, mp3, wav, m4a, ogg, flac) as an inline media block. Gemini, Gemini CLI, and Vertex Gemini models receive it natively as `inline_data`; every other provider sees `[media omitted: <name>, <mime>, <size>]`. Hard cap 5 MiB per file (`media.maxBytes`); settings-gated |
+| `read_media` | Attaches a local video/audio file (mp4, webm, mov, mp3, wav, m4a, ogg, flac) as a native media block (stored in session blob sidecars and staged via the Gemini Files API when large). Gemini, Gemini CLI, and Vertex Gemini models receive it natively; OpenAI audio-capable Chat models consume WAV/MP3; every other provider sees `[media omitted: <name>, <mime>, <size>]`. Hard cap 64 MiB per file (`media.maxBytes`); settings-gated |
 | `subagent` | Delegate isolated work to named Rust Pi child agents |
 
 ### Project memory learning
@@ -858,8 +862,10 @@ and limits (`src/web_remote/`, `src/interactive_ftui.rs`).
 **Interactive queued input.** In the default terminal interface, messages
 accepted as a turn finishes continue in their original order, with each
 message's prepared file contents preserved. They keep separate message
-boundaries and their own authored instructions. Aborts, failures, and run-time
-caps return unsent authored text to the editor for review before resubmission.
+boundaries and their own authored instructions. Ordinary steering and follow-up
+input can include images and audio/video. Aborts, failures, and run-time caps
+preserve unclaimed prepared input for review, including captured attachment
+bytes. Resubmitting an unchanged recovered draft reuses those bytes.
 
 **ACP workspace settings.** Sessions created by `pi --acp` resolve global
 settings and trusted settings from the requested workspace when creating,
@@ -918,7 +924,7 @@ blocks the fork until the source is ready.
 `audio` blocks, and embedded audio/video resource blobs. Audio-only prompts
 work. Gemini-family providers receive native media; other transports show an
 explicit omission label while the complete attachment stays in session history
-and editor replay. Audio/video admission honors `media.maxBytes` (5 MiB by
+and editor replay. Audio/video admission honors `media.maxBytes` (64 MiB by
 default), with a 10 MiB transport ceiling per attachment and at most 32 media
 attachments per prompt. See [ACP audio and video prompts](docs/tools/media_tools.md#acp-audio-and-video-prompts)
 for the editor wire format and aggregate limits.
@@ -987,9 +993,20 @@ one-use links and grants or revokes remote control. Host input reclaims control;
 the remote composer preserves local drafts and cannot operate local approval,
 credential, or extension dialogs. Complete sources are screened before clipping,
 and local drafts, in-flight response text, and truncated tool cards stay local.
-Headless, WASM, and QR pairing remain unimplemented.
+Headless and WASM operation remain unimplemented.
 
-**Print mode** sends one message, streams the response to stdout, and exits. Useful for shell scripts and one-off queries.
+**Print mode** sends one or more messages, streams each response to stdout, and exits. Useful for shell scripts and one-off queries.
+
+Text and JSON print modes use the same success contract: a terminal provider
+failure or cancellation exits **1** and stops before any remaining prompt.
+Retries and configured failover finish before Pi decides the final outcome.
+JSON output retains the completed agent lifecycle, followed by one
+`{"type":"error","phase":"run",...,"exit_code":1}` diagnostic. Missing or
+whitespace-only input is a usage error (**2**); JSON mode reports it before
+opening a session stream. Headless denied tool approvals exit **3**, configured
+or explicit resource load failures (`--skill`, `--prompt-template`,
+`--theme-path`) exit **4**, and reaching a session cost cap (`maxCost`) exits
+**5**. A successfully recovered request still exits **0**.
 
 **Print mode and tool approval.** The approval mode defaults to `always-ask` on
 every surface, including `-p`. The absence of a terminal is not treated as
@@ -1189,6 +1206,28 @@ ship separately from binary releases: the installer on `main` includes fixes for
 stock macOS tar/xz support and older awk versions that are absent from the
 installer at the v0.8.0 tag.
 
+The current installer requires the **Minisign CLI** for official release binaries.
+Install it with `brew install minisign` on macOS or `sudo apt install minisign` on
+Debian/Ubuntu. It verifies both the artifact's `.minisig` and the signed
+`SHA256SUMS` manifest with the public key pinned in this repository's
+[`minisign.pub`](minisign.pub), before extracting or running the downloaded binary.
+The authenticated metadata must match the requested project, release, platform,
+filename, and digest. Missing or invalid signatures stop installation; a checksum
+override does not bypass this requirement for official release URLs.
+
+Use versioned `/releases/download/<tag>/<asset>` URLs for explicit official
+artifacts; the unversioned `/releases/latest/download/` alias is rejected. Old
+releases without the required signatures are also rejected. Custom and offline
+artifacts retain caller-supplied checksum verification; use `--minisign-url` to
+require a detached signature for those artifacts too. The signature must use the
+same pinned project key.
+
+The native `pi self-update` implementation on `main` verifies signatures internally
+and does not require the Minisign CLI. It authenticates the manifest and raw binary
+before replacement, and automatic latest-version updates cannot downgrade an
+installed version. An explicit `--version` still permits an intentional older
+signed release.
+
 ```bash
 # Latest release
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash
@@ -1221,6 +1260,7 @@ Notable installer flags:
 - `--offline [TARBALL]`: enforce offline mode; optional local artifact path (`.tar.gz`, `.tar.xz`, `.zip`, or raw binary)
 - `--artifact-url`: force a specific release artifact URL
 - `--checksum` / `--checksum-url`: override checksum source for explicit artifacts
+- `--minisign-url`: supply a required detached Minisign signature for a custom or offline artifact, verified with the pinned project key
 - `--sigstore-bundle-url`: override the optional Sigstore bundle URL used by
   `cosign verify-blob`; set both `COSIGN_IDENTITY_RE` and
   `COSIGN_OIDC_ISSUER` to the trusted signer policy (there is deliberately no
@@ -1330,7 +1370,7 @@ pi -p "Quick question"          # Print mode (no session)
 Interactive file references:
 
 - Type `@relative/path` in the editor to attach a file’s contents (autocomplete inserts the `@` form).
-- Images and supported audio/video files become native attachments in file-argument order. Audio/video extensions are `.mp4`, `.mov`, `.webm`, `.mp3`, `.wav`, `.flac`, `.ogg`, and `.m4a` (case-insensitive), with a 5 MiB per-file limit. Oversized files produce a visible notice and empty files are skipped.
+- Images and supported audio/video files become native attachments in file-argument order. Audio/video extensions are `.mp4`, `.mov`, `.webm`, `.mp3`, `.wav`, `.flac`, `.ogg`, and `.m4a` (case-insensitive), with a 64 MiB per-file limit (`media.maxBytes`). Oversized files produce a visible notice and empty files are skipped.
 - File arguments use the current workspace roots, including roots added with `--add-dir` or `/add-dir`; `/remove-dir` revokes subsequent attachment reads. CLI startup files and messages are submitted by both terminal frontends, and FTUI `/retry` retains the original attachment bytes.
 - Gemini-family providers receive native audio/video. Providers without that transport receive a visible media-omission label; session history retains the attachment. See [native RPC content](docs/rpc.md#chat) and [SDK native prompts](docs/sdk.md#native-image-audio-and-video-prompts).
 
@@ -1492,9 +1532,15 @@ Ambient proxy variables are honored by default, the same as `git` and `curl`.
 Where they are set for some other tool — a capture proxy, a stale VPN helper —
 turn the inheritance off with `"http": { "ignore_env_proxy": true }` or
 `PI_HTTP_PROXY=off`; explicit settings and `PI_*_PROXY` still apply. Proxy
-endpoints may be `http://`, `socks5://` (local DNS) or `socks5h://` (DNS on the
-proxy), with optional username/password authentication; SOCKS credentials are
-not encrypted on the hop to the proxy. Requests to `localhost` (case-insensitive,
+endpoints may be `http://`, `https://`, `socks5://` (local DNS) or `socks5h://`
+(DNS on the proxy), with optional username/password authentication. An
+`https://` proxy encrypts and authenticates the hop to the proxy before sending
+credentials or CONNECT metadata. HTTPS destinations receive an independent
+TLS connection inside that tunnel; both peer certificates and hostnames must
+verify against Pi's configured trust store. A failed handshake or refused
+CONNECT never falls back to plaintext or a direct connection. HTTP and SOCKS
+proxy credentials are not encrypted on the hop to the proxy.
+Requests to `localhost` (case-insensitive,
 with an optional trailing dot), literal IPv4 addresses in `127.0.0.0/8`, and
 IPv6 `::1` or IPv4-mapped loopback addresses go directly to the local server.
 This keeps Ollama and LM Studio reachable when a global proxy is configured.
@@ -1504,10 +1550,10 @@ hostnames retain the configured proxy routing.
 To intentionally send loopback destinations through the proxy, such as to reach
 a service on the proxy host or capture local traffic, set
 `"http": { "proxyLoopback": true }`. Explicit `NO_PROXY` / `http.noProxy`
-matches still take precedence. An unusable ambient value (e.g. an `https://`
-or `socks4://` endpoint) is skipped with a warning rather than failing requests.
+matches still take precedence. An unusable ambient value (e.g. a `socks4://`
+endpoint) is skipped with a warning rather than failing requests.
 
-The `bash` tool's child environment overrides advertise only HTTP proxy
+The `bash` tool's child environment overrides advertise only HTTP(S) proxy
 endpoints (as `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` and their lowercase
 spellings). Credentials are deliberately omitted from that per-child copy,
 so authenticated HTTP proxies need their own configuration in those tools
@@ -2332,7 +2378,7 @@ The previous stack, built on the `charmed_rust` library family (a Rust port of G
 | `/resume` (`/r`), `/session` (`/info`), `/name`, `/history` | Session picker, info, naming, input history |
 | `/settings`, `/theme`, `/hotkeys` (`/keys`), `/changelog` | Settings UI, themes (incl. `auto`), keybindings, changelog |
 | `/plan`, `/approval`, `/advisor` | Plan mode, approval modes, second-model turn review |
-| `/goal status` | Inspect a saved objective; see [goal commands](docs/goal-mode.md). FrankenTUI only, added after the published `v0.8.0` release |
+| `/goal status` | Inspect a saved objective; see [goal commands](docs/goal-mode.md). Added after the published `v0.8.0` release |
 | `/btw <question>`, `/tan <work>` | Ephemeral smol-role side question; background task-role tangential work |
 | `/mcp`, `/usage`, `/rules`, `/omfg` | MCP server status, provider credit/quota, stream rules, grievances |
 | `/export`, `/share`, `/copy` (`/cp`) | HTML export, secret/unlisted GitHub Gist share (not private; anyone with the URL can view it), copy last reply |

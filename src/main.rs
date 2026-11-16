@@ -1050,7 +1050,11 @@ fn main_impl() -> Result<()> {
 
     // List-providers is a fast offline query that uses only static metadata.
     if cli.list_providers {
-        list_providers();
+        list_providers(
+            cli.mode
+                .as_deref()
+                .is_some_and(|mode| mode.eq_ignore_ascii_case("json")),
+        );
         return Ok(());
     }
 
@@ -1151,7 +1155,8 @@ fn main_impl() -> Result<()> {
     }
     if cli.command.is_none()
         && cli.fetch_models.is_none()
-        && early_mode.eq("text")
+        && cli.list_models.is_none()
+        && matches!(early_mode.as_str(), "text" | "json")
         && cli.export.is_none()
         && piped_stdin.is_none()
         && cli.file_args().is_empty()
@@ -1160,7 +1165,7 @@ fn main_impl() -> Result<()> {
             .iter()
             .all(|message| message.trim().is_empty())
     {
-        bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
+        return Err(print_input_required());
     }
 
     // Initialize logging (skip for ultra-fast paths like --version).
@@ -2241,7 +2246,10 @@ async fn run(
         Ok(resources) => resources,
         Err(err) => {
             eprintln!("Warning: Failed to load skills/prompts/themes/extensions: {err}");
-            if resource_cli.has_explicit_paths() {
+            let has_explicit_non_extension_paths = !resource_cli.skill_paths.is_empty()
+                || !resource_cli.prompt_paths.is_empty()
+                || !resource_cli.theme_paths.is_empty();
+            if !resource_cli.extension_paths.is_empty() && !has_explicit_non_extension_paths {
                 return Err(anyhow::Error::new(err));
             }
             return Err(anyhow::Error::new(ConfiguredResourceLoadFailed(
@@ -2381,7 +2389,7 @@ async fn run(
     let shared_tools = pi::tools::SharedToolRegistry::new(if cli.builtin_tools_disabled() {
         ToolRegistry::without_builtins(Some(&config))
     } else {
-        ToolRegistry::with_builtin_tool_policy(
+        let mut registry = ToolRegistry::with_builtin_tool_policy(
             &shared_enabled_tools,
             &cwd,
             Some(&config),
@@ -2390,7 +2398,9 @@ async fn run(
             workspace_trusted,
             Some(&workspace_trust_guard),
             !cli.no_implicit_tools,
-        )
+        );
+        registry.promote_tools(&cli.explicit_tools());
+        registry
     });
     let startup_cost_budget = startup_session
         .as_ref()
@@ -2570,7 +2580,10 @@ async fn run(
                 launch_cwd: cwd.clone(),
             }),
             workspace_trust_guard: Some(workspace_trust_guard.clone()),
-            launch: pi::acp::AcpLaunchOptions::from_cli(&cli),
+            launch: pi::acp::AcpLaunchOptions {
+                extension_flags: extension_flags.clone(),
+                ..pi::acp::AcpLaunchOptions::from_cli(&cli)
+            },
             available_models,
             model_registry: model_registry.clone(),
             auth: auth.clone(),
@@ -2623,8 +2636,8 @@ async fn run(
     // Persistence was decided before resolving --continue/--resume into an
     // exact path, including the no-candidate case that creates a new session.
     debug_assert!(!is_print_mode || requested_session || cli.no_session);
-    if mode.eq("text") && initial.is_none() && messages.is_empty() {
-        bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
+    if is_print_mode && initial.is_none() && messages.is_empty() {
+        return Err(print_input_required());
     }
 
     // Path-scoped model sets + disabled providers (bd-cv653.3.2): the most
@@ -8918,53 +8931,125 @@ async fn resolve_provider_api_key_from_auth(provider: &str, auth: &AuthStorage) 
     Ok(String::new())
 }
 
-fn list_providers() {
-    let mut rows: Vec<(&str, &str, String, String, &str)> = PROVIDER_METADATA
+struct ProviderListRow<'a> {
+    id: &'a str,
+    name: &'a str,
+    aliases: &'a [&'a str],
+    aliases_joined: String,
+    env_keys: &'a [&'a str],
+    env_joined: String,
+    api: &'a str,
+    caps: pi::provider::ProviderCapabilities,
+    caps_summary: String,
+}
+
+fn format_providers_list(json_mode: bool) -> String {
+    let mut rows: Vec<ProviderListRow<'_>> = PROVIDER_METADATA
         .iter()
         .map(|meta| {
             let display = meta.display_name.unwrap_or(meta.canonical_id);
-            let aliases = if meta.aliases.is_empty() {
+            let aliases_joined = if meta.aliases.is_empty() {
                 String::new()
             } else {
                 meta.aliases.join(", ")
             };
-            let env_keys = meta.auth_env_keys.join(", ");
+            let env_joined = meta.auth_env_keys.join(", ");
             let api = meta.routing_defaults.map_or("-", |defaults| defaults.api);
-            (meta.canonical_id, display, aliases, env_keys, api)
+            let caps = pi::providers::provider_capabilities_for_id(meta.canonical_id);
+            let caps_summary = caps.summary();
+            ProviderListRow {
+                id: meta.canonical_id,
+                name: display,
+                aliases: meta.aliases,
+                aliases_joined,
+                env_keys: meta.auth_env_keys,
+                env_joined,
+                api,
+                caps,
+                caps_summary,
+            }
         })
         .collect();
-    rows.sort_by_key(|(id, _, _, _, _)| *id);
+    rows.sort_by_key(|row| row.id);
 
-    let id_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(8);
-    let name_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(4);
-    let alias_w = rows.iter().map(|r| r.2.len()).max().unwrap_or(0).max(7);
-    let env_w = rows.iter().map(|r| r.3.len()).max().unwrap_or(0).max(8);
-    let api_w = rows.iter().map(|r| r.4.len()).max().unwrap_or(0).max(3);
+    if json_mode {
+        let entries: Vec<Value> = rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "id": row.id,
+                    "name": row.name,
+                    "aliases": row.aliases,
+                    "env_keys": row.env_keys,
+                    "api": row.api,
+                    "capabilities": row.caps.to_json(),
+                })
+            })
+            .collect();
+        return serde_json::to_string_pretty(&json!({ "providers": entries }))
+            .unwrap_or_else(|_| "{\"providers\":[]}".to_string());
+    }
 
-    // Buffer all output to reduce write syscalls from O(rows) to O(1).
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
+    let id_w = rows.iter().map(|r| r.id.len()).max().unwrap_or(0).max(8);
+    let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0).max(4);
+    let alias_w = rows
+        .iter()
+        .map(|r| r.aliases_joined.len())
+        .max()
+        .unwrap_or(0)
+        .max(7);
+    let env_w = rows
+        .iter()
+        .map(|r| r.env_joined.len())
+        .max()
+        .unwrap_or(0)
+        .max(8);
+    let api_w = rows.iter().map(|r| r.api.len()).max().unwrap_or(0).max(3);
+    let cap_w = rows
+        .iter()
+        .map(|r| r.caps_summary.len())
+        .max()
+        .unwrap_or(0)
+        .max(12);
+
+    let mut out = String::new();
     let _ = writeln!(
         out,
-        "{:<id_w$}  {:<name_w$}  {:<alias_w$}  {:<env_w$}  {:<api_w$}",
-        "provider", "name", "aliases", "auth env", "api",
+        "{:<id_w$}  {:<name_w$}  {:<alias_w$}  {:<env_w$}  {:<api_w$}  {:<cap_w$}",
+        "provider", "name", "aliases", "auth env", "api", "capabilities",
     );
     let _ = writeln!(
         out,
-        "{:<id_w$}  {:<name_w$}  {:<alias_w$}  {:<env_w$}  {:<api_w$}",
+        "{:<id_w$}  {:<name_w$}  {:<alias_w$}  {:<env_w$}  {:<api_w$}  {:<cap_w$}",
         "-".repeat(id_w),
         "-".repeat(name_w),
         "-".repeat(alias_w),
         "-".repeat(env_w),
         "-".repeat(api_w),
+        "-".repeat(cap_w),
     );
-    for (id, name, aliases, env_keys, api) in &rows {
+    for row in &rows {
         let _ = writeln!(
             out,
-            "{id:<id_w$}  {name:<name_w$}  {aliases:<alias_w$}  {env_keys:<env_w$}  {api:<api_w$}"
+            "{:<id_w$}  {:<name_w$}  {:<alias_w$}  {:<env_w$}  {:<api_w$}  {:<cap_w$}",
+            row.id, row.name, row.aliases_joined, row.env_joined, row.api, row.caps_summary
         );
     }
     let _ = writeln!(out, "\n{} providers available.", rows.len());
+    out
+}
+
+fn list_providers(json_mode: bool) {
+    let rendered = format_providers_list(json_mode);
+    // Buffer all output to reduce write syscalls from O(rows) to O(1).
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    if json_mode {
+        let _ = writeln!(out, "{rendered}");
+    } else {
+        let _ = out.write_all(rendered.as_bytes());
+    }
+    let _ = out.flush();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10047,17 +10132,24 @@ fn validate_print_attachment_command(initial: &InitialMessage, first_is_piped: b
     Ok(())
 }
 
+fn print_input_required() -> anyhow::Error {
+    pi::error::Error::validation(
+        "No input provided. Use: pi -p \"your message\" or pipe input via stdin",
+    )
+    .into()
+}
+
+/// A completed event stream can still describe a failed or cancelled turn.
+/// Every print surface must reject that outcome before admitting another prompt.
 fn ensure_print_command_response(message: &AssistantMessage) -> Result<()> {
-    if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
-        bail!(
+    match message.stop_reason {
+        StopReason::Aborted => Err(pi::error::Error::Aborted.into()),
+        StopReason::Error => bail!(
             "{}",
-            message
-                .error_message
-                .as_deref()
-                .unwrap_or("Retried turn failed")
-        );
+            message.error_message.as_deref().unwrap_or("Request error")
+        ),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -10321,11 +10413,7 @@ async fn run_print_mode_inner(
         note_machine_stream_opened();
     }
     if initial.is_none() && messages.is_empty() {
-        if mode.eq("json") {
-            flush_stdout()?;
-            return Ok(());
-        }
-        bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
+        return Err(print_input_required());
     }
 
     let text_stream_state = Arc::new(StdMutex::new(PrintTextStreamState::default()));
@@ -10384,11 +10472,7 @@ async fn run_print_mode_inner(
     }
 
     if initial.is_none() && messages.is_empty() {
-        if mode.eq("json") {
-            flush_stdout()?;
-            return Ok(());
-        }
-        bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
+        return Err(print_input_required());
     }
 
     let retry_enabled = config.retry_enabled();
@@ -10421,7 +10505,7 @@ async fn run_print_mode_inner(
     if let Some(initial) = initial {
         let content = pi::app::build_initial_content(&initial);
         reset_print_text_stream_state(&text_stream_state);
-        let message = run_print_prompt_with_retry(
+        let message = match run_print_prompt_with_retry(
             session,
             config,
             abort_signal,
@@ -10437,18 +10521,37 @@ async fn run_print_mode_inner(
             failover_ctx,
             &mut failover_state,
         )
-        .await?;
+        .await
+        {
+            Ok(message) => message,
+            Err(err) => {
+                if approval_state.surface_was_unavailable() {
+                    flush_stdout()?;
+                    return Err(anyhow::Error::new(ApprovalSurfaceUnavailable));
+                }
+                flush_stdout()?;
+                return Err(err);
+            }
+        };
         sent_prompts = sent_prompts.saturating_add(1);
         completed_agent_turn = true;
-        if mode.eq("text") {
+        let text_finish = if mode.eq("text") {
             finish_print_text_response(
                 &message,
                 snapshot_print_text_stream_state(&text_stream_state),
                 config,
-            )?;
+            )
+        } else {
+            Ok(())
+        };
+        if approval_state.surface_was_unavailable() {
+            flush_stdout()?;
+            return Err(anyhow::Error::new(ApprovalSurfaceUnavailable));
         }
-        if owner_session_id.is_some() {
-            ensure_print_command_response(&message)?;
+        text_finish?;
+        if let Err(err) = ensure_print_command_response(&message) {
+            flush_stdout()?;
+            return Err(err);
         }
     }
 
@@ -10525,7 +10628,7 @@ async fn run_print_mode_inner(
             }
         };
         reset_print_text_stream_state(&text_stream_state);
-        let response = run_print_prompt_with_retry(
+        let response = match run_print_prompt_with_retry(
             session,
             config,
             abort_signal,
@@ -10538,37 +10641,47 @@ async fn run_print_mode_inner(
             failover_ctx,
             &mut failover_state,
         )
-        .await?;
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                if approval_state.surface_was_unavailable() {
+                    flush_stdout()?;
+                    return Err(anyhow::Error::new(ApprovalSurfaceUnavailable));
+                }
+                flush_stdout()?;
+                return Err(err);
+            }
+        };
         sent_prompts = sent_prompts.saturating_add(1);
         completed_agent_turn = true;
-        if mode.eq("text") {
+        let text_finish = if mode.eq("text") {
             finish_print_text_response(
                 &response,
                 snapshot_print_text_stream_state(&text_stream_state),
                 config,
-            )?;
+            )
+        } else {
+            Ok(())
+        };
+        if approval_state.surface_was_unavailable() {
+            flush_stdout()?;
+            return Err(anyhow::Error::new(ApprovalSurfaceUnavailable));
         }
-        if owner_session_id.is_some() {
-            ensure_print_command_response(&response)?;
+        text_finish?;
+        if let Err(err) = ensure_print_command_response(&response) {
+            flush_stdout()?;
+            return Err(err);
         }
-        if retry_command {
-            // JSON prompts historically report a provider error in-band.
-            // A requested command must also fail the process for scripts.
-            ensure_print_command_response(&response)?;
-            if is_json {
-                write_print_line(&serde_json::to_string(&serde_json::json!({
-                    "type": "command_result", "command": "retry", "success": true
-                }))?);
-            }
+        if retry_command && is_json {
+            write_print_line(&serde_json::to_string(&serde_json::json!({
+                "type": "command_result", "command": "retry", "success": true
+            }))?);
         }
     }
 
     if sent_prompts.eq(&0) {
-        if mode.eq("json") {
-            flush_stdout()?;
-            return Ok(());
-        }
-        bail!("No messages were sent");
+        return Err(pi::error::Error::validation("No messages were sent").into());
     }
 
     if let Some(owner_session_id) = owner_session_id
@@ -10606,7 +10719,7 @@ async fn run_print_mode_inner(
                 .await?;
                 ensure_print_background_owner(session, owner_session_id).await?;
                 reset_print_text_stream_state(&text_stream_state);
-                let response = run_print_prompt_with_retry(
+                let response = match run_print_prompt_with_retry(
                     session,
                     config,
                     abort_signal,
@@ -10622,18 +10735,33 @@ async fn run_print_mode_inner(
                     failover_ctx,
                     &mut failover_state,
                 )
-                .await?;
-                if mode.eq("text") {
+                .await
+                {
+                    Ok(response) => response,
+                    Err(err) => {
+                        if approval_state.surface_was_unavailable() {
+                            flush_stdout()?;
+                            return Err(anyhow::Error::new(ApprovalSurfaceUnavailable));
+                        }
+                        flush_stdout()?;
+                        return Err(err);
+                    }
+                };
+                let text_finish = if mode.eq("text") {
                     finish_print_text_response(
                         &response,
                         snapshot_print_text_stream_state(&text_stream_state),
                         config,
-                    )?;
-                }
-                ensure_print_command_response(&response)?;
+                    )
+                } else {
+                    Ok(())
+                };
                 if approval_state.surface_was_unavailable() {
+                    flush_stdout()?;
                     return Err(anyhow::Error::new(ApprovalSurfaceUnavailable));
                 }
+                text_finish?;
+                ensure_print_command_response(&response)?;
             }
         }
         .await;
@@ -10764,11 +10892,7 @@ fn finish_print_text_response(
 ) -> Result<()> {
     if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
         emit_trailing_print_newline(stream_state)?;
-        let error_message = message
-            .error_message
-            .clone()
-            .unwrap_or_else(|| "Request error".to_string());
-        bail!(error_message);
+        return ensure_print_command_response(message);
     }
 
     if stream_state.should_render_final_message() {
@@ -13669,6 +13793,30 @@ mod tests {
             !append_file_fingerprint(&mut hasher, &path),
             "non-regular or symlinked cache inputs must disable the fast-path cache"
         );
+    }
+
+    #[test]
+    fn print_terminal_response_errors_keep_their_exit_classification() {
+        for reason in [StopReason::Error, StopReason::Aborted] {
+            for message in [None, Some("terminal fixture error".to_string())] {
+                let response = AssistantMessage {
+                    stop_reason: reason,
+                    error_message: message,
+                    ..AssistantMessage::default()
+                };
+                let error = ensure_print_command_response(&response).unwrap_err();
+                assert_eq!(exit_code_for_error(&error), EXIT_CODE_FAILURE);
+                assert!(!error.to_string().is_empty());
+                if reason == StopReason::Aborted {
+                    assert_eq!(fatal_error_code(&error), "aborted");
+                }
+            }
+        }
+        assert_eq!(
+            exit_code_for_error(&print_input_required()),
+            EXIT_CODE_USAGE
+        );
+        assert_eq!(fatal_error_code(&print_input_required()), "usage");
     }
 
     #[test]
@@ -19057,5 +19205,81 @@ mod tests {
             render_model_table_for_test(&cached),
             render_model_table_for_test(&borrowed)
         );
+    }
+
+    #[test]
+    fn exit_code_taxonomy_covers_print_exit_codes_1_through_5() {
+        assert_eq!(
+            exit_code_for_error(&anyhow!("provider stream failed")),
+            EXIT_CODE_FAILURE
+        );
+        let missing_input = print_input_required();
+        assert_eq!(exit_code_for_error(&missing_input), EXIT_CODE_USAGE);
+        assert_eq!(fatal_error_code(&missing_input), "usage");
+
+        let unsent = anyhow::Error::from(pi::error::Error::validation("No messages were sent"));
+        assert_eq!(exit_code_for_error(&unsent), EXIT_CODE_USAGE);
+        assert_eq!(fatal_error_code(&unsent), "usage");
+
+        let approval_err = anyhow::Error::new(ApprovalSurfaceUnavailable);
+        assert_eq!(
+            exit_code_for_error(&approval_err),
+            EXIT_CODE_APPROVAL_UNAVAILABLE
+        );
+        assert_eq!(
+            fatal_error_code(&approval_err),
+            "approval.surface_unavailable"
+        );
+
+        let resource_err = anyhow::Error::new(ConfiguredResourceLoadFailed(
+            "Failed to load skill from /missing/SKILL.md".to_string(),
+        ));
+        assert_eq!(
+            exit_code_for_error(&resource_err),
+            EXIT_CODE_RESOURCE_LOAD_FAILED
+        );
+        assert_eq!(fatal_error_code(&resource_err), "resource.load_failed");
+
+        let cost_err = anyhow::Error::new(pi::error::Error::CostCap {
+            spent: 0.05,
+            cap: 0.01,
+        });
+        assert_eq!(exit_code_for_error(&cost_err), EXIT_CODE_COST_CAP);
+        assert_eq!(fatal_error_code(&cost_err), "cost_cap");
+    }
+
+    #[test]
+    fn format_providers_list_renders_capabilities_in_text_and_json_modes() {
+        let text = format_providers_list(false);
+        assert!(text.contains("capabilities"));
+        assert!(text.contains("gitlab"));
+        assert!(text.contains("cursor"));
+        assert!(text.contains("multi_turn, tool_use, streaming, vision"));
+        assert!(text.contains("multi_turn, tool_use, streaming"));
+        assert!(text.contains("multi_turn, tool_use"));
+
+        let json_raw = format_providers_list(true);
+        let parsed: Value = serde_json::from_str(&json_raw).expect("valid providers JSON");
+        let providers = parsed["providers"].as_array().expect("providers array");
+        let find_provider = |id: &str| {
+            providers
+                .iter()
+                .find(|entry| entry["id"] == id)
+                .unwrap_or_else(|| panic!("missing provider {id}"))
+        };
+        let gitlab = find_provider("gitlab");
+        assert_eq!(gitlab["capabilities"]["multi_turn"], true);
+        assert_eq!(gitlab["capabilities"]["tool_use"], true);
+        assert_eq!(gitlab["capabilities"]["streaming"], false);
+        assert_eq!(gitlab["capabilities"]["vision"], false);
+
+        let cursor = find_provider("cursor");
+        assert_eq!(cursor["capabilities"]["multi_turn"], true);
+        assert_eq!(cursor["capabilities"]["tool_use"], true);
+        assert_eq!(cursor["capabilities"]["streaming"], true);
+        assert_eq!(cursor["capabilities"]["vision"], false);
+
+        let anthropic = find_provider("anthropic");
+        assert_eq!(anthropic["capabilities"]["vision"], true);
     }
 }
