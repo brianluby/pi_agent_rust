@@ -135,7 +135,7 @@ Extension runtime guarantees are also concrete:
 | Two-stage `exec` guard (`exec` capability policy + command-level mediation + DCG/heredoc AST signals) | Dangerous shell intent is caught before spawn, including destructive payloads hidden in multiline wrappers |
 | Trust lifecycle + kill switch (`pending/acknowledged/trusted/killed`) | You can quarantine an extension instantly, log who pulled the switch and why, and require explicit re-acknowledgement before restoring access |
 | Hostcall lane kill-switch controls (`forced_compat_global_kill_switch`, `forced_compat_extension_kill_switch`) | Fast-path regressions can be contained immediately by forcing compatibility-lane execution without disabling the extension system |
-| Deterministic hostcall reactor mesh (shard affinity, bounded SPSC lanes, backpressure telemetry, optional NUMA slab tracking) | Runtime behavior stays predictable under contention; queue pressure and routing decisions are observable instead of opaque |
+| Opt-in hostcall reactor telemetry harness (`enable_hostcall_reactor`: shard routing, bounded queue backpressure, optional NUMA slab tracking) | Lets stress harnesses and operators inspect shard backpressure and fallback transitions on demand without adding mutex/clone overhead to default inline fast-lane dispatch |
 | Cold owner-isolated JS realms + persistent transpile cache | Every reload gets a fresh realm while versioned disk-cached transpilation avoids treating mutable JavaScript state as safely reusable |
 | Tamper-evident runtime risk ledger (`verify` / `replay` / `calibrate`) | Security decisions are hash-linked and can be replayed or threshold-tuned from real runtime traces |
 
@@ -183,7 +183,7 @@ assuming one optimization proves an end-to-end result.
 |---|---|---|
 | Cold-start minimization | Single native binary, no Node/Bun runtime bootstrap, no JIT warmup, startup prewarm for extension runtime paths | Reduce time-to-first-interaction |
 | Less copying on hot paths | `Arc`/`Cow` message flow, zero-copy hostcall/tool payload handling, reduced clone-heavy provider/session paths | Reduce CPU and allocation pressure |
-| Deterministic dispatch core | Typed hostcall opcodes, fast-lane/compat-lane routing, bounded shard queues with reactor-mesh telemetry | Reduce tail latency under concurrent extension load |
+| Deterministic dispatch core | Typed hostcall opcodes, inline fast-lane/compat-lane routing, kill switches, and opt-in reactor-mesh backpressure telemetry | Keep common hostcalls fast while preserving predictable fallback and observability under load |
 | Efficient long-session storage | SQLite session index + v2 sidecar (segmented log + offset index) with O(index+tail) reopen path | Avoid full-history work on eligible resumes |
 | Streaming parser tuned for real networks | SSE parser tracks scanned bytes, handles UTF-8 tails, normalizes chunk boundaries, interns event-type strings | Reduce repeated scanning and parser stalls |
 | Safe fast-path controls | Shadow dual execution sampling, automatic backoff on divergence/overhead, compatibility-lane kill switches for containment | Bound optimization risk and preserve fallback behavior |
@@ -226,7 +226,7 @@ If you want full details, see:
 
 | Feature | Pi (Rust) | Typical TS/Python CLI |
 |---------|-----------|----------------------|
-| **Startup** | Native single-binary path (Fresh `v0.3.0` measurement pending; pre-v0.3.0 criterion: ~5-7ms p95 version, ~12-15ms help; see `tests/perf/reports/budget_summary.json` `startup_version_p95` and `startup_full_agent_p95`) | Runtime-dependent |
+| **Startup** | Native single-binary path (Fresh comparative measurement pending; historical pre-v0.3.0 criterion: ~5-7ms p95 version, ~12-15ms help; see `tests/perf/reports/budget_summary.json` `startup_version_p95` and `startup_full_agent_p95`) | Runtime-dependent |
 | **Binary size** | Size-budgeted release profile (LTO, strip, `opt-level = "z"`); the `binary_size_release` budget and its latest stripped-artifact measurement are reported in [Current Evidence State](#current-evidence-state), never promoted here until claim readiness is `ready` | Runtime-dependent |
 | **Memory (idle)** | Bounded-resource design; the `idle_memory_rss` budget and its latest release-binary measurement are reported in [Current Evidence State](#current-evidence-state) (`docs/perf-budgets-recipe.md` defines the canonical 5-measurement taxonomy) | Runtime-dependent |
 | **Streaming** | Native SSE parser | Library-dependent |
@@ -867,6 +867,15 @@ input can include images and audio/video. Aborts, failures, and run-time caps
 preserve unclaimed prepared input for review, including captured attachment
 bytes. Resubmitting an unchanged recovered draft reuses those bytes.
 
+**ACP transport limits.** Input JSON frames are capped at 128 MiB before
+parsing, excluding the final LF. At most two unread frames are queued;
+backpressure preserves their order. An oversized frame, invalid UTF-8, or
+stdin read failure produces a JSON-RPC parse error with a null ID and closes
+input admission. Active prompts follow the normal cancellation, persistence,
+and cleanup path before exit. Ordinary malformed JSON remains recoverable,
+and a bounded final frame without LF is accepted at EOF. Attachment limits
+below still apply independently.
+
 **ACP workspace settings.** Sessions created by `pi --acp` resolve global
 settings and trusted settings from the requested workspace when creating,
 loading from disk, or forking a session. Reattaching to a running session keeps
@@ -1045,13 +1054,13 @@ Pi supports two extension runtime families with capability-gated host connectors
   - `.js/.ts/.mjs/.cjs/.tsx/.mts/.cts` run directly in embedded QuickJS (no descriptor conversion).
   - `*.native.json` loads the native-rust descriptor runtime.
   - One session currently uses one runtime family at a time (JS/TS or native descriptor).
-- Cold/warm extension load paths are instrumented; fresh `v0.3.0` measurements are pending
+- Cold/warm extension load paths are instrumented; fresh comparative measurements are pending
 - Node API shims for `fs`, `path`, `os`, `crypto`, `child_process`, `url`, and more
 - Capability-based security: extensions call explicit connectors (`tool/exec/http/session/ui`) with audit logging
 - Command-level exec mediation: dangerous shell signatures are classified and blocked before spawn, with redacted denial alerts and mediation ledger entries
 - Trust-state lifecycle and kill-switch controls with audited state transitions (`pending`/`acknowledged`/`trusted`/`killed`)
 - Workspace trust-on-first-use gate: project settings, extension files, MCP configuration, and discovered project agent profiles require approval keyed to workspace path and content digest. `--trust`, `PI_WORKSPACE_TRUST`, or global `trustAllWorkspaces` support automation; non-interactive launches fail closed.
-- Hostcall reactor mesh with deterministic shard routing, bounded queue backpressure, and optional NUMA-aware telemetry
+- Opt-in hostcall reactor mesh telemetry (`enable_hostcall_reactor`) with shard routing and bounded queue backpressure tracking (production defaults use direct inline fast/compat lane dispatch without extra queue cloning)
 - Fresh owner-isolated realms on every reload, with versioned persistent transpile caching instead of mutable realm reuse
 
 Imported `createReadTool`, `createWriteTool`, `createEditTool`, `createBashTool`,
@@ -1182,11 +1191,11 @@ From:
 - Historical verdict blob at `2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91:docs/evidence/dropin-certification-verdict.json` (generated `2026-05-18T19:37:26Z` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8`; the live file may contain a later verdict)
 
 - Historical strict drop-in result: **22/22 certification gates PASS, 16/16 blocking gates PASS** - `CERTIFIED` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8` only *(from the Git-pinned historical verdict blob above; it neither describes the live verdict file nor certifies `v0.3.0`)*
-- Unified evidence bundle, as regenerated `2026-08-28`: `30` total sections, `18` present, `12` missing, `0` invalid (bundle verdict: `partial`) *(from tests/evidence_bundle/index.json; historical snapshot)*
+- Unified evidence bundle, as regenerated `2026-11-21`: `30` total sections, `18` present, `12` missing, `0` invalid (bundle verdict: `partial`) *(from tests/evidence_bundle/index.json; historical snapshot)*
 - Extension must-pass gate, as regenerated `2026-08-17`: `206/208` must-pass extensions passed (`2` failures); informational stretch set `10/19` passed — the May 2026 `123/123` snapshot predates the expanded corpus *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json; historical snapshot)*
 - Extension health delta, as regenerated `2026-08-17`: `226` extensions tested at `95.6%` pass rate with `0` regressions vs the 2026-02-07 baseline *(from tests/ext_conformance/reports/health_delta/health_delta_report.json; historical snapshot)*
 - Extension journey coverage, as regenerated `2026-08-17`: `125/125` journey scenarios passed (`100.0%`); command, event-subscriber, multi-capability, passive, and tool-provider categories are green *(from tests/ext_conformance/reports/journeys/journey_report.json; historical snapshot)*
-- Historical stress-triage evidence is retained under `tests/perf/reports/`; it is not current enough to support a `v0.3.0` performance claim.
+- Historical stress-triage evidence is retained under `tests/perf/reports/`; it is not current enough to support a release-facing performance claim.
 
 ---
 
@@ -1194,7 +1203,7 @@ From:
 
 ### Curl Installer (Recommended)
 
-As of November 3, 2026, the latest published stable release is **v0.8.0**. It does
+As of November 20, 2026, the latest published stable release is **v0.8.0**. It does
 not include `/goal`; the [goal guide](docs/goal-mode.md#availability) describes
 the newer implementation on `main`. Fetching the installer from `main` still selects a published release
 binary, so it does not install every feature documented on `main`. Check the full
@@ -1387,7 +1396,7 @@ Interactive file references:
 | `-p, --print` | Single response, no interaction |
 | `--mode text|json|rpc` | Output/protocol mode. `json` streams one event per line; `message_update` records are delta-only (no cumulative `message` / `partial`), so stdout stays linear in the response length — read the full message from `message_end`. A fatal error in `json` or `rpc` mode prints exactly one `{"type":"error","phase":"startup","code":"<stable code>","message":"…","exit_code":N}` record on stdout before the non-zero exit (`phase` is `run` once the stream had opened) |
 | `--provider <NAME>` | Force provider for this run (aliases supported) |
-| `--model <MODEL>` | Model to use (auto-select fallback: `anthropic/claude-sonnet-4-6`, then `anthropic/claude-opus-4-7`, then `openai/gpt-5.1-codex`) |
+| `--model <MODEL>` | Model to use (auto-select fallback: `openai-codex/gpt-5.6-sol`, then `openai/gpt-5.6`, then `anthropic/claude-sonnet-4-6`) |
 | `--thinking <LEVEL>` | Thinking level: off/minimal/low/medium/high/xhigh/max |
 | `--tools <TOOLS>` | Comma-separated tool list; overrides optional-tool activation settings for this run. An empty list disables all built-ins |
 | `--no-tools` | Disable built-in tools, including tools enabled in settings |
@@ -1801,7 +1810,7 @@ The sections above compare mechanics. This section calls out concrete features p
 | **Argument-aware runtime risk scoring for shell paths** (`dcg_rule_hit`, `dcg_heredoc_hit`, heredoc AST inspection across Bash/Python/JS/TS/Ruby) | Detects destructive intent hidden in multiline scripts and wrapper commands before hostcall execution |
 | **Tamper-evident runtime risk ledger tooling** (`ext_runtime_risk_ledger verify|replay|calibrate`) | Security decisions are hash-chained and can be verified, replayed, and threshold-calibrated from real traces |
 | **Unified incident evidence bundle export** (risk ledger, security alerts, hostcall telemetry, exec mediation, secret-broker events) | Incident response can triage from one structured artifact set instead of stitching ad-hoc logs |
-| **Deterministic hostcall reactor mesh with optional NUMA slab pool** (shard affinity, global-order drain, bounded SPSC lanes, telemetry) | Keeps extension dispatch predictable under load and surfaces queue/backpressure behavior for tuning |
+| **Opt-in hostcall reactor telemetry harness with optional NUMA slab pool** (`enable_hostcall_reactor`: shard affinity, global-order drain, bounded queue backpressure) | Available to stress harnesses and explicit callers for backpressure testing while default production dispatch runs inline on fast/compat lanes |
 | **Cold realm factory + persistent transpile cache** | Rebuilds mutable JS state for every load while reusing only versioned compiled artifacts that are safe to share across realms |
 | **Extension preflight static analysis** (imports/forbidden-pattern scan with policy-aware hints) | Catches risky extension patterns before runtime execution |
 | **Node/Bun-compatible extension runtime without Node/Bun dependency** (embedded QuickJS + shims) | Runs legacy extension workflows in a single native binary deployment model |
@@ -2551,8 +2560,9 @@ Pi also supports a v2 sidecar store next to JSONL sessions for faster resume and
 - Validation checks offset bounds, checksum matches, and frame/index alignment before trusting the sidecar.
 - Truncated trailing frames are recoverable during rebuild; non-EOF frame corruption fails closed instead of silently dropping data.
 
-**CLI support:**
+**CLI & opt-in live sync support:**
 
+- Set `sessionStore: "v2"` in `settings.json` (or `PI_SESSION_STORE=v2` in the environment) to enable live incremental `.v2` segment/index synchronization alongside canonical JSONL writes (default remains JSONL v3 without live sidecar syncing).
 - `pi migrate <path> --dry-run` validates migration without writing.
 - `pi migrate <path>` performs JSONL-to-v2 migration and verifies parity.
 
@@ -2684,7 +2694,7 @@ CLI tools have different performance requirements than servers or GUI applicatio
 | Application runtime bootstrap | Required | Not required |
 | Application module loading | Commonly dynamic | Ahead-of-time linked Rust code |
 | JIT warmup | Runtime-dependent | Not used |
-| Current release timing | Not measured here | Fresh `v0.3.0` measurement pending |
+| Current release timing | Not measured here | Fresh comparative measurement pending |
 
 Current comparative timing numbers are intentionally omitted until a fresh,
 provenance-matched benchmark run is available.
@@ -2719,7 +2729,7 @@ Concrete engineering work in this codebase includes:
 |------|---------------|----------------|
 | Extension dispatch core | Typed hostcall opcode fast paths, compatibility fallback lane, zero-copy payload arena, canonical-hash shortcuts, interned operation paths | Cuts per-call overhead on the hottest extension operations while preserving correctness fallback paths |
 | Registry/policy lookup | Immutable policy snapshots with O(1) capability checks, plus RCU-style metadata snapshots for extension registry/tool metadata | Removes repeated dynamic lookup overhead in hot authorization/dispatch paths |
-| Queueing + concurrency | Core-pinned SPSC reactor mesh, S3-FIFO-inspired admission with fairness guards, BRAVO-style fallback behavior | Improves tail latency under contention instead of only optimizing median latency |
+| Queueing + concurrency | Direct inline fast/compat lane dispatch by default, plus opt-in `HostcallReactorMesh` shard-queue backpressure telemetry (`enable_hostcall_reactor`) and budget-controller fallback guards | Avoids extra mutex/clone overhead on normal calls while keeping bounded overflow fallback and backpressure testing available on demand |
 | Batched execution | AMAC-style interleaved batch executor with stall-aware toggling | Avoids head-of-line stalls when many independent hostcalls are in flight |
 | IO specialization | Opt-in `experimental-controllers` `io_uring` lane policy + telemetry and explicit executor-unavailable fallback | Evaluates IO-heavy call policy in experimental builds without presenting the placeholder bridge as real `io_uring` execution |
 | Runtime startup for extensions | Cold owner-isolated QuickJS realms, prebaked `pi` prelude + `node:*` virtual-module bytecode hydration, bounded in-realm source caches, and versioned persistent transpile caching | Avoids mutable-realm reuse while reducing repeated JS prelude/shim parsing and transpilation work |
@@ -2785,14 +2795,15 @@ See `docs/testing-policy.md` and `docs/releasing.md` for normative policy detail
 
 Current checked-in performance evidence state:
 - Run output: `tests/perf/reports/` (budget_summary.json, PERF_BUDGETS.md)
-- Current budget summary (generated 2026-09-21 from source `9c887d33`; no run
+- Current budget summary (generated 2026-11-21; `source_commit` unbound, no run
   id, no correlation id, `strict_mode` false): `19` declared budgets, of which
   `0` PASS, `0` FAIL and `19` NO_DATA. Header and per-budget `budget_results`
   rows now agree, and they agree on this: the tree carries no performance
   measurements at all. Claim readiness is `blocked`,
   `performance_claims_authorized` is false, and the blocking reason codes are
   `budget_data_missing`, `ci_budget_data_missing`, `correlation_id_missing`,
-  `data_contract_failure`, `run_id_missing` and `strict_mode_disabled`.
+  `data_contract_failure`, `run_id_missing`, `source_commit_unbound`, and
+  `strict_mode_disabled`.
   Counts are value-bound to the artifact:
   *(from tests/perf/reports/budget_summary.json; no performance claim)*
 - Before spending time on a definitive refresh, run
@@ -2822,7 +2833,7 @@ Current checked-in performance evidence state:
   throughput, memory, or startup numbers to this README.
 
 - Full-suite gate at its latest regeneration (`2026-08-04`): `17/20` gates passed with `12/14` blocking gates. The `ext_must_pass` blocker is now substantive rather than staleness-only: the `2026-08-17` regeneration recorded `206/208` with two marckrenn-pi-sub family failures (tracked for remediation), alongside the practical-finish checkpoint *(from tests/full_suite_gate/full_suite_verdict.json; historical snapshot)*
-- Unified evidence bundle, as regenerated `2026-08-28`: `30` total sections, `18` present, `12` missing, `0` invalid (bundle verdict: `partial`) *(from tests/evidence_bundle/index.json; historical snapshot)*
+- Unified evidence bundle, as regenerated `2026-11-21`: `30` total sections, `18` present, `12` missing, `0` invalid (bundle verdict: `partial`) *(from tests/evidence_bundle/index.json; historical snapshot)*
 - Historical drop-in result: `22/22` certification gates passed, overall verdict `CERTIFIED` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8` only *(from the verdict blob stored at Git revision `2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91`, not from the live verdict file)*
 - Extension must-pass gate, as regenerated `2026-08-17`: `206/208` must-pass extensions passed (`2` failures); informational stretch set `10/19` passed *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json; historical snapshot)*
 - Context-intelligence closeout gate: `pass`, with child Beads mapped to code, tests, docs/evidence, validation commands, pushed commits, redaction posture, perf-budget evidence, README freshness, staged UBS, and Beads ledger reconciliation *(from docs/evidence/context-intelligence-closeout-gate.json; historical snapshot)*
@@ -3155,7 +3166,7 @@ multi-agent runs, see [docs/swarm-operations-runbook.md](docs/swarm-operations-r
 
 Pi's perf pipeline includes strict evidence checks so global speed claims cannot be based on partial or stale data.
 
-**v0.3.0 performance-claim status: NOT authorized.** Its checked-in
+**Current release performance-claim status: NOT authorized.** Its checked-in
 `pi.perf.budget_summary.v2` artifact is an explicit blocked/NO_DATA result, so
 this release may ship only without quantitative or global performance claims.
 That blocked state is not a passing benchmark result.
@@ -3201,7 +3212,7 @@ closed to the compiled allocator and includes a fallback reason in artifacts.
 ### Memory Usage
 
 Rust's ownership model avoids a garbage-collected application runtime. Current
-memory figures are intentionally withheld until the `v0.3.0` evidence inputs
+memory figures are intentionally withheld until fresh evidence inputs
 are regenerated with matching source and run provenance.
 
 ### Streaming Architecture
@@ -3481,7 +3492,7 @@ A: This is an authorized Rust port of [Pi Agent](https://github.com/badlogic/pi)
 A: Startup time matters when you're in a terminal all day. Rust provides a native single-binary deployment without a managed application runtime. Fresh comparative measurements are required before this release makes a speed claim.
 
 **Q: Can I use providers beyond Anthropic (OpenAI/Gemini/Cohere/Azure/Bedrock/Vertex/Copilot/GitLab/Cursor/Codex)?**
-A: Yes. Pi has 11 native provider implementation modules: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini (native + Gemini CLI + Antigravity routes), Cohere, Azure OpenAI, Amazon Bedrock, Vertex AI, GitHub Copilot, GitLab Duo, and Cursor. Pi also supports many OpenAI-compatible presets (for example Groq, OpenRouter, OrcaRouter, Mistral, Together, DeepSeek, Cerebras, DeepInfra, Alibaba/Qwen, and Moonshot/Kimi). Provider IDs and aliases are case-insensitive. Set credentials and choose via `--provider`/`--model`; run `pi --list-providers` to see canonical IDs, aliases, and env keys.
+A: Yes. Pi has 11 native provider implementation modules: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini (native + Gemini CLI + Antigravity routes), Cohere, Azure OpenAI, Amazon Bedrock, Vertex AI, GitHub Copilot, GitLab Duo, and Cursor. GitLab Duo and Cursor provide multi-turn tool calling via `<pi_tool_call>` prompt-tag emulation (capability flags for `multi_turn`, `tool_use`, `streaming`, and `vision` are introspectable via `pi::sdk::ProviderCapabilities` and `pi --list-providers`). Pi also supports many OpenAI-compatible presets (for example Groq, OpenRouter, OrcaRouter, Mistral, Together, DeepSeek, Cerebras, DeepInfra, Alibaba/Qwen, and Moonshot/Kimi). Provider IDs and aliases are case-insensitive. Set credentials and choose via `--provider`/`--model`; run `pi --list-providers` to see canonical IDs, aliases, and env keys.
 
 **Q: How do sessions work?**
 A: By default, each session is a JSONL v3 file with message entries, parent references for branching, and compaction metadata. Builds include `sqlite-sessions` support by default, so configured deployments can use SQLite-backed session storage too; JSONL remains the default store unless configuration selects SQLite.
@@ -3566,11 +3577,12 @@ visible instead of being promoted to green validation evidence.
 
 ### Feature defaults
 
-Default DSR builds enable `sqlite-sessions` only; JSONL remains the default
-session store unless configuration selects SQLite. Heavyweight extras
-(`image-resize`, `jemalloc`, `clipboard`, `wasm-host`, and syntax highlighting)
-are opt-in so the default release binary stays under the size budget. Feature
-variants must be declared in the DSR recipe instead of injected through a
+Default builds (`Cargo.toml` `[features].default`) enable `sqlite-sessions`,
+`tui`, `bpe-tokens`, and `ftui`; JSONL remains the default session store unless
+configuration selects SQLite. Heavyweight extras (`image-resize`, `jemalloc`,
+`clipboard`, `wasm-host`, `url-pdf`, `profiler`, and `syntax-highlighting`) are
+opt-in. Shipping DSR binaries use `[profile.dist]` (`opt-level = 3`, LTO + strip).
+Feature variants must be declared in the DSR recipe instead of injected through a
 direct Cargo invocation.
 
 ### Testing
@@ -3745,8 +3757,8 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 
 > **STATUS: UNMEASURED.** `claim_readiness.status = "blocked"`,
 > `performance_claims_authorized = false`. The checked-in budget summary was
-> regenerated on 2026-09-21 from source `9c887d33` and contains no
-> measurements whatsoever: of `19` declared budgets, `0` PASS, `0` FAIL and
+> regenerated on 2026-11-21 with `source_commit` unbound (`null`) and contains
+> no measurements whatsoever: of `19` declared budgets, `0` PASS, `0` FAIL and
 > `19` NO_DATA.
 > *(from tests/perf/reports/budget_summary.json; no performance claim)*
 
@@ -3781,14 +3793,14 @@ unmeasured rather than as good or bad.
 Of the 19, 14 are CI-enforced and none of those has data. Blocking reason
 codes: `budget_data_missing`, `ci_budget_data_missing`,
 `correlation_id_missing`, `data_contract_failure`, `run_id_missing`,
-`strict_mode_disabled`.
+`source_commit_unbound`, `strict_mode_disabled`.
 
 Two adjacent gates, bound to their own artifacts rather than to the budget
 summary:
 
 | Gate | Status | Notes |
 |---|---|---|
-| `ext_must_pass` | fail | 2/208 marckrenn-pi-sub extensions fail conformance (event-handler mismatch); triaged to upstream fix or de-scope, see `bd-marckrenn-pi-sub-triage-xd3gh` |
+| `ext_must_pass` | fail | 2/208 marckrenn-pi-sub extensions fail conformance (event-handler mismatch); tracked for audited inclusion-list adjudication and refresh in `bd-reality-check-2026-11-19-bridge-yxf43.9` (superseding closed deferral `bd-marckrenn-pi-sub-triage-xd3gh`) |
 | `evidence_bundle` | partial | 0 invalid sections; 18 present, 12 missing (all optional) |
 
 Thresholds, categories, methodology and failing data contracts for every

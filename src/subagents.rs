@@ -172,6 +172,7 @@ pub(crate) struct RevivalSpec {
     role_model_spec: Option<String>,
     parent_model: Option<ToolModelSelection>,
     timeout: Duration,
+    max_task_bytes: usize,
     depth: usize,
     public_task: Option<String>,
     launch_admission: Option<LaunchAdmission>,
@@ -245,6 +246,7 @@ pub(crate) async fn revive_child(
     )
     .with_parent_model(launch.parent_model.clone())
     .with_cost_budget(launch.cost_budget.clone())
+    .with_task_limit(launch.max_task_bytes)
     .with_revival(id.to_string(), launch.clone());
     let mut result = owner
         .with_current(runner.run_one(&agents, task, launch.step, on_update.map(Arc::from)))
@@ -1077,11 +1079,7 @@ impl SubagentTask {
     ) -> std::result::Result<(), &'static str> {
         let raw = previous.map_or("", |result| result.output.as_str());
         let marker = concat!("{", "previous", "}");
-        let limit = if self.task_file.is_some() {
-            task_file::MAX_BYTES
-        } else {
-            usize::MAX
-        };
+        let limit = task_file::MAX_BYTES;
         // Count before replace allocates: a small repeated token can otherwise
         // amplify a bounded file and bounded predecessor into gigabytes.
         let count = self.task.matches(marker).count();
@@ -1106,7 +1104,7 @@ impl SubagentTask {
 }
 
 const CHAIN_TASK_LIMIT: &str =
-    "PI_SUBAGENT_TASK_FILE_LIMIT: expanded taskFile chain instructions exceed 4 MiB";
+    "PI_SUBAGENT_TASK_LIMIT: generated delegation instructions exceed the task byte limit";
 
 fn push_chain_part(
     target: &mut String,
@@ -1304,7 +1302,6 @@ fn with_fallback_policy_args(args: Vec<OsString>, policy: Option<&str>) -> Vec<O
 
 fn child_args(
     agent: &AgentDefinition,
-    task: &str,
     role_model_spec: Option<&str>,
     parent_model: Option<&ToolModelSelection>,
     selection: Option<&model_selection::Selection>,
@@ -1327,7 +1324,6 @@ fn child_args(
         selection,
         output_schema,
     ));
-    args.push(format!("Task: {task}").into());
     args
 }
 
@@ -1443,9 +1439,89 @@ fn child_options(
     args
 }
 
-/// Compile an `outputSchema`, surfacing draft/keyword errors as strings.
+const MAX_OUTPUT_SCHEMA_BYTES: usize = 64 * 1024;
+const OUTPUT_SCHEMA_LIMIT: &str =
+    "PI_SUBAGENT_SCHEMA_LIMIT: outputSchema must be a bounded object or boolean JSON Schema";
+// Diagnostics are corrective context, not an exhaustive validation report. A
+// bounded answer can fail many schema branches per item, multiplying into far
+// more text than the answer and even preventing the corrective child launch.
+const MAX_OUTPUT_VALIDATION_BYTES: usize = 1024;
+const OUTPUT_VALIDATION_TRUNCATED: &str = "PI_SUBAGENT_SCHEMA_DIAGNOSTICS_TRUNCATED: schema preview omitted remaining text; the complete required schema is in the system instructions.";
+
+/// Bound authored schemas before recursive serialization or compilation. The
+/// same admission serves one-shot definitions and retained worker contracts;
+/// workers keep their smaller wire-size limit.
+fn encode_output_schema(schema: &Value, limit: usize) -> std::result::Result<String, &'static str> {
+    if !schema.is_object() && !schema.is_boolean() {
+        return Err(OUTPUT_SCHEMA_LIMIT);
+    }
+    let mut remaining = 4096_usize;
+    let mut pending = vec![(schema, 0_usize)];
+    while let Some((value, depth)) = pending.pop() {
+        if depth > 32 || remaining == 0 {
+            return Err(OUTPUT_SCHEMA_LIMIT);
+        }
+        remaining -= 1;
+        match value {
+            Value::Array(values) => {
+                if values.len() > remaining.saturating_sub(pending.len()) {
+                    return Err(OUTPUT_SCHEMA_LIMIT);
+                }
+                pending.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            Value::Object(fields) => {
+                if fields.len() > remaining.saturating_sub(pending.len()) {
+                    return Err(OUTPUT_SCHEMA_LIMIT);
+                }
+                pending.extend(fields.values().map(|value| (value, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+
+    struct SchemaBytes {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+    impl std::io::Write for SchemaBytes {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+                return Err(std::io::Error::other(OUTPUT_SCHEMA_LIMIT));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = SchemaBytes {
+        bytes: Vec::new(),
+        limit,
+    };
+    serde_json::to_writer(&mut writer, schema).map_err(|_| OUTPUT_SCHEMA_LIMIT)?;
+    String::from_utf8(writer.bytes).map_err(|_| OUTPUT_SCHEMA_LIMIT)
+}
+
+struct NoExternalSchemaResources;
+
+impl jsonschema::Retrieve for NoExternalSchemaResources {
+    fn retrieve(
+        &self,
+        _uri: &jsonschema::Uri<String>,
+    ) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        Err(std::io::Error::other("external subagent schema retrieval is disabled").into())
+    }
+}
+
+/// Compile an `outputSchema`, surfacing bounds and draft/keyword errors as strings.
 fn compile_output_schema(schema: &Value) -> std::result::Result<jsonschema::Validator, String> {
-    jsonschema::validator_for(schema).map_err(|error| error.to_string())
+    encode_output_schema(schema, MAX_OUTPUT_SCHEMA_BYTES).map_err(str::to_string)?;
+    jsonschema::options()
+        .with_retriever(NoExternalSchemaResources)
+        .build(schema)
+        .map_err(|error| error.to_string())
 }
 
 /// Validate a child's final output against `schema` (bd-cv653.5.1).
@@ -1453,21 +1529,64 @@ fn compile_output_schema(schema: &Value) -> std::result::Result<jsonschema::Vali
 /// The output is located tolerantly before validation: the whole trimmed
 /// text, else the payload of a ```json fence, else the first balanced
 /// `{...}`/`[...]` region — models frequently wrap yields in prose despite
-/// the directive. Returns the parsed value on success, or the collected
-/// validation (or parse) errors.
+/// the directive. Returns the parsed value on success, or bounded validation
+/// (or parse) diagnostics. Invalid answers return bounded corrective
+/// context instead of enumerating failures: jsonschema's `iter_errors` builds
+/// every error eagerly, and even `validate` builds complete nested error trees
+/// for unsuccessful `anyOf`/`oneOf` branches. Only `is_valid` avoids that fan-out.
 fn validate_child_output(output: &str, schema: &Value) -> std::result::Result<Value, Vec<String>> {
     let validator = compile_output_schema(schema).map_err(|error| vec![error])?;
     let candidate = extract_json_candidate(output)
         .ok_or_else(|| vec!["child output contains no parseable JSON value".to_string()])?;
-    let errors: Vec<String> = validator
-        .iter_errors(&candidate)
-        .map(|error| format!("{}: {error}", error.instance_path()))
-        .collect();
-    if errors.is_empty() {
-        Ok(candidate)
-    } else {
-        Err(errors)
+    if validator.is_valid(&candidate) {
+        return Ok(candidate);
     }
+    // Preserve useful contract context without formatting rejected instances
+    // or allocating an exhaustive error tree. The child receives the complete
+    // schema separately, so a shortened preview never narrows its contract.
+    let (message, truncated) = bounded_schema_diagnostic(
+        format_args!(
+            "PI_SUBAGENT_SCHEMA_OUTPUT: child output does not satisfy outputSchema. Check required fields, value types and every other constraint before returning the complete corrected JSON. Required schema: {schema}"
+        ),
+        MAX_OUTPUT_VALIDATION_BYTES,
+    );
+    let mut errors = vec![message];
+    if truncated {
+        errors.push(OUTPUT_VALIDATION_TRUNCATED.to_string());
+    }
+    Err(errors)
+}
+
+/// Stop formatting at the byte budget instead of allocating the full schema's
+/// display text before shortening its diagnostic preview.
+fn bounded_schema_diagnostic(message: std::fmt::Arguments<'_>, limit: usize) -> (String, bool) {
+    struct Diagnostic {
+        text: String,
+        remaining: usize,
+    }
+
+    impl std::fmt::Write for Diagnostic {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            let mut end = self.remaining.min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.text.push_str(&text[..end]);
+            self.remaining -= end;
+            if end < text.len() {
+                Err(std::fmt::Error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let mut diagnostic = Diagnostic {
+        text: String::new(),
+        remaining: limit,
+    };
+    let truncated = std::fmt::write(&mut diagnostic, message).is_err();
+    (diagnostic.text, truncated)
 }
 
 /// Locate the JSON value in a child's final text output.
@@ -1526,13 +1645,32 @@ fn balanced_json_region(text: &str) -> Option<&str> {
     None
 }
 
-/// The corrective follow-up task for the single bounded retry. (`child_args`
-/// adds the `Task:` prefix, so this must not.)
-fn corrective_retry_task(original_task: &str, errors: &[String]) -> String {
-    format!(
-        "{original_task}\n\nYour previous output failed schema validation:\n{}\n\nReturn ONLY the corrected JSON value matching the required schema — no prose, no code fences.",
-        errors.join("\n")
-    )
+/// The corrective follow-up task for the single bounded retry. The stdin
+/// transport adds `Task:`. Bound every append before allocating the result.
+fn corrective_retry_task(
+    original_task: &str,
+    errors: &[String],
+    limit: usize,
+) -> std::result::Result<String, &'static str> {
+    let mut task = String::new();
+    push_chain_part(&mut task, original_task, limit)?;
+    push_chain_part(
+        &mut task,
+        "\n\nYour previous output failed schema validation:\n",
+        limit,
+    )?;
+    for (index, error) in errors.iter().enumerate() {
+        if index != 0 {
+            push_chain_part(&mut task, "\n", limit)?;
+        }
+        push_chain_part(&mut task, error, limit)?;
+    }
+    push_chain_part(
+        &mut task,
+        "\n\nReturn ONLY the corrected JSON value matching the required schema — no prose, no code fences.",
+        limit,
+    )?;
+    Ok(task)
 }
 
 fn child_depth() -> usize {
@@ -1911,7 +2049,7 @@ mod tests {
                     assert!(matches!(scout.source, AgentSource::BuiltIn));
                     "read,grep,find,ls"
                 };
-                let args = child_args(scout, "inspect", None, None, None, None);
+                let args = child_args(scout, None, None, None, None);
                 assert!(
                     args.windows(2)
                         .any(|pair| pair[0] == "--tools" && pair[1] == expected)
@@ -1923,7 +2061,7 @@ mod tests {
                 .discover(AgentScope::Both)
                 .expect("explicit host trust");
             assert!(matches!(agents["scout"].source, AgentSource::Project));
-            let args = child_args(&agents["scout"], "inspect", None, None, None, None);
+            let args = child_args(&agents["scout"], None, None, None, None);
             assert!(args.windows(2).any(|pair| {
                 pair[0] == "--tools" && pair[1] == "eval,github,security_scan,subagent"
             }));
@@ -2109,15 +2247,13 @@ mod tests {
         };
         let args_of =
             |agent: &AgentDefinition, spec: Option<&str>, parent: Option<&ToolModelSelection>| {
-                child_args(agent, "inspect provider", spec, parent, None, None)
-                    .iter()
-                    .map(|arg| arg.to_string_lossy().to_string())
-                    .collect::<Vec<_>>()
+                child_args(agent, spec, parent, None, None)
             };
-        let model_value = |args: &[String]| {
-            args.windows(2)
-                .find(|pair| pair[0] == "--model")
-                .map(|pair| pair[1].clone())
+        let model_value = |args: &[OsString]| {
+            args.windows(2).find_map(|pair| match pair {
+                [flag, value] if flag == "--model" => Some(value.to_string_lossy().into_owned()),
+                _ => None,
+            })
         };
 
         // No pin + role spec → role spec is used (task/smol resolution
@@ -2173,10 +2309,7 @@ mod tests {
             source: AgentSource::User,
             file_path: PathBuf::from("/tmp/scout.md"),
         };
-        let args = child_args(&agent, "inspect provider", None, None, None, None)
-            .iter()
-            .map(|arg| arg.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
+        let args = child_args(&agent, None, None, None, None);
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--model", "ai-router/gpt-5.6-sol"])
@@ -2198,26 +2331,16 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["--append-system-prompt", "be precise"])
         );
-        assert_eq!(
-            args.last().map(String::as_str),
-            Some("Task: inspect provider")
+        assert!(
+            args.iter()
+                .all(|arg| !arg.to_string_lossy().starts_with("Task: "))
         );
         let selected = model_selection::Selection {
             provider: "local".to_string(),
             model: "vendor/model:literal".to_string(),
             thinking: Some(crate::model::ThinkingLevel::Low),
         };
-        let args = child_args(
-            &agent,
-            "inspect provider",
-            Some("role/model"),
-            None,
-            Some(&selected),
-            None,
-        )
-        .iter()
-        .map(|arg| arg.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
+        let args = child_args(&agent, Some("role/model"), None, Some(&selected), None);
         assert!(args.windows(2).any(|pair| pair == ["--provider", "local"]));
         assert!(
             args.windows(2)
@@ -2246,7 +2369,7 @@ mod tests {
         agents.push(empty);
         for agent in agents {
             for args in [
-                child_args(&agent, "inspect", None, None, None, None),
+                child_args(&agent, None, None, None, None),
                 worker_args(&agent, None, None, None),
             ] {
                 let cli = crate::cli::Cli::try_parse_from(
@@ -2300,15 +2423,11 @@ mod tests {
     fn tan_definition_uses_task_role_and_default_non_recursive_tools() {
         let args = child_args(
             &tan_agent_definition(),
-            "update the changelog",
             Some("ai-router/gpt-5.6-terra"),
             None,
             None,
             None,
-        )
-        .iter()
-        .map(|arg| arg.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
+        );
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--model", "ai-router/gpt-5.6-terra"])
@@ -2324,9 +2443,9 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["--append-system-prompt", TAN_SYSTEM_PROMPT])
         );
-        assert_eq!(
-            args.last().map(String::as_str),
-            Some("Task: update the changelog")
+        assert!(
+            args.iter()
+                .all(|arg| !arg.to_string_lossy().starts_with("Task: "))
         );
     }
 
@@ -2429,7 +2548,7 @@ mod tests {
     }
 
     /// bd-cv653.5.1: JSON extraction tolerates prose/fence wrapping, and
-    /// validation reports keyword errors with instance paths.
+    /// invalid shapes retain their required contract in bounded diagnostics.
     #[test]
     fn output_schema_validation_matrix() {
         let schema = json!({
@@ -2468,6 +2587,100 @@ mod tests {
             no_json.expect_err("no json"),
             vec!["child output contains no parseable JSON value".to_string()]
         );
+    }
+
+    #[test]
+    fn output_schema_failures_do_not_amplify_instances_or_combinator_errors() {
+        let rejected = "rejected-value-".repeat(14);
+        let output = json!(vec![rejected.clone(); 1200]).to_string();
+        assert!(output.len() < MAX_CHILD_OUTPUT_BYTES);
+        let integer_array = json!({"type":"array", "items":{"type":"integer"}});
+        let boolean_array = json!({"type":"array", "items":{"type":"boolean"}});
+        for schema in [
+            json!({"type":"array", "items":{"allOf":vec![json!({"type":"integer"});64]}}),
+            json!({"anyOf":[integer_array, boolean_array]}),
+            json!({"oneOf":[integer_array, boolean_array]}),
+        ] {
+            // All inputs are admitted and bounded, but exhaustive diagnostics
+            // repeat each rejected value for every failing schema branch.
+            let errors = validate_child_output(&output, &schema).expect_err("invalid values");
+            assert!(errors.len() <= 2, "{errors:?}");
+            assert!(errors[0].contains("PI_SUBAGENT_SCHEMA_OUTPUT"));
+            assert!(errors[0].len() <= MAX_OUTPUT_VALIDATION_BYTES);
+            assert!(
+                errors.iter().map(String::len).sum::<usize>()
+                    <= MAX_OUTPUT_VALIDATION_BYTES + OUTPUT_VALIDATION_TRUNCATED.len()
+            );
+            assert!(errors.iter().all(|message| !message.contains(&rejected)));
+            if errors.len() == 2 {
+                assert_eq!(errors[1], OUTPUT_VALIDATION_TRUNCATED);
+            }
+            // Bounding failure diagnostics cannot change the accepted data or
+            // accidentally accept a later invalid element after valid ones.
+            assert_eq!(
+                validate_child_output("[7,8]", &schema).unwrap(),
+                json!([7, 8])
+            );
+            assert!(validate_child_output(r#"[7,8,"invalid tail"]"#, &schema).is_err());
+        }
+    }
+
+    #[test]
+    fn schema_diagnostic_formatting_stops_at_utf8_budget_without_finishing_display() {
+        struct Repeated<'a>(&'a std::cell::Cell<usize>);
+
+        impl std::fmt::Display for Repeated<'_> {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                for _ in 0..100_000 {
+                    self.0.set(self.0.get() + 1);
+                    formatter.write_str("雪")?;
+                }
+                Ok(())
+            }
+        }
+
+        let writes = std::cell::Cell::new(0);
+        let (text, truncated) =
+            bounded_schema_diagnostic(format_args!("{}", Repeated(&writes)), 16);
+        assert_eq!(text, "雪".repeat(5));
+        assert!(truncated);
+        assert_eq!(writes.get(), 6, "the formatter must stop producing text");
+        assert_eq!(
+            bounded_schema_diagnostic(format_args!("雪雪"), 6),
+            ("雪雪".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn output_schema_admission_bounds_bytes_nodes_depth_and_external_resources() {
+        let padding = MAX_OUTPUT_SCHEMA_BYTES - r#"{"description":""}"#.len();
+        let boundary = json!({"description":"x".repeat(padding)});
+        assert_eq!(
+            encode_output_schema(&boundary, MAX_OUTPUT_SCHEMA_BYTES)
+                .expect("schema at exact byte limit")
+                .len(),
+            MAX_OUTPUT_SCHEMA_BYTES
+        );
+        compile_output_schema(&boundary).expect("bounded annotation is a valid schema");
+        for schema in [
+            json!({"description":"x".repeat(padding + 1)}),
+            json!({"enum":vec![Value::Null; 4096]}),
+            (0..33).fold(json!(true), |value, _| json!({"annotation":value})),
+            json!([]),
+        ] {
+            let error = compile_output_schema(&schema).expect_err("schema must be refused");
+            assert!(error.contains("PI_SUBAGENT_SCHEMA_LIMIT"), "{error}");
+        }
+        let local = json!({"$defs":{"answer":{"type":"integer"}}, "$ref":"#/$defs/answer"});
+        let validator = compile_output_schema(&local).expect("local schema references work");
+        assert!(validator.is_valid(&json!(7)));
+        assert!(!validator.is_valid(&json!("seven")));
+        for reference in [
+            "file:///never-read-schema.json",
+            "https://schema.invalid/schema.json",
+        ] {
+            assert!(compile_output_schema(&json!({"$ref":reference})).is_err());
+        }
     }
 
     /// bd-cv653.5.1: an agent definition may carry a single-line JSON

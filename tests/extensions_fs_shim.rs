@@ -114,6 +114,200 @@ fn fs_stat_object_shape() {
     });
 }
 
+#[test]
+fn fs_virtual_metadata_tracks_same_tick_writes_and_entry_identity() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock_and_config(
+            Arc::new(DeterministicClock::new(1_700_000_000_000)),
+            default_config(),
+        )
+        .await
+        .expect("create runtime");
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(fs => {
+                    fs.mkdirSync('/metadata');
+                    const parentBefore = fs.statSync('/metadata');
+                    fs.writeFileSync('/metadata/status', 'ready');
+                    const first = fs.statSync('/metadata/status');
+                    const parentCreated = fs.statSync('/metadata');
+                    fs.writeFileSync('/metadata/status', 'other');
+                    const second = fs.statSync('/metadata/status');
+                    const parentWritten = fs.statSync('/metadata');
+                    const fd = fs.openSync('/metadata/status', 'r+');
+                    fs.writeSync(fd, 'again', 0);
+                    const written = fs.fstatSync(fd);
+                    fs.ftruncateSync(fd, 2);
+                    const truncated = fs.fstatSync(fd);
+                    fs.closeSync(fd);
+                    fs.symlinkSync('/metadata/status', '/metadata/alias');
+                    const alias = fs.lstatSync('/metadata/alias');
+                    const followed = fs.statSync('/metadata/alias');
+                    fs.renameSync('/metadata/status', '/metadata/renamed');
+                    const renamed = fs.statSync('/metadata/renamed');
+                    fs.renameSync('/metadata/renamed', '/metadata/renamed');
+                    const samePath = fs.statSync('/metadata/renamed');
+                    fs.unlinkSync('/metadata/renamed');
+                    fs.writeFileSync('/metadata/renamed', 'new');
+                    const recreated = fs.statSync('/metadata/renamed');
+                    globalThis.metadataChecks = {
+                        created: first.mtimeMs > 0 && first.ino > 0,
+                        sameSizeWrite: second.size === first.size && second.mtimeMs > first.mtimeMs,
+                        writePreservesIdentity: second.ino === first.ino && second.birthtimeMs === first.birthtimeMs,
+                        writePreservesAccess: second.atimeMs === first.atimeMs,
+                        descriptorWrite: written.mtimeMs > second.mtimeMs && written.ino === first.ino,
+                        descriptorTruncate: truncated.size === 2 && truncated.mtimeMs > written.mtimeMs,
+                        parentCreation: parentCreated.mtimeMs > parentBefore.mtimeMs,
+                        parentContentUnchanged: parentWritten.mtimeMs === parentCreated.mtimeMs,
+                        linkIdentity: alias.isSymbolicLink() && alias.ino !== followed.ino && followed.ino === first.ino,
+                        renameIdentity: renamed.ino === first.ino && renamed.birthtimeMs === first.birthtimeMs,
+                        renameTimes: renamed.mtimeMs === truncated.mtimeMs && renamed.ctimeMs > truncated.ctimeMs,
+                        samePathRename: samePath.ino === renamed.ino && samePath.ctimeMs === renamed.ctimeMs,
+                        recreateIdentity: recreated.ino !== renamed.ino && recreated.birthtimeMs > renamed.birthtimeMs,
+                        datesMatch: [first, second, written, truncated, alias, followed, renamed, recreated].every(s =>
+                            ['atime', 'mtime', 'ctime', 'birthtime'].every(name => s[name].getTime() === Math.trunc(s[name + 'Ms']))),
+                    };
+                });
+                "#,
+            )
+            .await
+            .expect("exercise virtual metadata");
+        runtime.drain_microtasks().await.expect("drain");
+        let checks = runtime.read_global_json("metadataChecks").await.unwrap();
+        for (name, passed) in checks.as_object().expect("metadata checks") {
+            assert_eq!(passed, &serde_json::Value::Bool(true), "{name}: {checks}");
+        }
+    });
+}
+
+#[test]
+fn fs_virtual_utimes_updates_metadata_and_rejects_invalid_times_atomically() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock_and_config(
+            Arc::new(DeterministicClock::new(1_700_000_000_000)),
+            default_config(),
+        )
+        .await
+        .expect("create runtime");
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(async fs => {
+                    fs.writeFileSync('/timestamps', 'value');
+                    const initial = fs.statSync('/timestamps');
+                    fs.utimesSync('/timestamps', 1.25, new Date(3500));
+                    const byPath = fs.statSync('/timestamps');
+                    const handle = await fs.promises.open('/timestamps', 'r+');
+                    await handle.utimes('4.125', new Date(5500));
+                    const byHandle = await handle.stat();
+                    await handle.close();
+                    const rejected = [];
+                    for (const value of [NaN, Infinity, -Infinity, new Date('invalid'), null, {}, '']) {
+                        try { fs.utimesSync('/timestamps', 6, value); rejected.push(false); }
+                        catch (_) { rejected.push(true); }
+                    }
+                    const afterRejected = fs.statSync('/timestamps');
+                    await fs.promises.utimes('/timestamps', new Date(7000), '8.5');
+                    const promised = fs.statSync('/timestamps');
+                    globalThis.timeChecks = {
+                        pathTimes: byPath.atimeMs === 1250 && byPath.mtimeMs === 3500,
+                        handleTimes: byHandle.atimeMs === 4125 && byHandle.mtimeMs === 5500,
+                        invalidRejected: rejected.length === 7 && rejected.every(Boolean),
+                        invalidAtomic: afterRejected.atimeMs === byHandle.atimeMs && afterRejected.mtimeMs === byHandle.mtimeMs
+                            && afterRejected.ctimeMs === byHandle.ctimeMs,
+                        promisedTimes: promised.atimeMs === 7000 && promised.mtimeMs === 8500,
+                        identity: promised.ino === initial.ino && promised.birthtimeMs === initial.birthtimeMs,
+                        changeTime: promised.ctimeMs > byHandle.ctimeMs,
+                    };
+                });
+                "#,
+            )
+            .await
+            .expect("exercise virtual timestamp updates");
+        runtime.drain_microtasks().await.expect("drain");
+        let checks = runtime.read_global_json("timeChecks").await.unwrap();
+        for (name, passed) in checks.as_object().expect("timestamp checks") {
+            assert_eq!(passed, &serde_json::Value::Bool(true), "{name}: {checks}");
+        }
+    });
+}
+
+#[test]
+fn fs_virtual_metadata_is_retired_by_runtime_scrub() {
+    futures::executor::block_on(async {
+        let clock = Arc::new(DeterministicClock::new(1_700_000_000_000));
+        let runtime = PiJsRuntime::with_clock_and_config(clock.clone(), default_config())
+            .await
+            .expect("create runtime");
+        let create = r#"
+            import('node:fs').then(fs => {
+                fs.writeFileSync('/reset-metadata', 'new');
+                const stat = fs.statSync('/reset-metadata');
+                globalThis.metadataIdentity = { ino: stat.ino, birthtime: stat.birthtimeMs };
+            });
+        "#;
+        runtime.eval(create).await.expect("create virtual file");
+        runtime.drain_microtasks().await.expect("drain");
+        let before = runtime.read_global_json("metadataIdentity").await.unwrap();
+        let report = runtime.scrub_for_cold_drop().await.expect("scrub runtime");
+        assert!(report.inventoried_state_cleared, "{report:?}");
+        assert_eq!(report.residual_entries_after, 0);
+        clock.advance(100);
+        runtime.eval(create).await.expect("recreate virtual file");
+        runtime.drain_microtasks().await.expect("drain");
+        let after = runtime.read_global_json("metadataIdentity").await.unwrap();
+        assert_ne!(before["ino"], after["ino"]);
+        assert_ne!(before["birthtime"], after["birthtime"]);
+    });
+}
+
+#[test]
+fn fs_utimes_rejects_unimplemented_host_mutations_without_changing_the_file() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("host-timestamps");
+        std::fs::write(&path, "host").expect("write host fixture");
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let runtime = PiJsRuntime::with_clock_and_config(
+            Arc::new(DeterministicClock::new(0)),
+            PiJsRuntimeConfig {
+                cwd: temp.path().display().to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create runtime");
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(fs => {
+                    try {
+                        fs.utimesSync(process.cwd() + '/host-timestamps', 1, 2);
+                        globalThis.hostTimestampResult = 'unexpected success';
+                    } catch (error) {
+                        globalThis.hostTimestampResult = error.code;
+                    }
+                });
+                "#,
+            )
+            .await
+            .expect("attempt host timestamp mutation");
+        runtime.drain_microtasks().await.expect("drain");
+        assert_eq!(
+            runtime
+                .read_global_json("hostTimestampResult")
+                .await
+                .unwrap(),
+            "ERR_PI_SHIM_UNSUPPORTED_OPERATION"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+    });
+}
+
 // ---------------------------------------------------------------------------
 // readdir + withFileTypes
 // ---------------------------------------------------------------------------
@@ -1082,70 +1276,519 @@ fn fs_stream_facades() {
 }
 
 // ---------------------------------------------------------------------------
-// watch / watchFile stubs
+// Bounded stat polling
 // ---------------------------------------------------------------------------
 
+async fn poll_files(
+    runtime: &PiJsRuntime<Arc<DeterministicClock>>,
+    clock: &Arc<DeterministicClock>,
+    time: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    clock.set(time);
+    for _ in 0..256 {
+        if !runtime.tick().await?.ran_macrotask {
+            return Ok(());
+        }
+    }
+    Err(format!("file polling did not settle after 256 ticks at {time} ms").into())
+}
+
 #[test]
-fn fs_watch_stubs() {
+fn fs_watch_file_tracks_same_size_virtual_edits_and_protects_previous_stats() {
+    futures::executor::block_on(async {
+        let clock = Arc::new(DeterministicClock::new(0));
+        let runtime = PiJsRuntime::with_clock_and_config(clock.clone(), default_config())
+            .await
+            .expect("create runtime");
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(fs => {
+                    globalThis.watchedFs = fs;
+                    globalThis.watchChanges = [];
+                    globalThis.watchOnce = globalThis.watchClosed = globalThis.watchStopped = 0;
+                    fs.writeFileSync('/watched', 'first');
+                    globalThis.watcher = fs.watchFile('/watched', { persistent: false }, function(current, previous) {
+                        watchChanges.push({ size: current.size, previousSize: previous.size,
+                            changed: current.mtimeMs > previous.mtimeMs, receiver: this === watcher });
+                        current.size = -99;
+                        current.mtimeMs = -99;
+                        current.mtime.setTime(-99);
+                        fs.readFileSync('/watched', 'utf8');
+                    });
+                    globalThis.watchHandles = {
+                        unreferenced: !watcher.hasRef(), ref: watcher.ref() === watcher && watcher.hasRef(),
+                        unref: watcher.unref() === watcher && !watcher.hasRef(),
+                        private: Object.getPrototypeOf(watcher) === null && Object.isFrozen(watcher),
+                    };
+                    watcher.once('change', () => watchOnce++);
+                    watcher.on('stop', () => watchStopped++).on('close', () => watchClosed++);
+                    fs.writeFileSync('/watched', 'other');
+                });
+                "#,
+            )
+            .await
+            .expect("register polling watcher");
+        poll_files(&runtime, &clock, 5006)
+            .await
+            .expect("file polls settle");
+        assert_eq!(
+            runtime.read_global_json("watchChanges").await.unwrap(),
+            serde_json::json!([])
+        );
+        poll_files(&runtime, &clock, 5007)
+            .await
+            .expect("file polls settle");
+        runtime
+            .eval("watchedFs.writeFileSync('/watched', 'third');")
+            .await
+            .unwrap();
+        poll_files(&runtime, &clock, 10014)
+            .await
+            .expect("file polls settle");
+        poll_files(&runtime, &clock, 15021)
+            .await
+            .expect("file polls settle");
+        assert_eq!(
+            runtime.read_global_json("watchChanges").await.unwrap(),
+            serde_json::json!([
+                {"size":5, "previousSize":5, "changed":true, "receiver":true},
+                {"size":5, "previousSize":5, "changed":true, "receiver":true},
+            ])
+        );
+        assert_eq!(runtime.read_global_json("watchOnce").await.unwrap(), 1);
+        assert_eq!(
+            runtime.read_global_json("watchHandles").await.unwrap(),
+            serde_json::json!({
+                "unreferenced":true, "ref":true, "unref":true, "private":true,
+            })
+        );
+        runtime
+            .eval("watcher.stop().close(); watchedFs.writeFileSync('/watched', 'later');")
+            .await
+            .unwrap();
+        poll_files(&runtime, &clock, 20028)
+            .await
+            .expect("file polls settle");
+        assert_eq!(runtime.read_global_json("watchClosed").await.unwrap(), 1);
+        assert_eq!(runtime.read_global_json("watchStopped").await.unwrap(), 1);
+        assert!(!runtime.has_pending());
+    });
+}
+
+#[test]
+fn fs_watch_file_tracks_namespace_replacement_and_ignores_detached_writes() {
+    futures::executor::block_on(async {
+        let clock = Arc::new(DeterministicClock::new(0));
+        let runtime = PiJsRuntime::with_clock_and_config(clock.clone(), default_config())
+            .await
+            .expect("create runtime");
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(fs => {
+                    globalThis.watchedFs = fs;
+                    globalThis.replacementChanges = [];
+                    fs.writeFileSync('/source-file', 'new');
+                    fs.writeFileSync('/watched-file', 'old');
+                    globalThis.detachedFd = fs.openSync('/watched-file', 'r+');
+                    fs.watchFile('/watched-file', { interval: 10 }, (current, previous) => {
+                        replacementChanges.push({ size: current.size,
+                            changedIdentity: current.ino !== previous.ino });
+                    });
+                    fs.renameSync('/source-file', '/watched-file');
+                });
+                "#,
+            )
+            .await
+            .expect("watch replaced namespace entry");
+        poll_files(&runtime, &clock, 10).await.unwrap();
+        runtime
+            .eval("watchedFs.writeSync(detachedFd, 'detached data', 0);")
+            .await
+            .unwrap();
+        poll_files(&runtime, &clock, 20).await.unwrap();
+        runtime
+            .eval("watchedFs.writeFileSync('/watched-file', 'new data');")
+            .await
+            .unwrap();
+        poll_files(&runtime, &clock, 30).await.unwrap();
+        assert_eq!(
+            runtime
+                .read_global_json("replacementChanges")
+                .await
+                .unwrap(),
+            serde_json::json!([
+                { "size": 3, "changedIdentity": true },
+                { "size": 8, "changedIdentity": false },
+            ])
+        );
+        runtime
+            .eval("watchedFs.closeSync(detachedFd); watchedFs.unwatchFile('/watched-file');")
+            .await
+            .unwrap();
+        assert!(!runtime.has_pending());
+    });
+}
+
+#[test]
+fn fs_watch_file_reports_missing_once_and_retains_predeletion_metadata() {
+    futures::executor::block_on(async {
+        let clock = Arc::new(DeterministicClock::new(0));
+        let runtime = PiJsRuntime::with_clock_and_config(clock.clone(), default_config())
+            .await
+            .expect("create runtime");
+        runtime.eval(r#"
+            import('node:fs').then(fs => {
+                globalThis.watchedFs = fs;
+                globalThis.missingChanges = [];
+                fs.watchFile('/lifecycle', { interval: 10 }, (current, previous) => {
+                    missingChanges.push({ size: current.size, previousSize: previous.size,
+                        previousTime: previous.mtimeMs, missing: !current.isFile(),
+                        epoch: current.mtime.getTime() === 0 && current.atime.getTime() === 0
+                            && current.ctime.getTime() === 0 && current.birthtime.getTime() === 0 });
+                });
+            });
+        "#).await.unwrap();
+        poll_files(&runtime, &clock, 10)
+            .await
+            .expect("file polls settle");
+        poll_files(&runtime, &clock, 20)
+            .await
+            .expect("file polls settle");
+        runtime
+            .eval("watchedFs.writeFileSync('/lifecycle', 'one');")
+            .await
+            .unwrap();
+        poll_files(&runtime, &clock, 30)
+            .await
+            .expect("file polls settle");
+        runtime
+            .eval("watchedFs.unlinkSync('/lifecycle');")
+            .await
+            .unwrap();
+        poll_files(&runtime, &clock, 40)
+            .await
+            .expect("file polls settle");
+        poll_files(&runtime, &clock, 50)
+            .await
+            .expect("file polls settle");
+        runtime
+            .eval("watchedFs.writeFileSync('/lifecycle', 'two');")
+            .await
+            .unwrap();
+        poll_files(&runtime, &clock, 60)
+            .await
+            .expect("file polls settle");
+        let changes = runtime.read_global_json("missingChanges").await.unwrap();
+        let changes = changes.as_array().unwrap();
+        assert_eq!(changes.len(), 4);
+        assert_eq!(
+            changes[0],
+            serde_json::json!({
+                "size":0, "previousSize":0, "previousTime":0, "missing":true, "epoch":true,
+            })
+        );
+        assert_eq!(changes[1]["size"], 3);
+        assert_eq!(changes[1]["previousSize"], 0);
+        assert_eq!(changes[2]["size"], 0);
+        assert_eq!(changes[2]["previousSize"], 3);
+        assert_eq!(changes[2]["epoch"], true);
+        assert_eq!(changes[3]["size"], 3);
+        assert_eq!(changes[3]["previousSize"], 3);
+        assert_eq!(changes[3]["previousTime"], changes[2]["previousTime"]);
+        runtime
+            .eval("watchedFs.unwatchFile('/lifecycle');")
+            .await
+            .unwrap();
+        assert!(!runtime.has_pending());
+    });
+}
+
+#[test]
+fn fs_unwatch_file_removes_only_the_requested_listener_before_further_dispatch() {
+    futures::executor::block_on(async {
+        let clock = Arc::new(DeterministicClock::new(0));
+        let runtime = PiJsRuntime::with_clock_and_config(clock.clone(), default_config())
+            .await
+            .expect("create runtime");
+        runtime.eval(r#"
+            import('node:fs').then(fs => {
+                globalThis.watchedFs = fs;
+                globalThis.selectiveChanges = [];
+                fs.writeFileSync('/test/shared', 'a');
+                globalThis.secondListener = () => selectiveChanges.push('second');
+                const lastListener = () => selectiveChanges.push('removed');
+                let added = false;
+                globalThis.firstListener = () => {
+                    selectiveChanges.push('first');
+                    fs.unwatchFile('/test/shared', lastListener);
+                    if (!added) { added = true; first.on('change', () => selectiveChanges.push('added')); }
+                };
+                const first = fs.watchFile('shared', { interval: 10 }, firstListener);
+                const second = fs.watchFile('/test/shared', { interval: 10 }, secondListener);
+                first.on('change', lastListener);
+                globalThis.sameWatcher = first === second;
+                fs.unwatchFile('/never-watched');
+                globalThis.originalCwd = process.cwd;
+                process.cwd = () => '/moved-after-registration';
+                fs.writeFileSync('/test/shared', 'b');
+            });
+        "#).await.unwrap();
+        poll_files(&runtime, &clock, 10)
+            .await
+            .expect("file polls settle");
+        runtime
+            .eval("watchedFs.writeFileSync('/test/shared', 'c');")
+            .await
+            .unwrap();
+        poll_files(&runtime, &clock, 20)
+            .await
+            .expect("file polls settle");
+        runtime.eval("watchedFs.unwatchFile('/test/shared', secondListener); watchedFs.writeFileSync('/test/shared', 'd');").await.unwrap();
+        poll_files(&runtime, &clock, 30)
+            .await
+            .expect("file polls settle");
+        assert_eq!(runtime.read_global_json("sameWatcher").await.unwrap(), true);
+        assert_eq!(
+            runtime.read_global_json("selectiveChanges").await.unwrap(),
+            serde_json::json!([
+                "first", "second", "first", "second", "added", "first", "added"
+            ])
+        );
+        runtime
+            .eval("watchedFs.unwatchFile('/test/shared'); process.cwd = originalCwd;")
+            .await
+            .unwrap();
+        assert!(!runtime.has_pending());
+    });
+}
+
+#[test]
+fn fs_watch_file_retires_a_throwing_last_once_listener() {
+    futures::executor::block_on(async {
+        let clock = Arc::new(DeterministicClock::new(0));
+        let runtime = PiJsRuntime::with_clock_and_config(clock.clone(), default_config())
+            .await
+            .expect("create runtime");
+        runtime.eval(r#"
+            import('node:fs').then(fs => {
+                const initial = () => {};
+                const watcher = fs.watchFile('/missing-once', { interval: 10 }, initial);
+                globalThis.throwingOnceCalls = 0;
+                watcher.once('change', () => { throwingOnceCalls++; throw new Error('intentional once failure'); });
+                watcher.removeListener('change', initial);
+            });
+        "#).await.unwrap();
+        poll_files(&runtime, &clock, 10)
+            .await
+            .expect("file polls settle");
+        poll_files(&runtime, &clock, 20)
+            .await
+            .expect("file polls settle");
+        assert_eq!(
+            runtime.read_global_json("throwingOnceCalls").await.unwrap(),
+            1
+        );
+        runtime
+            .eval("globalThis.afterOnce = __pi_vfs_api.counts().watchers;")
+            .await
+            .unwrap();
+        assert_eq!(runtime.read_global_json("afterOnce").await.unwrap(), 0);
+        assert!(!runtime.has_pending());
+    });
+}
+
+#[test]
+fn fs_watch_file_preserves_raw_protected_storage_admission() {
+    futures::executor::block_on(async {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let storage = root.path().join("storage");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&storage).unwrap();
+        std::fs::write(storage.join("settings.json"), "{}").unwrap();
+        let runtime = persistent_storage_runtime(&workspace, &storage, Default::default()).await;
+        let path = serde_json::to_string(&storage.display().to_string()).unwrap();
+        runtime
+            .eval(&format!(
+                r#"
+            import('node:fs').then(fs => {{
+                globalThis.rawWatchDenied = false;
+                try {{ fs.watchFile({path} + '/nested/../settings.json', () => {{}}); }}
+                catch (_) {{ globalThis.rawWatchDenied = true; }}
+                fs.watchFile({path} + '/settings.json', () => {{}}).close();
+                globalThis.rawWatchCount = __pi_vfs_api.counts().watchers;
+            }});
+        "#
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.read_global_json("rawWatchDenied").await.unwrap(),
+            true
+        );
+        assert_eq!(runtime.read_global_json("rawWatchCount").await.unwrap(), 0);
+        assert!(!runtime.has_pending());
+    });
+}
+
+#[test]
+fn fs_watch_file_reads_real_host_metadata_on_each_poll() {
+    futures::executor::block_on(async {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("watched.txt");
+        std::fs::write(&file, "first").unwrap();
+        let before = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(before))
+            .unwrap();
+        let clock = Arc::new(DeterministicClock::new(0));
+        let runtime = PiJsRuntime::with_clock_and_config(
+            clock.clone(),
+            PiJsRuntimeConfig {
+                cwd: root.path().display().to_string(),
+                ..default_config()
+            },
+        )
+        .await
+        .unwrap();
+        let path = serde_json::to_string(&file.display().to_string()).unwrap();
+        runtime
+            .eval(&format!(
+                r#"
+            import('node:fs').then(fs => {{
+                globalThis.watchedFs = fs;
+                globalThis.hostChanges = [];
+                fs.watchFile({path}, {{ interval: 10 }}, (current, previous) => {{
+                    hostChanges.push({{ size: current.size, previousSize: previous.size,
+                        current: current.mtimeMs, previous: previous.mtimeMs }});
+                }});
+            }});
+        "#
+            ))
+            .await
+            .unwrap();
+        std::fs::write(&file, "other").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(before + std::time::Duration::from_secs(60)),
+            )
+            .unwrap();
+        poll_files(&runtime, &clock, 10)
+            .await
+            .expect("file polls settle");
+        let changes = runtime.read_global_json("hostChanges").await.unwrap();
+        assert_eq!(
+            changes,
+            serde_json::json!([{
+                "size":5, "previousSize":5, "current":1_600_000_060_000_u64, "previous":1_600_000_000_000_u64,
+            }])
+        );
+        runtime
+            .eval(&format!("watchedFs.unwatchFile({path});"))
+            .await
+            .unwrap();
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_watch_file_stops_on_revoked_read_admission_even_if_error_listener_throws() {
+    futures::executor::block_on(async {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let file = workspace.join("watched.txt");
+        let secret = root.path().join("outside.txt");
+        std::fs::write(&file, "first").unwrap();
+        std::fs::write(&secret, "not authorized").unwrap();
+        let clock = Arc::new(DeterministicClock::new(0));
+        let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+            clock.clone(),
+            PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..default_config()
+            },
+            None,
+            "watch.owner".to_string(),
+        )
+        .await
+        .unwrap();
+        runtime.add_extension_root_with_id(workspace, Some("watch.owner"));
+        let path = serde_json::to_string(&file.display().to_string()).unwrap();
+        runtime.eval(&format!(r#"
+            import('node:fs').then(fs => {{
+                globalThis.deniedChanges = 0; globalThis.deniedErrors = [];
+                globalThis.deniedWatcher = fs.watchFile({path}, {{ interval: 10 }}, () => deniedChanges++);
+                deniedWatcher.on('error', error => {{
+                    deniedErrors.push({{ missing: error.code === 'ENOENT', denied: String(error).includes('denied') }});
+                    throw new Error('intentional error-listener failure');
+                }});
+            }});
+        "#)).await.unwrap();
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&secret, &file).unwrap();
+        poll_files(&runtime, &clock, 10)
+            .await
+            .expect("file polls settle");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(&file, "restored").unwrap();
+        poll_files(&runtime, &clock, 20)
+            .await
+            .expect("file polls settle");
+        assert_eq!(runtime.read_global_json("deniedChanges").await.unwrap(), 0);
+        assert_eq!(
+            runtime.read_global_json("deniedErrors").await.unwrap(),
+            serde_json::json!([{"missing":false, "denied":true}])
+        );
+        assert!(!runtime.has_pending());
+    });
+}
+
+#[test]
+fn fs_watch_file_validates_options_and_bounds_watchers_and_listeners() {
     futures::executor::block_on(async {
         let runtime = PiJsRuntime::with_clock_and_config(
             Arc::new(DeterministicClock::new(0)),
             default_config(),
         )
         .await
-        .expect("create runtime");
-
-        runtime
-            .eval(
-                r#"
-                import('node:fs').then((fs) => {
-                    fs.writeFileSync('/test', 'data');
-                    const w = fs.watch('/test');
-                    globalThis.hasClose = typeof w.close === 'function';
-                    globalThis.hasUnref = typeof w.unref === 'function';
-
-                    const wf = fs.watchFile('/test', () => {});
-                    globalThis.wfHasClose = typeof wf.close === 'function';
-
-                    try {
-                        fs.watch('/missing');
-                        globalThis.watchMissing = 'no_error';
-                    } catch (e) {
-                        globalThis.watchMissing = String(e.message).includes('ENOENT');
-                    }
-
-                    try {
-                        fs.watchFile('/missing', () => {});
-                        globalThis.watchFileMissing = 'no_error';
-                    } catch (e) {
-                        globalThis.watchFileMissing = String(e.message).includes('ENOENT');
-                    }
-
-                    // unwatchFile should not throw
-                    fs.unwatchFile('/test');
-                    globalThis.unwatchOk = true;
-                });
-                "#,
-            )
-            .await
-            .expect("eval");
-
-        runtime.drain_microtasks().await.expect("drain");
-
-        let close: serde_json::Value = runtime.read_global_json("hasClose").await.unwrap();
-        assert_eq!(close, true);
-        let unref: serde_json::Value = runtime.read_global_json("hasUnref").await.unwrap();
-        assert_eq!(unref, true);
-        let wf_close: serde_json::Value = runtime.read_global_json("wfHasClose").await.unwrap();
-        assert_eq!(wf_close, true);
-        let watch_missing: serde_json::Value =
-            runtime.read_global_json("watchMissing").await.unwrap();
-        assert_eq!(watch_missing, true);
-        let watch_file_missing: serde_json::Value =
-            runtime.read_global_json("watchFileMissing").await.unwrap();
-        assert_eq!(watch_file_missing, true);
-        let unwatch: serde_json::Value = runtime.read_global_json("unwatchOk").await.unwrap();
-        assert_eq!(unwatch, true);
+        .unwrap();
+        runtime.eval(r#"
+            import('node:fs').then(fs => {
+                const refused = action => { try { action(); return false; } catch (_) { return true; } };
+                const invalid = [0, -1, 1.5, NaN, Infinity, 2147483648, null, '10'];
+                globalThis.watchValidation = {
+                    interval: invalid.every(interval => refused(() => fs.watchFile('/options', { interval }, () => {}))),
+                    persistent: refused(() => fs.watchFile('/options', { persistent: 'yes' }, () => {})),
+                    bigint: refused(() => fs.watchFile('/options', { bigint: true }, () => {})),
+                    options: refused(() => fs.watchFile('/options', null, () => {})),
+                    listener: refused(() => fs.watchFile('/options', {})),
+                    unwatchListener: refused(() => fs.unwatchFile('/options', false)),
+                };
+                try { fs.watch('/options'); } catch (error) { watchValidation.native = error.code === 'ERR_FEATURE_UNAVAILABLE'; }
+                const watcher = fs.watchFile('/bounded-0', () => {});
+                for (let index = 1; index < 32; index++) watcher.on('change', () => {});
+                watchValidation.listenerLimit = refused(() => watcher.on('change', () => {}));
+                for (let index = 1; index < 128; index++) fs.watchFile('/bounded-' + index, () => {});
+                watchValidation.watcherLimit = refused(() => fs.watchFile('/overflow', () => {}));
+                for (let index = 0; index < 128; index++) fs.unwatchFile('/bounded-' + index);
+                watchValidation.cleared = __pi_vfs_api.counts().watchers === 0;
+            });
+        "#).await.unwrap();
+        let checks = runtime.read_global_json("watchValidation").await.unwrap();
+        assert_eq!(checks.as_object().unwrap().len(), 10);
+        for (name, check) in checks.as_object().unwrap() {
+            assert_eq!(check, &serde_json::Value::Bool(true), "{name}: {checks}");
+        }
+        assert!(!runtime.has_pending());
     });
 }
 
@@ -1227,6 +1870,212 @@ fn fs_fd_stubs() {
     });
 }
 
+#[test]
+fn fs_descriptors_retain_file_identity_across_rename_unlink_and_replacement() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock_and_config(
+            Arc::new(DeterministicClock::new(1_700_000_000_000)),
+            default_config(),
+        )
+        .await
+        .expect("create runtime");
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(async fs => {
+                    const read = fd => {
+                        const bytes = Buffer.alloc(fs.fstatSync(fd).size);
+                        const count = fs.readSync(fd, bytes, 0, bytes.length, 0);
+                        return bytes.subarray(0, count).toString('utf8');
+                    };
+                    fs.writeFileSync('/descriptors/source', 'abcdef');
+                    fs.writeFileSync('/descriptors/destination', 'replaced');
+                    const fd = fs.openSync('/descriptors/source', 'r+');
+                    const peer = await fs.promises.open('/descriptors/source', 'r+');
+                    const displaced = fs.openSync('/descriptors/destination', 'r+');
+                    const original = fs.fstatSync(fd);
+                    const oldDestination = fs.fstatSync(displaced);
+                    fs.renameSync('/descriptors/source', '/descriptors/destination');
+                    const moved = {
+                        sourceAbsent: !fs.existsSync('/descriptors/source'),
+                        data: read(fd), peer: read(peer.fd),
+                        sameInode: fs.fstatSync(fd).ino === original.ino
+                            && fs.statSync('/descriptors/destination').ino === original.ino,
+                        displacedData: read(displaced), displacedLinks: fs.fstatSync(displaced).nlink,
+                    };
+                    fs.writeSync(fd, 'XY', 0);
+                    fs.writeSync(displaced, 'ZZ', 0);
+                    fs.futimesSync(displaced, 1, 2);
+                    const written = {
+                        data: fs.readFileSync('/descriptors/destination', 'utf8'),
+                        peer: read(peer.fd), displaced: read(displaced),
+                        isolatedTimes: fs.fstatSync(displaced).mtimeMs === 2000
+                            && fs.statSync('/descriptors/destination').mtimeMs !== 2000,
+                    };
+                    fs.unlinkSync('/descriptors/destination');
+                    fs.writeSync(fd, '!', 6);
+                    const unlinked = {
+                        absent: !fs.existsSync('/descriptors/destination'),
+                        data: read(peer.fd), links: fs.fstatSync(fd).nlink,
+                    };
+                    fs.writeFileSync('/descriptors/destination', 'replacement');
+                    await peer.truncate(3);
+                    await peer.utimes(3, 4);
+                    const detached = {
+                        data: read(fd), size: (await peer.stat()).size,
+                        timestamp: fs.fstatSync(fd).mtimeMs,
+                        newData: fs.readFileSync('/descriptors/destination', 'utf8'),
+                        distinctInode: fs.statSync('/descriptors/destination').ino !== original.ino,
+                        originalSnapshotSize: original.size, oldDestinationSize: oldDestination.size,
+                        sourceStillAbsent: !fs.existsSync('/descriptors/source'),
+                    };
+                    fs.closeSync(fd);
+                    fs.closeSync(displaced);
+                    await peer.close();
+                    globalThis.descriptorLifecycle = { moved, written, unlinked, detached };
+                });
+                "#,
+            )
+            .await
+            .expect("exercise descriptor lifecycle");
+        runtime.drain_microtasks().await.expect("drain");
+        assert_eq!(
+            runtime
+                .read_global_json("descriptorLifecycle")
+                .await
+                .unwrap(),
+            serde_json::json!({
+                "moved": {
+                    "sourceAbsent": true, "data": "abcdef", "peer": "abcdef",
+                    "sameInode": true, "displacedData": "replaced", "displacedLinks": 0,
+                },
+                "written": {
+                    "data": "XYcdef", "peer": "XYcdef", "displaced": "ZZplaced", "isolatedTimes": true,
+                },
+                "unlinked": { "absent": true, "data": "XYcdef!", "links": 0 },
+                "detached": {
+                    "data": "XYc", "size": 3, "timestamp": 4000, "newData": "replacement",
+                    "distinctInode": true, "originalSnapshotSize": 6, "oldDestinationSize": 8,
+                    "sourceStillAbsent": true,
+                },
+            })
+        );
+    });
+}
+
+#[test]
+fn fs_descriptor_append_and_truncate_preserve_shared_content_and_cursor() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock_and_config(
+            Arc::new(DeterministicClock::new(0)),
+            default_config(),
+        )
+        .await
+        .expect("create runtime");
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(fs => {
+                    fs.writeFileSync('/cursor', 'abcdef');
+                    const fd = fs.openSync('/cursor', 'r+');
+                    const appender = fs.openSync('/cursor', 'a');
+                    const consumed = fs.readSync(fd, Buffer.alloc(6), 0, 6, null);
+                    fs.ftruncateSync(fd, 2);
+                    fs.writeSync(fd, '!');
+                    fs.writeSync(appender, '?', 0);
+                    globalThis.descriptorCursor = {
+                        consumed, bytes: Array.from(fs.readFileSync('/cursor')),
+                        size: fs.fstatSync(fd).size,
+                    };
+                    fs.closeSync(fd);
+                    fs.closeSync(appender);
+                });
+                "#,
+            )
+            .await
+            .expect("exercise append and truncate");
+        runtime.drain_microtasks().await.expect("drain");
+        assert_eq!(
+            runtime.read_global_json("descriptorCursor").await.unwrap(),
+            serde_json::json!({ "consumed": 6, "bytes": [97, 98, 0, 0, 0, 0, 33, 63], "size": 8 })
+        );
+    });
+}
+
+#[test]
+fn fs_host_descriptor_metadata_stays_with_captured_contents_after_path_replacement() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("snapshot.txt");
+        let retained = temp.path().join("retained.txt");
+        std::fs::write(&path, "original").expect("write original");
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let runtime = PiJsRuntime::with_clock_and_config(
+            Arc::new(DeterministicClock::new(0)),
+            PiJsRuntimeConfig {
+                cwd: temp.path().display().to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create runtime");
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(fs => {
+                    globalThis.snapshotFs = fs;
+                    globalThis.snapshotPath = process.cwd() + '/snapshot.txt';
+                    globalThis.snapshotFd = fs.openSync(snapshotPath, 'r');
+                    globalThis.snapshotStat = fs.fstatSync(snapshotFd);
+                });
+                "#,
+            )
+            .await
+            .expect("open snapshot");
+        runtime.drain_microtasks().await.expect("drain");
+        std::fs::rename(&path, &retained).expect("move original");
+        std::fs::write(&path, "replacement is longer").expect("write replacement");
+        runtime
+            .eval(
+                r#"
+                const bytes = Buffer.alloc(64);
+                const count = snapshotFs.readSync(snapshotFd, bytes, 0, bytes.length, 0);
+                const after = snapshotFs.fstatSync(snapshotFd);
+                globalThis.hostDescriptor = {
+                    text: bytes.subarray(0, count).toString('utf8'), size: after.size,
+                    mtime: after.mtimeMs, sameIdentity: after.ino === snapshotStat.ino,
+                    pathSize: snapshotFs.statSync(snapshotPath).size,
+                };
+                "#,
+            )
+            .await
+            .expect("read retained snapshot");
+        std::fs::remove_file(&path).expect("remove replacement");
+        runtime
+            .eval(
+                r#"
+                hostDescriptor.afterUnlinkSize = snapshotFs.fstatSync(snapshotFd).size;
+                snapshotFs.closeSync(snapshotFd);
+                "#,
+            )
+            .await
+            .expect("stat unlinked snapshot");
+        assert_eq!(
+            runtime.read_global_json("hostDescriptor").await.unwrap(),
+            serde_json::json!({
+                "text": "original", "size": 8, "mtime": 1_700_000_000_000_u64,
+                "sameIdentity": true, "pathSize": 21, "afterUnlinkSize": 8,
+            })
+        );
+    });
+}
+
 // ---------------------------------------------------------------------------
 // host FS fallback in statSync (the fix we applied)
 // ---------------------------------------------------------------------------
@@ -1302,6 +2151,163 @@ fn fs_stat_host_fallback() {
                 || outside_message.contains("ENOENT"),
             "outside stat should be denied or not found, got: {outside_message}"
         );
+    });
+}
+
+#[test]
+fn fs_host_metadata_detects_same_size_edits_across_stat_surfaces() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        std::fs::write(&path, "before").expect("write settings");
+        let first_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open settings")
+            .set_times(std::fs::FileTimes::new().set_modified(first_time))
+            .expect("set first modification time");
+        let runtime = PiJsRuntime::with_clock_and_config(
+            Arc::new(DeterministicClock::new(0)),
+            PiJsRuntimeConfig {
+                cwd: temp.path().display().to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create runtime");
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(async (fs) => {
+                    const path = process.cwd() + '/settings.json';
+                    globalThis.readMetadata = async () => {
+                        const fd = fs.openSync(path, 'r');
+                        let descriptor;
+                        try { descriptor = fs.fstatSync(fd); }
+                        finally { fs.closeSync(fd); }
+                        const stats = [
+                            fs.statSync(path), fs.lstatSync(path), descriptor,
+                            await fs.promises.stat(path), await fs.promises.lstat(path),
+                            await new Promise((resolve, reject) => fs.stat(path, (e, s) => e ? reject(e) : resolve(s))),
+                            await new Promise((resolve, reject) => fs.lstat(path, (e, s) => e ? reject(e) : resolve(s))),
+                        ];
+                        return stats.map(s => ({
+                            size: s.size, mtimeMs: s.mtimeMs,
+                            datesMatch: ['atime', 'mtime', 'ctime', 'birthtime'].every(name =>
+                                s[name] instanceof Date && s[name].getTime() === Math.trunc(s[name + 'Ms'])),
+                        }));
+                    };
+                    globalThis.beforeMetadata = await readMetadata();
+                });
+                "#,
+            )
+            .await
+            .expect("read initial metadata");
+        runtime.drain_microtasks().await.expect("drain");
+        let before = runtime.read_global_json("beforeMetadata").await.unwrap();
+
+        // The original all-zero timestamps conceal this edit from caches even
+        // though its real mtime changes. Assign times instead of racing a clock.
+        std::fs::write(&path, "after!").expect("write same-size edit");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open edited settings")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(first_time + std::time::Duration::from_secs(2)),
+            )
+            .expect("set edited modification time");
+        runtime
+            .eval("readMetadata().then(value => { globalThis.afterMetadata = value; });")
+            .await
+            .expect("read edited metadata");
+        runtime.drain_microtasks().await.expect("drain");
+        let after = runtime.read_global_json("afterMetadata").await.unwrap();
+        for (snapshot, expected) in [
+            (&before, 1_700_000_000_000.0),
+            (&after, 1_700_000_002_000.0),
+        ] {
+            let rows = snapshot.as_array().expect("metadata snapshots");
+            assert_eq!(rows.len(), 7);
+            for row in rows {
+                assert_eq!(row["size"], 6);
+                assert_eq!(row["datesMatch"], true);
+                let modified = row["mtimeMs"].as_f64().expect("mtime in milliseconds");
+                assert!((modified - expected).abs() < 0.001, "{row}");
+            }
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_host_metadata_preserves_inode_mode_and_symlink_identity() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target.txt");
+        let link = temp.path().join("alias.txt");
+        std::fs::write(&target, "target").expect("write target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640))
+            .expect("set target permissions");
+        std::os::unix::fs::symlink(&target, &link).expect("create alias");
+        let target_metadata = std::fs::metadata(&target).expect("target metadata");
+        let link_metadata = std::fs::symlink_metadata(&link).expect("link metadata");
+        let runtime = PiJsRuntime::with_clock_and_config(
+            Arc::new(DeterministicClock::new(0)),
+            PiJsRuntimeConfig {
+                cwd: temp.path().display().to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create runtime");
+        runtime
+            .eval(
+                r#"
+                import('node:fs').then(fs => {
+                    const path = process.cwd() + '/alias.txt';
+                    const describe = s => ({
+                        mode: s.mode, ino: s.ino, dev: s.dev, uid: s.uid, gid: s.gid,
+                        nlink: s.nlink, size: s.size, ctimeMs: s.ctimeMs,
+                        file: s.isFile(), symlink: s.isSymbolicLink(),
+                    });
+                    globalThis.followedMetadata = describe(fs.statSync(path));
+                    globalThis.linkMetadata = describe(fs.lstatSync(path));
+                });
+                "#,
+            )
+            .await
+            .expect("stat alias");
+        runtime.drain_microtasks().await.expect("drain");
+        for (name, metadata, is_link) in [
+            ("followedMetadata", target_metadata, false),
+            ("linkMetadata", link_metadata, true),
+        ] {
+            let observed = runtime.read_global_json(name).await.unwrap();
+            assert_eq!(observed["file"], !is_link);
+            assert_eq!(observed["symlink"], is_link);
+            for (field, expected) in [
+                ("mode", u64::from(metadata.mode())),
+                ("ino", metadata.ino()),
+                ("dev", metadata.dev()),
+                ("uid", u64::from(metadata.uid())),
+                ("gid", u64::from(metadata.gid())),
+                ("nlink", metadata.nlink()),
+                ("size", metadata.len()),
+            ] {
+                // Native inode/device IDs may exceed 2^53 even for a tempfile.
+                // Compare the same Number representation used by non-bigint Stats.
+                #[allow(clippy::cast_precision_loss)]
+                let expected = expected as f64;
+                let actual = observed[field].as_f64().expect("numeric stat field");
+                assert_eq!(actual.to_bits(), expected.to_bits(), "{field}: {observed}");
+            }
+            assert!(observed["ctimeMs"].as_f64().unwrap_or_default() > 0.0);
+        }
     });
 }
 

@@ -32,6 +32,7 @@
 
 mod client_files;
 mod client_terminals;
+mod commands;
 mod content;
 mod history;
 mod mcp;
@@ -654,6 +655,8 @@ pub struct AcpLaunchOptions {
     pub no_implicit_tools: bool,
     /// Host-level refusal of all client-supplied MCP servers.
     pub no_mcp: bool,
+    pub skills: Vec<String>,
+    pub no_skills: bool,
     pub extensions: Vec<String>,
     /// Parsed extension flags, applied before startup/session_start hooks.
     pub extension_flags: Vec<crate::cli::ExtensionCliFlag>,
@@ -692,6 +695,8 @@ impl AcpLaunchOptions {
             no_tools: cli.no_tools,
             no_implicit_tools: cli.no_implicit_tools,
             no_mcp: cli.no_mcp,
+            skills: cli.skill.clone(),
+            no_skills: cli.no_skills,
             extensions: cli.extension.clone(),
             extension_flags: Vec::new(),
             no_extensions: cli.no_extensions,
@@ -743,6 +748,8 @@ impl AcpLaunchOptions {
         cli.no_tools = self.no_tools;
         cli.no_implicit_tools = self.no_implicit_tools;
         cli.no_mcp = self.no_mcp;
+        cli.skill.clone_from(&self.skills);
+        cli.no_skills = self.no_skills;
         cli.extension.clone_from(&self.extensions);
         cli.no_extensions = self.no_extensions;
         cli.extension_policy.clone_from(&self.extension_policy);
@@ -804,9 +811,9 @@ pub struct AcpOptions {
     /// can be reopened by ID via `session/load` or `session/resume`, as well
     /// as via `pi --session`/`--resume`. When `None`, sessions remain in-memory.
     pub session_dir: Option<PathBuf>,
-    /// The "available skills" system-prompt block, rendered by the host from
-    /// its resource loader (`--no-skills` and trust applied), so the model
-    /// in an editor session knows which skills it can load.
+    /// Initial skills catalog supplied by the host. Filesystem-backed hosts
+    /// reload admitted resources for each editor workspace before extensions
+    /// start; programmatic hosts retain their supplied block.
     pub skills_prompt: Option<String>,
 }
 
@@ -875,7 +882,8 @@ impl AcpOptions {
                     surface.workspace_display
                 );
             }
-            // Startup resources can include launch-workspace skills.
+            // Startup resources can include launch-workspace skills. Bootstrap
+            // replaces this block with resources admitted for the target workspace.
             if !state.trusted
                 || crate::workspace_trust::workspace_key(cwd)
                     != crate::workspace_trust::workspace_key(&source.launch_cwd)
@@ -965,12 +973,106 @@ impl AcpPermissionClient {
     }
 }
 
+// The content decoder applies smaller semantic budgets. Bound the wire frame
+// before JSON parsing as well, including metadata and escaped text, and keep
+// only two unread frames rather than hundreds of attachment-bearing requests.
+const MAX_ACP_INPUT_FRAME_BYTES: usize = 128 * 1024 * 1024;
+const ACP_INPUT_QUEUE_CAPACITY: usize = 2;
+
+enum AcpInput {
+    Stdio(asupersync::channel::mpsc::Receiver<io::Result<String>>),
+    #[cfg(test)]
+    Lines(asupersync::channel::mpsc::Receiver<String>),
+}
+
+impl AcpInput {
+    async fn recv(&mut self, cx: &AgentCx) -> Option<io::Result<String>> {
+        match self {
+            Self::Stdio(receiver) => receiver.recv(cx).await.ok(),
+            #[cfg(test)]
+            Self::Lines(receiver) => receiver.recv(cx).await.ok().map(Ok),
+        }
+    }
+}
+
+fn acp_input_limit_error(max_bytes: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("PI_ACP_INPUT_LIMIT: command exceeds the {max_bytes}-byte frame limit"),
+    )
+}
+
+/// LF terminates a frame; an optional CR remains part of its byte budget.
+/// Reject before copying an oversized suffix, and never resynchronize through
+/// a rejected frame. A bounded final frame without LF remains valid at EOF.
+fn read_acp_input_frame(reader: &mut impl BufRead, max_bytes: usize) -> io::Result<Option<String>> {
+    let mut frame = Vec::new();
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if available.is_empty() {
+            if frame.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.unwrap_or(available.len());
+        if take > max_bytes.saturating_sub(frame.len()) {
+            return Err(acp_input_limit_error(max_bytes));
+        }
+        frame.extend_from_slice(&available[..take]);
+        reader.consume(take + usize::from(newline.is_some()));
+        if newline.is_some() {
+            break;
+        }
+    }
+    String::from_utf8(frame).map(Some).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PI_ACP_INPUT_UTF8: command is not valid UTF-8",
+        )
+    })
+}
+
+fn forward_acp_input(
+    reader: &mut impl BufRead,
+    sender: &asupersync::channel::mpsc::Sender<io::Result<String>>,
+    max_bytes: usize,
+) {
+    loop {
+        let mut frame = match read_acp_input_frame(reader, max_bytes) {
+            Ok(Some(line)) => Ok(line),
+            Ok(None) => return,
+            Err(error) => Err(error),
+        };
+        let failed = frame.is_err();
+        loop {
+            match sender.try_send(frame) {
+                Ok(()) => break,
+                Err(asupersync::channel::mpsc::SendError::Full(unsent)) => {
+                    frame = unsent;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
+        }
+        if failed {
+            return;
+        }
+    }
+}
+
 /// Run the ACP server over stdio.
 ///
 /// Reads JSON-RPC requests line-by-line from stdin, dispatches them,
 /// and writes JSON-RPC responses/notifications to stdout.
 pub async fn run_stdio(options: AcpOptions) -> Result<()> {
-    let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(256);
+    let (in_tx, in_rx) =
+        asupersync::channel::mpsc::channel::<io::Result<String>>(ACP_INPUT_QUEUE_CAPACITY);
     let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
     let out_tx = AcpOutput::new(out_tx);
 
@@ -978,31 +1080,7 @@ pub async fn run_stdio(options: AcpOptions) -> Result<()> {
     std::thread::spawn(move || {
         let stdin = io::stdin();
         let mut reader = io::BufReader::new(stdin.lock());
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let trimmed = line.trim().to_string();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    // Retry loop with backpressure.
-                    let mut to_send = trimmed;
-                    loop {
-                        match in_tx.try_send(to_send) {
-                            Ok(()) => break,
-                            Err(asupersync::channel::mpsc::SendError::Full(unsent)) => {
-                                to_send = unsent;
-                                std::thread::sleep(std::time::Duration::from_millis(10));
-                            }
-                            Err(_) => return,
-                        }
-                    }
-                }
-            }
-        }
+        forward_acp_input(&mut reader, &in_tx, MAX_ACP_INPUT_FRAME_BYTES);
     });
 
     // Stdout writer thread.
@@ -1020,7 +1098,7 @@ pub async fn run_stdio(options: AcpOptions) -> Result<()> {
         let _ = writer_done_tx.send(result);
     });
 
-    let result = Box::pin(run(options, in_rx, out_tx)).await;
+    let result = Box::pin(run_with_input(options, AcpInput::Stdio(in_rx), out_tx)).await;
     // Prompt settlement can leave final frames queued. The process must keep
     // running until stdout flushes them, or report that delivery is incomplete.
     // A blocked OS write cannot be joined safely on an async worker.
@@ -1076,12 +1154,17 @@ async fn finish_acp_output(
     result.and(delivered)
 }
 
-/// Core ACP event loop.
+#[cfg(test)]
 async fn run(
     options: AcpOptions,
-    mut in_rx: asupersync::channel::mpsc::Receiver<String>,
+    in_rx: asupersync::channel::mpsc::Receiver<String>,
     out_tx: AcpOutput,
 ) -> Result<()> {
+    Box::pin(run_with_input(options, AcpInput::Lines(in_rx), out_tx)).await
+}
+
+/// Core ACP event loop, including ordered stdin failures and owner cleanup.
+async fn run_with_input(options: AcpOptions, mut input: AcpInput, out_tx: AcpOutput) -> Result<()> {
     let cx = AgentCx::for_current_or_request();
     let sessions: AcpSessionsMap = Arc::new(Mutex::new(HashMap::new()));
     let prompt_counter = Arc::new(AtomicU64::new(0));
@@ -1092,11 +1175,30 @@ async fn run(
     // Capture dispatch errors so every exit path still tears down MCP state.
     let result: Result<()> = {
         let dispatch = async {
-            while let Ok(line) = in_rx.recv(&cx).await {
+            while let Some(frame) = input.recv(&cx).await {
                 // Buffered input can keep this future ready without returning to the
                 // outer failure race. Never dispatch another request after a lost frame.
                 if let Some(reason) = out_tx.failure_reason() {
                     return Err(Error::session(reason));
+                }
+                let line = match frame.and_then(|line| {
+                    if line.strip_suffix('\n').unwrap_or(&line).len() > MAX_ACP_INPUT_FRAME_BYTES {
+                        return Err(acp_input_limit_error(MAX_ACP_INPUT_FRAME_BYTES));
+                    }
+                    Ok(line)
+                }) {
+                    Ok(line) => line,
+                    Err(error) => {
+                        let _ = out_tx.send(json_rpc_error(
+                            Value::Null,
+                            PARSE_ERROR,
+                            format!("Failed to read command: {error}"),
+                        ));
+                        return Err(Error::Io(Box::new(error)));
+                    }
+                };
+                if line.trim().is_empty() {
+                    continue;
                 }
                 let raw_message: Value = match serde_json::from_str(&line) {
                     Ok(value) => value,
@@ -1227,6 +1329,8 @@ async fn run(
                                 }
                                 let result = session_setup_response(&session_id, &state)?
                                     .ok_or_else(|| Error::session("New session is unavailable"))?;
+                                let commands_notification =
+                                    commands::for_state(&session_id, &state);
                                 let mcp_state = state.mcp.clone();
                                 let state_arc = Arc::new(Mutex::new(state));
                                 {
@@ -1237,6 +1341,11 @@ async fn run(
                                 }
 
                                 let _ = out_tx.send(json_rpc_ok(id, result));
+                                if let Some(notification) = commands_notification {
+                                    history::send_line(&out_tx, notification)
+                                        .await
+                                        .map_err(|error| Error::session(error.message))?;
+                                }
                                 if let Some(mcp_state) = mcp_state {
                                     mcp::announce(&mcp_state, &session_id, &out_tx)
                                         .await
@@ -1291,8 +1400,8 @@ async fn run(
                             continue;
                         };
 
-                        let mcp_command = match mcp::command_from_prompt(prompt_blocks) {
-                            Ok(command) => command,
+                        let mut prompt_command = match mcp::command_from_prompt(prompt_blocks) {
+                            Ok(command) => command.map(commands::PromptCommand::Mcp),
                             Err(error) => {
                                 let _ = out_tx.send(json_rpc_error(id, INVALID_PARAMS, error));
                                 continue;
@@ -1315,6 +1424,19 @@ async fn run(
                         };
 
                         let session_config = if let Ok(state) = session_state.lock(&cx).await {
+                            if prompt_command.is_none() {
+                                match commands::extension_from_prompt(
+                                    prompt_blocks,
+                                    state.agent_session.as_ref(),
+                                ) {
+                                    Ok(command) => prompt_command = command,
+                                    Err(error) => {
+                                        let _ =
+                                            out_tx.send(json_rpc_error(id, INVALID_PARAMS, error));
+                                        continue;
+                                    }
+                                }
+                            }
                             Arc::clone(&state.config)
                         } else {
                             let _ = out_tx.send(json_rpc_error(
@@ -1377,7 +1499,7 @@ async fn run(
                             let stop_reason = Box::pin(run_prompt(
                                 session_state,
                                 message_content,
-                                mcp_command,
+                                prompt_command,
                                 abort_signal,
                                 out_tx_prompt.clone(),
                                 prompt_session_id.clone(),
@@ -1914,6 +2036,9 @@ async fn run(
         }
     };
 
+    // Release unread frames and wake a backpressured reader before waiting
+    // for prompt persistence, editor requests, and MCP ownership to settle.
+    drop(input);
     let drained = out_tx.finish_prompts().await;
     mcp::shutdown(&sessions).await;
     drained?;
@@ -2678,56 +2803,161 @@ async fn arm_acp_prewalk(state: &mut AcpSessionState, options: &AcpOptions) -> R
     Ok(())
 }
 
-/// Discover and boot QuickJS/native/WASM extensions for an ACP session using
-/// workspace trust policy, then sync extension-contributed MCP definitions.
+/// Resolve resources from the host's captured settings roots. An editor may
+/// request a different workspace, but cannot rebind a launch-time override.
+fn acp_resource_roots(
+    options: &AcpOptions,
+    cwd: &std::path::Path,
+) -> crate::package_manager::ResolveRoots {
+    let global_dir = options.global_dir();
+    let config_override = options
+        .settings_source
+        .as_ref()
+        .and_then(|source| {
+            source
+                .config_override
+                .as_deref()
+                .map(|path| Config::resolve_config_override_path(path, &source.launch_cwd))
+        })
+        .or_else(|| {
+            options
+                .workspace_trust_guard
+                .as_ref()
+                .and_then(|guard| guard.config_override().map(std::path::Path::to_path_buf))
+        });
+    let project_settings_enabled = config_override.is_none()
+        && options
+            .workspace_trust_guard
+            .as_ref()
+            .is_some_and(crate::workspace_trust::WorkspaceTrustGuard::trusted);
+    crate::package_manager::ResolveRoots {
+        global_settings_path: config_override.unwrap_or_else(|| global_dir.join("settings.json")),
+        project_settings_path: cwd.join(Config::project_dir()).join("settings.json"),
+        global_base_dir: global_dir,
+        project_base_dir: cwd.join(Config::project_dir()),
+        project_settings_enabled,
+        home_dir: dirs::home_dir(),
+    }
+}
+
+/// Explicit host paths keep their launch origin even when they do not exist.
+/// Otherwise a same-named file in the requested workspace could replace them.
+fn acp_explicit_skill_paths(options: &AcpOptions) -> Vec<String> {
+    options
+        .launch
+        .skills
+        .iter()
+        .map(|raw| {
+            let trimmed = raw.trim();
+            let candidate = std::path::Path::new(trimmed);
+            if trimmed.is_empty() || trimmed.starts_with('~') || candidate.is_absolute() {
+                return raw.clone();
+            }
+            options.settings_source.as_ref().map_or_else(
+                || raw.clone(),
+                |source| {
+                    source
+                        .launch_cwd
+                        .join(candidate)
+                        .to_string_lossy()
+                        .into_owned()
+                },
+            )
+        })
+        .collect()
+}
+
+fn install_acp_skills_prompt(
+    state: &mut AcpSessionState,
+    options: &AcpOptions,
+    resources: &crate::resources::ResourceLoader,
+) -> Result<()> {
+    let loaded = resources.format_skills_for_prompt();
+    let skills_prompt =
+        if options.settings_source.is_some() || options.workspace_trust_guard.is_some() {
+            loaded
+        } else {
+            let mut supplied = options.skills_prompt.clone().unwrap_or_default();
+            supplied.push_str(&loaded);
+            supplied
+        };
+    let cli = options.launch.selection_cli()?;
+    let enabled_tools = acp_enabled_tools(&cli, &options.config);
+    let enabled_tools_refs: Vec<&str> = enabled_tools.iter().map(String::as_str).collect();
+    let prompt = build_acp_system_prompt(
+        &cli,
+        &state.cwd,
+        &options.global_dir(),
+        &enabled_tools_refs,
+        &options.config,
+        Some(&skills_prompt),
+    )?;
+    let handle = state
+        .agent_session
+        .as_mut()
+        .ok_or_else(|| Error::session("Cannot install skills while the session is busy"))?;
+    handle
+        .session_mut()
+        .agent
+        .set_system_prompt(Some(prompt.clone()));
+    if let Some(manager) = handle.extension_manager() {
+        manager.set_system_prompt(Some(prompt));
+    }
+    Ok(())
+}
+
+/// Discover workspace skills and boot QuickJS/native/WASM extensions using
+/// the admitted settings roots, then sync extension-contributed resources.
 async fn boot_acp_extensions(state: &mut AcpSessionState, options: &AcpOptions) -> Result<()> {
     let workspace_options = options.for_workspace(&state.cwd)?;
     let has_provenance = workspace_options.settings_source.is_some()
         || workspace_options.workspace_trust_guard.is_some();
-    if !has_provenance && workspace_options.launch.extensions.is_empty() {
+    if !has_provenance
+        && workspace_options.launch.extensions.is_empty()
+        && workspace_options.launch.skills.is_empty()
+    {
         return Ok(());
     }
     let workspace_trusted = workspace_options
         .workspace_trust_guard
         .as_ref()
         .is_some_and(crate::workspace_trust::WorkspaceTrustGuard::trusted);
-    let extension_paths: Vec<String> = workspace_options
+    let launch_cwd = workspace_options
+        .settings_source
+        .as_ref()
+        .map_or_else(|| state.cwd.clone(), |source| source.launch_cwd.clone());
+    let launch_manager = crate::package_manager::PackageManager::new(launch_cwd);
+    let extension_paths = workspace_options
         .launch
         .extensions
         .iter()
-        .map(|raw| {
-            let candidate = std::path::Path::new(raw);
-            if !candidate.is_absolute()
-                && let Some(source) = &workspace_options.settings_source
-            {
-                let anchored = source.launch_cwd.join(candidate);
-                if anchored.exists() {
-                    return anchored.to_string_lossy().into_owned();
-                }
-            }
-            raw.clone()
-        })
-        .collect();
-
+        .map(|raw| launch_manager.anchor_extension_source(raw))
+        .collect::<Result<Vec<_>>>()?;
+    let roots = acp_resource_roots(&workspace_options, &state.cwd);
     let package_manager = crate::package_manager::PackageManager::new(state.cwd.clone())
         .with_project_trust(workspace_trusted);
     let resource_cli = crate::resources::ResourceCliOptions {
-        no_skills: true,
+        no_skills: workspace_options.launch.no_skills || !has_provenance,
         no_prompt_templates: true,
-        no_extensions: workspace_options.launch.no_extensions,
+        no_extensions: workspace_options.launch.no_extensions || !has_provenance,
         no_themes: true,
-        skill_paths: Vec::new(),
+        skill_paths: acp_explicit_skill_paths(&workspace_options),
         prompt_paths: Vec::new(),
         extension_paths,
         theme_paths: Vec::new(),
     };
-    let resources = crate::resources::ResourceLoader::load(
+    let mut resources = crate::resources::ResourceLoader::load_with_roots(
         &package_manager,
         &state.cwd,
         &workspace_options.config,
         &resource_cli,
+        &roots,
     )
     .await?;
+    if let Some(guard) = &workspace_options.workspace_trust_guard {
+        guard.validate_workspace(&state.cwd)?;
+    }
+    install_acp_skills_prompt(state, &workspace_options, &resources)?;
     if resources.extensions().is_empty() {
         return Ok(());
     }
@@ -2792,9 +3022,11 @@ async fn boot_acp_extensions(state: &mut AcpSessionState, options: &AcpOptions) 
                     }
                 }
             }
+            let discovered = ext_mgr.discover_resources(&state.cwd, "startup").await;
+            resources.extend_with_paths(&state.cwd, &discovered)?;
         }
     }
-
+    install_acp_skills_prompt(state, &workspace_options, &resources)?;
     mcp::sync_extensions(state, workspace_options.launch.no_mcp).await;
     Ok(())
 }
@@ -3395,7 +3627,7 @@ async fn apply_set_config_option(
 async fn run_prompt(
     session_state: Arc<Mutex<AcpSessionState>>,
     message: Vec<ContentBlock>,
-    mcp_command: Option<mcp::Command>,
+    command: Option<commands::PromptCommand>,
     abort_signal: AbortSignal,
     out_tx: AcpOutput,
     session_id: String,
@@ -3452,6 +3684,16 @@ async fn run_prompt(
     );
     let recovery_callback = Arc::clone(&recovery_updates);
     let event_handler = build_acp_event_handler(out_tx.clone(), session_id.clone());
+    let on_event = move |event| {
+        recovery_callback.observe(&event);
+        event_handler(event);
+    };
+    let commands_before = commands::available(Some(&agent_session), mcp_state.is_some());
+    let (mcp_command, extension_command) = match command {
+        Some(commands::PromptCommand::Mcp(command)) => (Some(command), None),
+        Some(commands::PromptCommand::Extension { name, args }) => (None, Some((name, args))),
+        None => (None, None),
+    };
 
     let prepared = mcp::before_prompt(
         mcp_state.as_ref(),
@@ -3465,12 +3707,20 @@ async fn run_prompt(
     .await;
     let stop_reason = if let Some(reason) = prepared {
         reason
+    } else if let Some((name, args)) = extension_command {
+        commands::execute(
+            &mut agent_session,
+            &name,
+            &args,
+            abort_signal,
+            &out_tx,
+            &session_id,
+            on_event,
+        )
+        .await
     } else {
         match agent_session
-            .prompt_with_content_with_abort(message, abort_signal, move |event| {
-                recovery_callback.observe(&event);
-                event_handler(event);
-            })
+            .prompt_with_content_with_abort(message, abort_signal, on_event)
             .await
         {
             Ok(message) if message.stop_reason == crate::model::StopReason::Error => {
@@ -3516,6 +3766,14 @@ async fn run_prompt(
     // Even a failed/aborted fallback can have committed a different model.
     // Publish the final selections before returning the prompt response.
     recovery_updates.finish(&agent_session);
+    let commands_after = commands::available(Some(&agent_session), mcp_state.is_some());
+    if commands_after != commands_before {
+        let _ = history::send_line(
+            &out_tx,
+            commands::notification(&session_id, &commands_after),
+        )
+        .await;
+    }
     // Cancellation ends provider work, not the obligation to return its owner
     // to the editor session. Cleanup must not use a cancelled request context.
     let cleanup_cx = AgentCx::for_request();
@@ -3806,6 +4064,174 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
 
+    #[test]
+    fn acp_input_reader_bounds_bytes_and_preserves_framing() {
+        for (bytes, limit, expected) in [
+            (&b"1234\n"[..], 4, "1234"),
+            (&b"1234"[..], 4, "1234"),
+            (&b"123\r\n"[..], 4, "123\r"),
+            (&b"\n"[..], 0, ""),
+            ("\u{00e9}\n".as_bytes(), 2, "\u{00e9}"),
+        ] {
+            let mut reader = io::BufReader::with_capacity(1, io::Cursor::new(bytes));
+            assert_eq!(
+                read_acp_input_frame(&mut reader, limit).unwrap().as_deref(),
+                Some(expected)
+            );
+            assert!(read_acp_input_frame(&mut reader, limit).unwrap().is_none());
+        }
+        for suffix in ["", "\n", "\r\n", "\n{\"method\":\"exit\"}\n"] {
+            let bytes = format!("{}{suffix}", "x".repeat(1024));
+            let mut reader = io::BufReader::with_capacity(8, io::Cursor::new(bytes.as_bytes()));
+            let error = read_acp_input_frame(&mut reader, 32).expect_err("oversized frame");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("PI_ACP_INPUT_LIMIT"));
+            assert!(reader.get_ref().position() <= 40, "must not read the tail");
+        }
+        let error =
+            read_acp_input_frame(&mut io::Cursor::new(b"\xff\n"), 4).expect_err("invalid UTF-8");
+        assert!(error.to_string().contains("PI_ACP_INPUT_UTF8"));
+    }
+
+    #[test]
+    fn acp_input_reader_retries_interrupts_but_reports_io_failure() {
+        struct FaultReader {
+            bytes: io::Cursor<Vec<u8>>,
+            fault: Option<io::ErrorKind>,
+        }
+        impl io::Read for FaultReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                io::Read::read(&mut self.bytes, buffer)
+            }
+        }
+        impl BufRead for FaultReader {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                if let Some(kind) = self.fault.take() {
+                    return Err(kind.into());
+                }
+                self.bytes.fill_buf()
+            }
+            fn consume(&mut self, count: usize) {
+                self.bytes.consume(count);
+            }
+        }
+        let mut reader = FaultReader {
+            bytes: io::Cursor::new(b"ok\n".to_vec()),
+            fault: Some(io::ErrorKind::Interrupted),
+        };
+        assert_eq!(
+            read_acp_input_frame(&mut reader, 2).unwrap().as_deref(),
+            Some("ok")
+        );
+        reader.fault = Some(io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            read_acp_input_frame(&mut reader, 2).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn acp_input_forwarder_preserves_failure_order_without_admitting_a_suffix() {
+        let (sender, mut receiver) = asupersync::channel::mpsc::channel(ACP_INPUT_QUEUE_CAPACITY);
+        let mut reader = io::Cursor::new(b"ok\n12345\n{\"method\":\"exit\"}\n");
+        forward_acp_input(&mut reader, &sender, 4);
+        assert_eq!(receiver.try_recv().unwrap().unwrap(), "ok");
+        assert!(
+            receiver
+                .try_recv()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("PI_ACP_INPUT_LIMIT")
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn acp_input_failure_reports_parse_error_and_settles_active_owners() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let handle = runtime.handle();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let options = acp_workspace_options(root.path(), handle);
+            let (sender, receiver) =
+                asupersync::channel::mpsc::channel(ACP_INPUT_QUEUE_CAPACITY);
+            let bytes = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}}\n{}\n{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\"}}\n",
+                "x".repeat(129)
+            );
+            forward_acp_input(&mut io::Cursor::new(bytes.as_bytes()), &sender, 128);
+            drop(sender);
+            let (tx, rx) = std::sync::mpsc::sync_channel(8);
+            let output = AcpOutput::new(tx);
+            let (abort, signal) = AbortHandle::new();
+            let mut owner = output.begin_prompt("active-owner".into(), abort).unwrap();
+            owner.started = true;
+            let settle = async {
+                signal.wait().await;
+                // The transport must await the owner's durable settlement,
+                // rather than returning as soon as cancellation is requested.
+                owner.settled = true;
+                drop(owner);
+            };
+            let (result, ()) = futures::join!(
+                Box::pin(run_with_input(
+                    options,
+                    AcpInput::Stdio(receiver),
+                    output.clone(),
+                )),
+                settle,
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("PI_ACP_INPUT_LIMIT")
+            );
+            assert!(signal.is_aborted());
+            assert!(output.shared.state.lock().unwrap().prompts.is_empty());
+            let frames = rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(frames.len(), 2, "rejected tail must never dispatch");
+            assert_eq!(frames[0]["id"], 1);
+            assert_eq!(frames[0]["result"]["protocolVersion"], 1);
+            assert_eq!(frames[1]["id"], Value::Null);
+            assert_eq!(frames[1]["error"]["code"], PARSE_ERROR);
+        });
+    }
+
+    #[test]
+    fn acp_bounded_json_errors_remain_recoverable() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let handle = runtime.handle();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let options = acp_workspace_options(root.path(), handle);
+            let (sender, receiver) = asupersync::channel::mpsc::channel(ACP_INPUT_QUEUE_CAPACITY);
+            let bytes = b"{bad json}\n{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"initialize\"}";
+            forward_acp_input(&mut io::Cursor::new(bytes), &sender, 128);
+            drop(sender);
+            let (tx, rx) = std::sync::mpsc::sync_channel(8);
+            Box::pin(run_with_input(
+                options,
+                AcpInput::Stdio(receiver),
+                AcpOutput::new(tx),
+            ))
+            .await
+            .expect("ordinary malformed JSON does not close admission");
+            let frames = rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(frames.len(), 2);
+            assert_eq!(frames[0]["error"]["code"], PARSE_ERROR);
+            assert_eq!(frames[1]["id"], 7);
+            assert_eq!(frames[1]["result"]["protocolVersion"], 1);
+        });
+    }
+
     #[derive(Clone, Copy)]
     enum PromptTestOutcome {
         Complete,
@@ -3813,6 +4239,8 @@ mod tests {
         StreamError,
         Aborted,
         StreamAborted,
+        ErrorThenComplete,
+        StreamAbortedThenComplete,
         ToolThenBurst,
     }
 
@@ -3892,7 +4320,14 @@ mod tests {
                     reason: StopReason::Stop,
                     message,
                 }));
-            } else if matches!(self.outcome, PromptTestOutcome::Complete) {
+            } else if matches!(self.outcome, PromptTestOutcome::Complete)
+                || (call_number > 0
+                    && matches!(
+                        self.outcome,
+                        PromptTestOutcome::ErrorThenComplete
+                            | PromptTestOutcome::StreamAbortedThenComplete
+                    ))
+            {
                 message.content = vec![ContentBlock::Text(TextContent::new("Provider reply"))];
                 events.push(Ok(StreamEvent::TextDelta {
                     content_index: 0,
@@ -3903,7 +4338,10 @@ mod tests {
                     message,
                 }));
             } else {
-                message.stop_reason = if matches!(self.outcome, PromptTestOutcome::StreamAborted) {
+                message.stop_reason = if matches!(
+                    self.outcome,
+                    PromptTestOutcome::StreamAborted | PromptTestOutcome::StreamAbortedThenComplete
+                ) {
                     StopReason::Aborted
                 } else {
                     StopReason::Error
@@ -3995,6 +4433,416 @@ mod tests {
             .map(|line| serde_json::from_str(&line).expect("ACP notification"))
             .collect();
         (reason, updates)
+    }
+
+    async fn enable_acp_command_fixture(
+        state: &Arc<Mutex<AcpSessionState>>,
+        root: &std::path::Path,
+    ) {
+        let entry = root.join("acp-commands.mjs");
+        std::fs::write(
+            &entry,
+            r"
+            export default function(pi) {
+                pi.registerCommand('echo', {
+                    description: 'Echo the original command arguments',
+                    handler: async (args, ctx) => {
+                        await pi.getThinkingLevel();
+                        pi.sendMessage({
+                            customType: 'command-output', content: 'Command note: ' + args,
+                            display: true, details: { private: 'PRIVATE-COMMAND-DETAILS' }
+                        });
+                        pi.sendMessage({
+                            customType: 'command-private', content: 'PRIVATE-COMMAND-STATE',
+                            display: false
+                        });
+                        return { args, hasUI: ctx.hasUI };
+                    }
+                });
+                pi.registerCommand('workflow', { handler: async () => {
+                    await pi.getThinkingLevel();
+                    pi.sendUserMessage('Generated first');
+                    pi.sendMessage({
+                        customType: 'workflow-note', content: 'Generated custom', display: true
+                    }, { triggerTurn: true });
+                    pi.sendUserMessage('Generated last');
+                }});
+                pi.registerCommand('workflow-outcome', { handler: async () => {
+                    await pi.getThinkingLevel();
+                    pi.sendUserMessage('First generated step');
+                    pi.sendUserMessage('Second generated step');
+                    return 'Workflow finished';
+                }});
+                pi.registerCommand('publish', { handler: () => {
+                    pi.registerCommand('late-command', {
+                        description: 'Registered after startup', handler: () => 'late result'
+                    });
+                }});
+                pi.registerCommand('wait', { handler: async () => {
+                    pi.sendMessage({
+                        customType: 'waiting', content: 'Waiting for cancellation', display: true
+                    });
+                    await new Promise(() => {});
+                    pi.sendUserMessage('must never run');
+                }});
+                pi.registerCommand('mcp', { handler: () => { throw new Error('reserved'); }});
+            }
+            ",
+        )
+        .unwrap();
+        let cx = AgentCx::for_current_or_request();
+        let mut guard = OwnedMutexGuard::lock(Arc::clone(state), &cx).await.unwrap();
+        guard
+            .agent_session
+            .as_mut()
+            .unwrap()
+            .session_mut()
+            .enable_extensions(&[], root, None, &[entry])
+            .await
+            .unwrap();
+    }
+
+    async fn drive_test_command(
+        state: Arc<Mutex<AcpSessionState>>,
+        text: &str,
+        signal: AbortSignal,
+    ) -> (&'static str, Vec<Value>) {
+        let wire = vec![json!({ "type": "text", "text": text })];
+        let command = {
+            let cx = AgentCx::for_current_or_request();
+            let guard = state.lock(&cx).await.unwrap();
+            commands::extension_from_prompt(&wire, guard.agent_session.as_ref())
+                .unwrap()
+                .expect("registered extension command")
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(128);
+        let reason = Box::pin(run_prompt(
+            state,
+            vec![ContentBlock::Text(TextContent::new(text))],
+            Some(command),
+            signal,
+            AcpOutput::new(tx),
+            "editor-session".to_string(),
+            AgentCx::for_current_or_request(),
+        ))
+        .await;
+        let updates = rx
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        (reason, updates)
+    }
+
+    #[test]
+    fn extension_commands_run_without_provider_and_publish_persisted_output() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (state, provider, stored) =
+                prompt_test_state(root.path(), PromptTestOutcome::Complete, false).await;
+            enable_acp_command_fixture(&state, root.path()).await;
+            let (_, signal) = AbortHandle::new();
+            let (reason, updates) = drive_test_command(
+                Arc::clone(&state),
+                "  /echo Keep  These ARGs\nnext line",
+                signal,
+            )
+            .await;
+            assert_eq!(reason, ACP_STOP_REASON_END_TURN);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            let texts: Vec<_> = updates.iter().map(prompt_notice_text).collect();
+            assert_eq!(texts.len(), 2, "one custom message and the handler result");
+            assert_eq!(texts[0], "Command note: Keep  These ARGs\nnext line");
+            assert!(texts[1].contains(r#""hasUI":false"#));
+            assert!(
+                !updates
+                    .iter()
+                    .any(|line| line.to_string().contains("PRIVATE"))
+            );
+            let path = stored.try_lock().unwrap().path.clone().unwrap();
+            let saved = Session::open(path.to_str().unwrap()).await.unwrap();
+            assert!(saved.to_messages_for_current_path().iter().any(|message| {
+                matches!(message, crate::model::Message::Custom(message)
+                    if message.content == "Command note: Keep  These ARGs\nnext line")
+            }));
+            assert!(state.try_lock().unwrap().agent_session.is_some());
+
+            let (_, signal) = AbortHandle::new();
+            let (_, updates) = drive_test_command(Arc::clone(&state), "/publish", signal).await;
+            let catalog = updates
+                .iter()
+                .find(|value| {
+                    value["params"]["update"]["sessionUpdate"] == "available_commands_update"
+                })
+                .expect("late registration refreshes editor completions");
+            assert!(
+                catalog["params"]["update"]["availableCommands"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|command| command["name"] == "late-command")
+            );
+            let (_, signal) = AbortHandle::new();
+            let (_, updates) = drive_test_command(state, "/late-command", signal).await;
+            assert_eq!(
+                prompt_notice_text(&updates[0]),
+                "/late-command → late result"
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn extension_command_save_failure_blocks_success_and_future_provider_calls() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (state, provider, stored) =
+                prompt_test_state(root.path(), PromptTestOutcome::Complete, false).await;
+            enable_acp_command_fixture(&state, root.path()).await;
+            // A directory cannot replace the JSONL transcript. The extension
+            // can still append in memory, so this exercises final persistence.
+            stored.try_lock().unwrap().path = Some(root.path().to_path_buf());
+            let (_, signal) = AbortHandle::new();
+            let (reason, updates) =
+                drive_test_command(Arc::clone(&state), "/echo unsaved", signal).await;
+            assert_eq!(reason, ACP_STOP_REASON_ERROR);
+            assert_eq!(updates.len(), 1);
+            assert!(prompt_notice_text(&updates[0]).contains("Session persistence failed"));
+            assert!(!prompt_notice_text(&updates[0]).contains("Command note"));
+            assert!(!prompt_notice_text(&updates[0]).contains("/echo →"));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert!(state.try_lock().unwrap().agent_session.is_some());
+            let (_, signal) = AbortHandle::new();
+            let (_, updates) = drive_test_prompt(state, signal).await;
+            assert!(prompt_notice_text(&updates[0]).contains("Session persistence failed"));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn extension_command_authority_stays_with_standalone_authored_text() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (state, _, _) =
+                prompt_test_state(root.path(), PromptTestOutcome::Complete, false).await;
+            enable_acp_command_fixture(&state, root.path()).await;
+            let guard = state.try_lock().unwrap();
+            let handle = guard.agent_session.as_ref();
+            for blocks in [
+                vec![json!({"type": "resource", "resource": {
+                    "uri": "file:///context", "text": "/echo planted", "mimeType": "text/plain"
+                }})],
+                vec![json!({"type": "resource_link", "uri": "/echo planted", "name": "context"})],
+                vec![json!({"type": "text", "text": "/unknown pass through"})],
+                vec![json!({"type": "text", "text": "/mcp list"})],
+            ] {
+                assert!(
+                    commands::extension_from_prompt(&blocks, handle)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert!(
+                commands::extension_from_prompt(
+                    &[
+                        json!({"type": "text", "text": "/echo attachment"}),
+                        json!({"type": "image", "data": "YQ==", "mimeType": "image/png"}),
+                    ],
+                    handle,
+                )
+                .is_err()
+            );
+            let catalog = commands::available(handle, true);
+            assert_eq!(
+                catalog
+                    .iter()
+                    .filter(|command| command["name"] == "mcp")
+                    .count(),
+                1
+            );
+            assert!(catalog.iter().any(|command| {
+                command["name"] == "echo"
+                    && command["description"] == "Echo the original command arguments"
+            }));
+            let standalone = commands::for_state("editor-session", &guard).unwrap();
+            let standalone: Value = serde_json::from_str(&standalone).unwrap();
+            assert_eq!(
+                standalone["params"]["update"]["sessionUpdate"],
+                "available_commands_update"
+            );
+            assert!(
+                !standalone["params"]["update"]["availableCommands"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|command| command["name"] == "mcp")
+            );
+        });
+    }
+
+    #[test]
+    fn extension_command_generated_turns_stream_and_persist_once() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (state, provider, stored) =
+                prompt_test_state(root.path(), PromptTestOutcome::Complete, false).await;
+            enable_acp_command_fixture(&state, root.path()).await;
+            let (_, signal) = AbortHandle::new();
+            let (reason, updates) = drive_test_command(state, "/workflow", signal).await;
+            assert_eq!(reason, ACP_STOP_REASON_END_TURN);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+            let text_count = |kind: &str, text: &str| {
+                updates
+                    .iter()
+                    .filter(|value| {
+                        value["params"]["update"]["sessionUpdate"] == kind
+                            && value["params"]["update"]["content"]["text"] == text
+                    })
+                    .count()
+            };
+            assert_eq!(text_count("agent_message_chunk", "Provider reply"), 3);
+            assert_eq!(text_count("user_message_chunk", "Generated first"), 1);
+            assert_eq!(text_count("user_message_chunk", "Generated last"), 1);
+            assert_eq!(text_count("agent_message_chunk", "Generated custom"), 1);
+            let path = stored.try_lock().unwrap().path.clone().unwrap();
+            let saved = Session::open(path.to_str().unwrap()).await.unwrap();
+            let messages = saved.to_messages_for_current_path();
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| matches!(message, crate::model::Message::Assistant(_)))
+                    .count(),
+                3
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| matches!(message, crate::model::Message::User(_)))
+                    .count(),
+                2
+            );
+        });
+    }
+
+    #[test]
+    fn extension_command_preserves_failed_generated_turn_before_later_success() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            for (outcome, failed_stop, expected_reason) in [
+                (
+                    PromptTestOutcome::ErrorThenComplete,
+                    StopReason::Error,
+                    ACP_STOP_REASON_ERROR,
+                ),
+                (
+                    PromptTestOutcome::StreamAbortedThenComplete,
+                    StopReason::Aborted,
+                    ACP_STOP_REASON_CANCELLED,
+                ),
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let (state, provider, stored) =
+                    prompt_test_state(root.path(), outcome, false).await;
+                enable_acp_command_fixture(&state, root.path()).await;
+                let (_, signal) = AbortHandle::new();
+                let (reason, updates) =
+                    drive_test_command(Arc::clone(&state), "/workflow-outcome", signal).await;
+                assert_eq!(reason, expected_reason);
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+                assert!(state.try_lock().unwrap().agent_session.is_some());
+                let texts: Vec<_> = updates
+                    .iter()
+                    .filter(|update| {
+                        update["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+                    })
+                    .map(prompt_notice_text)
+                    .collect();
+                assert_eq!(
+                    texts
+                        .iter()
+                        .filter(|text| **text == "Provider reply")
+                        .count(),
+                    1,
+                    "the native driver completed the second generated turn"
+                );
+                assert_eq!(
+                    texts.iter().filter(|text| text.contains("Error:")).count(),
+                    usize::from(failed_stop == StopReason::Error),
+                    "a failed run must produce one terminal notice after all queued runs"
+                );
+                assert!(!texts.iter().any(|text| text.contains("Workflow finished")));
+                assert!(
+                    !updates
+                        .iter()
+                        .any(|update| update.to_string().contains("PRIVATE"))
+                );
+                let path = stored.try_lock().unwrap().path.clone().unwrap();
+                let saved = Session::open(path.to_str().unwrap()).await.unwrap();
+                let stops: Vec<_> = saved
+                    .to_messages_for_current_path()
+                    .iter()
+                    .filter_map(|message| match message {
+                        crate::model::Message::Assistant(message) => Some(message.stop_reason),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(stops, vec![failed_stop, StopReason::Stop]);
+            }
+        });
+    }
+
+    #[test]
+    fn cancelling_extension_handler_restores_owner_and_allows_next_prompt() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (state, provider, stored) =
+                prompt_test_state(root.path(), PromptTestOutcome::Complete, false).await;
+            enable_acp_command_fixture(&state, root.path()).await;
+            let (abort, signal) = AbortHandle::new();
+            let cancel = async {
+                loop {
+                    let started = stored.try_lock().is_ok_and(|session| {
+                        session
+                            .to_messages_for_current_path()
+                            .iter()
+                            .any(|message| {
+                                matches!(message, crate::model::Message::Custom(message)
+                                if message.custom_type == "waiting")
+                            })
+                    });
+                    if started {
+                        abort.abort();
+                        break;
+                    }
+                    sleep(wall_now(), Duration::from_millis(2)).await;
+                }
+            };
+            let ((reason, _), ()) = timeout(wall_now(), Duration::from_secs(5), async {
+                futures::join!(
+                    drive_test_command(Arc::clone(&state), "/wait", signal),
+                    cancel
+                )
+            })
+            .await
+            .expect("command cancellation must settle promptly");
+            assert_eq!(reason, ACP_STOP_REASON_CANCELLED);
+            assert!(state.try_lock().unwrap().agent_session.is_some());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            let (_, signal) = AbortHandle::new();
+            let (reason, _) = drive_test_prompt(state, signal).await;
+            assert_eq!(reason, ACP_STOP_REASON_END_TURN);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            let messages = stored.try_lock().unwrap().to_messages_for_current_path();
+            assert!(!messages.iter().any(|message| {
+                matches!(message, crate::model::Message::User(user)
+                    if matches!(&user.content, crate::model::UserContent::Text(text)
+                        if text == "must never run"))
+            }));
+        });
     }
 
     fn prompt_notice_text(update: &Value) -> &str {
@@ -5126,6 +5974,203 @@ mod tests {
         options.launch.system_prompt = Some("ACP workspace settings fixture".into());
         options.skills_prompt = Some("launch-workspace-skill-marker".into());
         options
+    }
+
+    fn write_acp_skill(path: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(path.parent().expect("skill parent")).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                "---\nname: {name}\ndescription: ACP workspace skill fixture\n---\nInstructions\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn acp_skill_prompt(state: &AcpSessionState) -> String {
+        state
+            .agent_session
+            .as_ref()
+            .expect("ACP session")
+            .session()
+            .agent
+            .system_prompt()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn acp_boot_loads_the_target_workspace_skills_with_trust_and_launch_controls() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut options = acp_workspace_options(root.path(), runtime.handle());
+        options.launch.no_extensions = true;
+        let source = options.settings_source.clone().unwrap();
+        let cwd = root.path().join("target");
+        write_acp_settings(&cwd.join(".pi/settings.json"), json!({}));
+        let params = json!({"cwd": cwd, "mcpServers": []});
+        write_acp_skill(
+            &source.global_dir.join("skills/acp-global/SKILL.md"),
+            "acp-global",
+        );
+        write_acp_skill(
+            &source.launch_cwd.join(".agents/skills/acp-launch/SKILL.md"),
+            "acp-launch",
+        );
+        write_acp_skill(
+            &cwd.join(".agents/skills/acp-target/SKILL.md"),
+            "acp-target",
+        );
+
+        let boot = |options: &AcpOptions| {
+            let (_, mut state) = handle_session_new(&params, options, None).unwrap();
+            runtime
+                .block_on(boot_acp_extensions(&mut state, options))
+                .unwrap();
+            state
+        };
+        let denied = acp_skill_prompt(&boot(&options));
+        assert!(denied.contains("<name>acp-global</name>"));
+        assert!(!denied.contains("<name>acp-target</name>"));
+        assert!(!denied.contains("<name>acp-launch</name>"));
+        assert!(!denied.contains("launch-workspace-skill-marker"));
+
+        trust_acp_settings(&cwd, &source.global_dir);
+        let admitted = acp_skill_prompt(&boot(&options));
+        assert!(admitted.contains("<name>acp-global</name>"));
+        assert!(admitted.contains("<name>acp-target</name>"));
+        assert!(!admitted.contains("<name>acp-launch</name>"));
+
+        let mut disabled = options.clone();
+        disabled.launch.no_skills = true;
+        let prompt = acp_skill_prompt(&boot(&disabled));
+        assert!(!prompt.contains("<available_skills>"));
+        assert!(!prompt.contains("launch-workspace-skill-marker"));
+
+        write_acp_skill(
+            &source.launch_cwd.join("explicit/SKILL.md"),
+            "acp-explicit-launch",
+        );
+        write_acp_skill(&cwd.join("explicit/SKILL.md"), "acp-explicit-target");
+        disabled.launch.skills = vec!["explicit/SKILL.md".to_string()];
+        let prompt = acp_skill_prompt(&boot(&disabled));
+        assert!(prompt.contains("<name>acp-explicit-launch</name>"));
+        assert!(!prompt.contains("<name>acp-explicit-target</name>"));
+        assert!(!prompt.contains("<name>acp-target</name>"));
+
+        let mut without_read = options.clone();
+        without_read.launch.tools = Some("write".into());
+        assert!(!acp_skill_prompt(&boot(&without_read)).contains("<available_skills>"));
+
+        write_acp_skill(
+            &cwd.join("missing-at-launch/SKILL.md"),
+            "acp-target-impostor",
+        );
+        disabled.launch.skills = vec!["missing-at-launch/SKILL.md".to_string()];
+        let (_, mut missing) = handle_session_new(&params, &disabled, None).unwrap();
+        assert!(
+            runtime
+                .block_on(boot_acp_extensions(&mut missing, &disabled))
+                .is_err(),
+            "a target file must not replace a missing launch-relative skill"
+        );
+
+        std::fs::write(cwd.join("plugin.ts"), "export default function () {}").unwrap();
+        for source_name in ["./plugin.ts", "plugin.ts"] {
+            let mut extension_options = options.clone();
+            extension_options.launch.no_skills = true;
+            extension_options.launch.extensions = vec![source_name.into()];
+            let (_, mut missing) = handle_session_new(&params, &extension_options, None).unwrap();
+            assert!(
+                runtime
+                    .block_on(boot_acp_extensions(&mut missing, &extension_options))
+                    .is_err(),
+                "{source_name} must remain anchored to its launch workspace"
+            );
+            assert!(
+                missing
+                    .agent_session
+                    .as_ref()
+                    .unwrap()
+                    .extension_manager()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn acp_skill_loading_preserves_captured_config_and_programmatic_catalogs() {
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut options = acp_workspace_options(root.path(), runtime.handle());
+        options.launch.no_extensions = true;
+        let source = options.settings_source.as_mut().unwrap();
+        source.config_override = Some(PathBuf::from("selected-settings.json"));
+        let source = source.clone();
+        let cwd = root.path().join("target");
+        write_acp_settings(&cwd.join(".pi/settings.json"), json!({}));
+        let selected = source.global_dir.join("selected-catalog/SKILL.md");
+        write_acp_skill(&selected, "acp-selected-catalog");
+        write_acp_skill(
+            &source.global_dir.join("ambient-catalog/SKILL.md"),
+            "acp-ambient-catalog",
+        );
+        write_acp_skill(
+            &cwd.join(".agents/skills/acp-target/SKILL.md"),
+            "acp-target",
+        );
+        write_acp_settings(
+            &source.global_dir.join("settings.json"),
+            json!({"skills": ["ambient-catalog"]}),
+        );
+        write_acp_settings(
+            &source.launch_cwd.join("selected-settings.json"),
+            json!({"skills": ["selected-catalog"]}),
+        );
+        write_acp_settings(
+            &cwd.join("selected-settings.json"),
+            json!({"skills": ["ambient-catalog"]}),
+        );
+        trust_acp_settings(&cwd, &source.global_dir);
+        let params = json!({"cwd": cwd, "mcpServers": []});
+
+        let (_, mut state) = handle_session_new(&params, &options, None).unwrap();
+        runtime
+            .block_on(boot_acp_extensions(&mut state, &options))
+            .unwrap();
+        let prompt = acp_skill_prompt(&state);
+        assert!(prompt.contains("<name>acp-selected-catalog</name>"));
+        assert!(!prompt.contains("<name>acp-ambient-catalog</name>"));
+        assert!(!prompt.contains("<name>acp-target</name>"));
+
+        let mut supplied = options.clone();
+        supplied.settings_source = None;
+        supplied.workspace_trust_guard = None;
+        supplied.skills_prompt = Some("programmatic-host-catalog".into());
+        supplied.launch.no_skills = true;
+        let (_, mut state) = handle_session_new(&params, &supplied, None).unwrap();
+        runtime
+            .block_on(boot_acp_extensions(&mut state, &supplied))
+            .unwrap();
+        assert!(acp_skill_prompt(&state).contains("programmatic-host-catalog"));
+
+        supplied.launch.skills = vec![selected.to_string_lossy().into_owned()];
+        let (_, mut state) = handle_session_new(&params, &supplied, None).unwrap();
+        runtime
+            .block_on(boot_acp_extensions(&mut state, &supplied))
+            .unwrap();
+        let prompt = acp_skill_prompt(&state);
+        assert!(prompt.contains("programmatic-host-catalog"));
+        assert!(prompt.contains("<name>acp-selected-catalog</name>"));
+        assert!(!prompt.contains("<name>acp-ambient-catalog</name>"));
+        assert!(!prompt.contains("<name>acp-target</name>"));
+
+        let mut cli = AcpLaunchOptions::default().selection_cli().unwrap();
+        cli.no_skills = true;
+        cli.skill = vec!["relative/SKILL.md".into()];
+        let round_trip = AcpLaunchOptions::from_cli(&cli).selection_cli().unwrap();
+        assert!(round_trip.no_skills);
+        assert_eq!(round_trip.skill, cli.skill);
     }
 
     fn assert_acp_optional_tools(state: &AcpSessionState, expected: &[&str]) {

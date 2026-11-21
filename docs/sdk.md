@@ -4,9 +4,11 @@ This guide is for teams embedding Pi as a Rust library. The Rust SDK provides
 idiomatic Rust APIs for Pi's core embedding workflows, using Rust-native
 patterns such as `Result` types and structured concurrency.
 
-**Note**: This SDK is an idiomatic Rust companion to the pi-mono TypeScript
-SDK, not a drop-in equivalent. Parity remains governed by the active
-certification contract and its provenance-matched verdict.
+**Note**: This SDK is an idiomatic, OMP-inspired Rust library for embedding Pi —
+not a legacy TypeScript Pi drop-in equivalent. Supported behavior is governed by
+the documented `pi::sdk` SemVer surface and the authoritative DSR quality gate
+(`AGENTS.md`); historical drop-in certification artifacts under `docs/contracts/`
+and `docs/evidence/` are retired records, not active release gates.
 
 ## Install
 
@@ -19,24 +21,16 @@ futures = "0.3"
 When developing against a local checkout, replace `version = "0.8.0"` with
 `path = "/path/to/pi_agent_rust"` while retaining `package = "pi_agent_rust"`.
 
-### Raise your crate's `recursion_limit`
+### `recursion_limit` notes (post-type-erasure)
 
-Add this at the top of the crate that drives a session:
-
-```rust
-#![recursion_limit = "256"]
-```
-
-Pi's runtime nests its future types deeply enough that proving `Send` for a
-session future can exceed rustc's default limit of 128. `recursion_limit` is
-per-crate and is **not** inherited from a dependency, so pi raising it
-internally does nothing for yours. Without it you get an `overflow evaluating
-the requirement ...: std::marker::Send` error, or a
-`recursion_depth_exceeding_limit` warning that `-D warnings` makes fatal — and
-neither names the real cause.
-
-This is not hypothetical: every one of pi's own binaries, examples and
-integration tests needed the attribute, `examples/basic_sdk.rs` included.
+Following type erasure of extension manager and WASM runtime futures
+(`WasmExtensionHandle` and `JsExtensionRuntimeHandle`), standard SDK consumers
+and `examples/basic_sdk.rs` compile cleanly at `rustc`'s default
+`recursion_limit = 128`. If your crate nests Pi session futures inside deep
+custom combinators or trait adapters and hits `overflow evaluating the
+requirement ...: std::marker::Send` (or a `recursion_depth_exceeding_limit`
+lint under `-D warnings`), add `#![recursion_limit = "256"]` at your crate root
+because `recursion_limit` is per-crate and is not inherited from dependencies.
 
 ## SemVer Surface
 
@@ -78,6 +72,27 @@ be breaking for Rust consumers.
 | `pi::sdk::{SessionPromptResult, SessionTransport, SessionTransportEvent, SessionTransportState}` | Stable | Unified in-process/RPC transport adapter. |
 | `pi::sdk::{RpcTransportClient, RpcTransportOptions}` | Stable | Subprocess RPC transport client. |
 | `pi::sdk::{RpcBashResult, RpcCancelledResult, RpcCommandInfo, RpcCompactionResult, RpcCycleModelResult, RpcExportHtmlResult, RpcExtensionUiResponse, RpcForkMessage, RpcForkResult, RpcLastAssistantText, RpcModelInfo, RpcSessionState, RpcSessionStats, RpcThinkingLevelResult, RpcTokenStats}` | Stable | RPC request/response payloads. |
+| `pi::sdk::{RpcForkContentResult, edit_fork_content}` | Stable | Native fork selection and attachment-preserving edits. `RpcForkContentResult` is non-exhaustive. |
+
+`RpcTransportClient::fork_with_content` returns editable prose in
+`RpcForkContentResult.text` and the full ordered native blocks in `content`
+when the selected prompt was structured. Image, audio, and video bytes remain
+attached to those blocks; no source file needs to exist when resubmitting.
+After checking `cancelled`, pass
+`content` to `prompt_with_content` or `stream_prompt_with_content`. The fork
+itself does not submit the selected prompt. For plain text prompts, `content`
+is `None`; older servers that omit the field also decode successfully. An
+extension veto returns `cancelled: true`, empty `text`, and no content.
+
+The existing `fork` method keeps its `RpcForkResult` text-only API, including
+its original public fields and `PartialEq`/`Eq` implementations. Both methods
+send the same RPC `fork` command. Use `fork_with_content` when attachments
+must survive selection and resubmission.
+
+To edit a structured selection, `pi::sdk::edit_fork_content` replaces the
+prose while retaining its native attachments. Pass the returned blocks,
+the original `text`, and the edited text. An unchanged edit preserves the
+complete original block layout and text metadata.
 
 ## Migration Map (TypeScript -> Rust)
 
@@ -788,6 +803,33 @@ cannot override the SDK-generated `type` or `id` fields.
 The returned `RpcEvents` vector still contains the delivered events for callers
 that need the completed transcript. Live callbacks are therefore additive, not a
 change to the completion payload.
+
+For a long turn whose events you render or forward as they arrive, use
+`RpcTransportClient::stream_prompt(message, images, streaming_behavior, on_event)`
+or `stream_prompt_with_content(content, streaming_behavior, on_event)`. These
+methods return `Result<()>` and transfer each event to the callback without
+retaining a transcript. Their client memory use does not grow with the number of
+delivered events: the same bounded pipe queue and pre-acknowledgement buffer
+apply. Any events retained by your callback are your application's responsibility.
+The existing `prompt_with_options_streaming` and `prompt_with_content_streaming`
+methods continue collecting and returning all events.
+
+```rust
+async fn stream(rpc: &mut pi::sdk::RpcTransportClient) -> pi::sdk::Result<()> {
+    rpc.stream_prompt("Review the current changes", None, None, |event| {
+        println!("{event}");
+    })
+    .await
+}
+```
+
+Both callback-only methods use the same acknowledgement and cancellation rules
+as the collecting methods. A failed acknowledgement delivers no speculative
+events. Success means the callback received `agent_end`; inspect its `error`
+field to distinguish a completed turn from a provider failure or abort.
+Protocol and I/O failures return an error. Keep polling after sending
+`control_handle().abort()` to preserve the connection for later requests;
+dropping the stream future closes the transport.
 
 ### Cancellation and subprocess ownership
 

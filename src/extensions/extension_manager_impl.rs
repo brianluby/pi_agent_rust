@@ -902,6 +902,7 @@ impl ExtensionManager {
             if !clamped.enabled || !clamped.safety_envelope.enabled {
                 for state in guard.budget_fallback_states.values_mut() {
                     state.safety_envelope.clear_veto();
+                    state.service_safety_envelope.clear_veto();
                 }
             }
 
@@ -1104,9 +1105,20 @@ impl ExtensionManager {
         );
     }
 
-    pub(super) fn record_budget_recovery_sample(&self, extension_id: Option<&str>, success: bool) {
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn record_budget_call_outcome(
+        &self,
+        extension_id: Option<&str>,
+        success: bool,
+        duration_ms: f64,
+    ) {
         let Some(ext_id) = extension_id.map(str::trim).filter(|id| !id.is_empty()) else {
             return;
+        };
+        let duration_ms = if duration_ms.is_finite() && duration_ms >= 0.0 {
+            duration_ms
+        } else {
+            0.0
         };
         let Ok(mut guard) = self.inner.lock() else {
             return;
@@ -1115,69 +1127,159 @@ impl ExtensionManager {
         if !config.enabled {
             return;
         }
-        let Some(state) = guard.budget_fallback_states.get_mut(ext_id) else {
-            return;
+        let state = guard
+            .budget_fallback_states
+            .entry(ext_id.to_string())
+            .or_default();
+
+        // Execution duration and overload inter-arrival time are independent
+        // signals. Observe completed calls in both lanes so a slow successful
+        // call cannot count as recovery merely because it returned no error.
+        state.service_observations = state.service_observations.saturating_add(1);
+        let safety_veto =
+            state
+                .service_safety_envelope
+                .evaluate(duration_ms, success, &config.safety_envelope);
+        let regime_shift_triggered = if config.regime_shift.enabled {
+            let cusum_alarm = state.service_regime_shift.cusum.observe(
+                duration_ms,
+                config.regime_shift.cusum_k,
+                config.regime_shift.cusum_h,
+            );
+            let bocpd_alarm = state.service_regime_shift.bocpd.observe(
+                duration_ms,
+                config.regime_shift.bocpd_lambda,
+                config.regime_shift.bocpd_threshold,
+                config.regime_shift.bocpd_max_run_length,
+            );
+            if cusum_alarm || bocpd_alarm {
+                let source = if cusum_alarm { "cusum" } else { "bocpd" };
+                state.service_regime_shift.triggered = true;
+                state.service_regime_shift.trigger_source = Some(source);
+                state.service_regime_shift.trigger_count =
+                    state.service_regime_shift.trigger_count.saturating_add(1);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
         };
-        if !state.in_fallback {
-            return;
-        }
+        // The regime detector must still work when the independently
+        // configurable envelope is disabled and records no observations.
+        let calibrated_regime_shift = regime_shift_triggered
+            && state.service_observations >= u64::from(config.safety_envelope.min_observations);
 
-        let oco_update = state
-            .oco_tuner
-            .as_mut()
-            .filter(|_| config.oco_tuner.enabled)
-            .map(|state| state.update(!success, None, None, &config.oco_tuner));
+        if state.in_fallback {
+            let oco_update = state
+                .oco_tuner
+                .as_mut()
+                .filter(|_| config.oco_tuner.enabled)
+                .map(|oco| oco.update(!success, None, None, &config.oco_tuner));
 
-        // Feed recovery outcome to the safety envelope (latency=0 for success).
-        state
-            .safety_envelope
-            .evaluate(0.0, success, &config.safety_envelope);
+            if !success || safety_veto || calibrated_regime_shift {
+                state.healthy_success_streak = 0;
+                return;
+            }
 
-        if !success {
+            state.healthy_success_streak = state.healthy_success_streak.saturating_add(1);
+            if state.healthy_success_streak < config.recovery_successes_to_exit {
+                return;
+            }
+
+            state.in_fallback = false;
             state.healthy_success_streak = 0;
+            state.overload_timestamps_ms.clear();
+            // Overload recovery starts a new signal window.
+            state.regime_shift.cusum.reset_cumsum();
+            state.regime_shift.bocpd.reset();
+            state.regime_shift.triggered = false;
+            state.regime_shift.trigger_source = None;
+            state.safety_envelope.reset();
+            // Keep the service evidence that established recovery. Discarding
+            // its calibration would manufacture cold-start uncertainty and
+            // repeatedly put healthy traffic back into fallback.
+            state.service_regime_shift.cusum.reset_cumsum();
+            state.service_regime_shift.triggered = false;
+            state.service_regime_shift.trigger_source = None;
+            let oco_snapshot = state.oco_tuner.as_ref().map(OcoTunerState::snapshot);
+            tracing::info!(
+                event = "host_call.budget_controller.recovered",
+                extension_id = %ext_id,
+                budget_tier = config.tier.as_str(),
+                recovery_successes = config.recovery_successes_to_exit,
+                duration_ms,
+                oco_enabled = config.oco_tuner.enabled,
+                oco_queue_budget = ?oco_snapshot.as_ref().map(|s| s.queue_budget),
+                oco_batch_budget = ?oco_snapshot.as_ref().map(|s| s.batch_budget),
+                oco_time_slice_ms = ?oco_snapshot.as_ref().map(|s| s.time_slice_ms),
+                oco_cumulative_regret = ?oco_snapshot.as_ref().map(|s| s.cumulative_regret),
+                oco_instantaneous_loss = ?oco_update.as_ref().map(|u| u.instantaneous_loss),
+                oco_update_cumulative_regret = ?oco_update.as_ref().map(|u| u.cumulative_regret),
+                fallback_lane = "fast",
+                "Budget controller exited compatibility fallback mode"
+            );
             return;
         }
 
-        state.healthy_success_streak = state.healthy_success_streak.saturating_add(1);
-        if state.healthy_success_streak < config.recovery_successes_to_exit {
-            return;
+        if safety_veto || calibrated_regime_shift {
+            let trigger_kind = if safety_veto {
+                state
+                    .service_safety_envelope
+                    .veto_reason
+                    .unwrap_or("service_latency_safety_envelope")
+            } else {
+                state
+                    .service_regime_shift
+                    .trigger_source
+                    .unwrap_or("service_latency_regime_shift")
+            };
+            state.in_fallback = true;
+            state.healthy_success_streak = 0;
+            state.last_trigger_reason = Some("service_latency_shift".to_string());
+            tracing::warn!(
+                event = "host_call.budget_controller.fallback_entered",
+                extension_id = %ext_id,
+                budget_tier = config.tier.as_str(),
+                trigger_reason = "service_latency_shift",
+                trigger_kind,
+                duration_ms,
+                safety_veto,
+                regime_shift_triggered,
+                fallback_lane = "compat",
+                "Budget controller entered compatibility fallback mode on sustained service-latency shift"
+            );
         }
-
-        state.in_fallback = false;
-        state.healthy_success_streak = 0;
-        state.overload_timestamps_ms.clear();
-        // Reset regime-shift detectors so the next regime starts fresh.
-        state.regime_shift.cusum.reset_cumsum();
-        state.regime_shift.bocpd.reset();
-        state.regime_shift.triggered = false;
-        state.regime_shift.trigger_source = None;
-        // Reset safety envelope so the next regime starts fresh.
-        state.safety_envelope.reset();
-        let oco_snapshot = state.oco_tuner.as_ref().map(OcoTunerState::snapshot);
-        tracing::info!(
-            event = "host_call.budget_controller.recovered",
-            extension_id = %ext_id,
-            budget_tier = config.tier.as_str(),
-            recovery_successes = config.recovery_successes_to_exit,
-            oco_enabled = config.oco_tuner.enabled,
-            oco_queue_budget = ?oco_snapshot.as_ref().map(|s| s.queue_budget),
-            oco_batch_budget = ?oco_snapshot.as_ref().map(|s| s.batch_budget),
-            oco_time_slice_ms = ?oco_snapshot.as_ref().map(|s| s.time_slice_ms),
-            oco_cumulative_regret = ?oco_snapshot.as_ref().map(|s| s.cumulative_regret),
-            oco_instantaneous_loss = ?oco_update.as_ref().map(|u| u.instantaneous_loss),
-            oco_update_cumulative_regret = ?oco_update.as_ref().map(|u| u.cumulative_regret),
-            fallback_lane = "fast",
-            "Budget controller exited compatibility fallback mode"
-        );
     }
 
-    /// Snapshot the regime-shift detector state for an extension.
+    /// Snapshot aggregate reactor queue depth and capacity when the opt-in
+    /// reactor mesh is enabled.
+    pub(super) fn reactor_queue_saturation(&self) -> (Option<usize>, Option<usize>) {
+        self.reactor_telemetry().map_or((None, None), |telemetry| {
+            let depth = telemetry.queue_depths.iter().sum::<usize>();
+            let capacity = telemetry
+                .shard_count
+                .saturating_mul(telemetry.lane_capacity);
+            (Some(depth), Some(capacity))
+        })
+    }
+
+    /// Snapshot the overload inter-arrival regime-shift state for an extension.
     pub fn regime_shift_snapshot(&self, extension_id: &str) -> Option<RegimeShiftSnapshot> {
         let guard = self.inner.lock().ok()?;
         guard
             .budget_fallback_states
             .get(extension_id)
             .map(|state| state.regime_shift.snapshot())
+    }
+
+    /// Snapshot regime-shift detection over measured hostcall execution time.
+    pub fn service_regime_shift_snapshot(&self, extension_id: &str) -> Option<RegimeShiftSnapshot> {
+        let guard = self.inner.lock().ok()?;
+        guard
+            .budget_fallback_states
+            .get(extension_id)
+            .map(|state| state.service_regime_shift.snapshot())
     }
 
     /// Check if any extension has an active safety envelope veto.
@@ -1192,10 +1294,10 @@ impl ExtensionManager {
         guard
             .budget_fallback_states
             .values()
-            .any(|state| state.safety_envelope.vetoing)
+            .any(|state| state.safety_envelope.vetoing || state.service_safety_envelope.vetoing)
     }
 
-    /// Snapshot the safety envelope state for an extension.
+    /// Snapshot the overload-signal safety envelope for an extension.
     pub fn safety_envelope_snapshot(&self, extension_id: &str) -> Option<SafetyEnvelopeSnapshot> {
         let guard = self.inner.lock().ok()?;
         let config = &guard.budget_controller_config;
@@ -1203,6 +1305,20 @@ impl ExtensionManager {
             .budget_fallback_states
             .get(extension_id)
             .map(|state| state.safety_envelope.snapshot(&config.safety_envelope))
+    }
+
+    /// Snapshot the independent execution-time and outcome safety envelope.
+    pub fn service_safety_envelope_snapshot(
+        &self,
+        extension_id: &str,
+    ) -> Option<SafetyEnvelopeSnapshot> {
+        let guard = self.inner.lock().ok()?;
+        let config = &guard.budget_controller_config;
+        guard.budget_fallback_states.get(extension_id).map(|state| {
+            state
+                .service_safety_envelope
+                .snapshot(&config.safety_envelope)
+        })
     }
 
     /// Snapshot OCO tuner state for an extension.
@@ -5662,16 +5778,44 @@ impl ExtensionManager {
                 .unwrap_or(false))
     }
 
-    /// Dispatch multiple fire-and-forget events in a single JS bridge call.
+    /// Dispatch multiple fire-and-forget events to subscribed runtimes.
     ///
     /// Events that have no registered hooks are filtered out before crossing
     /// the bridge.  Returns `Ok(())` — individual per-event errors are logged
-    /// but do not fail the batch.
+    /// but do not fail the batch. JS-only batches retain a single bridge call;
+    /// batches with WASM subscribers use the shared ordered dispatch path.
     pub async fn dispatch_event_batch(
         &self,
         events: Vec<(ExtensionEventName, Option<Value>)>,
     ) -> Result<()> {
         if events.is_empty() {
+            return Ok(());
+        }
+
+        #[cfg(feature = "wasm-host")]
+        if self.wasm_extensions().iter().any(|extension| {
+            events.iter().any(|(event, _)| {
+                extension
+                    .event_hooks()
+                    .iter()
+                    .any(|hook| hook == event.as_str())
+            })
+        }) {
+            // The single-bridge optimization only reaches JS/native runtimes.
+            // Observation events arrive here through EventCoalescer, so using
+            // it for WASM would silently discard message/tool boundaries while
+            // still delivering their coalesced updates. Share direct dispatch's
+            // subscriptions, context, deadlines, and cancellation ownership.
+            for (event, data) in events {
+                if let Err(err) = self.dispatch_event(event, data).await {
+                    tracing::warn!(
+                        event = "ext.event_batch.error",
+                        event_name = %event,
+                        error = %err,
+                        "Batch event dispatch failed"
+                    );
+                }
+            }
             return Ok(());
         }
 

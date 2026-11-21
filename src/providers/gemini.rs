@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 
 mod files;
@@ -154,9 +154,10 @@ impl GeminiProvider {
 
     /// Build the base request body. The live request additionally applies
     /// model-specific thinking controls before the request-rewrite hook.
-    #[allow(clippy::unused_self)]
     pub fn build_request(&self, context: &Context<'_>, options: &StreamOptions) -> GeminiRequest {
-        let contents = convert_messages_to_gemini(&context.messages);
+        // Developer API accepts matching function IDs. Keep the internal Code
+        // Assist dialect's existing name/order-based request shape.
+        let contents = convert_messages_to_gemini(&context.messages, !self.google_cli_mode);
         let system_instruction = context.system_prompt.as_deref().map(|s| GeminiContent {
             role: None,
             parts: vec![GeminiPart::Text {
@@ -513,14 +514,16 @@ where
     pub(super) pending_events: VecDeque<StreamEvent>,
     started: bool,
     pub(super) finished: bool,
-    /// Whether a chunk carried a terminal marker (`finishReason` on the
-    /// candidate, or a `promptFeedback.blockReason`). Gemini's final chunk
-    /// always carries one; a transport close without it is a truncated
-    /// stream, not a complete answer.
+    /// Whether the selected candidate carried a real terminal marker, or the
+    /// response was rejected. Empty/unspecified reasons are not completion;
+    /// neither is a finish marker belonging to a different candidate.
     saw_terminal: bool,
     /// A later STOP cannot authorize calls from a response that hit its
     /// output limit. Text-only truncation still retains its Length outcome.
-    saw_truncation: bool,
+    truncation_reason: Option<&'static str>,
+    /// Provider IDs are opaque correlation keys, not replaceable local labels.
+    /// Generated IDs for anonymous calls share the same uniqueness boundary.
+    tool_ids: HashSet<String>,
     /// Shared by wire reads and queued event delivery across next() calls.
     ready_work_since_yield: usize,
     content_state: reasoning::ContentState,
@@ -555,7 +558,8 @@ where
             started: false,
             finished: false,
             saw_terminal: false,
-            saw_truncation: false,
+            truncation_reason: None,
+            tool_ids: HashSet::new(),
             ready_work_since_yield: 0,
             content_state: reasoning::ContentState::default(),
             usage_state: reasoning::UsageState::default(),
@@ -710,14 +714,46 @@ where
             return Ok(());
         }
 
-        // Process candidates
-        if let Some(candidates) = response.candidates
-            && let Some(candidate) = candidates.into_iter().next()
-        {
-            self.process_candidate(candidate)?;
+        if self.partial.stop_reason == StopReason::Error {
+            return Ok(());
+        }
+
+        if let Some(candidates) = response.candidates {
+            // A stream can interleave/reorder alternatives. Taking the first
+            // array element on every chunk splices one candidate's calls into
+            // another candidate's STOP. Only candidate zero owns this reply.
+            // ProtoJSON can omit its default numeric zero, including when
+            // explicitly indexed alternatives appear in the same chunk.
+            let multiple_candidates = candidates.len() > 1;
+            let mut indices = HashSet::new();
+            let mut selected = None;
+            for candidate in candidates {
+                let index = candidate.index.unwrap_or(0);
+                if multiple_candidates && !indices.insert(index) {
+                    self.reject_candidate("duplicate candidate index");
+                    return Ok(());
+                }
+                if index == 0 {
+                    selected = Some(candidate);
+                }
+            }
+            if let Some(candidate) = selected {
+                self.process_candidate(candidate)?;
+            }
         }
 
         Ok(())
+    }
+
+    fn reject_candidate(&mut self, reason: &str) {
+        self.saw_terminal = true;
+        self.partial.stop_reason = StopReason::Error;
+        self.partial.error_message = Some(format!(
+            "{} stream protocol error: {reason}; local tool calls withheld",
+            self.service_label()
+        ));
+        self.content_state
+            .close(&self.partial, &mut self.pending_events);
     }
 
     fn process_cloud_code_event(&mut self, data: &str) -> Result<()> {
@@ -741,14 +777,30 @@ where
         if self.partial.stop_reason == StopReason::Error {
             return Ok(());
         }
-        let has_finish_reason = candidate.finish_reason.is_some();
-        self.saw_terminal |= has_finish_reason;
+        let already_finished = self.saw_terminal;
+        // The API explicitly says an empty reason means generation is still
+        // in progress. Protobuf's unspecified default is not authorization
+        // either: require a later real reason before accepting transport EOF.
+        // https://ai.google.dev/api/generate-content#FinishReason
+        let finish_reason = candidate
+            .finish_reason
+            .as_deref()
+            .filter(|reason| !reason.is_empty() && *reason != "FINISH_REASON_UNSPECIFIED");
+        self.saw_terminal |= finish_reason.is_some();
 
         // Handle finish reason
-        if let Some(reason) = candidate.finish_reason.as_deref() {
+        if let Some(reason) = finish_reason {
             self.partial.stop_reason = match reason {
+                "STOP" => StopReason::Stop,
                 "MAX_TOKENS" => {
-                    self.saw_truncation = true;
+                    self.truncation_reason.get_or_insert("MAX_TOKENS");
+                    StopReason::Length
+                }
+                // Continuation stops at a per-request limit, not at a complete
+                // model turn. Until another request completes the generation,
+                // its partial tool batch has no execution authority.
+                "CONTINUATION" => {
+                    self.truncation_reason.get_or_insert("CONTINUATION");
                     StopReason::Length
                 }
                 // Developer API and Vertex both report failed generations
@@ -775,8 +827,10 @@ where
                 | "ESCALATION"
                 | "PUP_LIMITED_DISABLED" => StopReason::Error,
                 "FUNCTION_CALL" => StopReason::ToolUse,
-                // Preserve compatibility with unrecognized finish strings.
-                _ => StopReason::Stop,
+                _ => {
+                    self.reject_candidate("unsupported finishReason");
+                    return Ok(());
+                }
             };
             if self.partial.stop_reason == StopReason::Error {
                 self.partial.error_message = Some(format!(
@@ -789,7 +843,7 @@ where
             }
         }
 
-        if self.saw_truncation {
+        if let Some(reason) = self.truncation_reason {
             // A complete call object is not permission to run an unfinished
             // batch. The agent executes calls on Length as well as ToolUse,
             // so preserve Length only when the whole response has no calls.
@@ -809,7 +863,7 @@ where
             if has_calls {
                 self.partial.stop_reason = StopReason::Error;
                 self.partial.error_message = Some(format!(
-                    "{} stopped generation: MAX_TOKENS; truncated function calls withheld",
+                    "{} stopped generation: {reason}; truncated function calls withheld",
                     self.service_label()
                 ));
                 self.content_state
@@ -817,6 +871,26 @@ where
                 return Ok(());
             }
             self.partial.stop_reason = StopReason::Length;
+        }
+
+        if already_finished
+            && candidate.content.as_ref().is_some_and(|content| {
+                content.parts.iter().any(|part| match part {
+                    GeminiPart::Text { text }
+                    | GeminiPart::SignedText { text, .. }
+                    | GeminiPart::Thought { text, .. } => !text.is_empty(),
+                    GeminiPart::FunctionCall { .. }
+                    | GeminiPart::InlineData { .. }
+                    | GeminiPart::FunctionResponse { .. } => true,
+                    GeminiPart::Unknown(_) => false,
+                })
+            })
+        {
+            // Trailing usage and empty signature-bearing parts are legitimate
+            // metadata. A new call or generated text cannot borrow a previous
+            // candidate's terminal marker, even if it repeats the same STOP.
+            self.reject_candidate("generated content arrived after finishReason");
+            return Ok(());
         }
 
         // Process content parts — queue all events into pending_events
@@ -867,13 +941,23 @@ where
                         self.content_state
                             .close(&self.partial, &mut self.pending_events);
                         self.ensure_started();
-                        // Generate a unique ID for this tool call
-                        let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                        let GeminiFunctionCall { id, name, args } = function_call;
+                        let id =
+                            id.unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()));
+                        if id.trim().is_empty()
+                            || name.trim().is_empty()
+                            || !self.tool_ids.insert(id.clone())
+                        {
+                            // Do not include IDs, names or argument contents:
+                            // provider payloads may carry private user data.
+                            return Err(Error::api(
+                                "Gemini tool protocol error: empty or duplicate function identity; local tool batch withheld",
+                            ));
+                        }
 
                         // Serialize args for the delta event
-                        let args_str = serde_json::to_string(&function_call.args)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        let GeminiFunctionCall { name, args } = function_call;
+                        let args_str =
+                            serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
 
                         let tool_call = ToolCall {
                             id,
@@ -1017,6 +1101,8 @@ pub(crate) struct GeminiBlob {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct GeminiFunctionCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) id: Option<String>,
     pub(crate) name: String,
     #[serde(default = "empty_function_arguments")]
     pub(crate) args: serde_json::Value,
@@ -1028,6 +1114,8 @@ fn empty_function_arguments() -> serde_json::Value {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct GeminiFunctionResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) id: Option<String>,
     pub(crate) name: String,
     pub(crate) response: serde_json::Value,
 }
@@ -1113,6 +1201,8 @@ struct CloudCodeAssistResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GeminiCandidate {
     #[serde(default)]
+    pub(crate) index: Option<u32>,
+    #[serde(default)]
     pub(crate) content: Option<GeminiContent>,
     #[serde(default)]
     pub(crate) finish_reason: Option<String>,
@@ -1141,13 +1231,18 @@ pub(crate) struct GeminiUsageMetadata {
 /// Keep every parallel function response in the same user turn. Gemini
 /// validates that the response turn answers all calls in the preceding model
 /// turn; separate user turns fail that contract even for text-only results.
-/// Responses without wire IDs are matched by position, so restore call order
-/// when parallel tools completed or were persisted in a different order.
+/// Matching IDs are echoed on dialects that support them. Anonymous calls keep
+/// the stable local ID assigned when their response was parsed. Dialects without
+/// IDs match by position, so restore call order when parallel tools completed
+/// or were persisted in a different order.
 /// Media follows the complete response turn, with its originating call named.
 ///
 /// Shared by the Developer API, Cloud Code Assist and Vertex adapters.
 /// https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures#parallel-function-calling-example
-pub(crate) fn convert_messages_to_gemini(messages: &[Message]) -> Vec<GeminiContent> {
+pub(crate) fn convert_messages_to_gemini(
+    messages: &[Message],
+    include_function_ids: bool,
+) -> Vec<GeminiContent> {
     let mut contents = Vec::with_capacity(messages.len());
     let mut results = Vec::new();
     let mut call_order = HashMap::new();
@@ -1156,26 +1251,40 @@ pub(crate) fn convert_messages_to_gemini(messages: &[Message]) -> Vec<GeminiCont
         if let Message::ToolResult(result) = message {
             results.push(result.as_ref());
         } else {
-            append_ordered_tool_result_turns(&mut contents, &mut results, &call_order);
+            append_ordered_tool_result_turns(
+                &mut contents,
+                &mut results,
+                &call_order,
+                include_function_ids,
+            );
             if let Message::Assistant(assistant) = message {
                 for block in &assistant.content {
                     if let ContentBlock::ToolCall(call) = block {
-                        call_order.insert(call.id.as_str(), next_call_ordinal);
+                        call_order.insert(
+                            call.id.as_str(),
+                            (next_call_ordinal, reasoning::is_google_message(assistant)),
+                        );
                         next_call_ordinal += 1;
                     }
                 }
             }
-            contents.extend(convert_message_to_gemini(message));
+            contents.extend(convert_message_to_gemini(message, include_function_ids));
         }
     }
-    append_ordered_tool_result_turns(&mut contents, &mut results, &call_order);
+    append_ordered_tool_result_turns(
+        &mut contents,
+        &mut results,
+        &call_order,
+        include_function_ids,
+    );
     contents
 }
 
 fn append_ordered_tool_result_turns(
     contents: &mut Vec<GeminiContent>,
     results: &mut Vec<&ToolResultMessage>,
-    call_order: &HashMap<&str, usize>,
+    call_order: &HashMap<&str, (usize, bool)>,
+    include_function_ids: bool,
 ) {
     if results.is_empty() {
         return;
@@ -1185,7 +1294,7 @@ fn append_ordered_tool_result_turns(
         .filter_map(|result| {
             call_order
                 .get(result.tool_call_id.as_str())
-                .map(|&ordinal| (ordinal, *result))
+                .map(|&(ordinal, _)| (ordinal, *result))
         })
         .collect();
     known_results.sort_by_key(|(ordinal, _)| *ordinal);
@@ -1202,13 +1311,20 @@ fn append_ordered_tool_result_turns(
     let mut responses = Vec::with_capacity(results.len());
     let mut media = Vec::new();
     for result in results.drain(..) {
-        append_tool_result_parts(result, &mut responses, &mut media);
+        let replay_id = include_function_ids
+            && call_order
+                .get(result.tool_call_id.as_str())
+                .is_some_and(|(_, google_history)| *google_history);
+        append_tool_result_parts(result, &mut responses, &mut media, replay_id);
     }
     append_tool_result_turns(contents, &mut responses, &mut media);
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent> {
+pub(crate) fn convert_message_to_gemini(
+    message: &Message,
+    include_function_ids: bool,
+) -> Vec<GeminiContent> {
     match message {
         Message::User(user) => vec![GeminiContent {
             role: Some("user".into()),
@@ -1250,6 +1366,7 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
                     ContentBlock::ToolCall(tc) => {
                         parts.push(GeminiPart::FunctionCall {
                             function_call: GeminiFunctionCall {
+                                id: (include_function_ids && google_history).then(|| tc.id.clone()),
                                 name: tc.name.clone(),
                                 args: tc.arguments.clone(),
                             },
@@ -1283,7 +1400,7 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
             let mut contents = Vec::new();
             let mut responses = Vec::new();
             let mut media = Vec::new();
-            append_tool_result_parts(result, &mut responses, &mut media);
+            append_tool_result_parts(result, &mut responses, &mut media, include_function_ids);
             append_tool_result_turns(&mut contents, &mut responses, &mut media);
             contents
         }
@@ -1294,6 +1411,7 @@ fn append_tool_result_parts(
     result: &crate::model::ToolResultMessage,
     responses: &mut Vec<GeminiPart>,
     media: &mut Vec<GeminiPart>,
+    include_function_ids: bool,
 ) {
     let inline_parts = tool_result_inline_parts(result);
     let mut content_text = result
@@ -1315,6 +1433,7 @@ fn append_tool_result_parts(
     };
     responses.push(GeminiPart::FunctionResponse {
         function_response: GeminiFunctionResponse {
+            id: include_function_ids.then(|| result.tool_call_id.clone()),
             name: result.tool_name.clone(),
             response,
         },
@@ -1573,6 +1692,38 @@ mod tests {
                         .is_none()
                 );
             }
+        }
+
+        fn candidate_frames(mode: Mode, frames: &[Value]) -> Vec<Result<StreamEvent>> {
+            let chunks = frames.iter().map(|frame| Ok(wire(mode, frame.clone())));
+            let (mut output, dropped) = observed(mode, chunks, Tail::Eof);
+            let mut events = Vec::new();
+            for _ in 0..32 {
+                let event = output
+                    .next()
+                    .now_or_never()
+                    .expect("small finite candidate fixture must be ready")
+                    .expect("candidate fixture must have a terminal outcome");
+                let terminal = matches!(
+                    &event,
+                    Err(_) | Ok(StreamEvent::Done { .. } | StreamEvent::Error { .. })
+                );
+                events.push(event);
+                if terminal {
+                    assert_retired(&mut output, &dropped);
+                    return events;
+                }
+            }
+            panic!("finite candidate fixture did not terminate");
+        }
+
+        fn terminal_message(events: &[Result<StreamEvent>]) -> &AssistantMessage {
+            let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
+                panic!("missing candidate terminal: {events:?}");
+            };
+            assert_eq!(*reason, message.stop_reason);
+            assert_usage(message);
+            message
         }
 
         struct UsageWireProvider {
@@ -2077,6 +2228,242 @@ mod tests {
                 }
             }
         }
+
+        #[test]
+        fn unspecified_candidate_requires_its_own_successful_finish() {
+            for mode in MODES {
+                for finish in [None, Some(""), Some("FINISH_REASON_UNSPECIFIED")] {
+                    let mut candidate = json!({"index": 0, "content": {"parts": [
+                        {"text": "retained explanation"},
+                        {"functionCall": {"name": "write", "args": {"path": "primary"}}}
+                    ]}});
+                    if let Some(finish) = finish {
+                        candidate["finishReason"] = json!(finish);
+                    }
+                    let mut frames = vec![
+                        json!({"candidates": [candidate]}),
+                        // Another candidate's STOP cannot complete candidate 0.
+                        json!({"candidates": [{"index": 1, "finishReason": "STOP"}]}),
+                        usage(),
+                    ];
+                    let events = candidate_frames(mode, &frames);
+                    assert!(events.last().is_some_and(Result::is_err));
+                    assert!(events.iter().any(|event| matches!(
+                        event, Ok(StreamEvent::TextDelta { delta, .. })
+                            if delta == "retained explanation"
+                    )));
+                    assert!(
+                        !events
+                            .iter()
+                            .any(|event| matches!(event, Ok(StreamEvent::Done { .. })))
+                    );
+
+                    // The same streamed call is usable once its own candidate
+                    // really finishes. This prevents a blanket tool rejection.
+                    frames.push(json!({"candidates": [{"index": 0, "finishReason": "STOP"}]}));
+                    let events = candidate_frames(mode, &frames);
+                    let message = terminal_message(&events);
+                    assert_eq!(message.stop_reason, StopReason::ToolUse);
+                    assert!(matches!(
+                        message.content.last(), Some(ContentBlock::ToolCall(call))
+                            if call.name == "write" && call.arguments["path"] == "primary"
+                    ));
+                }
+            }
+        }
+
+        #[test]
+        fn unknown_completion_cannot_authorize_prior_or_adjoining_calls() {
+            for mode in MODES {
+                let frames = [
+                    json!({"candidates": [{"content": {"parts": [
+                        {"text": "retained explanation"},
+                        {"functionCall": {"name": "prior", "args": {}}}
+                    ]}}]}),
+                    json!({"candidates": [{"finishReason": "NEW_FAILURE_REASON", "content": {
+                        "parts": [{"functionCall": {"name": "adjoining", "args": {}}}]
+                    }}]}),
+                    json!({"candidates": [{"finishReason": "STOP", "content": {
+                        "parts": [{"functionCall": {"name": "late", "args": {}}}]
+                    }}]}),
+                    usage(),
+                ];
+                let events = candidate_frames(mode, &frames);
+                let message = terminal_message(&events);
+                assert_eq!(message.stop_reason, StopReason::Error);
+                assert!(
+                    message
+                        .error_message
+                        .as_deref()
+                        .unwrap()
+                        .contains("unsupported finishReason")
+                );
+                assert_eq!(message.content.len(), 2);
+                assert!(matches!(&message.content[0], ContentBlock::Text(text)
+                    if text.text == "retained explanation"));
+                let calls: Vec<_> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Ok(StreamEvent::ToolCallEnd { tool_call, .. }) => {
+                            Some(tool_call.name.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(calls, ["prior"]);
+            }
+        }
+
+        #[test]
+        fn continuation_preserves_partial_text_and_withholds_tool_batches() {
+            for mode in MODES {
+                for with_call in [false, true] {
+                    let mut parts = vec![json!({"text": "partial response"})];
+                    if with_call {
+                        parts.push(json!({"functionCall": {"name": "write", "args": {}}}));
+                    }
+                    let frames = [
+                        json!({"candidates": [{"content": {"parts": parts}}]}),
+                        json!({"candidates": [{"finishReason": "CONTINUATION", "continuationToken": "opaque"}]}),
+                        // A later ordinary stop cannot turn this request's
+                        // incomplete batch into an executable one.
+                        json!({"candidates": [{"finishReason": "STOP"}]}),
+                        usage(),
+                    ];
+                    let events = candidate_frames(mode, &frames);
+                    let message = terminal_message(&events);
+                    assert_eq!(
+                        message.stop_reason,
+                        if with_call {
+                            StopReason::Error
+                        } else {
+                            StopReason::Length
+                        }
+                    );
+                    assert!(matches!(&message.content[0], ContentBlock::Text(text)
+                        if text.text == "partial response"));
+                    if with_call {
+                        assert!(
+                            message
+                                .error_message
+                                .as_deref()
+                                .unwrap()
+                                .contains("CONTINUATION")
+                        );
+                    } else {
+                        assert!(message.error_message.is_none());
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn candidate_zero_is_selected_by_identity_across_reordered_chunks() {
+            for mode in MODES {
+                // Alternative candidates may reuse a wire ID. Only the
+                // selected candidate participates in tool identity checks.
+                let frames = [
+                    json!({"candidates": [
+                        {"index": 1, "content": {"parts": [{"functionCall": {"id": "candidate-scoped-id", "name": "other", "args": {}}}]}, "finishReason": "STOP"},
+                        {"content": {"parts": [{"text": "selected explanation"}]}}
+                    ]}),
+                    json!({"candidates": [
+                        {"index": 0, "content": {"parts": [{"functionCall": {"id": "candidate-scoped-id", "name": "selected", "args": {"ok": true}}}]}},
+                        {"index": 1, "finishReason": "SAFETY"}
+                    ]}),
+                    json!({"candidates": [
+                        {"index": 1, "finishReason": "MAX_TOKENS"},
+                        {"finishReason": "STOP"}
+                    ]}),
+                    usage(),
+                ];
+                let events = candidate_frames(mode, &frames);
+                let message = terminal_message(&events);
+                assert_eq!(message.stop_reason, StopReason::ToolUse);
+                assert_eq!(message.content.len(), 2);
+                assert!(matches!(&message.content[0], ContentBlock::Text(text)
+                    if text.text == "selected explanation"));
+                assert!(matches!(&message.content[1], ContentBlock::ToolCall(call)
+                    if call.id == "candidate-scoped-id"
+                        && call.name == "selected" && call.arguments["ok"] == true));
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { .. })))
+                        .count(),
+                    1
+                );
+            }
+        }
+
+        #[test]
+        fn ambiguous_candidate_indices_reject_the_entire_chunk() {
+            for mode in MODES {
+                for indices in [
+                    [None, None],
+                    [Some(0), None],
+                    [Some(0), Some(0)],
+                    [Some(1), Some(1)],
+                ] {
+                    let candidates: Vec<_> = indices
+                        .into_iter()
+                        .map(|index| {
+                            let mut candidate = json!({"finishReason": "STOP", "content": {
+                                "parts": [{"functionCall": {"name": "withheld", "args": {}}}]
+                            }});
+                            if let Some(index) = index {
+                                candidate["index"] = json!(index);
+                            }
+                            candidate
+                        })
+                        .collect();
+                    let frames = [
+                        json!({"candidates": [{"content": {"parts": [{"text": "prior text"}]}}]}),
+                        json!({"candidates": candidates}),
+                        usage(),
+                    ];
+                    let events = candidate_frames(mode, &frames);
+                    let message = terminal_message(&events);
+                    assert_eq!(message.stop_reason, StopReason::Error);
+                    assert_eq!(message.content.len(), 1);
+                    assert!(!events.iter().any(|event| matches!(
+                        event,
+                        Ok(StreamEvent::ToolCallStart { .. } | StreamEvent::ToolCallEnd { .. })
+                    )));
+                }
+            }
+        }
+
+        #[test]
+        fn generated_content_after_finish_invalidates_completed_peers() {
+            for mode in MODES {
+                for late in [
+                    json!({"functionCall": {"name": "late", "args": {}}}),
+                    json!({"text": "unacknowledged late output"}),
+                ] {
+                    let frames = [
+                        json!({"candidates": [{"content": {"parts": [
+                            {"functionCall": {"name": "prior", "args": {}}}
+                        ]}, "finishReason": "STOP"}]}),
+                        json!({"candidates": [{"content": {"parts": [late]}, "finishReason": "STOP"}]}),
+                        usage(),
+                    ];
+                    let events = candidate_frames(mode, &frames);
+                    let message = terminal_message(&events);
+                    assert_eq!(message.stop_reason, StopReason::Error);
+                    assert!(
+                        message
+                            .error_message
+                            .as_deref()
+                            .unwrap()
+                            .contains("after finishReason")
+                    );
+                    assert_eq!(message.content.len(), 1);
+                    assert!(matches!(&message.content[0], ContentBlock::ToolCall(call)
+                        if call.name == "prior"));
+                }
+            }
+        }
     }
 
     use super::*;
@@ -2099,7 +2486,7 @@ mod tests {
             timestamp: 0,
         });
 
-        let converted = convert_message_to_gemini(&message);
+        let converted = convert_message_to_gemini(&message, true);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, Some("user".to_string()));
     }
@@ -3077,7 +3464,7 @@ mod tests {
             timestamp: 0,
         });
 
-        let converted = convert_message_to_gemini(&message);
+        let converted = convert_message_to_gemini(&message, true);
         assert_eq!(converted.len(), 2, "functionResponse turn + media turn");
         match &converted[0].parts[0] {
             GeminiPart::FunctionResponse { function_response } => {
@@ -3114,7 +3501,7 @@ mod tests {
             is_error: false,
             timestamp: 0,
         });
-        let converted = convert_message_to_gemini(&media_only);
+        let converted = convert_message_to_gemini(&media_only, true);
         assert_eq!(converted.len(), 2);
         match &converted[0].parts[0] {
             GeminiPart::FunctionResponse { function_response } => {
@@ -3130,7 +3517,7 @@ mod tests {
             is_error: false,
             timestamp: 0,
         });
-        assert_eq!(convert_message_to_gemini(&text_only).len(), 1);
+        assert_eq!(convert_message_to_gemini(&text_only, true).len(), 1);
     }
 
     #[test]
@@ -3228,13 +3615,13 @@ mod tests {
             assert_eq!(
                 contents[2]["parts"],
                 serde_json::json!([
-                    {"functionResponse": {"name": "read", "response": {"result": "image result"}}},
-                    {"functionResponse": {"name": "read", "response": {"result": "text result"}}},
-                    {"functionResponse": {"name": "read_media", "response": {
+                    {"functionResponse": {"id": "call_image", "name": "read", "response": {"result": "image result"}}},
+                    {"functionResponse": {"id": "call_text", "name": "read", "response": {"result": "text result"}}},
+                    {"functionResponse": {"id": "call_media", "name": "read_media", "response": {
                         "result": if with_media { "(see attached media)" } else { "" }
                     }}},
-                    {"functionResponse": {"name": "read", "response": {"error": "not found"}}},
-                    {"functionResponse": {"name": "read", "response": {"result": ""}}}
+                    {"functionResponse": {"id": "call_error", "name": "read", "response": {"error": "not found"}}},
+                    {"functionResponse": {"id": "call_empty", "name": "read", "response": {"result": ""}}}
                 ]),
             );
             if with_media {
@@ -3399,7 +3786,7 @@ mod tests {
                 timestamp: 0,
             }));
         }
-        let wire = serde_json::to_value(convert_messages_to_gemini(&messages)).unwrap();
+        let wire = serde_json::to_value(convert_messages_to_gemini(&messages, true)).unwrap();
         let results: Vec<_> = wire[1]["parts"]
             .as_array()
             .unwrap()
@@ -3423,7 +3810,7 @@ mod tests {
         );
 
         // Without any matching assistant calls, preserve the entire batch.
-        let wire = serde_json::to_value(convert_messages_to_gemini(&messages[1..])).unwrap();
+        let wire = serde_json::to_value(convert_messages_to_gemini(&messages[1..], true)).unwrap();
         assert_eq!(
             wire[0]["parts"][1]["functionResponse"]["response"]["result"],
             "b"
@@ -3456,7 +3843,7 @@ mod tests {
             timestamp: 0,
         });
 
-        let converted = convert_message_to_gemini(&message);
+        let converted = convert_message_to_gemini(&message, true);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, Some("model".to_string()));
         assert_eq!(converted[0].parts.len(), 2);
@@ -3488,7 +3875,7 @@ mod tests {
             timestamp: 0,
         });
 
-        let converted = convert_message_to_gemini(&message);
+        let converted = convert_message_to_gemini(&message, true);
         assert!(converted.is_empty());
     }
 
@@ -3503,7 +3890,7 @@ mod tests {
             timestamp: 0,
         });
 
-        let converted = convert_message_to_gemini(&message);
+        let converted = convert_message_to_gemini(&message, true);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, Some("user".to_string()));
 
@@ -3528,7 +3915,7 @@ mod tests {
             timestamp: 0,
         });
 
-        let converted = convert_message_to_gemini(&message);
+        let converted = convert_message_to_gemini(&message, true);
         assert_eq!(converted.len(), 1);
 
         match &converted[0].parts[0] {
@@ -3551,7 +3938,7 @@ mod tests {
             timestamp: 0,
         });
 
-        let converted = convert_message_to_gemini(&message);
+        let converted = convert_message_to_gemini(&message, true);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, Some("user".to_string()));
         match &converted[0].parts[0] {
@@ -3574,11 +3961,13 @@ mod tests {
             ("SAFETY", StopReason::Error),
             ("RECITATION", StopReason::Error),
             ("OTHER", StopReason::Error),
-            ("UNKNOWN_REASON", StopReason::Stop), // unknown defaults to Stop
+            ("CONTINUATION", StopReason::Length),
+            ("UNKNOWN_REASON", StopReason::Error),
         ];
 
         for (reason_str, expected) in test_cases {
             let candidate = GeminiCandidate {
+                index: None,
                 content: None,
                 finish_reason: Some(reason_str.to_string()),
             };
@@ -3700,8 +4089,9 @@ mod tests {
     #[test]
     fn signed_parallel_calls_survive_stream_session_and_replay() {
         const SIGNATURE: &str = "c2lnbmVkLXRvb2w=";
+        const IDS: [&str; 2] = ["provider-call_A/7=", "provider-call_B:8+"];
         let body = [
-            r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"read","args":{"path":"a.txt"}},"thoughtSignature":"c2lnbmVkLXRvb2w="},{"functionCall":{"name":"read","args":{"path":"b.txt"}}}]}}]}"#,
+            r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"id":"provider-call_A/7=","name":"read","args":{"path":"a.txt"}},"thoughtSignature":"c2lnbmVkLXRvb2w="},{"functionCall":{"id":"provider-call_B:8+","name":"read","args":{"path":"b.txt"}}}]}}]}"#,
             "",
             r#"data: {"candidates":[{"finishReason":"STOP"}]}"#,
             "",
@@ -3720,6 +4110,14 @@ mod tests {
             })
             .collect();
         assert_eq!(signatures, vec![Some(SIGNATURE), None]);
+        let ids: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(StreamEvent::ToolCallEnd { tool_call, .. }) => Some(tool_call.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, IDS);
         let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
             panic!("expected completed tool step: {events:?}");
         };
@@ -3769,6 +4167,13 @@ mod tests {
         );
         assert_eq!(wire["contents"].as_array().unwrap().len(), 3);
         assert_eq!(wire["contents"][2]["parts"].as_array().unwrap().len(), 2);
+        for (index, id) in IDS.into_iter().enumerate() {
+            assert_eq!(parts[index]["functionCall"]["id"], id);
+            assert_eq!(
+                wire["contents"][2]["parts"][index]["functionResponse"]["id"],
+                id,
+            );
+        }
         assert_eq!(
             wire["contents"][2]["parts"][0]["functionResponse"]["name"],
             "read"
@@ -3784,6 +4189,28 @@ mod tests {
         assert_eq!(
             wire["contents"][2]["parts"][1]["functionResponse"]["response"]["result"],
             "contents of b.txt"
+        );
+
+        // Internal Cloud Code Assist shares streaming and ordering, but its
+        // request dialect retains its established name/order-based matching.
+        let cli = GeminiProvider::new("gemini-3-pro").with_google_cli_mode(true);
+        let wire =
+            serde_json::to_value(cli.build_request(&context, &StreamOptions::default())).unwrap();
+        for index in 0..2 {
+            assert!(
+                wire["contents"][1]["parts"][index]["functionCall"]
+                    .get("id")
+                    .is_none()
+            );
+            assert!(
+                wire["contents"][2]["parts"][index]["functionResponse"]
+                    .get("id")
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            wire["contents"][1]["parts"][0]["thoughtSignature"],
+            SIGNATURE
         );
     }
 
@@ -3806,6 +4233,86 @@ mod tests {
         let unsigned = serde_json::json!({"functionCall": {"name": "read", "args": {}}});
         let part: GeminiPart = serde_json::from_value(unsigned.clone()).unwrap();
         assert_eq!(serde_json::to_value(part).unwrap(), unsigned);
+    }
+
+    #[test]
+    fn malformed_function_ids_fail_without_disclosing_payloads() {
+        for id in [json!(""), json!(" \t"), json!(17), json!({"private": "id"})] {
+            let body = format!(
+                "data: {}\n\n",
+                json!({"candidates": [{"content": {"parts": [{
+                    "functionCall": {"id": id, "name": "private-tool-name", "args": {
+                        "secret": "private-argument-value"
+                    }}
+                }]}, "finishReason": "STOP"}]}),
+            );
+            let events = collect_stream_items_from_body(&body);
+            let error = events
+                .last()
+                .expect("terminal failure")
+                .as_ref()
+                .expect_err("invalid function ID")
+                .to_string();
+            assert!(!error.contains("private"));
+            assert!(
+                events.iter().all(|event| !matches!(
+                    event,
+                    Ok(StreamEvent::ToolCallEnd { .. } | StreamEvent::Done { .. })
+                )),
+                "invalid identity must never become a completed call: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_and_unmatched_function_results_do_not_gain_google_ids() {
+        let context = Context::owned(
+            None,
+            vec![
+                Message::assistant(AssistantMessage {
+                    api: "openai-responses".to_string(),
+                    provider: "openai".to_string(),
+                    content: vec![ContentBlock::ToolCall(ToolCall {
+                        id: "foreign-call|foreign-item".to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    })],
+                    stop_reason: StopReason::ToolUse,
+                    ..AssistantMessage::default()
+                }),
+                Message::tool_result(ToolResultMessage {
+                    tool_call_id: "foreign-call|foreign-item".to_string(),
+                    tool_name: "read".to_string(),
+                    content: Vec::new(),
+                    details: None,
+                    is_error: false,
+                    timestamp: 0,
+                }),
+                Message::tool_result(ToolResultMessage {
+                    tool_call_id: "unmatched-call".to_string(),
+                    tool_name: "status".to_string(),
+                    content: Vec::new(),
+                    details: None,
+                    is_error: false,
+                    timestamp: 0,
+                }),
+            ],
+            Vec::new(),
+        );
+        let wire = serde_json::to_value(
+            GeminiProvider::new("gemini-3-pro").build_request(&context, &StreamOptions::default()),
+        )
+        .unwrap();
+        assert!(
+            wire["contents"][0]["parts"][0]["functionCall"]
+                .get("id")
+                .is_none()
+        );
+        assert_eq!(wire["contents"][1]["parts"].as_array().unwrap().len(), 2);
+        for part in wire["contents"][1]["parts"].as_array().unwrap() {
+            assert!(part["functionResponse"].get("id").is_none());
+        }
     }
 
     #[test]
@@ -4003,8 +4510,8 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn failed_generations_reject_adjoining_and_late_calls_across_google_transports() {
         // Published GenerateContent FinishReason values from the Developer
-        // API and Vertex. Unknown strings retain the separate mapping test's
-        // compatibility behavior.
+        // API and Vertex. Unknown reasons are rejected separately as protocol
+        // errors, so future failure modes never silently become success.
         let failures = [
             "SAFETY",
             "RECITATION",
@@ -4242,6 +4749,187 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::format_collect, clippy::too_many_lines)]
+    fn ambiguous_gemini_completions_never_execute_a_write() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for case in [
+            "empty",
+            "unspecified",
+            "other_candidate",
+            "unknown",
+            "continuation",
+            "late_call",
+            "duplicate_index",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("must-not-be-written.txt");
+            let candidate = json!({"index": 0, "content": {"parts": [
+                {"text": "retained explanation"},
+                {"functionCall": {"name": "write", "args": {
+                    "path": marker, "content": "must not execute"
+                }}}
+            ]}});
+            let mut frames = vec![json!({"candidates": [candidate.clone()]})];
+            match case {
+                "empty" => frames[0]["candidates"][0]["finishReason"] = json!(""),
+                "unspecified" => {
+                    frames[0]["candidates"][0]["finishReason"] = json!("FINISH_REASON_UNSPECIFIED");
+                }
+                "other_candidate" => {
+                    frames.push(json!({"candidates": [{"index": 1, "finishReason": "STOP"}]}));
+                }
+                "unknown" => {
+                    frames.push(json!({"candidates": [{"finishReason": "NEW_FAILURE_REASON"}]}));
+                }
+                "continuation" => {
+                    frames.push(json!({"candidates": [{"finishReason": "CONTINUATION"}]}));
+                }
+                "late_call" => {
+                    frames[0]["candidates"][0]["finishReason"] = json!("STOP");
+                    frames.push(json!({"candidates": [candidate]}));
+                }
+                "duplicate_index" => {
+                    let mut completed = candidate;
+                    completed["finishReason"] = json!("STOP");
+                    frames[0] = json!({"candidates": [completed.clone(), completed]});
+                }
+                _ => unreachable!("known regression fixture"),
+            }
+            frames.push(json!({"usageMetadata": {
+                "promptTokenCount": 21,
+                "candidatesTokenCount": 7,
+                "thoughtsTokenCount": 3,
+                "totalTokenCount": 31
+            }}));
+            let body = frames
+                .iter()
+                .map(|frame| format!("data: {frame}\n\n"))
+                .collect::<String>();
+            let (base_url, _requests) = spawn_test_server(200, "text/event-stream", &body);
+            let provider = GeminiProvider::new("gemini-test").with_base_url(base_url);
+            let tools = crate::tools::ToolRegistry::from_tools(vec![Box::new(
+                crate::tools::WriteTool::new(dir.path()),
+            )]);
+            let mut agent = crate::agent::Agent::new(
+                Arc::new(provider),
+                tools,
+                crate::agent::AgentConfig {
+                    max_tool_iterations: 1,
+                    turn_recovery: crate::turn_recovery::TurnRecoveryMode::Off,
+                    stream_options: StreamOptions {
+                        api_key: Some("test-key".to_string()),
+                        ..StreamOptions::default()
+                    },
+                    ..crate::agent::AgentConfig::default()
+                },
+            );
+            let executions = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&executions);
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            let message = runtime
+                .block_on(agent.run("Write the requested file", move |event| {
+                    if matches!(event, crate::agent::AgentEvent::ToolExecutionStart { .. }) {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }
+                }))
+                .unwrap();
+            assert_eq!(message.stop_reason, StopReason::Error, "{case}");
+            assert_eq!(executions.load(Ordering::SeqCst), 0, "{case}");
+            assert!(
+                !marker.exists(),
+                "ambiguous completion executed a write: {case}"
+            );
+            assert!(
+                !agent
+                    .messages()
+                    .iter()
+                    .any(|message| matches!(message, Message::ToolResult(_)))
+            );
+            if !matches!(case, "empty" | "unspecified" | "other_candidate") {
+                assert_eq!(message.usage.input, 21, "{case}");
+                assert_eq!(message.usage.output, 10, "{case}");
+                assert_eq!(message.usage.total_tokens, 31, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::format_collect)]
+    fn duplicate_function_ids_never_execute_parallel_peers() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for separate_frames in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let first = dir.path().join("must-not-exist-first.txt");
+            let second = dir.path().join("must-not-exist-second.txt");
+            let call = |path: &std::path::Path| {
+                json!({"functionCall": {"id": "same-opaque-provider-id", "name": "write",
+                    "args": {"path": path, "content": "private-write-content"}}})
+            };
+            let frames = if separate_frames {
+                vec![
+                    json!({"candidates": [{"content": {"parts": [call(&first)]}}]}),
+                    json!({"candidates": [{"content": {"parts": [call(&second)]},
+                        "finishReason": "STOP"}]}),
+                ]
+            } else {
+                vec![
+                    json!({"candidates": [{"content": {"parts": [call(&first), call(&second)]},
+                    "finishReason": "STOP"}]}),
+                ]
+            };
+            let body = frames
+                .iter()
+                .map(|frame| format!("data: {frame}\n\n"))
+                .collect::<String>();
+            let (base_url, _requests) = spawn_test_server(200, "text/event-stream", &body);
+            let provider = GeminiProvider::new("gemini-test").with_base_url(base_url);
+            let tools = crate::tools::ToolRegistry::from_tools(vec![Box::new(
+                crate::tools::WriteTool::new(dir.path()),
+            )]);
+            let mut agent = crate::agent::Agent::new(
+                Arc::new(provider),
+                tools,
+                crate::agent::AgentConfig {
+                    max_tool_iterations: 1,
+                    turn_recovery: crate::turn_recovery::TurnRecoveryMode::Off,
+                    stream_options: StreamOptions {
+                        api_key: Some("test-key".to_string()),
+                        ..StreamOptions::default()
+                    },
+                    ..crate::agent::AgentConfig::default()
+                },
+            );
+            let executions = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&executions);
+            let runtime = RuntimeBuilder::current_thread().build().unwrap();
+            let message = runtime
+                .block_on(agent.run("Write both files", move |event| {
+                    if matches!(event, crate::agent::AgentEvent::ToolExecutionStart { .. }) {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }
+                }))
+                .unwrap();
+            assert_eq!(message.stop_reason, StopReason::Error);
+            let error = message.error_message.as_deref().unwrap();
+            assert!(error.contains("duplicate function identity"), "{error}");
+            assert!(!error.contains("same-opaque-provider-id"));
+            assert!(!error.contains("private-write-content"));
+            assert_eq!(executions.load(Ordering::SeqCst), 0);
+            assert!(!first.exists() && !second.exists());
+            assert!(
+                !agent
+                    .messages()
+                    .iter()
+                    .any(|message| matches!(message, Message::ToolResult(_)))
+            );
+        }
+    }
+
+    #[test]
     #[allow(clippy::format_collect)]
     fn authorized_parallel_gemini_calls_execute_writes() {
         use std::sync::Arc;
@@ -4259,6 +4947,10 @@ mod tests {
                     "path": second, "content": "second authorized write"
                 }}}
             ]}});
+            if separate_terminal_chunk {
+                candidate["content"]["parts"][0]["functionCall"]["id"] = json!("opaque:first/1");
+                candidate["content"]["parts"][1]["functionCall"]["id"] = json!("opaque:second/2");
+            }
             if !separate_terminal_chunk {
                 candidate["finishReason"] = json!("STOP");
             }
@@ -4327,6 +5019,20 @@ mod tests {
             requests.recv_timeout(Duration::from_secs(5)).unwrap();
             let continuation = requests.recv_timeout(Duration::from_secs(5)).unwrap();
             assert_eq!(continuation.body.matches("functionResponse").count(), 2);
+            let body: Value = serde_json::from_str(&continuation.body).unwrap();
+            let contents = body["contents"].as_array().unwrap();
+            let calls = &contents[1]["parts"];
+            let responses = &contents[2]["parts"];
+            let first_id = calls[0]["functionCall"]["id"].as_str().unwrap();
+            let second_id = calls[1]["functionCall"]["id"].as_str().unwrap();
+            assert!(!first_id.is_empty() && !second_id.is_empty());
+            assert_ne!(first_id, second_id);
+            assert_eq!(responses[0]["functionResponse"]["id"], first_id);
+            assert_eq!(responses[1]["functionResponse"]["id"], second_id);
+            if separate_terminal_chunk {
+                assert_eq!(first_id, "opaque:first/1");
+                assert_eq!(second_id, "opaque:second/2");
+            }
         }
     }
 

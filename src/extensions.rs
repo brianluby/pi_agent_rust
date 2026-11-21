@@ -4098,10 +4098,16 @@ struct ExtensionBudgetFallbackState {
     in_fallback: bool,
     healthy_success_streak: u32,
     last_trigger_reason: Option<String>,
-    /// Regime-shift detector state (CUSUM + BOCPD).
+    /// Regime-shift detector state for overload inter-arrival intervals.
     regime_shift: RegimeShiftDetectorState,
-    /// Conformal + PAC-Bayes safety envelope state.
+    /// Conformal + PAC-Bayes safety envelope for overload signals.
     safety_envelope: SafetyEnvelopeState,
+    /// Measured execution durations must not share a baseline with the time
+    /// between overloads: the two observations describe different quantities.
+    service_regime_shift: RegimeShiftDetectorState,
+    service_safety_envelope: SafetyEnvelopeState,
+    /// Service warmup remains independent of whether its envelope is enabled.
+    service_observations: u64,
     /// Online convex optimization tuner state.
     oco_tuner: Option<OcoTunerState>,
 }
@@ -19760,7 +19766,7 @@ mod idle_runtime_tests {
                 ["after-veto-one", "after-veto-two"]
             );
 
-            manager.record_budget_recovery_sample(Some("overloaded-peer"), true);
+            manager.record_budget_call_outcome(Some("overloaded-peer"), true, 1.0);
             // ubs:ignore[rust.panic.assert-macros] -- cfg(test) regression invariant.
             assert!(!manager.any_safety_envelope_vetoing());
             fixture
@@ -20422,7 +20428,13 @@ pub async fn dispatch_host_call_shared(
                 method = %method,
                 reason = %qr,
             );
-            manager.record_budget_overload_signal(ctx.extension_id, "quota_exceeded", None, None);
+            let (queue_depth, queue_capacity) = manager.reactor_queue_saturation();
+            manager.record_budget_overload_signal(
+                ctx.extension_id,
+                "quota_exceeded",
+                queue_depth,
+                queue_capacity,
+            );
             // SEC-5.1: Alert for quota breach.
             manager.record_security_alert(SecurityAlert {
                 schema: SECURITY_ALERT_SCHEMA_VERSION.to_string(),
@@ -20484,20 +20496,21 @@ pub async fn dispatch_host_call_shared(
                 &reason,
             );
             if let Some(decision) = runtime_risk_decision.as_ref() {
+                let (queue_depth, queue_capacity) = manager.reactor_queue_saturation();
                 if decision.feature_budget_exceeded {
                     manager.record_budget_overload_signal(
                         ctx.extension_id,
                         "feature_extraction_budget_exceeded",
-                        None,
-                        None,
+                        queue_depth,
+                        queue_capacity,
                     );
                 }
                 if decision.fallback_reason.is_some() {
                     manager.record_budget_overload_signal(
                         ctx.extension_id,
                         "runtime_risk_decision_timeout",
-                        None,
-                        None,
+                        queue_depth,
+                        queue_capacity,
                     );
                 }
             }
@@ -20769,7 +20782,12 @@ impl HostcallFinalization {
             _ => None,
         };
         if let Some(manager) = manager.as_ref() {
-            manager.record_budget_recovery_sample(extension_id, outcome_error_code.is_none());
+            let duration_ms_f64 = self.started_at.elapsed().as_secs_f64() * 1000.0;
+            manager.record_budget_call_outcome(
+                extension_id,
+                outcome_error_code.is_none(),
+                duration_ms_f64,
+            );
         }
         if let (Some(manager), Some(risk_decision)) =
             (manager.as_ref(), self.runtime_risk_decision.as_ref())

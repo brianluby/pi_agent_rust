@@ -19,6 +19,7 @@ use std::fs::{File, Metadata};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_STORAGE_WRITE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -45,6 +46,96 @@ pub(super) struct PersistentStorage {
 
 fn denied(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message.into())
+}
+
+fn timestamp_millis(time: io::Result<SystemTime>) -> f64 {
+    time.map_or(0.0, |time| match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs_f64() * 1000.0,
+        Err(error) => -error.duration().as_secs_f64() * 1000.0,
+    })
+}
+
+/// Serialize an already-authorized metadata snapshot. Do not re-open the path:
+/// protected configuration reads deliberately obtained this snapshot through
+/// their no-follow handle. Millisecond timestamps retain their fractional part
+/// so extensions can detect same-size writes without reading the file again.
+pub(super) fn metadata_json(metadata: &Metadata) -> serde_json::Value {
+    let file_type = metadata.file_type();
+    let kind = if file_type.is_symlink() {
+        "symlink"
+    } else if file_type.is_dir() {
+        "dir"
+    } else if file_type.is_file() {
+        "file"
+    } else {
+        "other"
+    };
+    let mut fields = serde_json::Map::from_iter([
+        ("kind".to_string(), kind.into()),
+        ("size".to_string(), metadata.len().into()),
+        (
+            "atimeMs".to_string(),
+            timestamp_millis(metadata.accessed()).into(),
+        ),
+        (
+            "mtimeMs".to_string(),
+            timestamp_millis(metadata.modified()).into(),
+        ),
+        (
+            "birthtimeMs".to_string(),
+            timestamp_millis(metadata.created()).into(),
+        ),
+    ]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+        // Node's non-bigint Stats representation is also an IEEE-754 number.
+        #[allow(clippy::cast_precision_loss)]
+        let ctime_ms =
+            metadata.ctime() as f64 * 1000.0 + metadata.ctime_nsec() as f64 / 1_000_000.0;
+        fields.extend([
+            ("ctimeMs".to_string(), ctime_ms.into()),
+            ("mode".to_string(), metadata.mode().into()),
+            ("uid".to_string(), metadata.uid().into()),
+            ("gid".to_string(), metadata.gid().into()),
+            ("dev".to_string(), metadata.dev().into()),
+            ("ino".to_string(), metadata.ino().into()),
+            ("nlink".to_string(), metadata.nlink().into()),
+            ("rdev".to_string(), metadata.rdev().into()),
+            ("blksize".to_string(), metadata.blksize().into()),
+            ("blocks".to_string(), metadata.blocks().into()),
+            (
+                "isBlockDevice".to_string(),
+                file_type.is_block_device().into(),
+            ),
+            (
+                "isCharacterDevice".to_string(),
+                file_type.is_char_device().into(),
+            ),
+            ("isFIFO".to_string(), file_type.is_fifo().into()),
+            ("isSocket".to_string(), file_type.is_socket().into()),
+        ]);
+    }
+    #[cfg(not(unix))]
+    {
+        // Portable metadata exposes readonly/type bits but not POSIX ownership,
+        // inode or change time. Keep unavailable fields at the shim defaults.
+        let permissions = if metadata.permissions().readonly() {
+            0o444
+        } else {
+            0o666
+        };
+        let mode = if file_type.is_dir() {
+            0o040111 | permissions
+        } else if file_type.is_symlink() {
+            0o120000 | permissions
+        } else {
+            0o100000 | permissions
+        };
+        fields.insert("mode".to_string(), mode.into());
+    }
+    serde_json::Value::Object(fields)
 }
 
 /// Preserve errno as data: extensions must distinguish absent configuration
@@ -766,23 +857,66 @@ fn open_read_file(path: &Path) -> io::Result<(File, StorageParent)> {
     }
 }
 
+/// Capture descriptor contents and metadata through the same authorized handle.
+/// Concurrent length/mtime changes invalidate the capture instead of pairing
+/// bytes with another file or silently publishing a stale size. Filesystems
+/// without modification timestamps still retain the length/identity checks.
+pub(super) fn read_file_snapshot(mut file: File) -> io::Result<(Vec<u8>, Metadata)> {
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file descriptors require a regular host file",
+        ));
+    }
+    if before.len() > MAX_STORAGE_WRITE_BYTES as u64 {
+        return Err(denied("host snapshot read exceeds 64 MiB"));
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take((MAX_STORAGE_WRITE_BYTES as u64) + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_STORAGE_WRITE_BYTES {
+        return Err(denied("host snapshot read exceeds 64 MiB"));
+    }
+    let after = file.metadata()?;
+    let changed_time = matches!(
+        (before.modified(), after.modified()),
+        (Ok(before), Ok(after)) if before != after
+    );
+    if before.len() != after.len() || after.len() != bytes.len() as u64 || changed_time {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "host file changed while capturing descriptor contents",
+        ));
+    }
+    Ok((bytes, after))
+}
+
 pub(super) fn read_file(
     path: &Path,
     owner: Option<&str>,
     state: &Rc<RefCell<PiJsModuleState>>,
-) -> io::Result<Option<Vec<u8>>> {
+    snapshot: bool,
+) -> io::Result<Option<(Vec<u8>, Option<Metadata>)>> {
     let Some(path) = authorized_read_path(path, owner, state)? else {
         return Ok(None);
     };
     let (file, parent) = open_read_file(&path)?;
-    let mut bytes = Vec::new();
-    file.take((MAX_STORAGE_WRITE_BYTES as u64) + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_STORAGE_WRITE_BYTES {
-        return Err(denied("persistent storage read exceeds 64 MiB"));
-    }
+    let (bytes, metadata) = if snapshot {
+        let (bytes, metadata) = read_file_snapshot(file)?;
+        (bytes, Some(metadata))
+    } else {
+        let mut bytes = Vec::new();
+        file.take((MAX_STORAGE_WRITE_BYTES as u64) + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_STORAGE_WRITE_BYTES {
+            return Err(denied("persistent storage read exceeds 64 MiB"));
+        }
+        (bytes, None)
+    };
     parent.verify()?;
-    Ok(Some(bytes))
+    Ok(Some((bytes, metadata)))
 }
 
 /// Metadata uses the same literal grant and pinned file as content reads.
@@ -1101,6 +1235,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn descriptor_snapshot_uses_open_file_after_path_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(&path, b"original").unwrap();
+        let file = File::open(&path).unwrap();
+        let identity = FileIdentity::of_open_file(&file).unwrap();
+        std::fs::rename(&path, temp.path().join("retained.json")).unwrap();
+        std::fs::write(&path, b"replacement is longer").unwrap();
+
+        let (bytes, metadata) = read_file_snapshot(file).unwrap();
+        assert_eq!(bytes, b"original");
+        assert_eq!(metadata.len(), 8);
+        assert_ne!(identity, FileIdentity::of_path_nofollow(&path).unwrap());
+    }
+
+    #[test]
+    fn descriptor_snapshot_rejects_oversized_and_partial_captures() {
+        use std::io::{Seek as _, SeekFrom};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("data.bin");
+        std::fs::write(&path, b"content").unwrap();
+        let mut partial = File::open(&path).unwrap();
+        partial.seek(SeekFrom::Start(1)).unwrap();
+        assert_eq!(
+            read_file_snapshot(partial).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        let oversized = File::options().read(true).write(true).open(&path).unwrap();
+        oversized
+            .set_len(MAX_STORAGE_WRITE_BYTES as u64 + 1)
+            .unwrap();
+        assert!(
+            read_file_snapshot(oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds 64 MiB")
+        );
+    }
+
+    #[test]
+    fn metadata_timestamps_preserve_submillisecond_and_pre_epoch_times() {
+        let offset = std::time::Duration::from_micros(1_250);
+        let after = timestamp_millis(Ok(UNIX_EPOCH + offset));
+        let before = timestamp_millis(Ok(UNIX_EPOCH - offset));
+        assert_eq!(after.to_bits(), 1.25_f64.to_bits());
+        assert_eq!(before.to_bits(), (-1.25_f64).to_bits());
+        let unavailable = timestamp_millis(Err(io::Error::from(io::ErrorKind::Unsupported)));
+        assert_eq!(unavailable.to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[test]
     fn namespace_owner_and_foreign_boundaries_are_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
         let base = crate::extensions::safe_canonicalize(temp.path());
@@ -1228,7 +1414,7 @@ mod tests {
                     .resolve(path, Some("owner"))
                     .is_err()
             );
-            assert!(read_file(path, Some("owner"), &state).is_err());
+            assert!(read_file(path, Some("owner"), &state, false).is_err());
             for operation in ["write", "append"] {
                 assert!(mutate(operation, path, &contents, None).is_err());
             }
@@ -1251,7 +1437,10 @@ mod tests {
         mutate("write", &regular, &contents, None).unwrap();
         mutate("append", &regular, &contents, None).unwrap();
         assert_eq!(
-            read_file(&regular, Some("owner"), &state).unwrap().unwrap(),
+            read_file(&regular, Some("owner"), &state, false)
+                .unwrap()
+                .unwrap()
+                .0,
             b"session eventsession event"
         );
         let parent = pin_parent(&regular, false).unwrap();

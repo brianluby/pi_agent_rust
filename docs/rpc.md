@@ -11,6 +11,21 @@ pi --mode rpc
 
 Communication is via **JSON Lines** over stdin/stdout. Each line must be a valid JSON object.
 
+Each input frame is limited to **128 MiB**, excluding its final LF (an optional
+CR counts toward the limit). The stdin reader admits at most two unread frames
+at a time and applies backpressure without dropping commands. A bounded final
+frame is accepted at EOF even without a newline. The same frame limit applies
+before parsing requests supplied to the in-process `rpc::run` API; its caller
+owns the capacity of the input channel it supplies.
+
+Oversized frames (`PI_RPC_INPUT_LIMIT`), invalid UTF-8 (`PI_RPC_INPUT_UTF8`), and
+stdin read failures emit an unsuccessful `parse` response without a request ID
+and close input admission. Pi drains and preserves already-accepted work,
+including its terminal events, before returning the input error. No suffix of
+a rejected frame is interpreted as another command. Ordinary JSON syntax or
+command validation errors remain recoverable on the same connection. Attachment
+and content limits below still apply independently.
+
 ## Message Format
 
 ### Request
@@ -376,6 +391,13 @@ in-memory content; session resume still hydrates saved sidecar payloads.
   - Params: `focus` (optional string, at most 4096 UTF-8 bytes, no NUL).
 - **fork**: Fork from a message.
   - Params: `entryId`.
+  - Success returns `{text, cancelled: false}` and, for a structured user
+    message, `content`: the original ordered text/image/media blocks with
+    their complete encoded payloads. `text` contains only editable prose.
+    The selected message is excluded from the new history until the client
+    explicitly resubmits it. Send the returned `content` through a structured
+    `prompt` to retain attachments; sending only `text` loses them. A veto
+    returns `{cancelled: true}` without changing the session or its draft.
 - **checkpoint**: Mark a named restore point in the active session.
   - Params: `name` (optional, defaults to `"checkpoint"`), `note` (optional).
 - **rewind**: Collapse session history back to a checkpoint using optimistic concurrency control while idle.

@@ -81,15 +81,23 @@ instead of repeating the full body. These are result fields; callers cannot
 inject a digest. The digest identifies the captured source, before chain
 substitution, workflow input framing, or corrective/continuation instructions.
 
+Inline `task` instructions use the same **4 MiB** byte limit and must be
+nonempty, valid text without NUL bytes. Every one-shot child receives its task
+through private file-backed stdin, so inline tasks, files, chained output, and
+corrective retries do not depend on OS command-line limits. The child's standard
+stdin normalization trims trailing whitespace from the submitted `Task:` prompt;
+stored assignments and source digests retain the original text.
+
 Chains apply their existing `{previous}` and typed-data substitutions to the
-captured text. Expanded file-backed chain tasks are also limited to **4 MiB**;
+captured text. All expanded chain tasks are also limited to **4 MiB**;
 an oversized substitution fails that step without launching it, while preserving
 its source digest and the earlier steps' results. Workflows retain their
 **64 KiB** complete task budget, including
 appended typed inputs; using a file does not relax that limit. File content is
 instruction text and cannot select a different agent, model, tools, cwd, schema
-or approval policy. Large captured tasks reach the child through stdin to avoid
-OS command-line limits. Saved-session `seance` and retained worker/pool operations
+or approval policy. Corrective retry instructions must fit the same byte limit;
+an oversized correction preserves the failed attempt without starting another
+child. Saved-session `seance` and retained worker/pool operations
 continue to use their separate input contracts and reject `taskFile`.
 
 ## Per-call model selection
@@ -269,6 +277,11 @@ schema mappings are not accepted by this initial implementation. Schemas are
 compiled at definition load time, before a child is launched. Parser and schema
 errors identify the file and failure category without echoing schema values.
 
+Schemas in definitions and ordinary `outputSchema` calls are limited to 64 KiB
+of encoded JSON, 32 nesting levels, and 4,096 values. Local schema references are
+supported; external file and network references are unavailable. Retained
+worker and pool output contracts keep their smaller 16 KiB schema limit.
+
 `structured: true` keeps native JSON validation active independently of the
 optional structured-result text footer. Without an explicit schema it selects
 an unconstrained JSON schema: any JSON value is allowed, ordinary prose is not.
@@ -285,6 +298,14 @@ list at most 128 entries. Unix reads are nonblocking before checking the opened
 file type so a FIFO named `.md` cannot stall discovery. Authored file symlinks
 remain supported; these checks are not an atomic snapshot or a new trust boundary.
 Tags, anchors, merge keys, includes and executable constructors are unsupported.
+
+Definition bodies and schema directives reach native children through a private
+temporary prompt file, so valid large definitions do not consume command-line
+space. The composed prompt is limited to 4 MiB. Each one-shot attempt receives
+its own snapshot; a retained worker or pool member keeps its snapshot until the
+process is retired. Editing the original definition after admission does not
+change those instructions. A body that happens to name an existing file remains
+literal instruction text.
 
 Regression coverage lives in `src/subagents/definition/tests.rs`, including three
 public `SubagentTool` child-process protocol fixtures for schema validation,

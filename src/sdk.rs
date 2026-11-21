@@ -65,7 +65,7 @@ pub use crate::provider::{
     Context as ProviderContext, InputType, Model, ModelCost, Provider, ProviderCapabilities,
     StreamOptions, ThinkingBudgets as ProviderThinkingBudgets, ToolDef,
 };
-pub use crate::session::Session;
+pub use crate::session::{Session, edit_fork_content};
 pub use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
 
 /// Stable alias for model-exposed tool schema definitions.
@@ -1178,10 +1178,29 @@ pub struct RpcCompactionResult {
     pub details: Value,
 }
 
-/// Result payload returned by RPC `fork`.
+/// Text-only result payload returned by [`RpcTransportClient::fork`].
+/// Use [`RpcForkContentResult`] when the selected prompt may contain attachments.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RpcForkResult {
+    /// Editable prose; attachment badges and encoded bytes are not text.
+    #[serde(default)]
     pub text: String,
+    pub cancelled: bool,
+}
+
+/// Native selected input returned by [`RpcTransportClient::fork_with_content`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RpcForkContentResult {
+    /// Editable prose, without attachment badges or encoded payloads.
+    #[serde(default)]
+    pub text: String,
+    /// Exact structured selected prompt, absent for plain text, a veto, or a
+    /// server that predates native fork content.
+    /// Resubmit with `prompt_with_content`/`stream_prompt_with_content` to
+    /// preserve attachments and their order rather than sending `text` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Vec<ContentBlock>>,
     pub cancelled: bool,
 }
 
@@ -2118,7 +2137,22 @@ impl RpcTransportClient {
         self.request_typed("switch_session", payload).await
     }
 
+    /// Fork and return the selected prompt's editable text without submitting it.
+    /// Use [`Self::fork_with_content`] to retain native attachments as well.
     pub async fn fork(&mut self, entry_id: impl Into<String>) -> Result<RpcForkResult> {
+        let mut payload = Map::new();
+        payload.insert("entryId".to_string(), Value::String(entry_id.into()));
+        self.request_typed("fork", payload).await
+    }
+
+    /// Fork and retain the selected prompt's ordered native attachments.
+    /// The selected message remains unsent. Edit it with [`edit_fork_content`]
+    /// and explicitly submit using [`Self::prompt_with_content`] when ready.
+    /// An extension veto returns `cancelled: true` without selected content.
+    pub async fn fork_with_content(
+        &mut self,
+        entry_id: impl Into<String>,
+    ) -> Result<RpcForkContentResult> {
         let mut payload = Map::new();
         payload.insert("entryId".to_string(), Value::String(entry_id.into()));
         self.request_typed("fork", payload).await
@@ -2216,13 +2250,44 @@ impl RpcTransportClient {
     /// `streaming_behavior` has the same meaning as in
     /// [`Self::prompt_with_options_streaming`]. Native content uses the same
     /// bounded pre-acknowledgement buffer and terminal `agent_end` handling as
-    /// text and image prompts. Input is validated before dispatch.
+    /// text and image prompts. Input is validated before dispatch. This method
+    /// also retains every event for its return value; use
+    /// [`Self::stream_prompt_with_content`] to deliver events without retaining
+    /// a completed transcript in the client.
     pub async fn prompt_with_content_streaming(
         &mut self,
         content: Vec<ContentBlock>,
         streaming_behavior: Option<&str>,
-        on_event: impl FnMut(Value),
+        mut on_event: impl FnMut(Value),
     ) -> Result<Vec<Value>> {
+        let mut events = Vec::new();
+        self.stream_prompt_with_content(content, streaming_behavior, |event| {
+            on_event(event.clone());
+            events.push(event);
+        })
+        .await?;
+        Ok(events)
+    }
+
+    /// Stream ordered native content without collecting the resulting events.
+    ///
+    /// The callback owns each event, and the client retains no delivered
+    /// transcript. The bounded pipe queue and pre-acknowledgement buffer still
+    /// apply; memory does not grow with the number of acknowledged events
+    /// unless the callback stores them. Input validation, live controls,
+    /// acknowledgement checks, and terminal `agent_end` handling are identical
+    /// to [`Self::prompt_with_content_streaming`].
+    ///
+    /// A normal return means `agent_end` was delivered, including its error
+    /// field if the turn failed. Protocol and I/O failures return an error.
+    /// Dropping the future closes the transport; to cancel and reuse it, send
+    /// [`RpcControlHandle::abort`] and keep polling until the terminal event.
+    pub async fn stream_prompt_with_content(
+        &mut self,
+        content: Vec<ContentBlock>,
+        streaming_behavior: Option<&str>,
+        on_event: impl FnMut(Value),
+    ) -> Result<()> {
         let payload = rpc_native_content_payload(content)?;
         self.prompt_payload_streaming(payload, streaming_behavior, on_event)
             .await
@@ -2234,13 +2299,45 @@ impl RpcTransportClient {
     /// flushed. Those events are retained under explicit count/byte bounds and
     /// released in order once the matching success acknowledgement arrives.
     /// A failed acknowledgement never leaks speculative events to the caller.
+    /// Delivered events are also retained for the return value; use
+    /// [`Self::stream_prompt`] when only the live callback is needed.
     pub async fn prompt_with_options_streaming(
         &mut self,
         message: impl Into<String>,
         images: Option<Vec<ImageContent>>,
         streaming_behavior: Option<&str>,
-        on_event: impl FnMut(Value),
+        mut on_event: impl FnMut(Value),
     ) -> Result<Vec<Value>> {
+        let mut events = Vec::new();
+        self.stream_prompt(message, images, streaming_behavior, |event| {
+            on_event(event.clone());
+            events.push(event);
+        })
+        .await?;
+        Ok(events)
+    }
+
+    /// Stream text and optional images without collecting the resulting events.
+    ///
+    /// Unlike [`Self::prompt_with_options_streaming`], this method transfers
+    /// every acknowledged event directly to the callback and returns `()`.
+    /// The client retains only the bounded pipe queue and pre-acknowledgement
+    /// buffer, so it does not accumulate a transcript over long turns.
+    /// Callbacks that retain events own that additional memory themselves.
+    ///
+    /// Success means a terminal `agent_end` event reached the callback; inspect
+    /// that event's `error` field for turn failures. Protocol and I/O failures
+    /// return an error. A failed acknowledgement exposes no speculative events.
+    /// Dropping this future closes the transport. For cooperative cancellation
+    /// and continued use, obtain [`Self::control_handle`] first, send its abort,
+    /// and keep polling this future until the terminal event arrives.
+    pub async fn stream_prompt(
+        &mut self,
+        message: impl Into<String>,
+        images: Option<Vec<ImageContent>>,
+        streaming_behavior: Option<&str>,
+        on_event: impl FnMut(Value),
+    ) -> Result<()> {
         let mut payload = Map::new();
         payload.insert("message".to_string(), Value::String(message.into()));
         if let Some(images) = images {
@@ -2261,7 +2358,7 @@ impl RpcTransportClient {
         mut payload: Map<String, Value>,
         streaming_behavior: Option<&str>,
         mut on_event: impl FnMut(Value),
-    ) -> Result<Vec<Value>> {
+    ) -> Result<()> {
         let request_id = self.next_request_id()?;
         payload.insert("type".to_string(), Value::String("prompt".to_string()));
         payload.insert("id".to_string(), Value::String(request_id.clone()));
@@ -2275,7 +2372,6 @@ impl RpcTransportClient {
         self.write_json_line(&Value::Object(payload)).await?;
 
         let mut saw_ack = false;
-        let mut events = Vec::new();
         // Annotated, not inferred: the first USE of the element type is
         // `event.get("type")` in the drain loop below, and the only thing that
         // would constrain it is the `pre_ack.push(item)` further down. Method
@@ -2317,11 +2413,10 @@ impl RpcTransportClient {
                 for event in std::mem::take(&mut pre_ack) {
                     let reached_end =
                         event.get("type").and_then(Value::as_str) == Some("agent_end");
-                    on_event(event.clone());
-                    events.push(event);
+                    on_event(event);
                     if reached_end {
                         operation.finish();
-                        return Ok(events);
+                        return Ok(());
                     }
                 }
                 continue;
@@ -2344,11 +2439,10 @@ impl RpcTransportClient {
             }
 
             let reached_end = item_type == Some("agent_end");
-            on_event(item.clone());
-            events.push(item);
+            on_event(item);
             if reached_end {
                 operation.finish();
-                return Ok(events);
+                return Ok(());
             }
         }
     }
@@ -4141,6 +4235,29 @@ impl AgentSessionHandle {
     /// live model and future fallback candidates, retaining the CLI key pin.
     pub fn adopt_auth_storage(&mut self, mut auth: crate::auth::AuthStorage) {
         self.session.scope_auth_storage(&mut auth);
+        // Publish the explicit replacement before refreshing the local runtime.
+        // Resolving a credential can run a slow command; another owner may
+        // publish a newer login/logout while that refresh is still running.
+        // Record only the revision actually consumed, never republish the old
+        // snapshot after returning from the refresh.
+        let published_epoch = self.shared_auth.as_ref().and_then(|shared| {
+            shared.lock().ok().map(|mut guard| {
+                let epoch = guard.0.saturating_add(1);
+                *guard = (epoch, auth.clone());
+                epoch
+            })
+        });
+        self.apply_auth_storage(auth);
+        if let Some(epoch) = published_epoch {
+            self.shared_auth_epoch = epoch;
+        }
+    }
+
+    /// Refresh this handle from one credential snapshot without publishing it.
+    /// Readers and writers both use this local path after releasing the shared
+    /// lock so provider refreshes cannot erase a newer shared revision.
+    fn apply_auth_storage(&mut self, mut auth: crate::auth::AuthStorage) {
+        self.session.scope_auth_storage(&mut auth);
         let previous = self
             .session
             .auth_storage()
@@ -4178,14 +4295,7 @@ impl AgentSessionHandle {
             }
             opts.available_models
                 .retain(crate::models::model_entry_is_ready);
-            opts.auth = auth.clone();
-        }
-        if let Some(shared) = &self.shared_auth
-            && let Ok(mut guard) = shared.lock()
-        {
-            let next_epoch = guard.0.saturating_add(1);
-            *guard = (next_epoch, auth);
-            self.shared_auth_epoch = next_epoch;
+            opts.auth = auth;
         }
     }
 
@@ -4193,15 +4303,17 @@ impl AgentSessionHandle {
     /// fallback eligibility dynamically without restarting the session.
     pub fn update_shared_auth_storage(&mut self, f: impl FnOnce(&mut crate::auth::AuthStorage)) {
         let shared = self.ensure_shared_auth_storage();
-        let updated = {
+        let (epoch, updated) = {
             let Ok(mut guard) = shared.lock() else {
                 return;
             };
             f(&mut guard.1);
+            self.session.scope_auth_storage(&mut guard.1);
             guard.0 = guard.0.saturating_add(1);
-            guard.1.clone()
+            (guard.0, guard.1.clone())
         };
-        self.adopt_auth_storage(updated);
+        self.apply_auth_storage(updated);
+        self.shared_auth_epoch = epoch;
     }
 
     pub(crate) fn ensure_shared_auth_storage(
@@ -4230,8 +4342,8 @@ impl AgentSessionHandle {
             (guard.0 != self.shared_auth_epoch).then(|| (guard.0, guard.1.clone()))
         });
         if let Some((epoch, auth)) = maybe_updated {
+            self.apply_auth_storage(auth);
             self.shared_auth_epoch = epoch;
-            self.adopt_auth_storage(auth);
         }
     }
 

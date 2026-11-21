@@ -242,3 +242,227 @@ fn readme_default_list_count_matches_code() {
         "README default `--tools` count must match xdev::default_enabled_tools()"
     );
 }
+
+/// Primary default `provider/model` slugs for the first `limit` distinct
+/// providers listed in `pi::app::PROVIDER_DEFAULT_MODELS`.
+fn top_provider_defaults(limit: usize) -> Vec<String> {
+    let mut seen_providers = std::collections::HashSet::new();
+    let mut top = Vec::with_capacity(limit);
+    for &(provider, model_id) in pi::app::PROVIDER_DEFAULT_MODELS {
+        if seen_providers.insert(provider) {
+            top.push(format!("{provider}/{model_id}"));
+            if top.len() == limit {
+                break;
+            }
+        }
+    }
+    top
+}
+
+fn verify_readme_model_defaults_line(
+    readme_text: &str,
+    expected_top: &[String],
+) -> Result<(), String> {
+    let row = readme_text
+        .lines()
+        .find(|line| line.starts_with("| `--model <MODEL>` |"))
+        .ok_or_else(|| {
+            "README.md is missing the `| `--model <MODEL>` |` CLI option row".to_string()
+        })?;
+    let expected_prose = expected_top
+        .iter()
+        .enumerate()
+        .map(|(idx, slug)| {
+            if idx == 0 {
+                format!("`{slug}`")
+            } else {
+                format!("then `{slug}`")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let expected_fragment = format!("auto-select fallback: {expected_prose}");
+    if !row.contains(&expected_fragment) {
+        return Err(format!(
+            "README `--model` row drifted from PROVIDER_DEFAULT_MODELS: expected {expected_fragment:?} in {row:?}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn readme_model_auto_select_matches_provider_default_models() {
+    let readme = readme();
+    let expected_top = top_provider_defaults(3);
+    assert_eq!(
+        expected_top.len(),
+        3,
+        "PROVIDER_DEFAULT_MODELS must expose at least 3 distinct primary providers"
+    );
+    let parity = verify_readme_model_defaults_line(&readme, &expected_top);
+    assert!(parity.is_ok(), "{}", parity.err().unwrap_or_default());
+}
+
+#[test]
+fn readme_model_auto_select_parity_rejects_drift() {
+    let expected_top = top_provider_defaults(3);
+    let stale_readme = "| `--model <MODEL>` | Model to use (auto-select fallback: `anthropic/claude-sonnet-4-6`, then `anthropic/claude-opus-4-7`, then `openai/gpt-5.1-codex`) |\n";
+    let err = verify_readme_model_defaults_line(stale_readme, &expected_top)
+        .expect_err("stale README auto-select prose must fail closed");
+    assert!(
+        err.contains("drifted from PROVIDER_DEFAULT_MODELS"),
+        "unexpected error message: {err}"
+    );
+}
+
+fn read_repo_file(rel: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+    std::fs::read_to_string(&path).expect("read repository doc/config file") // ubs:ignore test harness
+}
+
+fn verify_default_features_doc_parity(readme_text: &str, cargo_toml: &str) -> Result<(), String> {
+    let default_line = cargo_toml
+        .lines()
+        .find(|line| line.trim_start().starts_with("default = ["))
+        .ok_or_else(|| "Cargo.toml missing [features] default = [...] line".to_string())?;
+    let inner = default_line
+        .split('[')
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .ok_or_else(|| format!("malformed Cargo.toml default features line: {default_line}"))?;
+    let default_features: Vec<&str> = inner
+        .split(',')
+        .filter_map(|token| {
+            let trimmed = token.trim().trim_matches('"');
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+        .collect();
+    if default_features.is_empty() {
+        return Err("parsed zero default features from Cargo.toml".to_string());
+    }
+    let section_start = readme_text
+        .find("### Feature defaults")
+        .ok_or_else(|| "README.md missing `### Feature defaults` section".to_string())?;
+    let section_body = &readme_text[section_start..];
+    let section_end = section_body[1..]
+        .find("\n### ")
+        .map_or(section_body.len(), |idx| idx + 1);
+    let section = &section_body[..section_end];
+    if section.contains("sqlite-sessions` only") {
+        return Err(
+            "README Feature defaults still falsely claims `sqlite-sessions` only".to_string(),
+        );
+    }
+    for feature in default_features {
+        if !section.contains(&format!("`{feature}`")) {
+            return Err(format!(
+                "README Feature defaults omits Cargo.toml default feature `{feature}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_dsr_recipe_check_count_doc(recipe_doc: &str, repos_yaml: &str) -> Result<(), String> {
+    let checks_block = repos_yaml
+        .split("\n    checks:\n")
+        .nth(1)
+        .ok_or_else(|| ".dsr/repos.yaml missing `checks:` list".to_string())?;
+    let actual_checks = checks_block
+        .lines()
+        .take_while(|line| line.starts_with("      ") || line.trim().is_empty())
+        .filter(|line| line.starts_with("      - "))
+        .count();
+    let heading_line = recipe_doc
+        .lines()
+        .find(|line| line.starts_with("## 2. The DSR quality recipe ("))
+        .ok_or_else(|| {
+            "docs/perf-budgets-recipe.md missing section 2 DSR check-count heading".to_string()
+        })?;
+    let expected_fragment = format!("({actual_checks} checks,");
+    if !heading_line.contains(&expected_fragment) {
+        return Err(format!(
+            "docs/perf-budgets-recipe.md check count drifted from .dsr/repos.yaml: expected {expected_fragment:?} in {heading_line:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_changelog_unreleased_completeness(changelog: &str) -> Result<(), String> {
+    let start = changelog
+        .find("## [Unreleased]")
+        .ok_or_else(|| "CHANGELOG.md missing `## [Unreleased]` heading".to_string())?;
+    let rest = &changelog[start..];
+    let end = rest[1..].find("\n## [v").map_or(rest.len(), |idx| idx + 1);
+    let unreleased = &rest[..end];
+    for required in [
+        "/goal",
+        "pi web",
+        "--wait-async",
+        "--max-cost",
+        "/memory sync",
+        "session/fork",
+        "/rules",
+        "/fast ultrafast",
+        "models.fetched.json",
+        "better-sqlite3",
+        "axios",
+        "SnapCompact",
+        "pi::sdk",
+    ] {
+        if !unreleased.contains(required) {
+            return Err(format!(
+                "CHANGELOG.md [Unreleased] omits post-v0.8.0 flagship item `{required}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn docs_and_changelog_parity_checks_pass_and_reject_planted_drift() {
+    let readme_text = readme();
+    let cargo_toml = read_repo_file("Cargo.toml");
+    let recipe_doc = read_repo_file("docs/perf-budgets-recipe.md");
+    let repos_yaml = read_repo_file(".dsr/repos.yaml");
+    let sdk_doc = read_repo_file("docs/sdk.md");
+    let changelog = read_repo_file("CHANGELOG.md");
+
+    let feat_check = verify_default_features_doc_parity(&readme_text, &cargo_toml);
+    assert!(
+        feat_check.is_ok(),
+        "{}",
+        feat_check.err().unwrap_or_default()
+    );
+
+    let dsr_doc_check = verify_dsr_recipe_check_count_doc(&recipe_doc, &repos_yaml);
+    assert!(
+        dsr_doc_check.is_ok(),
+        "{}",
+        dsr_doc_check.err().unwrap_or_default()
+    );
+
+    assert!(
+        !sdk_doc.contains("governed by the active\ncertification contract")
+            && !sdk_doc.contains("governed by the active certification contract"),
+        "docs/sdk.md must not claim retired drop-in certification as an active release gate"
+    );
+    assert!(
+        !readme_text.contains("Fresh `v0.3.0` measurement pending")
+            && !readme_text.contains("**v0.3.0 performance-claim status"),
+        "README.md must not carry stale v0.3.0 pending-measurement release labels"
+    );
+
+    let cl_check = verify_changelog_unreleased_completeness(&changelog);
+    assert!(cl_check.is_ok(), "{}", cl_check.err().unwrap_or_default());
+
+    // Planted-red negatives: injected drift must fail closed.
+    let stale_feat = "### Feature defaults\n\nDefault DSR builds enable `sqlite-sessions` only.\n";
+    assert!(verify_default_features_doc_parity(stale_feat, &cargo_toml).is_err());
+
+    let stale_recipe = "## 2. The DSR quality recipe (8 checks, registered)\n";
+    assert!(verify_dsr_recipe_check_count_doc(stale_recipe, &repos_yaml).is_err());
+
+    let truncated_cl = "## [Unreleased]\n\n### Added\n- Only one item.\n\n## [v0.8.0]\n";
+    assert!(verify_changelog_unreleased_completeness(truncated_cl).is_err());
+}

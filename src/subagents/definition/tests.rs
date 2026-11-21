@@ -14,17 +14,10 @@ fn definition(extra: &str) -> Result<AgentDefinition> {
 }
 
 fn argv(agent: &AgentDefinition) -> Vec<String> {
-    child_args(
-        agent,
-        "inspect",
-        None,
-        None,
-        None,
-        agent.output_schema.as_ref(),
-    )
-    .into_iter()
-    .map(|value| value.to_string_lossy().into_owned())
-    .collect()
+    child_args(agent, None, None, None, agent.output_schema.as_ref())
+        .into_iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect()
 }
 
 #[test]
@@ -88,7 +81,7 @@ fn empty_definition_argv_is_accepted_by_the_real_cli_without_builtin_tools() {
     use clap::Parser as _;
     let agent = definition("tools: []").unwrap();
     let mut args = vec![std::ffi::OsString::from("pi")];
-    args.extend(child_args(&agent, "inspect", None, None, None, None));
+    args.extend(child_args(&agent, None, None, None, None));
     let cli = crate::cli::Cli::try_parse_from(args).unwrap();
     assert!(cli.no_tools);
     assert!(
@@ -114,7 +107,7 @@ fn persistent_optional_tools_cannot_expand_child_tool_permissions() {
     for extra in ["", "tools: read, grep", "tools: []"] {
         let agent = definition(extra).expect("child agent definition");
         let mut args = vec![std::ffi::OsString::from("pi")];
-        args.extend(child_args(&agent, "inspect", None, None, None, None));
+        args.extend(child_args(&agent, None, None, None, None));
         let cli = crate::cli::Cli::try_parse_from(args).expect("child CLI");
         assert!(cli.tools.is_some(), "child selection is always explicit");
         let enabled = cli.enabled_tools(&config);
@@ -398,7 +391,20 @@ fn child(path: &Path, answer: &str) -> PathBuf {
     .to_string();
     let quoted = event.replace('\'', "'\\''");
     let file = path.join("child.sh");
-    std::fs::write(&file, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > child-argv.txt\nprintf 'run\\n' >> child-runs.txt\nprintf '%s\\n' '{quoted}'\n")).unwrap();
+    std::fs::write(
+        &file,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > child-argv.txt\n\
+             while [ \"$#\" -gt 0 ]; do\n\
+                 case \"$1\" in\n\
+                     --append-system-prompt) shift; cat \"$1\" > child-system-prompt.txt ;;\n\
+                 esac\n\
+                 shift\n\
+             done\n\
+             printf 'run\\n' >> child-runs.txt\nprintf '%s\\n' '{quoted}'\n"
+        ),
+    )
+    .unwrap();
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
     file
 }
@@ -437,7 +443,15 @@ fn typed_definition_reaches_real_child_argv_and_parent_result_validation() {
     let args = std::fs::read_to_string(dir.path().join("child-argv.txt")).unwrap();
     assert!(args.lines().any(|line| line == "--no-tools"));
     assert!(args.contains("--append-system-prompt\n"));
-    assert!(args.contains("single JSON value matching this JSON Schema"));
+    assert!(!args.contains("single JSON value matching this JSON Schema"));
+    let prompt = std::fs::read_to_string(dir.path().join("child-system-prompt.txt")).unwrap();
+    assert!(prompt.contains("single JSON value matching this JSON Schema"));
+    let path = args
+        .lines()
+        .skip_while(|line| *line != "--append-system-prompt")
+        .nth(1)
+        .unwrap();
+    assert!(!Path::new(path).exists());
     assert_eq!(
         std::fs::read_to_string(dir.path().join("child-runs.txt")).unwrap(),
         "run\n"
