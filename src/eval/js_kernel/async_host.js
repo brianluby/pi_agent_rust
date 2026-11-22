@@ -19,6 +19,8 @@
     const drainPrototype = Object.getPrototypeOf;
     const drainPlainPrototype = Object.prototype;
     const drainSetPrototype = Object.setPrototypeOf;
+    const batchCharCode = Function.prototype.call.bind(String.prototype.charCodeAt);
+    const batchStartsWith = Function.prototype.call.bind(String.prototype.startsWith);
     const now = Date.now;
     const resolvedPromise = Promise.resolve.bind(Promise);
     const promiseThen = Function.prototype.call.bind(Promise.prototype.then);
@@ -66,6 +68,112 @@
     });
     globalThis.tool.call = (name, args = {}) => callTool(name, args, false);
     globalThis.tool.result = (name, args = {}) => callTool(name, args, true);
+
+    const toolBatchInput = () => new TypeErrorType('EVAL_TOOL_BATCH_INPUT: expected 1..16 JSON calls with exactly name and args');
+    const toolBatchProtocol = () => new ErrorType('EVAL_TOOL_BATCH_PROTOCOL: invalid native tool batch result');
+    const toolBatchBytes = (value, maximum, fail, identifier = false) => {
+        if (typeof value !== 'string') throw fail();
+        let bytes = 0;
+        for (let index = 0; index < value.length; index++) {
+            const code = batchCharCode(value,index);
+            if (identifier && (code < 32 || code >= 127 && code <= 159)) throw fail();
+            if (code >= 0xd800 && code <= 0xdbff) {
+                const next = batchCharCode(value,++index);
+                if (!(next >= 0xdc00 && next <= 0xdfff)) throw fail();
+                bytes += 4;
+            } else {
+                if (code >= 0xdc00 && code <= 0xdfff) throw fail();
+                bytes += code < 128 ? 1 : code < 2048 ? 2 : 3;
+            }
+            if (bytes > maximum) throw fail();
+        }
+        return bytes;
+    };
+    // Copy only JSON data before queueing. Descriptors avoid invoking getters;
+    // null prototypes prevent inherited toJSON hooks from rewriting the copy.
+    const toolBatchCopy = (value, budget, depth = 0) => {
+        if (depth > 64 || --budget.nodes < 0 || --budget.bytes < 0) throw toolBatchInput();
+        if (value === null || typeof value === 'boolean') return value;
+        if (typeof value === 'number') {
+            if (!finite(value)) throw toolBatchInput();
+            return value;
+        }
+        if (typeof value === 'string') {
+            budget.bytes -= toolBatchBytes(value,budget.bytes,toolBatchInput);
+            return value;
+        }
+        if (typeof value !== 'object') throw toolBatchInput();
+        const array = isArray(value);
+        if (!array && drainPrototype(value) !== drainPlainPrototype && drainPrototype(value) !== null) throw toolBatchInput();
+        const own = drainOwnKeys(value);
+        if (own.length > budget.nodes + 1) throw toolBatchInput();
+        if (array) {
+            const length = drainDescriptor(value,'length');
+            if (!length || !hasOwn(length,'value') || !integer(length.value) || length.value < 0
+                || length.value > budget.nodes || own.length !== length.value + 1) throw toolBatchInput();
+            const copied = [];
+            drainSetPrototype(copied,null);
+            for (let index = 0; index < length.value; index++) {
+                const field = drainDescriptor(value,`${index}`);
+                if (!field || !hasOwn(field,'value') || !field.enumerable) throw toolBatchInput();
+                copied[index] = toolBatchCopy(field.value,budget,depth + 1);
+            }
+            return copied;
+        }
+        const copied = drainCreate(null);
+        for (let index = 0; index < own.length; index++) {
+            const key = own[index];
+            const field = drainDescriptor(value,key);
+            if (typeof key !== 'string' || !field || !hasOwn(field,'value') || !field.enumerable) throw toolBatchInput();
+            budget.bytes -= toolBatchBytes(key,budget.bytes,toolBatchInput);
+            copied[key] = toolBatchCopy(field.value,budget,depth + 1);
+        }
+        return copied;
+    };
+    globalThis.tool.batch = async function(calls) {
+        if (arguments.length !== 1 || !isArray(calls) || calls.length < 1 || calls.length > 16) throw toolBatchInput();
+        const copied = toolBatchCopy(calls,{nodes:131072,bytes:256 * 1024});
+        for (let index = 0; index < copied.length; index++) {
+            const call = copied[index];
+            if (call === null || typeof call !== 'object' || isArray(call) || keys(call).length !== 2
+                || !hasOwn(call,'name') || !hasOwn(call,'args') || typeof call.name !== 'string' || !call.name
+                || call.name === 'eval' || call.name === 'xdev'
+                || batchStartsWith(call.name,'__pi_')
+                || call.args === null || typeof call.args !== 'object' || isArray(call.args)) throw toolBatchInput();
+            toolBatchBytes(call.name,128,toolBatchInput,true);
+        }
+        const payload = drainCreate(null);
+        payload.calls = copied;
+        toolBatchBytes(stringify(payload),256 * 1024,toolBatchInput);
+        const encoded = await callTool('__pi_tool_batch',payload,false);
+        toolBatchBytes(encoded,4 * 1024 * 1024,
+            () => new ErrorType('EVAL_BRIDGE_LIMIT: tool batch result exceeds 4 MiB'));
+        let page;
+        try { page = parse(encoded); } catch (_) { throw toolBatchProtocol(); }
+        if (page === null || typeof page !== 'object' || isArray(page) || keys(page).length !== 2
+            || !hasOwn(page,'schema') || page.schema !== 'pi.eval.tool_batch.v1'
+            || !hasOwn(page,'items') || !isArray(page.items) || page.items.length !== copied.length) throw toolBatchProtocol();
+        const ids = drainCreate(null);
+        for (let index = 0; index < page.items.length; index++) {
+            const item = page.items[index];
+            if (item === null || typeof item !== 'object' || isArray(item) || keys(item).length !== 4
+                || !hasOwn(item,'index') || item.index !== index || !hasOwn(item,'name') || item.name !== copied[index].name
+                || !hasOwn(item,'toolCallId') || typeof item.toolCallId !== 'string' || !item.toolCallId
+                || hasOwn(ids,item.toolCallId) || hasOwn(item,'result') === hasOwn(item,'error')) throw toolBatchProtocol();
+            toolBatchBytes(item.toolCallId,128,toolBatchProtocol,true);
+            ids[item.toolCallId] = true;
+            if (hasOwn(item,'error')) {
+                if (typeof item.error !== 'string' || !item.error) throw toolBatchProtocol();
+            } else {
+                const result = item.result;
+                if (result === null || typeof result !== 'object' || isArray(result)
+                    || !hasOwn(result,'schema') || result.schema !== 'pi.eval.tool_result.v1'
+                    || !hasOwn(result,'content') || !isArray(result.content) || !hasOwn(result,'details')
+                    || !hasOwn(result,'isError') || typeof result.isError !== 'boolean') throw toolBatchProtocol();
+            }
+        }
+        return page;
+    };
 
     // Retain only opaque job/worker ids. Every operation re-enters the live native
     // host, which checks session ownership, enabled tools and current policy.
@@ -795,6 +903,7 @@
             || typeof snapshot.agent !== 'string' || !snapshot.agent
             || !validPoolStatus(snapshot.status) || typeof snapshot.sealed !== 'boolean'
             || !integer(snapshot.concurrency) || snapshot.concurrency < 1 || snapshot.concurrency > 8
+            || !integer(snapshot.maxBatchSize) || snapshot.maxBatchSize < 1 || snapshot.maxBatchSize > 8
             || !isArray(snapshot.items) || snapshot.items.length > 32
             || snapshot.admittedItems !== snapshot.items.length
             || !integer(snapshot.remainingMs) || snapshot.remainingMs < 0
@@ -907,7 +1016,8 @@
         const args = {operation,poolId:handle.poolId,itemId:handle.itemId};
         if (timeoutMs !== undefined) args.timeoutMs = timeoutMs;
         const snapshot = checkPool(await nativeResult('subagent',args),handle.poolId,handle.itemId);
-        if (snapshot.jobId !== handle.jobId || snapshot.agent !== handle.agent) {
+        if (snapshot.jobId !== handle.jobId || snapshot.agent !== handle.agent
+            || snapshot.maxBatchSize !== handle.maxBatchSize) {
             throw new ErrorType('EVAL_POOL_PROTOCOL: native pool identity changed');
         }
         return snapshot;
@@ -932,6 +1042,7 @@
             this.poolId = pool.poolId;
             this.jobId = pool.jobId;
             this.agent = pool.agent;
+            this.maxBatchSize = pool.maxBatchSize;
             freeze(this);
         }
         async status() { return readPoolItem(this,'pool_result'); }
@@ -968,6 +1079,7 @@
     const adoptPool = (state, snapshot) => {
         checkPool(snapshot,state.poolId ?? undefined);
         if (snapshot.agent !== state.options.agent || snapshot.concurrency !== state.concurrency
+            || snapshot.maxBatchSize !== state.maxBatchSize
             || (state.jobId !== null && snapshot.jobId !== state.jobId)
             || snapshot.items.length < state.items.length) {
             throw new ErrorType('EVAL_POOL_PROTOCOL: native pool identity or retained items changed');
@@ -989,7 +1101,7 @@
         } : {
             schema:'pi.eval.workpool.pending.v1',poolId:null,jobId:null,agent:state.options.agent,
             status:state.unknownAdmission ? 'unavailable' : state.closed ? 'cancelled' : 'unstarted',
-            sealed:state.closed,concurrency:state.concurrency,admittedItems:0,items:[],
+            sealed:state.closed,concurrency:state.concurrency,maxBatchSize:state.maxBatchSize,admittedItems:0,items:[],
         }),
         name:state.name,closed:state.closed,interrupted:state.interrupted,
         unknownAdmission:state.unknownAdmission,lastError:state.lastError,
@@ -1012,8 +1124,8 @@
         return poolView(state);
     };
     class AgentPool {
-        constructor(options, name, concurrency) {
-            poolSet(this,{options,name,concurrency,poolId:null,jobId:null,snapshot:null,items:[],
+        constructor(options, name, concurrency, maxBatchSize) {
+            poolSet(this,{options,name,concurrency,maxBatchSize,poolId:null,jobId:null,snapshot:null,items:[],
                 closed:false,interrupted:false,finishAcknowledged:false,closeAcknowledged:false,
                 unknownAdmission:false,admissionPending:false,lastError:null,recovered:false,
                 tail:resolvedPromise(),busy:false,generation:cellGeneration});
@@ -1024,6 +1136,7 @@
         get jobId() { return poolGet(this).jobId; }
         get name() { return poolGet(this).name; }
         get concurrency() { return poolGet(this).concurrency; }
+        get maxBatchSize() { return poolGet(this).maxBatchSize; }
         get closed() { return poolGet(this).closed; }
         get unknownAdmission() { return poolGet(this).unknownAdmission; }
         get recovered() { return poolGet(this).recovered; }
@@ -1140,7 +1253,8 @@
                     const snapshot = checkPool(page.snapshot,state.poolId);
                     const ids = page.admittedItemIds;
                     if (snapshot.jobId !== state.jobId || snapshot.agent !== state.options.agent
-                        || snapshot.concurrency !== state.concurrency || snapshot.admittedItems < previous
+                        || snapshot.concurrency !== state.concurrency || snapshot.maxBatchSize !== state.maxBatchSize
+                        || snapshot.admittedItems < previous
                         || !isArray(ids) || ids.length !== batch.length || ids.some((id,index) =>
                             !validTurnId(id) || id <= previous || id > snapshot.admittedItems
                             || (index > 0 && id !== ids[index - 1] + 1))
@@ -1235,6 +1349,7 @@
         const native = {agent:'task'};
         let name = 'workpool';
         let concurrency = 4;
+        let maxBatchSize = 1;
         for (const key of keys(options)) {
             const value = options[key];
             if (key === 'name') {
@@ -1243,6 +1358,10 @@
             } else if (key === 'concurrency') {
                 if (!integer(value) || value < 1 || value > 8) throw new RangeErrorType('EVAL_POOL_INPUT: concurrency must be an integer from 1 to 8');
                 concurrency = value;
+            } else if (key === 'maxBatchSize') {
+                if (!integer(value) || value < 1 || value > 8) throw new RangeErrorType('EVAL_POOL_INPUT: maxBatchSize must be an integer from 1 to 8');
+                maxBatchSize = value;
+                native.maxBatchSize = value;
             } else if (key === 'agent') {
                 if (!boundedText(value,128)) throw new TypeErrorType('EVAL_POOL_INPUT: agent must be nonempty text of at most 128 UTF-8 bytes without NUL');
                 native.agent = value;
@@ -1270,7 +1389,7 @@
             throw new TypeErrorType('EVAL_POOL_INPUT: isoApply requires worktree isolation');
         }
         poolBatchArgs({options:native,poolId:null,concurrency},[]);
-        return new AgentPool(freeze(native),name,concurrency);
+        return new AgentPool(freeze(native),name,concurrency,maxBatchSize);
     };
     workpool.attach = async (id, options = {}) => {
         recoveryOptions(id, options, 'allowPush');
@@ -1281,7 +1400,7 @@
         }
         // No pool_start, task replay, launch options or renewed timeout. A
         // known ID suffices because further pushes use the native frozen policy.
-        const pool = new AgentPool(freeze({agent:snapshot.agent}),'recovered-workpool',snapshot.concurrency);
+        const pool = new AgentPool(freeze({agent:snapshot.agent}),'recovered-workpool',snapshot.concurrency,snapshot.maxBatchSize);
         const state = poolGet(pool);
         adoptPool(state,snapshot);
         state.recovered = true;

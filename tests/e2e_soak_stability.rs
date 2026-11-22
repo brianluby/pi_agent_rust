@@ -2015,6 +2015,7 @@ fn evaluate_soak_series(
         .map(|s| s.hostcall_queue_depth)
         .max()
         .unwrap_or(0);
+    let latency_drift = lat_sum.last / lat_sum.median.max(1.0);
 
     let verdicts = vec![
         MetricVerdict {
@@ -2087,19 +2088,26 @@ fn evaluate_soak_series(
         },
         MetricVerdict {
             metric: "turn_latency_ms".to_string(),
-            status: "pass".to_string(),
+            status: if latency_drift <= budgets.max_latency_drift_ratio {
+                "info".to_string()
+            } else {
+                "warn".to_string()
+            },
             first: lat_sum.first,
             median: lat_sum.median,
             last: lat_sum.last,
             threshold: format!(
-                "drift_watch <= {:.1}x (provisional)",
+                "drift_watch <= {:.1}x (provisional, observational)",
                 budgets.max_latency_drift_ratio
             ),
-            detail: format!("slope={:.2}ms/sample", lat_sum.slope_per_sample),
+            detail: format!(
+                "drift={latency_drift:.2}x, slope={:.2}ms/sample",
+                lat_sum.slope_per_sample
+            ),
         },
     ];
 
-    if verdicts.iter().all(|v| v.status == "pass") {
+    if verdicts.iter().all(|v| v.status != "fail") {
         Ok(verdicts)
     } else {
         Err(verdicts)
@@ -2262,11 +2270,19 @@ impl Provider for DurationSoakProvider {
     }
 }
 
+/// Serializes tests that sample or intentionally mutate process-wide OS
+/// counters (`/proc/self/fd`, `/proc/self/task/*/children`) so injected FD
+/// leaks in mutation tests never contaminate concurrent clean soak tests.
+static PROCESS_SAMPLER_LOCK: Mutex<()> = Mutex::new(());
+
 fn run_parameterized_session_soak(
     harness: &TestHarness,
     test_name: &str,
     cfg: &SessionSoakConfig,
 ) -> SoakRunOutcome {
+    let _sampler_guard = PROCESS_SAMPLER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let cwd = harness.temp_dir().to_path_buf();
     let out_dir = cfg.artifact_dir.clone().unwrap_or_else(|| cwd.clone());
     std::fs::create_dir_all(&out_dir).expect("create soak artifact dir");
@@ -2349,17 +2365,16 @@ fn run_parameterized_session_soak(
                 }
             }
 
-            // Periodically switch models, branch (exercising non-linear path cache),
-            // append compaction anchors, and persist/reload from disk.
+            // Periodically record a model change for the active soak provider,
+            // branch (exercising non-linear path cache), append compaction
+            // anchors, and persist/reload from disk.
             if (turn + 1).is_multiple_of(4) {
                 let cx = asupersync::Cx::for_testing();
                 let mut guard = session.lock(&cx).await.expect("session lock");
-                let model_name = if (turn / 4).is_multiple_of(2) {
-                    "soak-model-a"
-                } else {
-                    "soak-model-b"
-                };
-                guard.append_model_change("soak-provider".to_string(), model_name.to_string());
+                guard.append_model_change(
+                    provider.name().to_string(),
+                    provider.model_id().to_string(),
+                );
                 if let Some(anchor_id) = guard.entries.first().and_then(|e| e.base_id().cloned())
                     && let Some(tip_id) = guard.leaf_id().map(ToOwned::to_owned)
                 {
@@ -3057,6 +3072,9 @@ fn soak_detector_catches_deliberately_leaked_descriptor() {
     // 2. Real OS file-descriptor leak detection via /proc/self/fd on Linux.
     #[cfg(target_os = "linux")]
     {
+        let _sampler_guard = PROCESS_SAMPLER_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let harness = TestHarness::new("soak_real_fd_leak_probe");
         let probe_path = harness.create_file("fd_leak_probe.tmp", "probe\n");
         let before = sample_open_fds();
@@ -3114,6 +3132,33 @@ fn soak_detector_catches_deliberately_unbounded_vector() {
             .iter()
             .any(|v| v.metric == "session_entries" && v.status == "fail"),
         "failing verdicts must explicitly name session_entries: {err_verdicts:?}"
+    );
+    assert!(
+        err_verdicts
+            .iter()
+            .any(|v| v.metric == "turn_latency_ms" && v.status == "info"),
+        "flat latency series must report observational info status: {err_verdicts:?}"
+    );
+
+    // 4. Observational turn_latency_ms drift warns above max_latency_drift_ratio
+    // without failing a clean resource series. Use 3 samples [5, 5, 200] so the
+    // median stays at 5ms (drift = 40x > 5x).
+    let first_sample = synthetic.first().expect("first synthetic sample");
+    let second_sample = synthetic.get(1).expect("second synthetic sample");
+    let mut baseline_sample = first_sample.clone();
+    baseline_sample.turn_index = 2;
+    baseline_sample.session_entries = 8;
+    let mut spike_sample = second_sample.clone();
+    spike_sample.session_entries = 12;
+    spike_sample.turn_latency_ms = 200;
+    let drift_only = vec![first_sample.clone(), baseline_sample, spike_sample];
+    let ok_verdicts = evaluate_soak_series(&drift_only, 6, &ProvisionalGrowthBudgets::default())
+        .expect("observational latency drift alone must warn rather than fail");
+    assert!(
+        ok_verdicts
+            .iter()
+            .any(|v| v.metric == "turn_latency_ms" && v.status == "warn"),
+        "steep latency drift must report observational warn status: {ok_verdicts:?}"
     );
 }
 
@@ -3314,7 +3359,16 @@ fn soak_sustained_tool_concurrency_extended() {
         "soak_sustained_tool_concurrency_extended",
         &cfg,
     );
-    assert_eq!(outcome.completed_waves, cfg.waves);
+    if cfg.max_duration.is_some() {
+        assert!(
+            outcome.completed_waves > 0 && outcome.completed_waves <= cfg.waves,
+            "time-capped concurrency soak must complete at least 1 wave (got {}/{})",
+            outcome.completed_waves,
+            cfg.waves
+        );
+    } else {
+        assert_eq!(outcome.completed_waves, cfg.waves);
+    }
     assert_eq!(outcome.total_tool_starts, outcome.total_tool_ends);
     assert!(outcome.overflow_admissions > 0);
 }

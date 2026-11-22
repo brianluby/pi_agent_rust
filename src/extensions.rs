@@ -20,7 +20,8 @@ use crate::hostcall_rewrite::{
     HostcallRewriteEngine, HostcallRewritePlan, HostcallRewritePlanKind,
 };
 use crate::hostcall_superinstructions::{
-    HostcallSuperinstructionCompiler, HostcallSuperinstructionPlan, execute_with_superinstruction,
+    HostcallSuperinstructionCompiler, HostcallSuperinstructionPlan, opcode_window_signature_str,
+    select_best_plan_for_str_slice,
 };
 use crate::hostcall_trace_jit::{GuardContext, TraceJitCompiler};
 use crate::permissions::{PermissionStore, PersistedDecision};
@@ -1236,6 +1237,7 @@ use exec_mediation::{
     classify_process_termination, classify_recursive_delete, classify_reverse_shell,
     classify_system_shutdown, normalize_command_for_classification,
 };
+pub use protocol::run_hostcall_egraph_paired_benchmark;
 pub(crate) use protocol::validate_host_call;
 
 /// Classify a command string into dangerous command classes.
@@ -11777,6 +11779,7 @@ struct JsRuntimeShard {
     snapshot: JsExtensionSnapshot,
     published_provider_specs: Vec<Value>,
     published_mcp_specs: Vec<Value>,
+    published_command_specs: Vec<Value>,
     provider_actor: Weak<JsActorLifecycle>,
     provider_generation: Option<Uuid>,
     /// An idle turn polls at most one FIFO dispatch. Retaining its future here
@@ -15770,6 +15773,7 @@ async fn build_js_runtime_shards(
             runtime: Rc::new(runtime),
             published_provider_specs: snapshot.providers.clone(),
             published_mcp_specs: snapshot.mcp_servers.clone(),
+            published_command_specs: snapshot.slash_commands.clone(),
             provider_actor: Weak::new(),
             provider_generation: None,
             snapshot,
@@ -16341,6 +16345,7 @@ fn publish_runtime_shard_registrations(
     let shard = &mut shards.shards[shard_index];
     if shard.published_provider_specs == shard.snapshot.providers
         && shard.published_mcp_specs == shard.snapshot.mcp_servers
+        && shard.published_command_specs == shard.snapshot.slash_commands
     {
         return Ok(());
     }
@@ -16377,6 +16382,19 @@ fn publish_runtime_shard_registrations(
             .published_mcp_specs
             .clone_from(&shard.snapshot.mcp_servers);
     }
+    if shard.published_command_specs != shard.snapshot.slash_commands
+        && manager.replace_runtime_command_specs(
+            &shard.extension_id,
+            &shard.provider_actor,
+            shard.provider_generation,
+            &shard.published_command_specs,
+            &shard.snapshot.slash_commands,
+        )?
+    {
+        shard
+            .published_command_specs
+            .clone_from(&shard.snapshot.slash_commands);
+    }
     Ok(())
 }
 
@@ -16398,6 +16416,15 @@ fn retire_runtime_shard_registrations(manager: &ExtensionManager, shard: &JsRunt
         &[],
     ) {
         tracing::warn!(%error, "Failed to retire stopped MCP registrations");
+    }
+    if let Err(error) = manager.replace_runtime_command_specs(
+        &shard.extension_id,
+        &shard.provider_actor,
+        shard.provider_generation,
+        &shard.published_command_specs,
+        &[],
+    ) {
+        tracing::warn!(%error, "Failed to retire stopped command registrations");
     }
 }
 
@@ -16562,6 +16589,26 @@ fn remaining_js_task_timeout(deadline: Instant, operation: &str) -> Result<Durat
                 "JS extension {operation} timed out before dispatch completed"
             ))
         })
+}
+
+fn is_session_before_event(event_name: &str) -> bool {
+    matches!(
+        event_name,
+        "session_before_switch"
+            | "session_before_fork"
+            | "session_before_compact"
+            | "session_before_tree"
+    )
+}
+
+fn event_response_cancels(response: &Value) -> bool {
+    response.as_bool() == Some(false)
+        || response.get("cancel").and_then(Value::as_bool) == Some(true)
+        || response.get("cancelled").and_then(Value::as_bool) == Some(true)
+}
+
+fn session_event_response_cancels(event_name: &str, response: &Value) -> bool {
+    is_session_before_event(event_name) && event_response_cancels(response)
 }
 
 fn json_value_is_truthy(value: &Value) -> bool {
@@ -17158,8 +17205,7 @@ async fn dispatch_extension_event_across_shards_until(
             }
             let should_stop = (event_name == "tool_call"
                 && value.get("block").is_some_and(json_value_is_truthy))
-                || (event_name.starts_with("session_before_")
-                    && value.get("cancel").is_some_and(json_value_is_truthy));
+                || session_event_response_cancels(event_name, &value);
             last = Some(value);
             if should_stop {
                 return Ok(last.expect("value assigned above"));
@@ -19283,6 +19329,7 @@ mod idle_runtime_tests {
                     .expect("fixture snapshot"),
                 published_provider_specs: Vec::new(),
                 published_mcp_specs: Vec::new(),
+                published_command_specs: Vec::new(),
                 provider_actor: Weak::new(),
                 provider_generation: None,
                 pending_idle_dispatch: None,
@@ -19582,6 +19629,7 @@ mod idle_runtime_tests {
                     .expect("fixture snapshot"),
                 published_provider_specs: Vec::new(),
                 published_mcp_specs: Vec::new(),
+                published_command_specs: Vec::new(),
                 provider_actor: Weak::new(),
                 provider_generation: None,
                 pending_idle_dispatch: Some(pending),
@@ -19687,7 +19735,9 @@ mod idle_runtime_tests {
                 safety_envelope: SafetyEnvelopeConfig {
                     enabled: true,
                     min_observations: 1,
-                    safety_error_threshold: 0.0,
+                    // Single overload failure yields PAC-Bayes bound 1.0 (> 0.99 -> veto);
+                    // single healthy completion yields ~0.976 (<= 0.99 -> permits recovery).
+                    safety_error_threshold: 0.99,
                     ..Default::default()
                 },
                 ..Default::default()

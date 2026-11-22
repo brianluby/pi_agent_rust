@@ -14,8 +14,8 @@ import argparse
 import http.server
 import json
 import os
+import queue
 import re
-import select
 import shutil
 import socketserver
 import subprocess
@@ -84,7 +84,7 @@ def auto_detect_pi_bin() -> str | None:
     return which_pi
 
 
-def validate_version_output(stdout: str) -> tuple[bool, str]:
+def validate_version_output(stdout: str, expected_git_sha: str | None = None) -> tuple[bool, str]:
     line = stdout.strip().splitlines()[0] if stdout.strip() else ""
     if not line:
         return False, "empty --version output"
@@ -93,7 +93,15 @@ def validate_version_output(stdout: str) -> tuple[bool, str]:
     match = VERSION_SHA_RE.match(line)
     if not match:
         return False, f"version does not contain canonical hex commit SHA: {line}"
-    return True, f"verified version line with commit {match.group(1)}: {line}"
+    found_sha = match.group(1).lower()
+    if expected_git_sha and expected_git_sha != "unknown":
+        expected_lower = expected_git_sha.lower()
+        if not expected_lower.startswith(found_sha) and not found_sha.startswith(expected_lower):
+            return (
+                False,
+                f"version commit {found_sha} does not match expected HEAD {expected_lower[:12]}: {line}",
+            )
+    return True, f"verified version line with commit {found_sha}: {line}"
 
 
 class LoopbackStubProvider:
@@ -310,11 +318,37 @@ def run_rpc_smoke(
     )
     assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
 
+    # Use background reader threads for both stdout and stderr so buffered lines
+    # inside Python's TextIOWrapper never stall behind select.select() and a noisy
+    # stderr stream can never fill the 64 KiB OS pipe buffer and deadlock pi.
+    stdout_queue: queue.Queue[str | None] = queue.Queue()
+    stderr_chunks: list[str] = []
+
+    def pump_stdout() -> None:
+        assert proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                stdout_queue.put(line)
+        finally:
+            stdout_queue.put(None)
+
+    def pump_stderr() -> None:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            stderr_chunks.append(line)
+            if len(stderr_chunks) > 256:
+                del stderr_chunks[:-256]
+
+    reader_thread = threading.Thread(target=pump_stdout, daemon=True)
+    stderr_thread = threading.Thread(target=pump_stderr, daemon=True)
+    reader_thread.start()
+    stderr_thread.start()
+
     def read_line(timeout_s: float = 20.0) -> str | None:
-        ready, _, _ = select.select([proc.stdout], [], [], timeout_s)
-        if not ready:
+        try:
+            return stdout_queue.get(timeout=timeout_s)
+        except queue.Empty:
             return None
-        return proc.stdout.readline()
 
     def send_and_wait(payload: dict[str, Any], wait_event: str | None = None) -> tuple[bool, dict[str, Any] | None]:
         proc.stdin.write(json.dumps(payload) + "\n")
@@ -337,19 +371,19 @@ def run_rpc_smoke(
                 got_event = True
         return True, resp
 
-    def wait_idle(tag: str) -> bool:
+    def wait_idle(tag: str) -> tuple[bool, dict[str, Any]]:
         deadline = time.monotonic() + 10.0
         n = 0
         while time.monotonic() < deadline:
             n += 1
             ok, resp = send_and_wait({"id": f"idle-{tag}-{n}", "type": "get_state"})
             if not ok or resp is None:
-                return False
+                return False, {}
             data = resp.get("data") or {}
             if not data.get("isStreaming", False) and not data.get("isCompacting", False):
-                return True
+                return True, data
             time.sleep(0.01)
-        return False
+        return False, {}
 
     try:
         ok_state, _ = send_and_wait({"id": "st-1", "type": "get_state"})
@@ -360,8 +394,10 @@ def run_rpc_smoke(
             {"id": "p-1", "type": "prompt", "message": "First turn before checkpoint"},
             wait_event="agent_end",
         )
-        if not ok_p1 or not wait_idle("p1"):
+        idle_p1, state_p1 = wait_idle("p1")
+        if not ok_p1 or not idle_p1:
             return 1, int((time.monotonic() - t0) * 1000), "RPC prompt 1 failed"
+        count_at_cp = state_p1.get("messageCount")
 
         ok_cp, cp_resp = send_and_wait({"id": "cp-1", "type": "checkpoint", "name": "alpha"})
         if not ok_cp:
@@ -371,30 +407,82 @@ def run_rpc_smoke(
             {"id": "p-2", "type": "prompt", "message": "Second turn to rewind"},
             wait_event="agent_end",
         )
-        if not ok_p2 or not wait_idle("p2"):
+        idle_p2, state_p2 = wait_idle("p2")
+        if not ok_p2 or not idle_p2:
             return 1, int((time.monotonic() - t0) * 1000), "RPC prompt 2 failed"
+        count_after_p2 = state_p2.get("messageCount")
 
         ok_rw, rw_resp = send_and_wait({"id": "rw-1", "type": "rewind", "name": "alpha"})
-        if not ok_rw:
+        if not ok_rw or rw_resp is None:
             return 1, int((time.monotonic() - t0) * 1000), f"RPC rewind failed: {rw_resp}"
+        rw_data = rw_resp.get("data") or {}
+        collapsed = rw_data.get("collapsedMessages")
+        if rw_data.get("checkpoint") != "alpha" or not isinstance(collapsed, int) or collapsed < 2:
+            return (
+                1,
+                int((time.monotonic() - t0) * 1000),
+                f"RPC rewind did not collapse checkpoint span (data={rw_data})",
+            )
+
+        idle_rw, state_rw = wait_idle("rw")
+        if not idle_rw:
+            return 1, int((time.monotonic() - t0) * 1000), "RPC post-rewind get_state failed"
+        def is_plain_int(val: Any) -> bool:
+            return isinstance(val, int) and not isinstance(val, bool)
+
+        count_after_rw = state_rw.get("messageCount")
+        if not (is_plain_int(count_at_cp) and is_plain_int(count_after_p2) and is_plain_int(count_after_rw)):
+            return (
+                1,
+                int((time.monotonic() - t0) * 1000),
+                f"RPC get_state missing integer messageCount (at_cp={count_at_cp!r}, after_p2={count_after_p2!r}, after_rw={count_after_rw!r})",
+            )
+        # Rewind collapses the post-checkpoint span and appends at most one
+        # rewind summary message, so messageCount must strictly decrease
+        # below count_after_p2 and land at count_at_cp or count_at_cp + 1.
+        if not (count_after_p2 > count_at_cp and count_at_cp <= count_after_rw < count_after_p2):
+            return (
+                1,
+                int((time.monotonic() - t0) * 1000),
+                f"RPC rewind did not shrink active context (at_cp={count_at_cp}, after_p2={count_after_p2}, after_rw={count_after_rw}, collapsed={collapsed})",
+            )
 
         proc.stdin.close()
         rc = proc.wait(timeout=15)
+        reader_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
         elapsed = int((time.monotonic() - t0) * 1000)
         if rc != 0:
-            return rc, elapsed, f"RPC shutdown exited {rc}: {proc.stderr.read()[-400:]}"
-        return 0, elapsed, "RPC get_state + prompt + checkpoint + rewind + graceful shutdown succeeded"
+            return rc, elapsed, f"RPC shutdown exited {rc}: {''.join(stderr_chunks)[-400:]}"
+        return (
+            0,
+            elapsed,
+            f"RPC get_state + prompt + checkpoint + rewind (messageCount {count_at_cp}->{count_after_p2}->{count_after_rw}) + graceful shutdown succeeded",
+        )
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+        reader_thread.join(timeout=2)
+        stderr_thread.join(timeout=2)
 
 
 def self_test() -> int:
-    ok1, _ = validate_version_output("pi 0.8.0 (6e3d82b6eb1e38d96beb381d11a09fbeb311dd9e 2026-11-21)")
-    assert ok1, "canonical 40-hex version should pass"
-    ok2, _ = validate_version_output("pi 0.9.0 (6e3d82b 2026-11-21)")
-    assert ok2, "canonical short-hex version should pass"
+    ok1, _ = validate_version_output(
+        "pi 0.9.0 (6e3d82b6eb1e38d96beb381d11a09fbeb311dd9e 2026-11-21)",
+        expected_git_sha="6e3d82b6eb1e38d96beb381d11a09fbeb311dd9e",
+    )
+    assert ok1, "canonical 40-hex matching HEAD should pass"
+    ok2, _ = validate_version_output(
+        "pi 0.9.0 (6e3d82b 2026-11-21)",
+        expected_git_sha="6e3d82b6eb1e38d96beb381d11a09fbeb311dd9e",
+    )
+    assert ok2, "canonical short-hex matching HEAD prefix should pass"
+    bad_mismatch, _ = validate_version_output(
+        "pi 0.9.0 (deadbeef 2026-11-21)",
+        expected_git_sha="6e3d82b6eb1e38d96beb381d11a09fbeb311dd9e",
+    )
+    assert not bad_mismatch, "mismatched HEAD SHA must fail closed"
     bad1, _ = validate_version_output("pi 0.8.0 (unknown 2026-10-13T16:17:00Z)")
     assert not bad1, "unknown SHA must fail closed"
     bad2, _ = validate_version_output("")
@@ -420,9 +508,11 @@ def main() -> int:
     parser.add_argument("--pi-bin", default=None, help="Path to pi binary to test")
     parser.add_argument("--dsr-run-dir", default=None, help="Authoritative DSR run dir to bind into records")
     parser.add_argument("--output-jsonl", required=False, default=None, help="Output JSONL bundle path")
+    parser.add_argument("--expect-head-sha", action="store_true", help="Require --version commit SHA to match current git HEAD")
     parser.add_argument("--allow-unknown-version", action="store_true", help="Report version SHA check as skip/warn instead of failing (diagnostic only)")
     parser.add_argument("--live-default-model", action="store_true", help="Also execute live default-model probe via run_provider_live_e2e.py --check-defaults")
     parser.add_argument("--skip-governance", action="store_true", help="Skip repo governance scripts (installer/freshness/reachability/readiness)")
+    parser.add_argument("--skip-br", action="store_true", help="Skip `br dep cycles` (use during an active DSR source freeze)")
     parser.add_argument("--self-test", action="store_true", help="Run internal planted-red self-tests and exit")
     args = parser.parse_args()
 
@@ -454,10 +544,12 @@ def main() -> int:
                 "--thinking", "off",
             ]
 
-            # 1. pi --version (canonical SHA, never unknown)
+            # 1. pi --version (canonical SHA, never unknown; optionally matches HEAD)
             cmd = [pi_bin, "--version"]
             rc, out, err, dur = run_cmd(cmd, cwd=tmp_path, env=stub_env)
-            ver_ok, ver_detail = validate_version_output(out)
+            ver_ok, ver_detail = validate_version_output(
+                out, expected_git_sha=git_sha if args.expect_head_sha else None
+            )
             verdict = "pass" if (rc == 0 and ver_ok) else ("skip" if args.allow_unknown_version else "fail")
             add(CheckRecord("cli_version_canonical_sha", " ".join(cmd), rc, 0, dur, git_sha, args.dsr_run_dir, verdict, ver_detail if rc == 0 else err.strip()))
 
@@ -520,7 +612,18 @@ def main() -> int:
                 *isolation, "Say OK.",
             ]
             rc, out, err, dur = run_cmd(cmd0, cwd=tmp_path, env=stub_env)
-            add(CheckRecord("json_exit_code_0_success", " ".join(cmd0), rc, 0, dur, git_sha, args.dsr_run_dir, "pass" if rc == 0 else "fail", f"rc={rc}"))
+            json_lines = [ln for ln in out.splitlines() if ln.strip()]
+            json_valid = bool(json_lines)
+            for ln in json_lines:
+                try:
+                    if not isinstance(json.loads(ln), dict):
+                        json_valid = False
+                        break
+                except json.JSONDecodeError:
+                    json_valid = False
+                    break
+            ok0 = rc == 0 and json_valid and "OK loopback turn 1" in out
+            add(CheckRecord("json_exit_code_0_success", " ".join(cmd0), rc, 0, dur, git_sha, args.dsr_run_dir, "pass" if ok0 else "fail", f"rc={rc}, json_lines={len(json_lines)}, json_valid={json_valid}, has_expected_text={'OK loopback turn 1' in out}"))
 
             # Exit 1 (provider HTTP 401 non-retryable failure)
             stub.set_mode("http_401")
@@ -530,12 +633,14 @@ def main() -> int:
                 *isolation, "Trigger provider 401.",
             ]
             rc, out, err, dur = run_cmd(cmd1, cwd=tmp_path, env=stub_env)
-            add(CheckRecord("json_exit_code_1_failure", " ".join(cmd1), rc, 1, dur, git_sha, args.dsr_run_dir, "pass" if rc == 1 else "fail", f"rc={rc}"))
+            combined1 = f"{out}\n{err}"
+            ok1 = rc == 1 and ("401" in combined1 or "authentication" in combined1.lower())
+            add(CheckRecord("json_exit_code_1_failure", " ".join(cmd1), rc, 1, dur, git_sha, args.dsr_run_dir, "pass" if ok1 else "fail", f"rc={rc}, detail={(err or out).strip()[:160]}"))
 
             # Exit 2 (usage error)
             cmd2 = [pi_bin, "--print", "--mode", "json", "--no-session", "--thinking", "invalid-level", "hi"]
             rc, out, err, dur = run_cmd(cmd2, cwd=tmp_path, env=stub_env)
-            add(CheckRecord("json_exit_code_2_usage", " ".join(cmd2), rc, 2, dur, git_sha, args.dsr_run_dir, "pass" if rc == 2 else "fail", f"rc={rc}"))
+            add(CheckRecord("json_exit_code_2_usage", " ".join(cmd2), rc, 2, dur, git_sha, args.dsr_run_dir, "pass" if rc == 2 else "fail", f"rc={rc}, detail={(err or out).strip()[:160]}"))
 
             # Exit 3 (headless approval surface unavailable)
             stub.set_mode("bash_tool_once")
@@ -546,7 +651,7 @@ def main() -> int:
                 *isolation, "Run echo hi.",
             ]
             rc, out, err, dur = run_cmd(cmd3, cwd=tmp_path, env=stub_env)
-            add(CheckRecord("json_exit_code_3_approval_unavailable", " ".join(cmd3), rc, 3, dur, git_sha, args.dsr_run_dir, "pass" if rc == 3 else "fail", f"rc={rc}"))
+            add(CheckRecord("json_exit_code_3_approval_unavailable", " ".join(cmd3), rc, 3, dur, git_sha, args.dsr_run_dir, "pass" if rc == 3 else "fail", f"rc={rc}, detail={(err or out).strip()[:160]}"))
 
             # Exit 4 (explicit missing --skill resource load failure)
             cmd4 = [
@@ -556,7 +661,7 @@ def main() -> int:
                 "hello",
             ]
             rc, out, err, dur = run_cmd(cmd4, cwd=tmp_path, env=stub_env)
-            add(CheckRecord("json_exit_code_4_resource_load_failed", " ".join(cmd4), rc, 4, dur, git_sha, args.dsr_run_dir, "pass" if rc == 4 else "fail", f"rc={rc}"))
+            add(CheckRecord("json_exit_code_4_resource_load_failed", " ".join(cmd4), rc, 4, dur, git_sha, args.dsr_run_dir, "pass" if rc == 4 else "fail", f"rc={rc}, detail={(err or out).strip()[:160]}"))
 
             # Exit 5 (maxCost cap exceeded before second prompt)
             stub.set_mode("expensive")
@@ -567,36 +672,70 @@ def main() -> int:
                 *isolation, "first prompt", "second prompt",
             ]
             rc, out, err, dur = run_cmd(cmd5, cwd=tmp_path, env=stub_env)
-            add(CheckRecord("json_exit_code_5_cost_cap", " ".join(cmd5), rc, 5, dur, git_sha, args.dsr_run_dir, "pass" if rc == 5 else "fail", f"rc={rc}"))
+            add(CheckRecord("json_exit_code_5_cost_cap", " ".join(cmd5), rc, 5, dur, git_sha, args.dsr_run_dir, "pass" if rc == 5 else "fail", f"rc={rc}, detail={(err or out).strip()[:160]}"))
+
+            # 6. Optional live default-model probe (routed into temp/output dir so tracked docs/evidence/ stays clean!)
+            if args.live_default_model:
+                live_out_dir = Path(args.output_jsonl).parent if args.output_jsonl else tmp_path
+                live_out_dir.mkdir(parents=True, exist_ok=True)
+                live_runpack = live_out_dir / "provider-live-validation-runpack.json"
+                live_defaults = live_out_dir / "provider-default-probe.jsonl"
+                cmd_live = [
+                    sys.executable,
+                    "scripts/perf/run_provider_live_e2e.py",
+                    "--check-defaults",
+                    "--binary", pi_bin,
+                    "--out", str(live_runpack),
+                    "--defaults-jsonl", str(live_defaults),
+                ]
+                rc, out, err, dur = run_cmd(cmd_live, cwd=REPO_ROOT, env=os.environ.copy(), timeout=180)
+                live_passes = 0
+                live_fails = 0
+                if live_defaults.is_file():
+                    for line in live_defaults.read_text(encoding="utf-8").splitlines():
+                        if not line.strip():
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if row.get("verdict") == "pass":
+                            live_passes += 1
+                        elif row.get("verdict") == "fail":
+                            live_fails += 1
+                if rc != 0 or live_fails > 0:
+                    live_verdict = "fail"
+                elif live_passes == 0:
+                    live_verdict = "skip"
+                else:
+                    live_verdict = "pass"
+                tail_live = (out or err).strip().splitlines()[-1][:200] if (out or err).strip() else f"rc={rc}"
+                add(CheckRecord(
+                    "live_default_model_probe",
+                    " ".join(cmd_live),
+                    rc,
+                    0,
+                    dur,
+                    git_sha,
+                    args.dsr_run_dir,
+                    live_verdict,
+                    f"live_passes={live_passes}, live_fails={live_fails}; {tail_live}",
+                ))
     finally:
         stub.close()
-
-    # 6. Optional live default-model probe
-    if args.live_default_model:
-        cmd_live = [sys.executable, "scripts/perf/run_provider_live_e2e.py", "--check-defaults", "--binary", pi_bin]
-        rc, out, err, dur = run_cmd(cmd_live, cwd=REPO_ROOT, env=os.environ.copy(), timeout=180)
-        add(CheckRecord(
-            "live_default_model_probe",
-            " ".join(cmd_live),
-            rc,
-            0,
-            dur,
-            git_sha,
-            args.dsr_run_dir,
-            "pass" if rc == 0 else "fail",
-            (out or err).strip().splitlines()[-1][:240] if (out or err).strip() else f"rc={rc}",
-        ))
 
     # 7. Supply chain, governance & tracker checks
     if not args.skip_governance:
         gov_checks: list[tuple[str, list[str]]] = [
             ("gov_installer_regression", ["bash", "tests/installer_regression.sh"]),
             ("gov_module_reachability", [sys.executable, "scripts/check_module_reachability.py"]),
+            ("gov_fixture_read_patience", [sys.executable, "scripts/check_fixture_read_patience.py"]),
             ("gov_readme_evidence_freshness", [sys.executable, "scripts/check_readme_evidence_freshness.py"]),
             ("gov_dsr_contract_sync", [sys.executable, "scripts/check_dsr_contract_sync.py", "--check-host-if-present"]),
             ("gov_claim_readiness_selftest", [sys.executable, "scripts/report_swarm_claim_readiness.py", "--self-test"]),
-            ("gov_beads_dep_cycles", ["br", "dep", "cycles"]),
         ]
+        if not args.skip_br:
+            gov_checks.append(("gov_beads_dep_cycles", ["br", "dep", "cycles"]))
         for name, cmd in gov_checks:
             rc, out, err, dur = run_cmd(cmd, cwd=REPO_ROOT, env=os.environ.copy(), timeout=300)
             tail = (out or err).strip().splitlines()[-1][:240] if (out or err).strip() else f"rc={rc}"

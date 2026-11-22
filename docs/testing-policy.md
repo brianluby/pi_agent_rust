@@ -86,7 +86,7 @@ All unit, VCR, conformance, and E2E suites run through the single authoritative 
 ```bash
 dsr quality --tool pi_agent_rust
 ```
-Do not substitute direct `cargo test` or `rch exec` invocations as a quality claim. Loom model checks (`--features loom-tests`, `hostcall_queue_loom`) remain opt-in specialized verification lanes.
+Do not substitute direct `cargo test` or `rch exec` invocations as a quality claim (DSR's Check 6 owns the underlying `cargo test --all-targets --lib` and full `--all-targets` test lanes remotely via RCH). Loom model checks (`--features loom-tests`, `hostcall_queue_loom`) remain opt-in specialized verification lanes.
 
 **Identifying tests in this suite:** Tests live in `#[cfg(test)]` modules inside `src/*.rs` or in
 `tests/` files listed in the `[suite.unit]` section of `tests/suite_classification.toml`.
@@ -311,7 +311,7 @@ Review checklist for exception approval:
 5. **Mock leak guard:** Enhanced version of guard #2 that also checks Suite 1 `src/` test modules
    for `NullSession`, `NullUiHandler`, `DummyProvider`.
 
-### DSR Gate Lanes (bd-1f42.8.8.1)
+### DSR / CI Gate Lanes (bd-1f42.8.8.1)
 
 Authoritative release verification runs through `dsr quality --tool pi_agent_rust` (`.dsr/repos.yaml`) and `scripts/release_gate.sh` (which exports `PI_RELEASE_GATE_STRICT_FRESHNESS=1` for pre-release 168h freshness enforcement). The `ci_full_suite_gate` integration target (`preflight_fast_fail`, `full_certification`) runs as part of Check 6 (`--all-targets`) inside DSR rather than through retired GitHub Actions workflows.
 
@@ -1031,8 +1031,10 @@ Two long-horizon defect classes — **session duration** (FD/child-process leaks
 - **Why outside the ordinary DSR quality lane:** Long duration soaks would dominate per-commit runtime, and sustained concurrency latency/load stress tests create cross-binary scheduling noise when run alongside hundreds of parallel integration binaries (`bd-814p6` / `bd-brx7l`).
 - **What stays inside Check 6 (`tests/e2e_soak_stability.rs`):** Fast deterministic unit and mutation-sensitivity tests for the soak sampler/evaluator itself (cadence, deliberately leaked OS file descriptor detection, deliberately unbounded vector detection, well-formed early-abort JSONL output, mutation-fault sensitivity, plus bounded 12-turn duration and 6-wave concurrency smokes).
 - **Explicit soak entrypoints (credential-free, deterministic loopback stub + parameterized Rust lane):**
-  - `scripts/e2e/run_session_soak.sh` (`PI_SOAK_TURNS`, `PI_SOAK_MAX_SECS`, `PI_SOAK_SAMPLE_INTERVAL`, `PI_SOAK_MUTATION_FAULT=none|leak_fd|unbounded_vec`)
-  - `scripts/e2e/run_tool_concurrency_soak.sh` (`PI_CONCURRENCY_WAVES`, `PI_CONCURRENCY_PARALLEL_READS`, `PI_CONCURRENCY_HOSTCALL_BURST`, `PI_SOAK_MAX_SECS`)
+  - Explicit DSR soak recipe entry in `.dsr/repos.yaml` (strictly separate from the ordinary 12-check `pi_agent_rust` recipe):
+    `DSR_REPOS_FILE=.dsr/repos.yaml dsr quality --tool pi_agent_rust_soak`
+  - `scripts/e2e/run_session_soak.sh` (`PI_SOAK_TURNS`, `PI_SOAK_BINARY_TURNS`, `PI_SOAK_MAX_SECS`, `PI_SOAK_SAMPLE_INTERVAL`, `PI_SOAK_MUTATION_FAULT=none|leak_fd|unbounded_vec`)
+  - `scripts/e2e/run_tool_concurrency_soak.sh` (`PI_CONCURRENCY_WAVES`, `PI_CONCURRENCY_BINARY_WAVES`, `PI_CONCURRENCY_PARALLEL_READS`, `PI_CONCURRENCY_HOSTCALL_BURST`, `PI_SOAK_MAX_SECS`)
 - **Time-series & calibration discipline:** Every run writes machine-readable timestamped JSONL series (`rss_kb`, `open_fds`, `child_procs`, `session_entries`, `session_index_bytes`, `hostcall_queue_depth`, `turn_latency_ms`), per-turn tool-effect batching decisions and fast-ring vs overflow admissions, all binary warnings/errors, and a `first / median / last` summary table. Initial growth thresholds are explicitly marked `"provisional_thresholds": true` until calibrated from observed multi-run series.
 
 

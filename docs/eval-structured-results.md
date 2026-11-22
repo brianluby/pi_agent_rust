@@ -67,8 +67,8 @@ eval does not enable any other tool. A disabled tool fails with
 Agent. Calling an opt-in tool such as `subagent` therefore requires that tool to
 be mounted and the ordinary approval policy to permit its request.
 
-There are at most **64 attempted host tool calls per cell**, including denied
-calls. Each receives a fresh native tool-call ID and the normal start, update
+There are at most **64 attempted native tool calls per cell**, including denied
+calls and every item in an explicit tool batch. Each receives a fresh native tool-call ID and the normal start, update
 and end events. All calls, including time spent awaiting approval, use the
 cell's existing deadline. The native caller captures the session identity before
 queueing, checks it at the first bridge lookup, and checks it again immediately
@@ -80,8 +80,9 @@ successful; effects already performed by a tool are not rolled back.
 `EVAL_BRIDGE_RECURSION`. Call a discoverable tool by its own name. This avoids
 reacquiring the same kernel lease or obtaining a fresh host budget through a
 wrapper. The host is borrowed only by the active invocation, never retained in
-the kernel or forwarded to a nested tool. Native calls are serialized, but an
-explicit background subagent launch returns while its owned task keeps running.
+the kernel or forwarded to a nested tool. Scalar native calls are serialized;
+`tool.batch` below explicitly groups compatible calls for bounded concurrency.
+An explicit background subagent launch returns while its owned task keeps running.
 The retained helpers below use this same bridge for launch and management.
 
 Native result details include `toolCalls` with schema `pi.eval.tool_calls.v1`.
@@ -98,6 +99,107 @@ Agent call. Typed model judgments use the separate explicit `__pi_judge` and
 `__pi_judge_batch` operations with their own selection and privacy policies.
 Completions, single judgments and batch items share a 16-reserved-attempt limit,
 including the background model requests below.
+
+## Bounded tool batches
+
+Both kernels expose `await tool.batch(calls)` for an explicit group of native
+tool calls. Compatible reads can run concurrently; mutations and other ordered
+effects form barriers. Results remain in input order regardless of completion
+order.
+
+JavaScript:
+
+```javascript
+const batch = await tool.batch([
+  {name: "read", args: {path: "README.md"}},
+  {name: "grep", args: {pattern: "TODO", path: "src"}}
+]);
+for (const item of batch.items) {
+  if ("error" in item) {
+    console.log(item.name, item.error);
+  } else {
+    console.log(item.name, item.result.isError, item.result.content);
+  }
+}
+```
+
+Python:
+
+```python
+batch = await tool.batch([
+    {"name": "read", "args": {"path": "README.md"}},
+    {"name": "grep", "args": {"pattern": "TODO", "path": "src"}},
+])
+for item in batch["items"]:
+    if "error" in item:
+        print(item["name"], item["error"])
+    else:
+        print(item["name"], item["result"]["isError"], item["result"]["content"])
+```
+
+The aggregate has `schema: "pi.eval.tool_batch.v1"` and an `items` array.
+Each item contains its zero-based `index`, original `name`, fresh native
+`toolCallId`, and exactly one of:
+
+- `result`: the full `pi.eval.tool_result.v1` envelope, including native
+  content, images, details and `isError`. A native denial or unsuccessful tool
+  outcome remains a result with `isError: true`.
+- `error`: an explicit bridge, host or result-encoding failure for this item.
+
+A returned aggregate does not mean every tool succeeded. Inspect both item
+errors and `result.isError`. One failed item does not erase successful peers
+or retry them. A batch is not a transaction: effects are never rolled back.
+
+| Limit | Behavior |
+|---|---|
+| Calls per batch | 1–16 |
+| Compatible calls in flight | At most 8; the host may lower this |
+| Native calls per cell | 64 shared by scalar calls and all batch items |
+| Encoded batch input | 256 KiB |
+| Encoded aggregate result | 4 MiB |
+| Deadline | The original cell deadline, including approval waits |
+
+Pass one array/list argument, with exactly `name` and object/dictionary-valued
+`args` in every entry. There are no batch options. Names are nonempty, at most
+128 UTF-8 bytes and contain no control characters. The helpers snapshot plain
+JSON before queueing and enforce the existing depth and value-count bounds.
+JavaScript accessors, hidden properties, sparse arrays and custom serializers
+are rejected without invoking them.
+
+Malformed batches, recursive wrapper names and insufficient remaining call
+budget fail before any native dispatch. Admission reserves all items at once,
+including later failures. Tool-specific argument validation and current tool
+availability remain per-item decisions in the ordinary native execution path.
+
+Scheduling uses trusted native effect metadata. Writes, process effects and
+unknown or ordered effects form serial barriers; the guest cannot declare a
+tool safe for concurrent execution. Each item still uses the current plan,
+approval, extension-hook, privacy, cancellation and session policy. The Agent
+rechecks the concrete tool handle after approval and hooks. If a previously
+compatible tool has become an ordered tool, that item fails with
+`EVAL_BRIDGE_EFFECTS_CHANGED` and is not retried serially. Observed session
+revocation is shared with the cell runner and remains revoked even if the
+original session is selected again.
+
+Standalone embeddings keep the exact `read`, `grep`, `find`, `ls`
+whitelist and pin the native handles they classify. SDK hosts default to
+serial execution unless they explicitly implement the effect and concurrent
+dispatch contract.
+
+An individually invalid or oversized result becomes an item error. If the
+combined result exceeds 4 MiB, native execution continues settling the
+admitted calls within the original deadline, then rejects the whole aggregate
+with `EVAL_BRIDGE_LIMIT`. It never returns a successful prefix. Native tool
+receipts are updated as each item settles and survive cancellation, timeout
+or aggregate encoding failure; inspect them before deciding whether to retry
+anything. Cancellation does not undo completed effects.
+
+The internal operation is `__pi_tool_batch`, with exactly
+`{"calls": [{"name": "...", "args": {}}]}`. Calls to `eval`, `xdev` and
+`__pi_*` wrappers are rejected. This operation uses the existing serialized
+guest bridge as one exchange. JavaScript `Promise.all` and Python
+`asyncio.gather` over scalar tool calls retain their existing serialized
+dispatch semantics; `tool.batch` is the explicit concurrency interface.
 
 ## Retained background model requests
 
@@ -693,9 +795,12 @@ print(first['content'])
 
 The pool exposes `id` / `poolId` and `jobId` in JavaScript, or `id` / `pool_id`
 and `job_id` in Python. IDs are null/`None` until the first native admission.
+`concurrency` and `maxBatchSize` / `max_batch_size` are read-only launch limits;
+`workpool.attach()` recovers their native values without changing them.
 `pool.items` retains fixed item handles in admission order as a frozen array or
 Python tuple. Each item has `itemId` / `item_id`, `poolId` / `pool_id`, `jobId` /
-`job_id`, and `agent`; `id` is the item ID. Items expose `status()`, `done()`,
+`job_id`, `agent`, and `maxBatchSize` / `max_batch_size`; `id` is the item ID.
+Items expose `status()`, `done()`,
 `output()` and `wait(seconds=30)`. They expose no worker ID or cancellation
 method: cancellation belongs to the entire pool.
 
@@ -732,6 +837,83 @@ creates and seals a real empty carrier job. An open pool remains available
 after its current batch drains. Call `finish()` when no further work will be
 added, or `close()` to stop it. Repeated acknowledged finish/close calls do not
 replay their native mutation. Cancelling does not roll back filesystem effects.
+
+### Group queued assignments into fewer model turns
+
+Set `maxBatchSize` in JavaScript or `max_batch_size` in Python to group up to
+eight queued assignments on the same child into one model turn. This reduces
+the number of turns needed for independent tasks that can share a conversation.
+The default is **1**, preserving one assignment per turn. The limit is frozen
+when the pool is created and cannot be changed by a later push or attachment.
+
+```javascript
+globalThis.pool = await workpool({
+    agent: 'reviewer', concurrency: 2, maxBatchSize: 4,
+    outputSchema: {
+        type: 'object',
+        properties: {summary: {type: 'string'}},
+        required: ['summary'], additionalProperties: false,
+    },
+});
+globalThis.items = await pool.push([
+    'Summarize the parser error-handling risks.',
+    'Summarize the cancellation risks.',
+    'Summarize the persistence risks.',
+    'Summarize the child-process cleanup risks.',
+]);
+await pool.finish();
+const first = await items[0].wait();
+console.log(first.details.results[0].data.summary);
+```
+
+```python
+pool = await workpool(
+    agent='reviewer', concurrency=2, max_batch_size=4,
+    output_schema={
+        'type': 'object',
+        'properties': {'summary': {'type': 'string'}},
+        'required': ['summary'], 'additionalProperties': False,
+    },
+)
+items = await pool.push([
+    'Summarize the parser error-handling risks.',
+    'Summarize the cancellation risks.',
+    'Summarize the persistence risks.',
+    'Summarize the child-process cleanup risks.',
+])
+await pool.finish()
+first = await items[0].wait()
+print(first['details']['results'][0]['data']['summary'])
+```
+
+The native scheduler takes an available FIFO prefix from each child's queue,
+bounded by the configured count and **64 KiB of combined UTF-8 task text**.
+It does not delay execution to fill a group, so a turn may contain fewer items
+than the limit. Opting into grouping uses the keyed protocol even for a
+singleton. Pool item IDs and handles remain stable, and each item keeps its
+own result, dependency tracking and privacy checks.
+
+The child receives native-owned keys and returns one final JSON envelope with
+exactly one `data` or `error` row per key. The host validates the entire key set
+before accepting any member. Missing, duplicate or foreign keys, extra fields,
+or an oversized/malformed envelope fail every member of that group; the host
+does not retry the assignments. The complete envelope is limited to **32 KiB**.
+An explicit item error or a failed per-item `outputSchema` validation affects
+only that item in an otherwise valid envelope. Successful `data` values appear
+at `result.details.results[0].data`, including without an output schema.
+
+Results become available after the child finishes the entire turn and reaches
+the post-compaction idle barrier. Grouping does not expose intermediate child
+yields. For earlier individual completion or larger per-item answers, keep the
+default limit of one. The map/reduce helpers fill a window of
+`min(32, maxItems, concurrency * maxBatchSize)` logical assignments, with the
+equivalent Python option names; see [workpool pipelines](eval-workpool-pipelines.md).
+
+In worktree isolation, all members of a group share the same cumulative
+worktree outcome. `result.details.workerBatch` records the physical request,
+native turn keys and `patchScope: "cumulative_worker_batch"`. These patches
+include the member's earlier turns and must not be stacked as independent
+item patches. Cancellation still belongs to the entire pool.
 
 ### Collect completed pool items across cells
 
@@ -774,7 +956,7 @@ print({'pending': page['pendingItems'], 'hasMore': page['hasMore'], 'done': page
 ```
 
 The returned `pi.subagent.pool.drain.v1` page contains `poolId`, `jobId`,
-`agent`, `status`, `sealed`, `admittedItems`, `settledItems`, `pendingItems`,
+`agent`, `maxBatchSize`, `status`, `sealed`, `admittedItems`, `settledItems`, `pendingItems`,
 `workerWorkspaces`, `items`, `cursor`, `nextCursor`, `hasMore`, `done` and
 `timedOut`. Each item has `id`, `workerIndex`, terminal `status`, and its full
 native `result` (`content`, `details`, optional `isError`). Item failures and
@@ -909,13 +1091,15 @@ through `jobs`. Recovery uses those direct native operations; an unacknowledged
 guest object does not automatically bind to a recovered identity. No batch is
 replayed during recovery.
 
-Pool options are `name`, `agent`, `model`, `concurrency`, `cwd`, `scope`,
+Pool options are `name`, `agent`, `model`, `concurrency`,
+`maxBatchSize` / `max_batch_size`, `cwd`, `scope`,
 `isolation: "none" | "worktree"`, `isoApply` / `iso_apply`, and
 `timeoutSeconds` / `timeout_seconds`. Names are labels for the guest object.
 Agent definition, model, child tools and working directory are captured at
 native startup and cannot be changed by later pushes. Pools support Unix and
 Windows. `outputSchema` / `output_schema` or a schema-bearing definition freezes
-one strict output contract for every member and turn; `schemaMode` /
+one strict output contract for every logical item, including each `data` value
+in a grouped turn; `schemaMode` /
 `schema_mode`, when supplied, must be `"strict"`. Historical `seance`
 consultation remains on the independent-task path.
 
@@ -950,9 +1134,9 @@ process-local bounded retention, not a disk-backed queue, process-restart
 recovery or durable conversation storage.
 
 Native aggregate completion is delivered through the existing session job
-notice, after drain and child cleanup. OMP's keyed yield batches and custom
-child-defined eval tools remain separate work. Native pools keep one prompt
-per admitted item, explicit sealing, and fixed child lifetimes.
+notice, after drain and child cleanup. Optional grouping supplies keyed final
+results while retaining explicit sealing and fixed child lifetimes. A child
+yield tool and custom child-defined eval tools remain separate work.
 
 ## Validation
 

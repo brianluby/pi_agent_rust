@@ -26,6 +26,12 @@ def envelope(details=None, *, failed=False):
             "details": details, "isError": failed}
 
 
+def tool_batch_page(names=("read",)):
+    return {"schema": "pi.eval.tool_batch.v1", "items": [
+        {"index": index, "name": name, "toolCallId": f"eval-native-{index}",
+         "result": envelope({"index": index})} for index, name in enumerate(names)]}
+
+
 def worker_snapshot(worker_id="worker-native", turn_id=1, status="running", result=None):
     return {
         "schema": "pi.subagent.worker.v1", "workerId": worker_id,
@@ -133,7 +139,8 @@ class PoolHost:
             counts[item["status"]] += 1
         return {"schema": "pi.subagent.pool.v1", "poolId": pool["id"], "jobId": pool["jobId"],
                 "agent": pool["agent"], "status": pool["status"], "sealed": pool["sealed"],
-                "concurrency": pool["concurrency"], "admittedItems": len(pool["items"]),
+                "concurrency": pool["concurrency"], "maxBatchSize": pool["maxBatchSize"],
+                "admittedItems": len(pool["items"]),
                 "queuedItems": counts["queued"], "runningItems": counts["running"],
                 "completedItems": counts["completed"], "failedItems": counts["failed"] + counts["cancelled"],
                 "workerContexts": [{"workerIndex": index + 1, "tokens": None, "window": None}
@@ -173,7 +180,8 @@ class PoolHost:
         if operation == "pool_start":
             pool_id = f"pool-native-{len(self.pools) + 1}"
             pool = {"id": pool_id, "jobId": f"carrier-{pool_id}", "agent": args["agent"],
-                    "concurrency": args["concurrency"], "status": "open", "sealed": False, "items": []}
+                    "concurrency": args["concurrency"], "maxBatchSize": args.get("maxBatchSize", 1),
+                    "status": "open", "sealed": False, "items": []}
             self.pools[pool_id] = pool
         else:
             pool = self.pools[args["poolId"]]
@@ -361,6 +369,204 @@ class StructuredReaderTests(unittest.TestCase):
         response = self.kernel.cell("saved['details']['count'] += 1; saved['details']['count']")
         self.assertEqual(self.value(response), 42)
         self.assertEqual(len(self.kernel.calls), 1)
+
+    def test_tool_batch_uses_one_exchange_and_preserves_complete_outcomes(self):
+        expected = tool_batch_page(("read", "grep", "write"))
+        expected["items"][0]["result"]["content"].append(
+            {"type": "image", "mimeType": "image/png", "data": "aW1hZ2U="})
+        del expected["items"][1]["result"]
+        expected["items"][1]["error"] = "EVAL_BRIDGE_UNAVAILABLE: tool is not enabled"
+        expected["items"][2]["result"] = envelope({"reason": "write denied"}, failed=True)
+        calls = [{"name": "read", "args": {"path": "a", "nested": [None, False, {"count": 7}]}},
+                 {"name": "grep", "args": {"pattern": "needle"}},
+                 {"name": "write", "args": {"path": "b", "content": "updated"}}]
+        response = self.kernel.cell(f"await tool.batch({calls!r})", self.reply_with(expected))
+        self.assertEqual(self.value(response), expected)
+        self.assertEqual(response["displays"], [])
+        self.assertEqual(len(self.kernel.calls), 1)
+        self.assertEqual(self.kernel.calls[0]["bridge"]["tool"], "__pi_tool_batch")
+        self.assertEqual(self.kernel.calls[0]["bridge"]["input"], {"calls": calls})
+
+    def test_tool_batch_accepts_sixteen_calls_and_exact_utf8_name_limit(self):
+        names = ["é" * 64, *(["read"] * 15)]
+        calls = [{"name": name, "args": {}} for name in names]
+        response = self.kernel.cell(f"len((await tool.batch({calls!r}))['items'])",
+                                    self.reply_with(tool_batch_page(names)))
+        self.assertEqual(self.value(response), 16)
+
+    def test_tool_batch_snapshots_arguments_before_waiting_for_protocol_ownership(self):
+        def bridge(frame):
+            if frame["bridge"]["tool"] == "read":
+                self.kernel.reply(frame, "held-result")
+            else:
+                self.assertEqual(frame["bridge"]["tool"], "__pi_tool_batch")
+                self.assertEqual(frame["bridge"]["input"], {"calls": [
+                    {"name": "read", "args": {"path": "original", "nested": [{"value": 1}]}}]})
+                self.kernel.reply(frame, json.dumps(tool_batch_page()))
+
+        response = self.kernel.cell("""
+import asyncio
+calls = [{'name':'read','args':{'path':'original','nested':[{'value':1}]}}]
+held = asyncio.create_task(tool.call('read', {'path':'held'}))
+pending = asyncio.create_task(tool.batch(calls))
+await asyncio.sleep(0)
+calls[0]['name'] = 'write'
+calls[0]['args']['path'] = 'changed'
+calls[0]['args']['nested'][0]['value'] = 9
+await held
+(await pending)['items'][0]['name']
+""", bridge)
+        self.assertEqual(self.value(response), "read")
+        self.assertEqual(len(self.kernel.calls), 2)
+
+    def test_tool_batch_rejects_the_entire_malformed_request_before_dispatch(self):
+        expressions = [
+            "tool.batch()", "tool.batch([])", "tool.batch({})",
+            "tool.batch([{'name':'read','args':{}}], {'concurrency':2})",
+            "tool.batch([{'name':'read','args':{}}], concurrency=2)",
+            "tool.batch([{'name':'read','args':{}}] * 17)",
+            "tool.batch([None])", "tool.batch([{'name':'read'}])",
+            "tool.batch([{'name':'read','args':[]}])", "tool.batch([{'name':'read','args':None}])",
+            "tool.batch([{'name':'read','args':{},'extra':1}])",
+            "tool.batch([{'name':'','args':{}}])", "tool.batch([{'name':7,'args':{}}])",
+            "tool.batch([{'name':'a'*129,'args':{}}])", "tool.batch([{'name':'é'*65,'args':{}}])",
+            *[f"tool.batch([{{'name':{name!r},'args':{{}}}}])"
+              for name in ("eval", "xdev", "__pi_tool_batch", "__pi_tool_result", "bad\nname", "bad\u0085name", "\ud800")],
+            *[f"tool.batch([{{'name':'read','args':{{'value':{value}}}}}])"
+              for value in ("float('nan')", "float('inf')", "2**64", "b'bytes'", "{1,2}", "(1,2)", "lambda:1")],
+            "tool.batch([{'name':'read','args':{1:'not a string key'}}])",
+            "tool.batch([{'name':'read','args':{'path':'\\n'*131072}}])",
+            "tool.batch([{'name':'read','args':{'path':'é'*131072}}])",
+            "tool.batch([{'name':'read','args':{}},{'name':'eval','args':{}}])",
+        ]
+        for expression in expressions:
+            with self.subTest(expression=expression):
+                response = self.kernel.cell(f"""
+caught = None
+try:
+    await {expression}
+except Exception as error:
+    caught = (type(error).__name__, str(error))
+caught
+""")
+                error = self.value(response)
+                self.assertIsNotNone(error)
+                self.assertEqual(error[0], "TypeError")
+                self.assertEqual(self.kernel.calls, [])
+        self.assert_next_cell_works()
+
+    def test_tool_batch_rejects_custom_containers_and_cycles_without_callbacks(self):
+        response = self.kernel.cell("""
+hits = 0
+class Custom(dict):
+    def items(self):
+        global hits
+        hits += 1
+        return {'path':'changed'}.items()
+cyclic = {}
+cyclic['self'] = cyclic
+failures = []
+for arguments in (Custom(path='secret'), cyclic):
+    try:
+        await tool.batch([{'name':'read','args':arguments}])
+    except Exception as error:
+        failures.append(str(error).startswith('EVAL_TOOL_BATCH_INPUT'))
+(hits, failures)
+""")
+        self.assertEqual(self.value(response), (0, [True, True]))
+        self.assertEqual(self.kernel.calls, [])
+
+    def test_tool_batch_response_rejects_missing_reordered_or_forged_outcomes(self):
+        mutations = [
+            lambda page: page.update(schema="wrong"), lambda page: page.update(extra=True),
+            lambda page: page["items"].pop(), lambda page: page["items"].reverse(),
+            lambda page: page["items"][0].update(index=False),
+            lambda page: page["items"][0].update(name="write"),
+            lambda page: page["items"][0].update(toolCallId=""),
+            lambda page: page["items"][0].update(toolCallId="é" * 65),
+            lambda page: page["items"][1].update(toolCallId=page["items"][0]["toolCallId"]),
+            lambda page: page["items"][0].update(extra=True),
+            lambda page: page["items"][0].update(error="both"),
+            lambda page: page["items"][0].pop("result"),
+            lambda page: page["items"][0]["result"].update(schema="wrong"),
+            lambda page: page["items"][0]["result"].pop("details"),
+            lambda page: page["items"][0]["result"].update(content={}),
+            lambda page: page["items"][0]["result"].update(isError=0),
+            lambda page: page["items"][0]["result"].update(details=float("nan")),
+        ]
+        replies = ["invalid-json", "null", "[]", "{}"]
+        for mutate in mutations:
+            page = tool_batch_page(("read", "grep"))
+            mutate(page)
+            replies.append(json.dumps(page, ensure_ascii=False))
+        for reply in replies:
+            response = self.kernel.cell("await tool.batch([{'name':'read','args':{}},{'name':'grep','args':{}}])",
+                                        lambda frame: self.kernel.reply(frame, reply))
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_TOOL_BATCH_PROTOCOL", response["error"])
+        self.assertEqual(len(self.kernel.calls), len(replies))
+        self.assert_next_cell_works()
+
+    def test_tool_batch_reply_limit_counts_utf8_bytes_and_accepts_exact_boundary(self):
+        page = tool_batch_page()
+        del page["items"][0]["result"]
+        page["items"][0]["error"] = ""
+        overhead = len(json.dumps(page, ensure_ascii=False).encode("utf-8"))
+        page["items"][0]["error"] = "x" * (4 * 1024 * 1024 - overhead)
+        response = self.kernel.cell("len((await tool.batch([{'name':'read','args':{}}]))['items'][0]['error'])",
+                                    self.reply_with(page))
+        self.assertEqual(self.value(response), 4 * 1024 * 1024 - overhead)
+        page["items"][0]["error"] = "é" * ((4 * 1024 * 1024 - overhead) // 2 + 2)
+        response = self.kernel.cell("await tool.batch([{'name':'read','args':{}}])", self.reply_with(page))
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_BRIDGE_LIMIT", response["error"])
+        self.assertEqual(len(self.kernel.calls), 2)
+
+    def test_tool_batch_cancelled_reply_drains_before_the_next_scalar_request(self):
+        waiting = []
+
+        def bridge(frame):
+            if frame["bridge"]["tool"] == "__pi_tool_batch":
+                waiting.append(frame)
+            else:
+                self.assertEqual(frame["bridge"]["tool"], "read")
+                self.assertEqual(frame["bridge"]["input"], {"path": "after"})
+                self.kernel.reply(frame, "after-cancellation")
+
+        def observe(frame):
+            if "batch-cancel-requested" in json.dumps(frame):
+                self.assertEqual(len(waiting), 1)
+                self.kernel.reply(waiting.pop(), json.dumps(tool_batch_page()))
+
+        response = self.kernel.cell("""
+import asyncio
+pending = asyncio.create_task(tool.batch([{'name':'read','args':{}}]))
+async def cancel_batch():
+    await asyncio.sleep(0)
+    pending.cancel()
+    print('batch-cancel-requested')
+canceller = asyncio.create_task(cancel_batch())
+cancelled = False
+try:
+    await pending
+except asyncio.CancelledError:
+    cancelled = True
+await canceller
+after = await tool.call('read', {'path':'after'})
+(cancelled, after)
+""", bridge, observe)
+        self.assertEqual(self.value(response), (True, "after-cancellation"))
+        self.assertEqual(waiting, [])
+        self.assertEqual(len(self.kernel.calls), 2)
+        self.assert_next_cell_works()
+
+    def test_tool_batch_bridge_error_is_not_replayed(self):
+        response = self.kernel.cell("await tool.batch([{'name':'read','args':{}}])",
+                                    lambda frame: self.kernel.reply(frame, error="EVAL_BRIDGE_LIMIT: aggregate withheld"))
+        self.assertFalse(response["ok"])
+        self.assertIn("aggregate withheld", response["error"])
+        self.assertEqual(len(self.kernel.calls), 1)
+        self.assert_next_cell_works()
 
     def launch_agent(self, variable="saved", job_id="job-native"):
         def bridge(frame):
@@ -1577,6 +1783,74 @@ await pool.close()
             "operation": "pool_start", "concurrency": 3, "tasks": ["inspect"], "model": {"role": "tiny"},
         })
 
+    def test_grouped_pool_limits_are_bounded_and_frozen_before_admission(self):
+        for value in ("0", "9", "-1", "1.5", "True", "None", "'4'", "float('nan')", "float('inf')"):
+            response = self.kernel.cell(f"await workpool(max_batch_size={value})")
+            self.assertFalse(response["ok"])
+            self.assertIn("EVAL_POOL_INPUT", response["error"])
+        self.assertEqual(self.kernel.calls, [])
+        self.create_pool()
+        self.assertEqual(self.value(self.kernel.cell("pool.max_batch_size, (await pool.peek())['maxBatchSize']")), (1, 1))
+        self.value(self.kernel.cell("options={'agent':'scout','concurrency':2,'max_batch_size':4}; "
+                                   "pool=await workpool(**options); options['max_batch_size']=8; pool.max_batch_size"))
+        response = self.kernel.cell("pool.max_batch_size=7")
+        self.assertFalse(response["ok"])
+        self.assertIn("AttributeError", response["error"])
+        self.assertEqual(self.value(self.kernel.cell("pool.max_batch_size")), 4)
+        native = PoolHost(self.kernel)
+        self.assertEqual(self.value(self.kernel.cell(
+            "items=await pool.push(['one','two','three']); [(item.item_id,item.max_batch_size) for item in items]", native)),
+            [(1, 4), (2, 4), (3, 4)])
+        self.assertEqual(self.kernel.calls[0]["bridge"]["input"]["args"]["maxBatchSize"], 4)
+        self.assertEqual(self.value(self.kernel.cell("(await pool.peek())['maxBatchSize']", native)), 4)
+
+    def test_missing_or_changed_grouped_limits_reject_admission_without_replay(self):
+        for value in (None, 0, 9, True, 2):
+            with self.subTest(value=value):
+                self.value(self.kernel.cell("pool=await workpool(agent='scout',concurrency=2,max_batch_size=4); pool.max_batch_size"))
+                native = PoolHost(self.kernel)
+                def invalid(frame):
+                    snapshot = native.apply(frame)
+                    if value is None:
+                        del snapshot["maxBatchSize"]
+                    else:
+                        snapshot["maxBatchSize"] = value
+                    self.kernel.reply(frame, json.dumps(envelope(snapshot)))
+                response = self.kernel.cell("await pool.push(['accepted once'])", invalid)
+                self.assertFalse(response["ok"])
+                self.assertIn("EVAL_POOL_ADMISSION", response["error"])
+                self.assertTrue(self.value(self.kernel.cell("pool.unknown_admission and pool.closed")))
+                response = self.kernel.cell("await pool.push(['do not replay'])")
+                self.assertFalse(response["ok"])
+                self.assertIn("EVAL_POOL_CLOSED", response["error"])
+                self.assertEqual(native.operations, ["pool_start"])
+                self.assertEqual(len(native.pools["pool-native-1"]["items"]), 1)
+
+    def test_grouped_exchange_and_item_reads_reject_changing_the_frozen_limit(self):
+        self.value(self.kernel.cell("pool=await workpool(agent='scout',concurrency=1,max_batch_size=4); pool.max_batch_size"))
+        native = PoolHost(self.kernel)
+        self.value(self.kernel.cell("await pool.push(['first']); pool.id", native))
+        def changed_exchange(frame):
+            page = native.apply(frame)
+            page["snapshot"]["maxBatchSize"] = 8
+            self.kernel.reply(frame, json.dumps(envelope(page)))
+        response = self.kernel.cell("await pool.exchange(['second'])", changed_exchange)
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_POOL_ADMISSION", response["error"])
+        self.assertEqual(self.value(self.kernel.cell("len(pool.items)")), 1)
+        response = self.kernel.cell("await pool.push(['no replay'])")
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_POOL_CLOSED", response["error"])
+        self.assertEqual(self.value(self.kernel.cell("len((await pool.peek())['items'])", native)), 2)
+        def changed_item(frame):
+            snapshot = native.apply(frame)
+            snapshot["maxBatchSize"] = 2
+            self.kernel.reply(frame, json.dumps(envelope(snapshot)))
+        response = self.kernel.cell("await pool.items[0].status()", changed_item)
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_POOL_PROTOCOL", response["error"])
+        self.assertEqual(native.operations, ["pool_start", "pool_exchange", "pool_status", "pool_result"])
+
 
     def test_retained_schema_options_are_forwarded_for_native_validation(self):
         for contract in ({"output_schema": {}}, {"schema_mode": "strict"},
@@ -2038,8 +2312,9 @@ class BudgetPoolHost(PoolHost):
         if self.calls > 64:
             self.kernel.reply(frame, error="EVAL_TOOL_LIMIT:64")
             return
-        request = frame["bridge"]["input"]
-        if request["name"] != "subagent":
+        bridge = frame["bridge"]
+        request = bridge["input"]
+        if bridge.get("tool") != "__pi_tool_result" or request.get("name") != "subagent":
             self.kernel.reply(frame, "callback")
             return
         encoded = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -2068,6 +2343,54 @@ class WorkpoolBudgetTests(unittest.TestCase):
     def value(self, response):
         self.assertTrue(response["ok"], response.get("error"))
         return ast.literal_eval(response["result"])
+
+    def test_actual_facade_admits_grouped_windows_and_retains_individual_items(self):
+        for ordered in (False, True):
+            native = BudgetPoolHost(self.kernel, reverse=True)
+            result = self.value(self.kernel.cell(f"""
+report=await workpool.map_reduce(range(16), lambda value,index: f'task {{value}}',
+    lambda total,item: total+item['input'], 0,
+    pool={{'concurrency':2,'max_batch_size':3}}, ordered={ordered!r})
+(report['value'],report['completed'],report['pool'].max_batch_size,report['cursor']['itemIds'])
+""", native))
+            self.assertEqual(result, (120, 16, 3, list(range(1, 17))))
+            self.assertEqual(native.high_water, 6)
+            self.assertLessEqual(native.calls, 18)
+            self.assertEqual(native.operations.count("pool_start"), 1)
+            self.assertEqual(len(native.pools["pool-native-1"]["items"]), 16)
+
+    def test_actual_facade_recovers_grouped_limit_without_relaunch_or_mutation(self):
+        native = PoolHost(self.kernel)
+        result = self.value(self.kernel.cell("""
+pool=await workpool(concurrency=2,max_batch_size=4)
+await pool.push(['first','second'])
+recovered=await workpool.attach(pool.id)
+(recovered.max_batch_size,recovered.closed,[item.max_batch_size for item in recovered.items])
+""", native))
+        self.assertEqual(result, (4, True, [4, 4]))
+        self.assertEqual(native.operations, ["pool_start", "pool_status"])
+        response = self.kernel.cell("recovered.max_batch_size=8")
+        self.assertFalse(response["ok"])
+        self.assertIn("AttributeError", response["error"])
+        self.assertEqual(self.value(self.kernel.cell("recovered.max_batch_size")), 4)
+        response = self.kernel.cell("await recovered.push(['no implicit resume'])")
+        self.assertFalse(response["ok"])
+        self.assertIn("EVAL_POOL_CLOSED", response["error"])
+        self.assertEqual(native.operations, ["pool_start", "pool_status"])
+
+    def test_maximum_grouped_window_preserves_request_bounds_and_64_call_ceiling(self):
+        for ordered in (False, True):
+            native = BudgetPoolHost(self.kernel, reverse=True)
+            report = self.value(self.kernel.cell(f"""
+report=await workpool.map_reduce(range(32), lambda value,index: chr(92)*65536,
+    lambda total,item: total+item['input'], 0,
+    pool={{'concurrency':8,'max_batch_size':8}}, ordered={ordered!r})
+(report['value'],report['completed'],report['cursor']['itemIds'])
+""", native))
+            self.assertEqual(report, (496, 32, list(range(1, 33))))
+            self.assertEqual(native.high_water, 32)
+            self.assertLessEqual(native.calls, 64)
+            self.assertEqual(native.operations.count("pool_start"), 1)
 
     def test_actual_facade_completes_32_items_within_64_calls_at_every_concurrency(self):
         for concurrency in (1, 2, 4, 8):

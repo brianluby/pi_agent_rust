@@ -824,6 +824,127 @@ async def _finish_bridge_calls(output):
     return "EVAL_BRIDGE_PENDING: cell ended with unawaited tool work; queued calls were cancelled and dispatched replies drained. Effects are not rolled back."
 
 
+def _make_tool_batch():
+    # These values belong to the installed helper, not a later cell's aliases.
+    # Exact builtin containers have no guest getters or custom JSON serializers.
+    kind, size, ordinal = type, len, ord
+    dictionary, sequence, text_type = dict, list, str
+    integer_type, float_type, boolean_type = int, float, bool
+    finite, parse, utf8 = math.isfinite, json.loads, str.encode
+    encode = json.JSONEncoder(ensure_ascii=False, allow_nan=False, separators=(",", ":")).iterencode
+    input_error, protocol_error = TypeError, ToolBridgeError
+
+    def invalid():
+        return input_error("EVAL_TOOL_BATCH_INPUT: expected 1..16 JSON calls with exactly name and args")
+
+    def protocol():
+        return protocol_error("EVAL_TOOL_BATCH_PROTOCOL: invalid native tool batch result")
+
+    def byte_count(value, maximum, failure, identifier=False):
+        if kind(value) is not text_type:
+            raise failure()
+        try:
+            count = size(utf8(value, "utf-8"))
+        except UnicodeError:
+            raise failure() from None
+        if count > maximum or identifier and any(ordinal(char) < 32 or 127 <= ordinal(char) <= 159 for char in value):
+            raise failure()
+        return count
+
+    def copy_json(value, budget, depth=0):
+        budget[0] -= 1
+        budget[1] -= 1
+        if depth > 64 or budget[0] < 0 or budget[1] < 0:
+            raise invalid()
+        value_type = kind(value)
+        if value is None or value_type is boolean_type:
+            return value
+        if value_type is integer_type:
+            if not -(1 << 63) <= value < (1 << 64):
+                raise invalid()
+            return value
+        if value_type is float_type:
+            if not finite(value):
+                raise invalid()
+            return value
+        if value_type is text_type:
+            budget[1] -= byte_count(value, budget[1], invalid)
+            return value
+        if value_type is sequence:
+            if size(value) > budget[0]:
+                raise invalid()
+            return [copy_json(item, budget, depth + 1) for item in value]
+        if value_type is dictionary:
+            if size(value) > budget[0]:
+                raise invalid()
+            copied = {}
+            for key, item in value.items():
+                budget[1] -= byte_count(key, budget[1], invalid)
+                copied[key] = copy_json(item, budget, depth + 1)
+            return copied
+        raise invalid()
+
+    def reject_constant(_value):
+        raise ValueError("non-JSON number")
+
+    async def batch(calls):
+        """Await one bounded native batch, preserving ordered full results.
+
+        The host schedules compatible calls and enforces mutation barriers.
+        Individual failures are data; cancellation still drains this one bridge
+        exchange and never retries a dispatched item or detaches its work.
+        """
+        if kind(calls) is not sequence or not 1 <= size(calls) <= 16:
+            raise invalid()
+        copied = copy_json(calls, [131072, 256 * 1024])
+        for call in copied:
+            if (kind(call) is not dictionary or set(call) != {"name", "args"}
+                    or kind(call["name"]) is not text_type or not call["name"]
+                    or call["name"] in ("eval", "xdev") or call["name"].startswith("__pi_")
+                    or kind(call["args"]) is not dictionary):
+                raise invalid()
+            byte_count(call["name"], 128, invalid, True)
+        payload = {"calls": copied}
+        request_bytes = 0
+        for chunk in encode(payload):
+            request_bytes += byte_count(chunk, 256 * 1024, invalid)
+            if request_bytes > 256 * 1024:
+                raise invalid()
+        encoded = await _bridge_call_async("__pi_tool_batch", payload)
+        byte_count(encoded, 4 * 1024 * 1024,
+                   lambda: protocol_error("EVAL_BRIDGE_LIMIT: tool batch result exceeds 4 MiB"))
+        try:
+            page = parse(encoded, parse_constant=reject_constant)
+        except (ValueError, RecursionError):
+            raise protocol() from None
+        if (kind(page) is not dictionary or set(page) != {"schema", "items"}
+                or page["schema"] != "pi.eval.tool_batch.v1" or kind(page["items"]) is not sequence
+                or size(page["items"]) != size(copied)):
+            raise protocol()
+        identifiers = set()
+        for index, item in enumerate(page["items"]):
+            if (kind(item) is not dictionary or size(item) != 4
+                    or kind(item.get("index")) is not integer_type or item["index"] != index
+                    or item.get("name") != copied[index]["name"]
+                    or kind(item.get("toolCallId")) is not text_type or not item["toolCallId"]
+                    or item["toolCallId"] in identifiers or ("result" in item) == ("error" in item)):
+                raise protocol()
+            byte_count(item["toolCallId"], 128, protocol, True)
+            identifiers.add(item["toolCallId"])
+            if "error" in item:
+                if kind(item["error"]) is not text_type or not item["error"]:
+                    raise protocol()
+            else:
+                result = item["result"]
+                if (kind(result) is not dictionary or result.get("schema") != "pi.eval.tool_result.v1"
+                        or kind(result.get("content")) is not sequence or "details" not in result
+                        or kind(result.get("isError")) is not boolean_type):
+                    raise protocol()
+        return page
+
+    return batch
+
+
 class _PiTools:
     """`tool` object exposed to cells: whitelisted re-entry into pi tools."""
 
@@ -872,6 +993,8 @@ class _PiTools:
                 or type(result.get("isError")) is not bool):
             raise ToolBridgeError("EVAL_BRIDGE_PROTOCOL: invalid structured tool result")
         return result
+
+    batch = staticmethod(_make_tool_batch())
 
     @staticmethod
     def read(path, **kwargs):
@@ -1718,6 +1841,7 @@ def _pool_snapshot(snapshot, pool_id=None, item_id=None):
             or snapshot.get("status") not in ("open", "draining", "completed", "failed", "cancelled")
             or type(snapshot.get("sealed")) is not bool
             or type(snapshot.get("concurrency")) is not int or not 1 <= snapshot["concurrency"] <= 8
+            or type(snapshot.get("maxBatchSize")) is not int or not 1 <= snapshot["maxBatchSize"] <= 8
             or type(snapshot.get("items")) is not list or len(snapshot["items"]) > 32
             or type(snapshot.get("admittedItems")) is not int
             or snapshot["admittedItems"] != len(snapshot["items"])
@@ -1843,7 +1967,8 @@ async def _pool_read_item(handle, operation, timeout_ms=None):
     if timeout_ms is not None:
         arguments["timeoutMs"] = timeout_ms
     snapshot = _pool_snapshot(await _agent_native_result("subagent", arguments), handle.pool_id, handle.item_id)
-    if snapshot["jobId"] != handle.job_id or snapshot["agent"] != handle.agent:
+    if (snapshot["jobId"] != handle.job_id or snapshot["agent"] != handle.agent
+            or snapshot["maxBatchSize"] != handle.max_batch_size):
         raise ToolBridgeError("EVAL_POOL_PROTOCOL: native pool identity changed")
     return snapshot
 
@@ -1861,13 +1986,14 @@ async def _pool_wait_item(handle, timeout_ms, raise_errors):
 class _AgentPoolItem:
     """One immutable native pool item. Only the pool can cancel its carrier."""
 
-    __slots__ = ("_pool_id", "_item_id", "_job_id", "_agent")
+    __slots__ = ("_pool_id", "_item_id", "_job_id", "_agent", "_max_batch_size")
 
     def __init__(self, pool, item_id):
         self._pool_id = pool["poolId"]
         self._item_id = item_id
         self._job_id = pool["jobId"]
         self._agent = pool["agent"]
+        self._max_batch_size = pool["maxBatchSize"]
 
     @property
     def id(self):
@@ -1889,6 +2015,10 @@ class _AgentPoolItem:
     def agent(self):
         return self._agent
 
+    @property
+    def max_batch_size(self):
+        return self._max_batch_size
+
     async def status(self):
         return await _pool_read_item(self, "pool_result")
 
@@ -1908,14 +2038,15 @@ class _AgentPoolItem:
 class _AgentPool:
     """One native pool carrier; finish drains, close cancels running and queued work."""
 
-    __slots__ = ("_options", "_name", "_concurrency", "_pool_id", "_job_id", "_snapshot", "_items",
+    __slots__ = ("_options", "_name", "_concurrency", "_max_batch_size", "_pool_id", "_job_id", "_snapshot", "_items",
                  "_closed", "_last_error", "_unknown_admission", "_admission_pending",
                  "_finish_acknowledged", "_close_acknowledged", "_lock")
 
-    def __init__(self, options, name, concurrency):
+    def __init__(self, options, name, concurrency, max_batch_size=1):
         self._options = options
         self._name = name
         self._concurrency = concurrency
+        self._max_batch_size = max_batch_size
         self._pool_id = None
         self._job_id = None
         self._snapshot = None
@@ -1949,6 +2080,10 @@ class _AgentPool:
         return self._concurrency
 
     @property
+    def max_batch_size(self):
+        return self._max_batch_size
+
+    @property
     def closed(self):
         return self._closed
 
@@ -1963,6 +2098,7 @@ class _AgentPool:
     def _adopt(self, snapshot):
         _pool_snapshot(snapshot, self._pool_id)
         if (snapshot["agent"] != self._options["agent"] or snapshot["concurrency"] != self._concurrency
+                or snapshot["maxBatchSize"] != self._max_batch_size
                 or (self._job_id is not None and snapshot["jobId"] != self._job_id)
                 or len(snapshot["items"]) < len(self._items)):
             raise ToolBridgeError("EVAL_POOL_PROTOCOL: native pool identity or retained items changed")
@@ -1980,7 +2116,8 @@ class _AgentPool:
             snapshot = {"schema": "pi.eval.workpool.pending.v1", "poolId": None, "jobId": None,
                         "agent": self._options["agent"], "status": "unavailable" if self._unknown_admission
                         else "cancelled" if self._closed else "unstarted", "sealed": self._closed,
-                        "concurrency": self._concurrency, "admittedItems": 0, "items": []}
+                        "concurrency": self._concurrency, "maxBatchSize": self._max_batch_size,
+                        "admittedItems": 0, "items": []}
         else:
             snapshot = {**self._snapshot, "items": [{**item, "resultRef": dict(item["resultRef"])}
                                                    for item in self._snapshot["items"]]}
@@ -2137,7 +2274,8 @@ class _AgentPool:
                 snapshot = _pool_snapshot(page.get("snapshot"), self._pool_id)
                 ids = page.get("admittedItemIds")
                 if (snapshot["jobId"] != self._job_id or snapshot["agent"] != self._options["agent"]
-                        or snapshot["concurrency"] != self._concurrency or snapshot["admittedItems"] < previous
+                        or snapshot["concurrency"] != self._concurrency
+                        or snapshot["maxBatchSize"] != self._max_batch_size or snapshot["admittedItems"] < previous
                         or type(ids) is not list or len(ids) != len(batch)
                         or any(type(item_id) is not int or not previous < item_id <= snapshot["admittedItems"]
                                or (index > 0 and item_id != ids[index - 1] + 1)
@@ -2241,6 +2379,7 @@ async def _workpool(**options):
     native = {"agent": "task"}
     name = "workpool"
     concurrency = 4
+    max_batch_size = 1
     for key, value in options.items():
         if key == "name":
             if not _pool_bounded_text(value, 128):
@@ -2250,6 +2389,11 @@ async def _workpool(**options):
             if type(value) is not int or not 1 <= value <= 8:
                 raise ValueError("EVAL_POOL_INPUT: concurrency must be an integer from 1 to 8")
             concurrency = value
+        elif key == "max_batch_size":
+            if type(value) is not int or not 1 <= value <= 8:
+                raise ValueError("EVAL_POOL_INPUT: max_batch_size must be an integer from 1 to 8")
+            max_batch_size = value
+            native["maxBatchSize"] = value
         elif key == "agent":
             if not _pool_bounded_text(value, 128):
                 raise TypeError("EVAL_POOL_INPUT: agent must be nonempty text of at most 128 UTF-8 bytes without NUL")
@@ -2284,7 +2428,7 @@ async def _workpool(**options):
             raise TypeError(f"EVAL_POOL_INPUT: unknown option {key}")
     if "isoApply" in native and native.get("isolation") != "worktree":
         raise TypeError("EVAL_POOL_INPUT: iso_apply requires worktree isolation")
-    pool = _AgentPool(native, name, concurrency)
+    pool = _AgentPool(native, name, concurrency, max_batch_size)
     pool._batch_arguments([])
     return pool
 

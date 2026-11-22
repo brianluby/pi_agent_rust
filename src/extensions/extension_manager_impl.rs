@@ -4018,8 +4018,9 @@ impl ExtensionManager {
                 continue;
             }
             if extension.slash_commands.iter().any(|command| {
-                extract_slash_command_name(command)
-                    .is_some_and(|existing| js_command_route_name(&existing) == normalized_name)
+                !is_non_callable_compat_inferred(command)
+                    && extract_slash_command_name(command)
+                        .is_some_and(|existing| js_command_route_name(&existing) == normalized_name)
             }) {
                 return Err(Error::extension(format!(
                     "registerCommand: command name collision: {normalized_name}"
@@ -4313,6 +4314,96 @@ impl ExtensionManager {
             return Ok(true);
         }
         guard.mcp_servers = servers;
+        self.refresh_snapshot_with_guard_release(guard);
+        Ok(true)
+    }
+
+    pub(super) fn replace_runtime_command_specs(
+        &self,
+        extension_id: &str,
+        actor: &Weak<JsActorLifecycle>,
+        provider_generation: Option<Uuid>,
+        previous: &[Value],
+        replacements: &[Value],
+    ) -> Result<bool> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !matches!(&guard.runtime, Some(ExtensionRuntimeHandle::Js(runtime))
+            if Weak::ptr_eq(&runtime.actor_lifecycle, actor))
+            || provider_generation.is_none()
+            || guard.js_provider_generation != provider_generation
+            || !guard.js_provider_catalog_ready
+            || (!replacements.is_empty() && actor.upgrade().is_none_or(|actor| actor.is_stopped()))
+        {
+            return Ok(false);
+        }
+        let Ok(target_index) = Self::extension_index_for_owner(&guard, extension_id) else {
+            return Ok(false);
+        };
+        let mut seen = HashSet::new();
+        for spec in replacements {
+            let Some(name) = extract_slash_command_name(spec)
+                .map(|name| js_command_route_name(&name).to_string())
+                .filter(|name| !name.is_empty())
+            else {
+                return Err(Error::extension("registerCommand: name is required"));
+            };
+            if !seen.insert(name.clone()) {
+                return Err(Error::extension(format!(
+                    "registerCommand: command name collision: {name}"
+                )));
+            }
+            for (index, extension) in guard.extensions.iter().enumerate() {
+                if index == target_index {
+                    continue;
+                }
+                if extension.slash_commands.iter().any(|command| {
+                    !is_non_callable_compat_inferred(command)
+                        && extract_slash_command_name(command)
+                            .is_some_and(|existing| js_command_route_name(&existing) == name)
+                }) {
+                    return Err(Error::extension(format!(
+                        "registerCommand: command name collision: {name}"
+                    )));
+                }
+            }
+        }
+        let target = &mut guard.extensions[target_index];
+        // A host may have replaced an owned command since the last publication.
+        // Retire only the exact accepted definitions, never a name alone.
+        let mut commands = target
+            .slash_commands
+            .iter()
+            .filter(|cmd| !previous.contains(cmd))
+            .cloned()
+            .collect::<Vec<_>>();
+        for replacement in replacements {
+            if let Some(name) = extract_slash_command_name(replacement) {
+                let normalized = js_command_route_name(&name);
+                if commands.iter().any(|existing| {
+                    !is_non_callable_compat_inferred(existing)
+                        && extract_slash_command_name(existing)
+                            .is_some_and(|other| js_command_route_name(&other) == normalized)
+                }) {
+                    return Err(Error::extension(format!(
+                        "registerCommand: command name collision: {normalized}"
+                    )));
+                }
+                // Live runtime registration supersedes any static-scan compat stub.
+                commands.retain(|existing| {
+                    !is_non_callable_compat_inferred(existing)
+                        || extract_slash_command_name(existing)
+                            .is_none_or(|other| js_command_route_name(&other) != normalized)
+                });
+            }
+            commands.push(replacement.clone());
+        }
+        if commands == target.slash_commands {
+            return Ok(true);
+        }
+        target.slash_commands = commands;
         self.refresh_snapshot_with_guard_release(guard);
         Ok(true)
     }
@@ -5443,30 +5534,28 @@ impl ExtensionManager {
             };
 
             #[cfg(feature = "wasm-host")]
-            let response = if has_hook_wasm
-                && (event != ExtensionEventName::UserBash
-                    || response.as_ref().is_none_or(Value::is_null))
-            {
-                let timeout_ms = if event == ExtensionEventName::UserBash {
-                    user_bash_remaining_timeout(timeout_ms, started_at)?
+            let response =
+                if has_hook_wasm && should_dispatch_wasm_event(&event_name, response.as_ref()) {
+                    let timeout_ms = if event == ExtensionEventName::UserBash {
+                        user_bash_remaining_timeout(timeout_ms, started_at)?
+                    } else {
+                        timeout_ms
+                    };
+                    let mut wasm_payload = event_payload;
+                    if let Value::Object(map) = &mut wasm_payload {
+                        map.insert("ctx".into(), (*ctx_payload).clone());
+                    }
+                    Self::dispatch_wasm_event_value(
+                        &wasm_extensions,
+                        &event_name,
+                        &wasm_payload,
+                        timeout_ms,
+                    )
+                    .await?
+                    .or(response)
                 } else {
-                    timeout_ms
+                    response
                 };
-                let mut wasm_payload = event_payload;
-                if let Value::Object(map) = &mut wasm_payload {
-                    map.insert("ctx".into(), (*ctx_payload).clone());
-                }
-                Self::dispatch_wasm_event_value(
-                    &wasm_extensions,
-                    &event_name,
-                    &wasm_payload,
-                    timeout_ms,
-                )
-                .await?
-                .or(response)
-            } else {
-                response
-            };
 
             let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
             tracing::info!(
@@ -5526,10 +5615,9 @@ impl ExtensionManager {
         // carries its own `Arc<AsyncMutex<Instance>>`, so these futures
         // don't share a lock.
         //
-        // Results are still aggregated with "last-wins" semantics (in
-        // stable iteration order over the filtered extension list), so
-        // behavior matches the prior sequential loop when extensions
-        // return a response deterministically.
+        // Aggregate in stable subscription order. Session before-events
+        // retain the first veto; other events keep last-response semantics.
+        // All started handlers still settle and report their errors.
         let calls = extensions
             .iter()
             .filter(|ext| ext.event_hooks().iter().any(|hook| hook == event_name))
@@ -5557,7 +5645,7 @@ impl ExtensionManager {
             match result {
                 Ok(Some(value)) => {
                     if first_err.is_none() {
-                        response = Some(value);
+                        merge_wasm_event_response(event_name, &mut response, value);
                     }
                 }
                 Ok(None) => {}
@@ -5767,15 +5855,7 @@ impl ExtensionManager {
             return Ok(false);
         };
 
-        Ok(response.as_bool() == Some(false)
-            || response
-                .get("cancelled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            || response
-                .get("cancel")
-                .and_then(Value::as_bool)
-                .unwrap_or(false))
+        Ok(event_response_cancels(&response))
     }
 
     /// Dispatch multiple fire-and-forget events to subscribed runtimes.
@@ -6181,6 +6261,24 @@ impl ExtensionManager {
     }
 }
 
+#[cfg(any(feature = "wasm-host", test))]
+fn should_dispatch_wasm_event(event_name: &str, response: Option<&Value>) -> bool {
+    response.is_none_or(|value| {
+        !session_event_response_cancels(event_name, value)
+            && (event_name != "user_bash" || value.is_null())
+    })
+}
+
+#[cfg(any(feature = "wasm-host", test))]
+fn merge_wasm_event_response(event_name: &str, response: &mut Option<Value>, value: Value) {
+    if !response
+        .as_ref()
+        .is_some_and(|current| session_event_response_cancels(event_name, current))
+    {
+        *response = Some(value);
+    }
+}
+
 #[cfg(feature = "wasm-host")]
 fn user_bash_remaining_timeout(timeout_ms: u64, started_at: Instant) -> Result<u64> {
     let remaining = Duration::from_millis(timeout_ms)
@@ -6289,6 +6387,95 @@ fn user_bash_result(result: &Value) -> Option<crate::tools::BashRunResult> {
         truncation: None,
         capture,
     })
+}
+
+#[cfg(test)]
+mod session_event_veto_tests {
+    use super::{merge_wasm_event_response, should_dispatch_wasm_event};
+    use serde_json::{Value, json};
+
+    #[test]
+    fn wasm_session_aggregation_preserves_the_first_veto_and_stops_runtime_handoff() {
+        for event_name in [
+            "session_before_switch",
+            "session_before_fork",
+            "session_before_compact",
+            "session_before_tree",
+        ] {
+            for veto in [
+                json!(false),
+                json!({"cancel": true, "reason": "first veto"}),
+                json!({"cancelled": true, "reason": "first veto"}),
+            ] {
+                let mut response = None;
+                for value in [
+                    json!(true),
+                    json!({"cancel": 1, "cancelled": "true"}),
+                    veto.clone(),
+                    json!({"cancel": false, "cancelled": false}),
+                    json!({"cancelled": true, "reason": "later veto"}),
+                    Value::Null,
+                ] {
+                    merge_wasm_event_response(event_name, &mut response, value);
+                }
+                assert_eq!(
+                    response,
+                    Some(veto),
+                    "{event_name} must retain the first veto"
+                );
+                assert!(
+                    !should_dispatch_wasm_event(event_name, response.as_ref()),
+                    "{event_name} must not reach another runtime after a veto"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wasm_session_aggregation_keeps_strict_flags_and_other_event_semantics() {
+        for event_name in [
+            "session_before_switch",
+            "session_before_fork",
+            "session_before_compact",
+            "session_before_tree",
+        ] {
+            let mut response = None;
+            for value in [
+                json!(true),
+                json!({"cancel": 1}),
+                json!({"cancel": "true"}),
+                json!({"cancelled": [true]}),
+                json!({"cancelled": false, "reason": "allowed"}),
+            ] {
+                assert!(should_dispatch_wasm_event(event_name, Some(&value)));
+                merge_wasm_event_response(event_name, &mut response, value);
+            }
+            assert_eq!(
+                response,
+                Some(json!({"cancelled": false, "reason": "allowed"}))
+            );
+        }
+
+        for event_name in ["session_start", "session_before_custom", "tool_result"] {
+            let mut response = None;
+            merge_wasm_event_response(event_name, &mut response, json!(false));
+            merge_wasm_event_response(event_name, &mut response, json!({"cancel": true}));
+            merge_wasm_event_response(event_name, &mut response, json!({"last": true}));
+            assert_eq!(response, Some(json!({"last": true})));
+            assert!(should_dispatch_wasm_event(event_name, response.as_ref()));
+        }
+
+        assert!(should_dispatch_wasm_event("user_bash", None));
+        assert!(should_dispatch_wasm_event("user_bash", Some(&Value::Null)));
+        assert!(!should_dispatch_wasm_event(
+            "user_bash",
+            Some(&json!(false))
+        ));
+        assert!(!should_dispatch_wasm_event(
+            "user_bash",
+            Some(&json!({"result": {"output": "already executed"}}))
+        ));
+    }
 }
 
 #[cfg(test)]

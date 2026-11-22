@@ -77,6 +77,145 @@ test('out-of-order replies keep text and result modes attached to the right call
     h.dispatch.dispatch(2,false,false,'late duplicate');
 });
 
+const toolBatchPage = (names = ['read']) => ({schema:'pi.eval.tool_batch.v1',items:names.map((name,index) =>
+    ({index,name,toolCallId:`eval-native-${index}`,result:envelope({index})}))});
+test('tool batches use one native request and preserve ordered complete outcomes', async () => {
+    const h = host();
+    const pending = vm.runInContext(`tool.batch([
+        {name:'read',args:{path:'a',nested:[null,false,{count:7}]}},
+        {name:'grep',args:{pattern:'needle'}}, {name:'write',args:{path:'b',content:'updated'}}
+    ])`,h.context);
+    assert.deepEqual(h.requests, [{id:1,name:'__pi_tool_batch',args:{calls:[
+        {name:'read',args:{path:'a',nested:[null,false,{count:7}]}},
+        {name:'grep',args:{pattern:'needle'}}, {name:'write',args:{path:'b',content:'updated'}}
+    ]}}]);
+    const page = toolBatchPage(['read','grep','write']);
+    page.items[0].result.content.push({type:'image',mimeType:'image/png',data:'aW1hZ2U='});
+    delete page.items[1].result;
+    page.items[1].error = 'EVAL_BRIDGE_UNAVAILABLE: tool is not enabled';
+    page.items[2].result.isError = true;
+    page.items[2].result.details = {reason:'write denied'};
+    h.dispatch.dispatch(1,false,true,JSON.stringify(page));
+    assert.deepEqual(JSON.parse(JSON.stringify(await pending)),page);
+    assert.equal(h.requests.length,1,'individual failures must not retry the batch');
+});
+test('tool batches accept the 16-call limit and exact UTF-8 name boundary', async () => {
+    const h = host();
+    const names = ['é'.repeat(64),...Array(15).fill('read')];
+    const pending = vm.runInContext(`tool.batch(${JSON.stringify(names.map(name=>({name,args:{}})))})`,h.context);
+    h.dispatch.dispatch(1,false,true,JSON.stringify(toolBatchPage(names)));
+    assert.equal((await pending).items.length,16);
+});
+test('tool batches snapshot inputs and do not invoke inherited serializers', async () => {
+    const h = host();
+    const pending = vm.runInContext(`
+        Object.prototype.toJSON = function(){throw Error('inherited object serializer')};
+        Array.prototype.toJSON = function(){throw Error('inherited array serializer')};
+        globalThis.batchInput = [{name:'read',args:{path:'original',nested:[{value:1}]}}];
+        tool.batch(batchInput)
+    `,h.context);
+    vm.runInContext("batchInput[0].name='write';batchInput[0].args.path='changed';batchInput[0].args.nested[0].value=9",h.context);
+    assert.deepEqual(h.requests[0].args,{calls:[{name:'read',args:{path:'original',nested:[{value:1}]}}]});
+    h.dispatch.dispatch(1,false,true,JSON.stringify(toolBatchPage()));
+    assert.equal((await pending).items[0].name,'read');
+});
+test('tool batch admission rejects malformed or recursive input before any dispatch', async () => {
+    const expressions = [
+        'tool.batch()', 'tool.batch([])', 'tool.batch({})',
+        "tool.batch([{name:'read',args:{}}],{concurrency:2})",
+        "tool.batch(Array(17).fill({name:'read',args:{}}))",
+        "tool.batch([null])", "tool.batch([{name:'read'}])", "tool.batch([{name:'read',args:[]}])",
+        "tool.batch([{name:'read',args:null}])", "tool.batch([{name:'read',args:{},extra:1}])",
+        "tool.batch([{name:'',args:{}}])", "tool.batch([{name:7,args:{}}])",
+        "tool.batch([{name:'a'.repeat(129),args:{}}])", "tool.batch([{name:'é'.repeat(65),args:{}}])",
+        ...['eval','xdev','__pi_tool_batch','__pi_tool_result','bad\nname','bad\u0085name','\ud800']
+            .map(name=>`tool.batch([{name:${JSON.stringify(name)},args:{}}])`),
+        "tool.batch([,{name:'read',args:{}}])", "tool.batch([{name:'read',args:{nested:[,1]}}])",
+        "tool.batch([Object.create({name:'read',args:{}})])",
+        "tool.batch([{name:'read',args:new Date()}])",
+        ...['undefined','Infinity','NaN','1n','Symbol()','()=>1']
+            .map(value=>`tool.batch([{name:'read',args:{value:${value}}}])`),
+        "(()=>{const args={};args.self=args;return tool.batch([{name:'read',args}])})()",
+        "tool.batch([{name:'read',args:{path:'\\n'.repeat(131072)}}])",
+        "tool.batch([{name:'read',args:{path:'é'.repeat(131072)}}])",
+    ];
+    for (const expression of expressions) {
+        const h = host();
+        await assert.rejects(vm.runInContext(expression,h.context),/EVAL_TOOL_BATCH_INPUT/,expression);
+        assert.equal(h.requests.length,0,expression);
+    }
+});
+test('tool batches reject getters and hidden properties without reading or publishing them', async () => {
+    for (const expression of [
+        "tool.batch([{get name(){hits++;return 'read'},args:{}}])",
+        "tool.batch([{name:'read',args:{get path(){hits++;return 'secret'}}}])",
+        "tool.batch([{name:'read',args:Object.defineProperty({},'hidden',{value:'secret'})}])",
+        "tool.batch([{name:'read',args:{toJSON(){hits++;return {path:'changed'}}}}])",
+    ]) {
+        const h = host({hits:0});
+        await assert.rejects(vm.runInContext(expression,h.context),/EVAL_TOOL_BATCH_INPUT/);
+        assert.equal(vm.runInContext('hits',h.context),0);
+        assert.equal(h.requests.length,0);
+    }
+});
+test('tool batches retain installed admission and decoding intrinsics', async () => {
+    const h = host();
+    vm.runInContext(`JSON.parse=()=>{throw Error('guest parser')};JSON.stringify=()=>{throw Error('guest encoder')};
+        Array.isArray=()=>false;Number.isFinite=()=>false;Object.keys=()=>[];
+        Object.getOwnPropertyDescriptor=()=>{throw Error('guest descriptor')};
+        String.prototype.charCodeAt=()=>0;String.prototype.startsWith=()=>true;globalThis.String=()=> 'wrong';`,h.context);
+    const pending = vm.runInContext("tool.batch([{name:'read',args:{path:'a',items:[1,2]}}])",h.context);
+    assert.deepEqual(h.requests[0].args,{calls:[{name:'read',args:{path:'a',items:[1,2]}}]});
+    h.dispatch.dispatch(1,false,true,JSON.stringify(toolBatchPage()));
+    assert.equal((await pending).items[0].result.details.index,0);
+});
+test('tool batch responses must match every original item and a unique native identity', async () => {
+    const mutations = [
+        page=>{page.schema='wrong'}, page=>{page.extra=true}, page=>{page.items.pop()},
+        page=>{page.items.reverse()}, page=>{page.items[0].index=false}, page=>{page.items[0].name='write'},
+        page=>{page.items[0].toolCallId=''}, page=>{page.items[0].toolCallId='é'.repeat(65)},
+        page=>{page.items[1].toolCallId=page.items[0].toolCallId},
+        page=>{page.items[0].extra=true}, page=>{page.items[0].error='both'},
+        page=>{delete page.items[0].result}, page=>{delete page.items[0].result;page.items[0].error=''},
+        page=>{page.items[0].result.schema='wrong'}, page=>{delete page.items[0].result.details},
+        page=>{page.items[0].result.content={}}, page=>{page.items[0].result.isError=0},
+    ];
+    const invalid = ['invalid-json','null','[]','{}',...mutations.map(mutate=>{
+        const page=toolBatchPage(['read','grep']);mutate(page);return JSON.stringify(page);
+    })];
+    for (const reply of invalid) {
+        const h = host();
+        const pending = vm.runInContext("tool.batch([{name:'read',args:{}},{name:'grep',args:{}}])",h.context);
+        h.dispatch.dispatch(1,false,true,reply);
+        await assert.rejects(pending,/EVAL_TOOL_BATCH_PROTOCOL/);
+        assert.equal(h.requests.length,1);
+    }
+});
+test('tool batch reply limits count aggregate UTF-8 bytes and accept the exact boundary', async () => {
+    const page = toolBatchPage();
+    delete page.items[0].result;
+    page.items[0].error='';
+    const overhead=Buffer.byteLength(JSON.stringify(page));
+    for (const [body,allowed] of [['x'.repeat(4*1024*1024-overhead),true],
+        ['é'.repeat(Math.ceil((4*1024*1024-overhead)/2)+1),false]]) {
+        const h=host();const pending=vm.runInContext("tool.batch([{name:'read',args:{}}])",h.context);
+        page.items[0].error=body;
+        h.dispatch.dispatch(1,false,true,JSON.stringify(page));
+        if (allowed) assert.equal((await pending).items[0].error.length,body.length);
+        else await assert.rejects(pending,/EVAL_BRIDGE_LIMIT/);
+        assert.equal(h.requests.length,1);
+    }
+});
+test('a batch bridge failure is not replayed and leaves scalar helpers usable', async () => {
+    const h=host();const pending=vm.runInContext("tool.batch([{name:'read',args:{}}])",h.context);
+    h.dispatch.dispatch(1,false,false,'EVAL_BRIDGE_LIMIT: aggregate was withheld');
+    await assert.rejects(pending,/aggregate was withheld/);
+    const next=vm.runInContext("tool.call('read',{path:'next'})",h.context);
+    h.dispatch.dispatch(2,false,true,'next-cell');
+    assert.equal(await next,'next-cell');
+    assert.equal(h.requests.length,2);
+});
+
 const jobSnapshot = (id, status = 'exited', result = {content:[{type:'text',text:'child completed'}], details:{results:[{data:{count:7}}]}}) =>
     ({schema:'pi.host_job.v1', id, status, ...(status === 'running' ? {} : {result})});
 async function launchAgent(h, variable, id) {
@@ -726,7 +865,7 @@ function poolHost(h) {
         const counts = {queued:0,running:0,completed:0,failed:0,cancelled:0};
         for (const item of pool.items) counts[item.status]++;
         return {schema:'pi.subagent.pool.v1',poolId:pool.id,jobId:pool.jobId,agent:pool.agent,
-            status:pool.status,sealed:pool.sealed,concurrency:pool.concurrency,
+            status:pool.status,sealed:pool.sealed,concurrency:pool.concurrency,maxBatchSize:pool.maxBatchSize,
             admittedItems:pool.items.length,queuedItems:counts.queued,runningItems:counts.running,
             completedItems:counts.completed,failedItems:counts.failed+counts.cancelled,remainingMs:900000,
             workerContexts:Array.from({length:pool.concurrency},(_,index)=>({workerIndex:index+1,tokens:null,window:null})),
@@ -753,7 +892,7 @@ function poolHost(h) {
         let pool;
         if (args.operation === 'pool_start') {
             const id = `pool-native-${pools.size + 1}`;
-            pool = {id,jobId:`carrier-${id}`,agent:args.agent,concurrency:args.concurrency,
+            pool = {id,jobId:`carrier-${id}`,agent:args.agent,concurrency:args.concurrency,maxBatchSize:args.maxBatchSize ?? 1,
                 status:'open',sealed:false,items:[]};
             pools.set(id,pool);
         } else {
@@ -1048,6 +1187,63 @@ test('workpool forwards native launch options while keeping its display name loc
         operation:'pool_start',concurrency:3,tasks:['inspect'],model:{role:'tiny'}});
     assert.equal(vm.runInContext('pool.name',h.context),'review');
 });
+test('grouped workpool limits are bounded and frozen before native admission', async () => {
+    const h = host(); const native = poolHost(h);
+    for (const value of ['0','9','-1','1.5','true','null','"4"','NaN','Infinity']) {
+        await assert.rejects(vm.runInContext(`workpool({maxBatchSize:${value}})`,h.context),/EVAL_POOL_INPUT/);
+    }
+    assert.equal(h.requests.length,0);
+    await createPool(h);
+    assert.equal(vm.runInContext('pool.maxBatchSize',h.context),1);
+    assert.equal((await vm.runInContext('pool.peek()',h.context)).maxBatchSize,1);
+    await vm.runInContext("globalThis.options={agent:'scout',concurrency:2,maxBatchSize:4}; workpool(options).then(value=>globalThis.pool=value)",h.context);
+    vm.runInContext('options.maxBatchSize=8; pool.maxBatchSize=7',h.context);
+    assert.equal(vm.runInContext('pool.maxBatchSize',h.context),4);
+    const items = await runPool(h,"pool.push(['one','two','three'])",native.reply);
+    assert.equal(h.requests[0].args.args.maxBatchSize,4);
+    assert.deepEqual(Array.from(items,item=>item.itemId),[1,2,3]);
+    assert.ok(items.every(item=>item.maxBatchSize===4));
+    assert.equal((await runPool(h,'pool.peek()',native.reply)).maxBatchSize,4);
+    const recovered = await runPool(h,"workpool.attach(pool.id).then(value=>globalThis.recovered=value)",native.reply);
+    assert.equal(recovered.maxBatchSize,4);
+    assert.equal(recovered.closed,true);
+    assert.equal(native.operations.filter(operation=>operation==='pool_start').length,1);
+});
+test('missing or changed grouped limits reject admission acknowledgments without replay', async () => {
+    for (const value of [undefined,0,9,true,2]) {
+        const h = host(); const native = poolHost(h);
+        await createPool(h,{agent:'scout',concurrency:2,maxBatchSize:4});
+        await assert.rejects(runPool(h,"pool.push(['accepted once'])",request=>{
+            const snapshot = native.apply(request);
+            if (value===undefined) delete snapshot.maxBatchSize;
+            else snapshot.maxBatchSize=value;
+            answer(h,request,snapshot);
+        }),/EVAL_POOL_ADMISSION/);
+        assert.equal(vm.runInContext('pool.unknownAdmission && pool.closed',h.context),true);
+        await assert.rejects(vm.runInContext("pool.push(['do not replay'])",h.context),/EVAL_POOL_CLOSED/);
+        assert.deepEqual(native.operations,['pool_start']);
+        assert.equal(native.pools.get('pool-native-1').items.length,1);
+    }
+});
+test('grouped pool exchange and item reads reject changing a frozen native limit', async () => {
+    const h = host(); const native = poolHost(h);
+    await createPool(h,{agent:'scout',concurrency:1,maxBatchSize:4});
+    await runPool(h,"pool.push(['first'])",native.reply);
+    await assert.rejects(runPool(h,"pool.exchange(['second'])",request=>{
+        const page = native.apply(request);
+        page.snapshot.maxBatchSize=8;
+        answer(h,request,page);
+    }),/EVAL_POOL_ADMISSION/);
+    assert.equal(vm.runInContext('pool.items.length',h.context),1);
+    await assert.rejects(vm.runInContext("pool.push(['no replay'])",h.context),/EVAL_POOL_CLOSED/);
+    assert.equal((await runPool(h,'pool.peek()',native.reply)).items.length,2);
+    await assert.rejects(runPool(h,'pool.items[0].status()',request=>{
+        const snapshot = native.apply(request);
+        snapshot.maxBatchSize=2;
+        answer(h,request,snapshot);
+    }),/EVAL_POOL_PROTOCOL/);
+    assert.deepEqual(native.operations,['pool_start','pool_exchange','pool_status','pool_result']);
+});
 test('a lost batch acknowledgment preserves handles and reconciles native admission without replay', async () => {
     const h = host(); const native = poolHost(h);
     await createPool(h);
@@ -1326,6 +1522,24 @@ function budgetedPipelineHost(h, native, reverse = false) {
     return {state,reply};
 }
 
+test('pipeline actual facade admits grouped windows and preserves each original item', async () => {
+    for (const ordered of [false,true]) {
+        const h=host(); const native=poolHost(h);
+        const budget=budgetedPipelineHost(h,native,true);
+        vm.runInContext(pipelineSource,h.context);
+        const result=await runPool(h,`workpool.mapReduce(Array.from({length:16},(_,i)=>i),i=>'task '+i,
+            (sum,item)=>sum+item.input,0,{pool:{concurrency:2,maxBatchSize:3},ordered:${ordered}})`,budget.reply);
+        assert.equal(result.value,120);
+        assert.equal(result.completed,16);
+        assert.equal(result.pool.maxBatchSize,3);
+        assert.equal(budget.state.highWater,6);
+        assert.ok(budget.state.calls<=18);
+        assert.equal(native.operations.filter(op=>op==='pool_start').length,1);
+        assert.equal(native.pools.get('pool-native-1').items.length,16);
+        assert.deepEqual(Array.from(result.cursor.itemIds),Array.from({length:16},(_,i)=>i+1));
+    }
+});
+
 test('pipeline actual facade completes 32 items within 64 host calls at every concurrency', async () => {
     for (const concurrency of [1,2,4,8]) for (const ordered of [false,true]) {
         const h = host(); const native = poolHost(h);
@@ -1385,5 +1599,21 @@ test('pipeline actual facade splits escaped large prompts within request and inp
         assert.equal(budget.state.calls,ordered ? 61 : 39);
         assert.equal(budget.state.highWater,8);
         assert.equal(native.pools.get('pool-native-1').items.length,32);
+    }
+});
+
+test('maximum grouped windows retain encoded request bounds and the 64-call ceiling', async () => {
+    for (const ordered of [false,true]) {
+        const h=host(); const native=poolHost(h); vm.runInContext(pipelineSource,h.context);
+        const budget=budgetedPipelineHost(h,native,true);
+        const report=await runPool(h,`workpool.mapReduce(Array.from({length:32},(_,i)=>i),
+            ()=>String.fromCharCode(92).repeat(65536),(sum,item)=>sum+item.input,0,
+            {pool:{concurrency:8,maxBatchSize:8},ordered:${ordered}})`,budget.reply);
+        assert.equal(report.value,496);
+        assert.equal(report.completed,32);
+        assert.equal(budget.state.highWater,32);
+        assert.ok(budget.state.calls<=64,'splitting a grouped window must stay within the existing cell budget');
+        assert.equal(native.operations.filter(op=>op==='pool_start').length,1);
+        assert.deepEqual(Array.from(report.cursor.itemIds),Array.from({length:32},(_,i)=>i+1));
     }
 });
