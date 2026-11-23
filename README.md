@@ -227,7 +227,7 @@ If you want full details, see:
 | Feature | Pi (Rust) | Typical TS/Python CLI |
 |---------|-----------|----------------------|
 | **Startup** | Native single-binary path (Fresh comparative measurement pending; historical pre-v0.3.0 criterion: ~5-7ms p95 version, ~12-15ms help; see `tests/perf/reports/budget_summary.json` `startup_version_p95` and `startup_full_agent_p95`) | Runtime-dependent |
-| **Binary size** | Size-budgeted release profile (LTO, strip, `opt-level = "z"`); the `binary_size_release` budget and its latest stripped-artifact measurement are reported in [Current Evidence State](#current-evidence-state), never promoted here until claim readiness is `ready` | Runtime-dependent |
+| **Binary size** | Speed-optimized release profile (LTO, strip, `opt-level = 3`); the `binary_size_release` budget and its latest stripped-artifact measurement are reported in [Current Evidence State](#current-evidence-state), never promoted here until claim readiness is `ready` | Runtime-dependent |
 | **Memory (idle)** | Bounded-resource design; the `idle_memory_rss` budget and its latest release-binary measurement are reported in [Current Evidence State](#current-evidence-state) (`docs/perf-budgets-recipe.md` defines the canonical 5-measurement taxonomy) | Runtime-dependent |
 | **Streaming** | Native SSE parser | Library-dependent |
 | **Tool execution** | Process tree management | Basic subprocess |
@@ -1203,17 +1203,17 @@ From:
 
 ### Curl Installer (Recommended)
 
-As of November 20, 2026, the latest published stable release is **v0.8.0**. It does
-not include `/goal`; the [goal guide](docs/goal-mode.md#availability) describes
-the newer implementation on `main`. Fetching the installer from `main` still selects a published release
-binary, so it does not install every feature documented on `main`. Check the full
-`pi --version` output, including its commit hash, when comparing an installation
-with the current documentation.
+As of November 21, 2026, the latest published stable release is **v0.9.0**. It is
+the first release that includes `/goal`; see the
+[goal guide](docs/goal-mode.md#availability). Fetching the installer from `main`
+still selects a published release binary, so it does not install features added to
+`main` after that release. Check the full `pi --version` output, including its
+commit hash, when comparing an installation with the current documentation.
 
 Use the current installer with `--version` to pin the **binary**. Installer fixes
-ship separately from binary releases: the installer on `main` includes fixes for
-stock macOS tar/xz support and older awk versions that are absent from the
-installer at the v0.8.0 tag.
+ship separately from binary releases: pinning an older binary such as v0.8.0 with
+the current installer keeps the fixes for stock macOS tar/xz support and older awk
+versions that are absent from the installer at the v0.8.0 tag.
 
 The current installer requires the **Minisign CLI** for official release binaries.
 Install it with `brew install minisign` on macOS or `sudo apt install minisign` on
@@ -1245,14 +1245,14 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/ma
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash -s -- --yes --easy-mode
 
 # Pin the binary release while using the current installer
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash -s -- --version v0.8.0
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash -s -- --version v0.9.0
 
 # Install the Linux x86-64 artifact with its published checksum
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | \
   bash -s -- \
-    --version v0.8.0 \
-    --artifact-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.8.0/pi-linux-amd64.tar.xz" \
-    --checksum-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.8.0/pi-linux-amd64.tar.xz.sha256"
+    --version v0.9.0 \
+    --artifact-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.9.0/pi-linux-amd64.tar.xz" \
+    --checksum-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.9.0/pi-linux-amd64.tar.xz.sha256"
 
 # Skip completion setup (CI/non-interactive minimal install)
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | \
@@ -1328,7 +1328,7 @@ command -v legacy-pi && legacy-pi --version
 
 Repository builds are tested with the exact toolchain pinned in
 `rust-toolchain.toml` (`nightly-2026-08-31`). The locked dependency graph
-requires Rust 1.95 or newer. Project builds are DSR-only:
+requires Rust 1.97 or newer. Project builds are DSR-only:
 
 ```bash
 dsr quality --tool pi_agent_rust
@@ -1694,7 +1694,7 @@ Provider-count rule: Pi has 11 native provider implementation modules. Those mod
 2. **Streaming-first**: Custom SSE parser, no blocking on responses
 3. **Process tree management**: `sysinfo` crate ensures no orphaned processes
 4. **Structured errors**: `thiserror` with specific error types per component
-5. **Size-budgeted release profile**: LTO + strip + `opt-level = "z"` for the size budget; published binaries use the speed-optimized `dist` profile (`opt-level = 3`)
+5. **Speed-optimized release profile**: LTO + strip + `opt-level = 3` across both `release` and `dist` profiles
 
 ### asupersync Context vs TypeScript Pi (pi-mono)
 
@@ -2387,7 +2387,7 @@ The previous stack, built on the `charmed_rust` library family (a Rust port of G
 | `/resume` (`/r`), `/session` (`/info`), `/name`, `/history` | Session picker, info, naming, input history |
 | `/settings`, `/theme`, `/hotkeys` (`/keys`), `/changelog` | Settings UI, themes (incl. `auto`), keybindings, changelog |
 | `/plan`, `/approval`, `/advisor` | Plan mode, approval modes, second-model turn review |
-| `/goal status` | Inspect a saved objective; see [goal commands](docs/goal-mode.md). Added after the published `v0.8.0` release |
+| `/goal status` | Inspect a saved objective; see [goal commands](docs/goal-mode.md). First released in `v0.9.0` |
 | `/btw <question>`, `/tan <work>` | Ephemeral smol-role side question; background task-role tangential work |
 | `/mcp`, `/usage`, `/rules`, `/omfg` | MCP server status, provider credit/quota, stream rules, grievances |
 | `/export`, `/share`, `/copy` (`/cp`) | HTML export, secret/unlisted GitHub Gist share (not private; anyone with the URL can view it), copy last reply |
@@ -2760,11 +2760,11 @@ Optimization spans algorithms, execution lanes, memory movement, queue disciplin
 
 ### Release and Distribution Profiles
 
-`Cargo.toml` defines `[profile.release]` (`opt-level = "z"`) for size-oriented local builds and perf-budget schema harnesses, while DSR builds published shipping binaries with `[profile.dist]` (`opt-level = 3`):
+`Cargo.toml` defines `[profile.release]` (`opt-level = 3`) so both `cargo build --release` / `cargo install` and DSR's `[profile.dist]` shipping builds optimize for runtime speed:
 
 ```toml
 [profile.release]
-opt-level = "z"      # Optimize generated code for size
+opt-level = 3        # Optimize generated code for runtime speed
 lto = true           # Link-time optimization across all crates
 codegen-units = 1    # Single codegen unit (slower compile, better optimization)
 panic = "abort"      # No unwinding machinery
@@ -3326,7 +3326,7 @@ Pi is honest about what it doesn't do:
 | **No GUI** | Terminal-only by design |
 | **Some extensions need npm stubs** | Common stubs are provided; unlisted npm packages still require a stub. See docs/planning/EXTENSIONS.md §8.1 |
 | **English-centric** | Works but not optimized for other languages |
-| **Pinned Rust toolchain** | Releases are validated with `nightly-2026-08-31`; locked dependencies require Rust 1.95+ |
+| **Pinned Rust toolchain** | Releases are validated with `nightly-2026-08-31`; locked dependencies require Rust 1.97+ |
 
 ---
 

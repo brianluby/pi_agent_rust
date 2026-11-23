@@ -44,15 +44,20 @@ how many queued assignments can share one child prompt. Larger values use
 keyed final results while preserving each item's identity, status and schema
 validation. Groups are also bounded to 64 KiB of task text and do not wait to
 fill; the setting survives native recovery and cannot change after launch.
+Grouped shared-workspace pools may also opt into `yieldResults: true` /
+`yield_results=True`: the child receives a native `yield` tool that publishes
+individual terminal results while it continues the remaining assignments.
+Accepted results survive later child failure; physical reuse still waits for
+the normal RPC idle barrier. Worktree pools keep final-only acceptance.
 
 [Streaming map/reduce](eval-workpool-pipelines.md) is available as
 `workpool.mapReduce()` in JavaScript and `workpool.map_reduce()` in Python.
 It consumes sync/async iterables with bounded admission, reduces full native
 results as they settle, and exposes per-result recovery cursors on failure.
 Its admission window is `min(32, maxItems, concurrency * maxBatchSize)`, with
-equivalent Python option names. It uses the existing pool lifetime limits and
-does not add an intermediate child `yield` tool or background execution of an
-entire eval cell.
+equivalent Python option names. It consumes early terminal yields when the
+pool explicitly enables them, within the existing pool lifetime limits.
+Background execution of an entire eval cell remains separate work.
 
 [Retained model helpers](eval-structured-results.md#retained-background-model-requests)
 provide `completion()`, `judge()` and `judgeBatch()` / `judge_batch()`, with
@@ -109,17 +114,19 @@ completed, failed or cancelled full results per native call, across cells and
 without waiting for earlier unfinished items. Explicit replayable cursors
 acknowledge only processed item IDs; reads do not seal or cancel the pool.
 See [incremental pool results](eval-structured-results.md#collect-completed-pool-items-across-cells).
-Native grouped results require the complete final keyed envelope and the
-post-turn idle barrier before acceptance. A malformed envelope fails its group;
-valid per-key errors and schema failures preserve successful peers. OMP's
-child-side `yield` tool remains unimplemented. Isolated items in a group share
+Native grouped results default to a complete final keyed envelope and the
+post-turn idle barrier before acceptance. Opt-in `yieldResults` permits
+authenticated native tool receipts to settle individual items earlier; the
+final envelope then covers only remaining keys. A malformed receipt or final
+envelope fails unfinished work while preserving earlier accepted items;
+valid per-key errors and schema failures preserve successful peers. Isolated items in a group share
 one cumulative worker patch, identified by `details.workerBatch`; these are
 not independent patches to stack. Pi uses explicit `finish()` for aggregate
 completion, while `pool.close()` cancels running and queued work. Worker
 lifetimes remain fixed from launch. See the linked contracts for supported
 isolation, schemas, partial admission and cleanup behavior.
 
-## JavaScript images
+## Python and JavaScript images
 
 JavaScript `display(value, mimeType)` accepts `image/png`, `image/jpeg`,
 `image/gif`, and `image/webp`. Pass a `Uint8Array` (including a subarray view)
@@ -131,12 +138,32 @@ display(jpegBytes, "image/jpeg");
 display(webpBase64, "image/webp");
 ```
 
+Python accepts the same formats with `display(value, mime=...)`, using `bytes`,
+`bytearray`, or canonical standard base64. Images returned by an enabled native
+tool can be displayed directly, subject to the existing display size limits:
+
+```python
+result = await tool.result("read", {"path": "diagram.jpg"})
+if not result["isError"]:
+    for block in result["content"]:
+        if block["type"] == "image":
+            display(block["data"], mime=block["mimeType"])
+```
+
+Python's rich-object protocol also accepts `_repr_jpeg_()` alongside
+`_repr_png_()`, and `_repr_mimebundle_()` can supply any of the four image types.
+A rich final expression uses the same validation and snapshot path as explicit
+`display`. Unsupported HTML/SVG representations are not requested or executed;
+an invalid preferred representation raises an error instead of silently falling
+back to text. Existing Pillow and Matplotlib adapters continue producing PNG.
+
 The model receives a native image content block, not a printed base64 string.
 The SDK display descriptor includes width, height, MIME type and encoded frame
 bytes, without another copy of the image. Inputs are explicit data: this helper
 does not read paths, fetch URLs, execute SVG/HTML, or invoke custom serializers.
-Python's public display helper remains PNG-only; this change extends the native
-JavaScript helper and the shared host MIME validator.
+Accepted image bytes retain their format without conversion or recompression.
+Python checks image envelopes and encoded size before publishing a complete
+frame; the shared host validator independently checks every received frame.
 
 Host checks preserve the existing limits: 32 displays per cell, 2 MiB per
 serialized frame, 4 MiB across frames, 16,384 pixels per axis, and 16,777,216
@@ -166,3 +193,16 @@ This executes the actual factory, including all four MIME types, byte views,
 base64 remainders, frame limits, unsupported types, snapshot semantics and
 captured-intrinsic tampering. It is not a substitute for native QuickJS and
 Rust integration tests.
+
+The Python subprocess harness exercises the bundled kernel's actual JSONL
+protocol, including all formats, rich JPEG hooks, MIME bundles, malformed and
+truncated envelopes, base64 canonicality, snapshots and byte/count/canvas limits:
+
+```sh
+python3 tests/eval_python_rich.py ImageDisplayTests RichProtocolTests
+```
+
+The public `EvalTool` integration regression is in `tests/eval_python_rich.rs`;
+it verifies native image blocks, live updates, dimensions and kernel reuse after
+an invalid image. The standalone Python harness does not replace the
+authoritative DSR Rust quality lane.

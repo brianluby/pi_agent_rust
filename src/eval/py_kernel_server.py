@@ -169,7 +169,7 @@ class _CellOutput:
     def display(self, sequence, snapshot):
         # A distinct display index leaves stdout/stderr accounting and console
         # archives unchanged. Send a complete bounded MIME snapshot, not text
-        # chunks that could expose a partial JSON value or PNG to the host.
+        # chunks that could expose a partial JSON value or image to the host.
         with _PROTOCOL_WRITE_LOCK:
             if not self.active or _OUTPUT_CONTEXT.get() is not self:
                 raise RuntimeError("EVAL_OUTPUT_CLOSED: display belongs to an inactive cell")
@@ -256,35 +256,144 @@ def _display_json_shape(value, depth=0, remaining=None):
         raise TypeError("EVAL_DISPLAY_JSON: use JSON values or an explicit text MIME type")
 
 
-def _display_png(value):
-    if type(value) not in (str, bytes, bytearray):
-        raise TypeError("EVAL_DISPLAY_PNG: expected PNG bytes or standard base64")
-    if len(value) > _MAX_DISPLAY_ITEM_BYTES:
-        raise ValueError("EVAL_DISPLAY_LIMIT: PNG exceeds the item budget")
-    if type(value) is str:
-        raw = base64.b64decode(value, validate=True)
-        encoded = base64.b64encode(raw).decode("ascii")
-        if encoded != value:
-            raise ValueError("EVAL_DISPLAY_PNG: use canonical standard base64")
-    else:
-        raw = value
-        encoded = base64.b64encode(raw).decode("ascii")
-    # Envelope admission only; no raster decompression in the kernel or host.
+_DISPLAY_IMAGE_MIMES = ("image/png", "image/jpeg", "image/gif", "image/webp")
+
+
+def _display_png_dimensions(raw):
     if (len(raw) < 45 or raw[:16] != b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
             or raw[-12:] != b"\x00\x00\x00\x00IEND\xaeB`\x82"):
         raise ValueError("EVAL_DISPLAY_PNG: missing PNG header or end marker")
-    width = int.from_bytes(raw[16:20], "big")
-    height = int.from_bytes(raw[20:24], "big")
-    _display_dimensions(width, height)
-    return encoded
+    return int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
 
 
-def _display_dimensions(width, height):
+def _display_jpeg_dimensions(raw):
+    if len(raw) < 4 or raw[:2] != b"\xff\xd8" or raw[-2:] != b"\xff\xd9":
+        raise ValueError("EVAL_DISPLAY_JPEG: missing start or end marker")
+    end = len(raw) - 2
+    offset = 2
+    size = None
+    while offset < end:
+        if raw[offset] != 0xff:
+            raise ValueError("EVAL_DISPLAY_JPEG: expected a segment marker")
+        while offset < end and raw[offset] == 0xff:
+            offset += 1
+        if offset >= end:
+            raise ValueError("EVAL_DISPLAY_JPEG: truncated marker")
+        marker = raw[offset]
+        offset += 1
+        if marker == 0x01:
+            continue
+        if marker == 0 or 0xd0 <= marker <= 0xd9 or end - offset < 2:
+            raise ValueError("EVAL_DISPLAY_JPEG: invalid segment marker")
+        length = int.from_bytes(raw[offset:offset + 2], "big")
+        if length < 2 or length > end - offset:
+            raise ValueError("EVAL_DISPLAY_JPEG: truncated segment")
+        if 0xc0 <= marker <= 0xcf and marker not in (0xc4, 0xc8, 0xcc):
+            if (length < 8 or not 1 <= raw[offset + 7] <= 4
+                    or length != 8 + 3 * raw[offset + 7] or size is not None):
+                raise ValueError("EVAL_DISPLAY_JPEG: invalid frame header")
+            size = (int.from_bytes(raw[offset + 5:offset + 7], "big"),
+                    int.from_bytes(raw[offset + 3:offset + 5], "big"))
+        if marker == 0xda:
+            if (length < 6 or not 1 <= raw[offset + 2] <= 4
+                    or length != 6 + 2 * raw[offset + 2]):
+                raise ValueError("EVAL_DISPLAY_JPEG: invalid scan header")
+            if size is None:
+                raise ValueError("EVAL_DISPLAY_JPEG: scan precedes its frame header")
+            return size
+        offset += length
+    raise ValueError("EVAL_DISPLAY_JPEG: frame or scan header is missing")
+
+
+def _display_gif_dimensions(raw):
+    if len(raw) < 14 or raw[:6] not in (b"GIF87a", b"GIF89a") or raw[-1] != 0x3b:
+        raise ValueError("EVAL_DISPLAY_GIF: missing header or trailer")
+    if raw[10] & 0x80 and len(raw) < 14 + (3 << ((raw[10] & 7) + 1)):
+        raise ValueError("EVAL_DISPLAY_GIF: truncated color table")
+    return int.from_bytes(raw[6:8], "little"), int.from_bytes(raw[8:10], "little")
+
+
+def _display_webp_dimensions(raw):
+    if len(raw) < 20 or raw[:4] != b"RIFF" or raw[8:12] != b"WEBP":
+        raise ValueError("EVAL_DISPLAY_WEBP: missing RIFF header")
+    if int.from_bytes(raw[4:8], "little") + 8 != len(raw):
+        raise ValueError("EVAL_DISPLAY_WEBP: RIFF length does not match the image")
+    offset = 12
+    size = None
+    while offset < len(raw):
+        if len(raw) - offset < 8:
+            raise ValueError("EVAL_DISPLAY_WEBP: truncated chunk header")
+        kind = raw[offset:offset + 4]
+        length = int.from_bytes(raw[offset + 4:offset + 8], "little")
+        start = offset + 8
+        if length > len(raw) - start:
+            raise ValueError("EVAL_DISPLAY_WEBP: truncated chunk")
+        if offset == 12:
+            if kind == b"VP8X" and length == 10:
+                if raw[start] & 0xc1 or raw[start + 1:start + 4] != b"\x00\x00\x00":
+                    raise ValueError("EVAL_DISPLAY_WEBP: invalid extended header")
+                size = (int.from_bytes(raw[start + 4:start + 7], "little") + 1,
+                        int.from_bytes(raw[start + 7:start + 10], "little") + 1)
+            elif (kind == b"VP8L" and length >= 5 and raw[start] == 0x2f
+                  and raw[start + 4] >> 5 == 0):
+                packed = int.from_bytes(raw[start + 1:start + 5], "little")
+                size = ((packed & 0x3fff) + 1, ((packed >> 14) & 0x3fff) + 1)
+            elif (kind == b"VP8 " and length >= 10 and raw[start] & 1 == 0
+                  and raw[start + 3:start + 6] == b"\x9d\x01\x2a"):
+                size = (int.from_bytes(raw[start + 6:start + 8], "little") & 0x3fff,
+                        int.from_bytes(raw[start + 8:start + 10], "little") & 0x3fff)
+            else:
+                raise ValueError("EVAL_DISPLAY_WEBP: unsupported or malformed image header")
+        offset = start + length
+        if length & 1:
+            if offset >= len(raw) or raw[offset] != 0:
+                raise ValueError("EVAL_DISPLAY_WEBP: missing chunk padding")
+            offset += 1
+    if size is None:
+        raise ValueError("EVAL_DISPLAY_WEBP: image header is missing")
+    return size
+
+
+def _display_image(value, mime, byte_budget):
+    kind = mime.removeprefix("image/").upper()
+    if type(value) not in (str, bytes, bytearray):
+        raise TypeError(f"EVAL_DISPLAY_{kind}: expected {kind} bytes or standard base64")
+    # Bound both the encoded frame and the remaining cell budget before
+    # copying a bytearray, decoding base64, or allocating encoded image text.
+    overhead = len('{"mimeType":"' + mime + '","data":""}')
+    encoded_size = len(value) if type(value) is str else 4 * ((len(value) + 2) // 3)
+    if encoded_size + overhead > min(byte_budget, _MAX_DISPLAY_ITEM_BYTES):
+        raise ValueError("EVAL_DISPLAY_LIMIT: encoded image exceeds the remaining display budget")
+    if type(value) is str:
+        try:
+            raw = base64.b64decode(value, validate=True)
+        except ValueError as error:
+            raise ValueError(f"EVAL_DISPLAY_{kind}: use canonical standard base64") from error
+        encoded = base64.b64encode(raw).decode("ascii")
+        if encoded != value:
+            raise ValueError(f"EVAL_DISPLAY_{kind}: use canonical standard base64")
+    else:
+        raw = bytes(value)
+        encoded = None
+    # Match the shared host envelope checks without raster decompression,
+    # image-library imports, format conversion or animation traversal.
+    inspectors = {
+        "image/png": _display_png_dimensions,
+        "image/jpeg": _display_jpeg_dimensions,
+        "image/gif": _display_gif_dimensions,
+        "image/webp": _display_webp_dimensions,
+    }
+    width, height = inspectors[mime](raw)
+    _display_dimensions(width, height, kind)
+    return encoded if encoded is not None else base64.b64encode(raw).decode("ascii")
+
+
+def _display_dimensions(width, height, kind="PNG"):
     # Also runs before optional libraries allocate/encode a raster. Fractional
     # figure pixels round up conservatively; NaN/inf fail the comparisons.
     if (not (0 < width <= 16384 and 0 < height <= 16384)
             or math.ceil(width) * math.ceil(height) > 16777216):
-        raise ValueError("EVAL_DISPLAY_PNG: dimensions exceed the display budget")
+        raise ValueError(f"EVAL_DISPLAY_{kind}: dimensions exceed the display budget")
 
 
 class _DisplayPngBuffer(io.BytesIO):
@@ -345,7 +454,7 @@ def _scientific_representation(value, byte_budget):
     return None
 
 
-_RICH_DISPLAY_MIMES = ("image/png", "application/json", "text/markdown", "text/plain")
+_RICH_DISPLAY_MIMES = _DISPLAY_IMAGE_MIMES + ("application/json", "text/markdown", "text/plain")
 _PLAIN_DISPLAY_TYPES = (str, int, float, bool, type(None), list, tuple, dict)
 
 
@@ -374,6 +483,7 @@ def _rich_representation(value, byte_budget):
                 if mime in bundle and (bundle[mime] is not None or mime == "application/json"):
                     return mime, bundle[mime]
     for mime, name in (("image/png", "_repr_png_"),
+                       ("image/jpeg", "_repr_jpeg_"),
                        ("application/json", "_repr_json_"),
                        ("text/markdown", "_repr_markdown_")):
         hook = getattr(value, name, None)
@@ -478,8 +588,8 @@ class _DisplaySink:
             else:
                 mime = "text/plain" if type(value) is str else "application/json"
         self.check_available()
-        if mime == "image/png":
-            data = _display_png(value)
+        if mime in _DISPLAY_IMAGE_MIMES:
+            data = _display_image(value, mime, _MAX_DISPLAY_BYTES - self.bytes)
         elif mime in ("text/plain", "text/markdown"):
             if type(value) is not str:
                 raise TypeError("EVAL_DISPLAY_TEXT: explicit text displays require a string")
@@ -487,7 +597,7 @@ class _DisplaySink:
         elif mime == "application/json":
             data = value
         else:
-            raise ValueError("EVAL_DISPLAY_MIME: supported types are text/plain, text/markdown, application/json, image/png")
+            raise ValueError("EVAL_DISPLAY_MIME: supported types are text/plain, text/markdown, application/json, image/png, image/jpeg, image/gif, image/webp")
         _display_json_shape(data)
         frame = {"mimeType": mime, "data": data}
         encoder = json.JSONEncoder(ensure_ascii=False, allow_nan=False, separators=(",", ":"))
@@ -515,11 +625,13 @@ class _DisplaySink:
 
 
 def display(value, *, mime=None):
-    """Capture JSON/text/PNG or a top-level object's supported rich output.
+    """Capture JSON/text/images or a top-level object's supported rich output.
 
     Explicit mime bypasses representation hooks and validates the supplied
     value directly. Omitted mime permits synchronous notebook-style hooks;
     HTML, SVG, external URLs and arbitrary object serialization stay disabled.
+    Image MIME types are image/png, image/jpeg, image/gif and image/webp;
+    supply bytes, bytearray or canonical standard base64, never a path or URL.
     """
     sink = _DISPLAY_CONTEXT.get()
     if sink is None:
@@ -1842,6 +1954,8 @@ def _pool_snapshot(snapshot, pool_id=None, item_id=None):
             or type(snapshot.get("sealed")) is not bool
             or type(snapshot.get("concurrency")) is not int or not 1 <= snapshot["concurrency"] <= 8
             or type(snapshot.get("maxBatchSize")) is not int or not 1 <= snapshot["maxBatchSize"] <= 8
+            or ("yieldResults" in snapshot and type(snapshot["yieldResults"]) is not bool)
+            or (snapshot.get("yieldResults", False) and snapshot["maxBatchSize"] < 2)
             or type(snapshot.get("items")) is not list or len(snapshot["items"]) > 32
             or type(snapshot.get("admittedItems")) is not int
             or snapshot["admittedItems"] != len(snapshot["items"])
@@ -1923,6 +2037,8 @@ def _pool_check_drain(page, pool, previous, maximum):
     if (type(page) is not dict or page.get("schema") != "pi.subagent.pool.drain.v1"
             or page.get("poolId") != pool.pool_id or page.get("jobId") != pool.job_id
             or page.get("agent") != pool._options["agent"]
+            or ("yieldResults" in page and type(page["yieldResults"]) is not bool)
+            or page.get("yieldResults", False) is not pool.yield_results
             or page.get("status") not in ("open", "draining", "completed", "failed", "cancelled")
             or type(page.get("sealed")) is not bool or (page["status"] == "open") == page["sealed"]
             or type(page.get("admittedItems")) is not int or not len(pool._items) <= page["admittedItems"] <= 32
@@ -1968,7 +2084,8 @@ async def _pool_read_item(handle, operation, timeout_ms=None):
         arguments["timeoutMs"] = timeout_ms
     snapshot = _pool_snapshot(await _agent_native_result("subagent", arguments), handle.pool_id, handle.item_id)
     if (snapshot["jobId"] != handle.job_id or snapshot["agent"] != handle.agent
-            or snapshot["maxBatchSize"] != handle.max_batch_size):
+            or snapshot["maxBatchSize"] != handle.max_batch_size
+            or snapshot.get("yieldResults", False) is not handle.yield_results):
         raise ToolBridgeError("EVAL_POOL_PROTOCOL: native pool identity changed")
     return snapshot
 
@@ -1986,7 +2103,7 @@ async def _pool_wait_item(handle, timeout_ms, raise_errors):
 class _AgentPoolItem:
     """One immutable native pool item. Only the pool can cancel its carrier."""
 
-    __slots__ = ("_pool_id", "_item_id", "_job_id", "_agent", "_max_batch_size")
+    __slots__ = ("_pool_id", "_item_id", "_job_id", "_agent", "_max_batch_size", "_yield_results")
 
     def __init__(self, pool, item_id):
         self._pool_id = pool["poolId"]
@@ -1994,6 +2111,7 @@ class _AgentPoolItem:
         self._job_id = pool["jobId"]
         self._agent = pool["agent"]
         self._max_batch_size = pool["maxBatchSize"]
+        self._yield_results = pool.get("yieldResults", False)
 
     @property
     def id(self):
@@ -2019,6 +2137,10 @@ class _AgentPoolItem:
     def max_batch_size(self):
         return self._max_batch_size
 
+    @property
+    def yield_results(self):
+        return self._yield_results
+
     async def status(self):
         return await _pool_read_item(self, "pool_result")
 
@@ -2038,15 +2160,16 @@ class _AgentPoolItem:
 class _AgentPool:
     """One native pool carrier; finish drains, close cancels running and queued work."""
 
-    __slots__ = ("_options", "_name", "_concurrency", "_max_batch_size", "_pool_id", "_job_id", "_snapshot", "_items",
+    __slots__ = ("_options", "_name", "_concurrency", "_max_batch_size", "_yield_results", "_pool_id", "_job_id", "_snapshot", "_items",
                  "_closed", "_last_error", "_unknown_admission", "_admission_pending",
                  "_finish_acknowledged", "_close_acknowledged", "_lock")
 
-    def __init__(self, options, name, concurrency, max_batch_size=1):
+    def __init__(self, options, name, concurrency, max_batch_size=1, yield_results=False):
         self._options = options
         self._name = name
         self._concurrency = concurrency
         self._max_batch_size = max_batch_size
+        self._yield_results = yield_results
         self._pool_id = None
         self._job_id = None
         self._snapshot = None
@@ -2084,6 +2207,10 @@ class _AgentPool:
         return self._max_batch_size
 
     @property
+    def yield_results(self):
+        return self._yield_results
+
+    @property
     def closed(self):
         return self._closed
 
@@ -2099,6 +2226,7 @@ class _AgentPool:
         _pool_snapshot(snapshot, self._pool_id)
         if (snapshot["agent"] != self._options["agent"] or snapshot["concurrency"] != self._concurrency
                 or snapshot["maxBatchSize"] != self._max_batch_size
+                or snapshot.get("yieldResults", False) is not self._yield_results
                 or (self._job_id is not None and snapshot["jobId"] != self._job_id)
                 or len(snapshot["items"]) < len(self._items)):
             raise ToolBridgeError("EVAL_POOL_PROTOCOL: native pool identity or retained items changed")
@@ -2117,6 +2245,7 @@ class _AgentPool:
                         "agent": self._options["agent"], "status": "unavailable" if self._unknown_admission
                         else "cancelled" if self._closed else "unstarted", "sealed": self._closed,
                         "concurrency": self._concurrency, "maxBatchSize": self._max_batch_size,
+                        "yieldResults": self._yield_results,
                         "admittedItems": 0, "items": []}
         else:
             snapshot = {**self._snapshot, "items": [{**item, "resultRef": dict(item["resultRef"])}
@@ -2276,6 +2405,7 @@ class _AgentPool:
                 if (snapshot["jobId"] != self._job_id or snapshot["agent"] != self._options["agent"]
                         or snapshot["concurrency"] != self._concurrency
                         or snapshot["maxBatchSize"] != self._max_batch_size or snapshot["admittedItems"] < previous
+                        or snapshot.get("yieldResults", False) is not self._yield_results
                         or type(ids) is not list or len(ids) != len(batch)
                         or any(type(item_id) is not int or not previous < item_id <= snapshot["admittedItems"]
                                or (index > 0 and item_id != ids[index - 1] + 1)
@@ -2380,6 +2510,7 @@ async def _workpool(**options):
     name = "workpool"
     concurrency = 4
     max_batch_size = 1
+    yield_results = False
     for key, value in options.items():
         if key == "name":
             if not _pool_bounded_text(value, 128):
@@ -2394,6 +2525,11 @@ async def _workpool(**options):
                 raise ValueError("EVAL_POOL_INPUT: max_batch_size must be an integer from 1 to 8")
             max_batch_size = value
             native["maxBatchSize"] = value
+        elif key == "yield_results":
+            if type(value) is not bool:
+                raise TypeError("EVAL_POOL_INPUT: yield_results must be a boolean")
+            yield_results = value
+            native["yieldResults"] = value
         elif key == "agent":
             if not _pool_bounded_text(value, 128):
                 raise TypeError("EVAL_POOL_INPUT: agent must be nonempty text of at most 128 UTF-8 bytes without NUL")
@@ -2428,7 +2564,9 @@ async def _workpool(**options):
             raise TypeError(f"EVAL_POOL_INPUT: unknown option {key}")
     if "isoApply" in native and native.get("isolation") != "worktree":
         raise TypeError("EVAL_POOL_INPUT: iso_apply requires worktree isolation")
-    pool = _AgentPool(native, name, concurrency, max_batch_size)
+    if yield_results and (max_batch_size < 2 or native.get("isolation") == "worktree"):
+        raise TypeError("EVAL_POOL_INPUT: yield_results requires max_batch_size above 1 and no worktree isolation")
+    pool = _AgentPool(native, name, concurrency, max_batch_size, yield_results)
     pool._batch_arguments([])
     return pool
 

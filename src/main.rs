@@ -1161,6 +1161,9 @@ fn main_impl() -> Result<()> {
         )
         .into());
     }
+    if cli.worker_yield && early_mode != "rpc" {
+        return Err(pi::error::Error::validation("--worker-yield requires RPC mode").into());
+    }
     if cli.command.is_none()
         && cli.fetch_models.is_none()
         && cli.list_models.is_none()
@@ -1969,6 +1972,18 @@ fn ftui_tool_selection(cli: &cli::Cli, enabled_tools: &[&str]) -> Option<Vec<Str
     })
 }
 
+fn initial_workspace(cli: &cli::Cli, cwd: &Path) -> Result<pi::workspace::WorkspaceHandle> {
+    let mut workspace = pi::workspace::WorkspaceHandle::single(cwd);
+    if let Some(path) = cli.workspace_roots_file.as_deref() {
+        // Native delegation supplies path authority, not project trust. Load
+        // all entries before publishing any root or discovering resources.
+        workspace
+            .load_child_workspace_roots(&invocation_path(path, cwd))
+            .map_err(|error| anyhow::anyhow!("--workspace-roots-file: {error}"))?;
+    }
+    Ok(workspace)
+}
+
 #[allow(
     clippy::too_many_lines,
     clippy::future_not_send,
@@ -2003,7 +2018,7 @@ async fn run(
     // @-file processing, the tool registry, and the interactive host so
     // /add-dir + /remove-dir mutate one live root set (the additional-roots
     // Arc<RwLock> is shared across clones).
-    let mut workspace = pi::workspace::WorkspaceHandle::single(&cwd);
+    let mut workspace = initial_workspace(&cli, &cwd)?;
 
     // Subcommands can use HTTP before the runtime configuration below. Normal
     // session startup installs the selected workspace's trusted proxy settings
@@ -2370,10 +2385,17 @@ async fn run(
     let shared_enabled_tools = cli.enabled_tools(&config);
     // A name the registry does not know is dropped without a word, so
     // `--tools read,bsah,edit` hands the model two tools and reports three.
+    let tool_selection_source = if cli.tools.is_some() {
+        "--tools"
+    } else {
+        "defaultTools"
+    };
     let unknown_tools = pi::tools::unknown_tool_names(&shared_enabled_tools);
     if !unknown_tools.is_empty() {
         for name in &unknown_tools {
-            eprintln!("Warning: --tools: \"{name}\" is not a tool pi provides; it is ignored");
+            eprintln!(
+                "Warning: {tool_selection_source}: \"{name}\" is not a tool pi provides; it is ignored"
+            );
         }
         // The constants group registry-built names ahead of host-coupled ones,
         // which is the right order to read the code in and the wrong one to
@@ -2385,16 +2407,19 @@ async fn run(
                 .map(|(name, _)| *name),
         );
         provided.sort_unstable();
-        eprintln!("Warning: --tools: pi provides {}", provided.join(", "));
+        eprintln!(
+            "Warning: {tool_selection_source}: pi provides {}",
+            provided.join(", ")
+        );
     }
     // A real tool the flag has no say over. Saying nothing invites the user to
     // conclude the tool is missing; saying "not a tool pi provides" — which is
     // what this printed before — tells them something false about a tool they
     // can actually have.
     for (name, how) in pi::tools::unselectable_tool_names(&shared_enabled_tools) {
-        eprintln!("Warning: --tools: \"{name}\": {how}");
+        eprintln!("Warning: {tool_selection_source}: \"{name}\": {how}");
     }
-    let shared_tools = pi::tools::SharedToolRegistry::new(if cli.builtin_tools_disabled() {
+    let shared_tools = pi::tools::SharedToolRegistry::new(if cli.builtin_tools_disabled(&config) {
         ToolRegistry::without_builtins(Some(&config))
     } else {
         let mut registry = ToolRegistry::with_builtin_tool_policy(
@@ -2405,11 +2430,14 @@ async fn run(
             Some(&workspace),
             workspace_trusted,
             Some(&workspace_trust_guard),
-            !cli.no_implicit_tools,
+            cli.implicit_tools_allowed(&config),
         );
         registry.promote_tools(&cli.explicit_tools());
         registry
     });
+    if cli.worker_yield {
+        pi::subagents::install_worker_yield_tool(&shared_tools)?;
+    }
     let startup_cost_budget = startup_session
         .as_ref()
         .map(|session| {
@@ -2755,7 +2783,15 @@ async fn run(
         None
     };
 
-    let enabled_tools = cli.enabled_tools(&config);
+    let enabled_tool_names = cli
+        .enabled_tools(&config)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let enabled_tools = enabled_tool_names
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     // CLI flag wins; fall back to PI_MAX_TOOL_ITERATIONS env, then default.
     // `clamp_max_tool_iterations` keeps invalid values out of the loop and
     // emits a warning instead of failing the run.
@@ -12548,6 +12584,22 @@ mod tests {
 
     #[cfg(feature = "ftui")]
     #[test]
+    fn ftui_configured_tool_lists_do_not_become_launch_overrides() {
+        let cli = cli::Cli::try_parse_from(["pi"]).expect("settings-driven launch");
+        for names in [vec!["read", "grep"], Vec::new()] {
+            let config: Config = serde_json::from_value(json!({ "defaultTools": names }))
+                .expect("configured default tools");
+            let selected = cli.enabled_tools(&config);
+            assert_eq!(selected, names);
+            assert!(
+                ftui_tool_selection(&cli, &selected).is_none(),
+                "session replacements must resolve defaultTools again"
+            );
+        }
+    }
+
+    #[cfg(feature = "ftui")]
+    #[test]
     fn ftui_implicit_selection_reloads_settings_and_keeps_automatic_tools() {
         let root = TempDir::new().expect("tempdir");
         let cwd = root.path().join("workspace");
@@ -14022,6 +14074,105 @@ mod tests {
         assert!(parsed.0.crash_test, "--crash-test must bind");
         assert!(parsed.0.profile, "--profile must bind");
         assert!(parsed.0.print);
+    }
+
+    #[test]
+    fn parse_cli_args_keeps_native_child_workspace_manifest() {
+        let parsed = parse_cli_args(vec![
+            "pi".to_string(),
+            "--workspace-roots-file".to_string(),
+            "native roots.json".to_string(),
+            "--add-dir".to_string(),
+            "explicit-root".to_string(),
+            "--mode".to_string(),
+            "rpc".to_string(),
+        ])
+        .expect("parse native workspace input")
+        .expect("parsed CLI payload");
+        assert_eq!(
+            parsed.0.workspace_roots_file,
+            Some(PathBuf::from("native roots.json"))
+        );
+        assert_eq!(parsed.0.add_dir, vec![PathBuf::from("explicit-root")]);
+        assert!(!parsed.0.trust);
+        assert!(parsed.1.is_empty());
+    }
+
+    #[test]
+    fn native_child_manifest_reaches_tool_confinement_without_loading_root_configuration() {
+        use pi::tools::Tool as _;
+
+        run_cli_workdir_test(async {
+            let temporary = TempDir::new().expect("workspace fixture");
+            let primary = temporary.path().join("primary");
+            let sibling = temporary.path().join("sibling");
+            let outside = temporary.path().join("outside");
+            fs::create_dir(&primary).expect("primary");
+            fs::create_dir_all(sibling.join(".pi")).expect("additional root");
+            fs::create_dir(&outside).expect("outside root");
+            fs::write(sibling.join("data.txt"), "inherited workspace data")
+                .expect("permitted file");
+            fs::write(outside.join("data.txt"), "ungranted workspace data").expect("refused file");
+            // Additional roots carry access only; malformed executable
+            // configuration there is not a startup configuration source.
+            fs::write(sibling.join(".pi/settings.json"), "invalid configuration")
+                .expect("unused additional configuration");
+            let sibling = pi::extensions::safe_canonicalize(&sibling);
+            fs::write(
+                primary.join("roots.json"),
+                pi::workspace::encode_child_workspace_roots(std::slice::from_ref(&sibling))
+                    .expect("canonical parent manifest"),
+            )
+            .expect("manifest");
+            let cli = cli::Cli::parse_from([
+                "pi",
+                "--workspace-roots-file",
+                "roots.json",
+                "--mode",
+                "rpc",
+            ]);
+            let mut workspace = initial_workspace(&cli, &primary).expect("native startup roots");
+            assert!(!cli.trust);
+            let read = pi::tools::ReadTool::new(&primary).with_workspace(workspace.clone());
+            let result = read
+                .execute(
+                    "inherited-read",
+                    json!({"path":sibling.join("data.txt")}),
+                    None,
+                )
+                .await
+                .expect("read inherited root");
+            assert!(!result.is_error);
+            assert!(result.content.iter().any(|block| matches!(
+                block,
+                pi::model::ContentBlock::Text(text) if text.text.contains("inherited workspace data")
+            )));
+            assert!(
+                read.execute(
+                    "outside-read",
+                    json!({"path":outside.join("data.txt")}),
+                    None
+                )
+                .await
+                .is_err()
+            );
+            assert!(workspace.remove_root(&sibling));
+            assert!(
+                read.execute(
+                    "revoked-read",
+                    json!({"path":sibling.join("data.txt")}),
+                    None
+                )
+                .await
+                .is_err()
+            );
+            fs::write(
+                primary.join("roots.json"),
+                r#"{"schema":"unknown","roots":[]}"#,
+            )
+            .expect("malformed manifest");
+            assert!(initial_workspace(&cli, &primary).is_err());
+        });
     }
     #[test]
     fn apply_extension_cli_flags_ignores_unknown_flags() {

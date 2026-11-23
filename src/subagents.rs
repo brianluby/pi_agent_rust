@@ -44,6 +44,15 @@ mod workspace;
 use deadline::Deadline;
 use execution::ChildRunner;
 
+/// Install the private receipt tool for a native grouped RPC worker.
+///
+/// # Errors
+/// Refuses an existing tool with the same name or an explicit off load mode.
+#[doc(hidden)]
+pub fn install_worker_yield_tool(tools: &crate::tools::SharedToolRegistry) -> Result<()> {
+    worker::yield_tool::install(tools)
+}
+
 const MAX_PARALLEL_TASKS: usize = 8;
 const DEFAULT_CONCURRENCY: usize = 4;
 const MAX_SUBAGENT_DEPTH: usize = 3;
@@ -80,6 +89,8 @@ pub struct TanCompletion {
     pub output: String,
     pub error: Option<String>,
     pub is_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_roots: Option<Value>,
 }
 
 impl TanCompletion {
@@ -92,6 +103,7 @@ impl TanCompletion {
             output: result.output,
             error: result.error,
             is_error: result.is_error,
+            workspace_roots: result.workspace_roots.map(|roots| json!(roots)),
         }
     }
 
@@ -125,6 +137,7 @@ impl TanCompletion {
 }
 
 /// A native tool that delegates bounded work to isolated Pi child processes.
+#[derive(Clone)]
 pub struct SubagentTool {
     cwd: PathBuf,
     global_dir: PathBuf,
@@ -132,7 +145,7 @@ pub struct SubagentTool {
     project_trusted: bool,
     /// A captured launch decision is authoritative over the standalone flag.
     workspace_trust_guard: Option<crate::workspace_trust::WorkspaceTrustGuard>,
-    /// Shared admission policy for saved sessions and task files, including live roots.
+    /// Shared admission policy and revocable grants for delegated work.
     workspace: crate::workspace::WorkspaceHandle,
     child_binary: PathBuf,
     structured_results: bool,
@@ -154,6 +167,8 @@ pub struct SubagentTool {
     /// Fallback policy for direct SDK calls; live Agent execution supplies its
     /// own projection so discoveries stay scoped to the invoking session.
     privacy: Option<crate::text_completion::AuxiliaryPrivacy>,
+    /// Owned invocation privacy for executable child workspace disclosures.
+    workspace_privacy: Option<crate::text_completion::AuxiliaryPrivacySnapshot>,
     /// The same native owner identity used by jobs list/wait/cancel.
     job_session_scope: crate::jobs::JobSessionScope,
 }
@@ -177,6 +192,7 @@ pub(crate) struct RevivalSpec {
     public_task: Option<String>,
     launch_admission: Option<LaunchAdmission>,
     cost_budget: Option<crate::cost::CostBudget>,
+    workspace_roots: Option<workspace::CapturedRoots>,
 }
 
 impl RevivalSpec {
@@ -246,6 +262,7 @@ pub(crate) async fn revive_child(
     )
     .with_parent_model(launch.parent_model.clone())
     .with_cost_budget(launch.cost_budget.clone())
+    .with_workspace_roots(launch.workspace_roots.clone())
     .with_task_limit(launch.max_task_bytes)
     .with_revival(id.to_string(), launch.clone());
     let mut result = owner
@@ -291,12 +308,14 @@ impl SubagentTool {
             parent_model: None,
             timeout: None,
             privacy: None,
+            workspace_privacy: None,
             job_session_scope: crate::jobs::JobSessionScope::default(),
         }
     }
 
-    /// Share the owning agent's live additional roots with saved-session
-    /// consultation. Changes to this handle apply to subsequent admission checks.
+    /// Share the owning agent's additional roots with delegated work and
+    /// saved-session consultation. Delegation freezes grants at admission;
+    /// removal revokes queued and running children at their native checkpoints.
     #[must_use]
     pub fn with_workspace(mut self, workspace: crate::workspace::WorkspaceHandle) -> Self {
         self.workspace = workspace;
@@ -411,6 +430,17 @@ impl SubagentTool {
             .map_or_else(|| self.parent_model.clone(), ToolModelScope::current)
     }
 
+    fn capture_workspace_roots(&self) -> Result<Option<workspace::CapturedRoots>> {
+        let privacy = self.workspace_privacy.clone().unwrap_or_else(|| {
+            crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(
+                self.privacy.clone().unwrap_or_else(|| {
+                    crate::text_completion::AuxiliaryPrivacy::from_settings(None)
+                }),
+            )
+        });
+        workspace::CapturedRoots::capture(&self.workspace, privacy)
+    }
+
     /// Set the host's request-wide execution ceiling (1 ms through 24 hours).
     /// Without this override, `PI_SUBAGENT_TIMEOUT_SECS` supplies the ceiling,
     /// defaulting to 900 seconds. A model's `timeoutSeconds` can only shorten it.
@@ -453,6 +483,7 @@ impl SubagentTool {
         }
 
         let deadline = Deadline::for_request(self.timeout, None)?;
+        let workspace_roots = self.capture_workspace_roots()?;
         let definition = tan_agent_definition();
         let agents = BTreeMap::from([(TAN_AGENT_NAME.to_string(), definition)]);
         let mut request = SubagentTask {
@@ -481,6 +512,7 @@ impl SubagentTool {
         .into_background()
         .with_parent_model(self.capture_parent_model())
         .with_cost_budget(self.cost_scope.current())
+        .with_workspace_roots(workspace_roots)
         .run_one(&agents, request, None, None)
         .await;
         Ok(TanCompletion::from_result(result))
@@ -510,6 +542,7 @@ impl SubagentTool {
             parent_model: None,
             timeout: None,
             privacy: None,
+            workspace_privacy: None,
             job_session_scope: crate::jobs::JobSessionScope::default(),
         }
     }
@@ -551,6 +584,7 @@ impl SubagentTool {
         deadline: Deadline,
     ) -> Result<PreparedRequest> {
         let parent_model = self.capture_parent_model();
+        let workspace_roots = self.capture_workspace_roots()?;
         let mut mode = request.mode()?;
         let agents = self.discover(request.scope)?;
         match &mut mode {
@@ -583,6 +617,7 @@ impl SubagentTool {
             )
             .with_parent_model(parent_model)
             .with_cost_budget(self.cost_scope.current())
+            .with_workspace_roots(workspace_roots)
             .with_launch_admission(launch_admission),
             agents,
             mode,
@@ -668,7 +703,8 @@ impl Tool for SubagentTool {
             " workflow is an alternative dependency graph of up to 32 named nodes with native call objects and needs IDs. Ready nodes execute in parallel waves, with accepted worktree writeback settled before dependent waves start. Failed or schema-invalid predecessors skip descendants; independent branches continue. One original deadline covers the graph. Inspect each ordered node's state, native result and hubId; this is not graph-wide rollback.",
             " Set async: true on a single, parallel tasks, chain, or workflow request to return a session-owned background job immediately. Use jobs list/wait/cancel with its jobId; a settled wait includes the native subagent or workflow result. Completion also arrives through the normal background follow-up queue. Definitions, model and request deadline freeze before acknowledgment; queued work does not get a fresh timeout. Background delegation does not retain an eval cell or an Agent callback. Seance remains foreground.",
             " Reusable workers: operation worker_start launches a persistent RPC child with agent/task; worker_send queues another task on its retained conversation. worker_status/worker_wait select workerId and optional turnId; worker_close cancels the entire worker and its queued turns. Each worker has one fixed lifetime deadline and at most 32 total turns; wait timeout does not cancel work. Workers and pools support Unix and Windows with isolation none or worktree. An isolated retained worker preserves its private checkout across turns and after closure; isoApply may only be keep. Each turn reports the cumulative patch against its fixed launch baseline without parent writeback. Pool results carry workerIndex and workerWorkspaces so patches from different members cannot be confused. outputSchema on worker_start or pool_start (or the agent's output_schema) freezes one contract for every turn: each final answer must be bare JSON that validates, returned as data, with no corrective retry; schemaMode there may only be strict. Their jobId owns the whole process lifetime; use worker_wait for individual turn results.",
-            " Native pools: pool_start freezes one agent and up to 8 reusable children under one session-owned job, with optional tasks as a string array. Optional maxBatchSize (1..8, default 1) groups queued assignments into one child prompt, bounded to 64 KiB of task text; larger values require a keyed final result for each original item, validated separately against outputSchema when present. Groups do not wait to fill, and item identities and result cursors stay unchanged. pool_push atomically appends a nonempty task batch, up to 32 items total. Idle workers with lower observed context pressure receive new work first; busy workers retain balanced FIFO queues. pool_finish seals admission and drains all accepted work before reaping children and delivering one ordered aggregate completion. pool_status returns bounded item summaries and result references; pool_result and pool_wait select poolId/itemId for full results. pool_wait without itemId observes aggregate completion without sealing. pool_drain returns up to 4 settled full results with an explicit replayable cursor, without waiting for earlier items, sealing admission or consuming results. pool_exchange atomically appends an optional task batch and optionally seals admission, then returns a drain page, admittedItemIds and a snapshot in one call. It validates controls and cursors before mutation; after a lost response, recover with pool_status/pool_drain instead of replaying the exchange. pool_close cancels all unfinished work. Pool identities and results survive eval kernel resets; original deadlines and session ownership remain fixed. Failed assignments are never replayed or transferred to replacement children."
+            " Native pools: pool_start freezes one agent and up to 8 reusable children under one session-owned job, with optional tasks as a string array. Optional maxBatchSize (1..8, default 1) groups queued assignments into one child prompt, bounded to 64 KiB of task text; larger values use keyed results for each original item, validated separately against outputSchema when present. Groups do not wait to fill, and item identities and result cursors stay unchanged. pool_push atomically appends a nonempty task batch, up to 32 items total. Idle workers with lower observed context pressure receive new work first; busy workers retain balanced FIFO queues. pool_finish seals admission and drains all accepted work before reaping children and delivering one ordered aggregate completion. pool_status returns bounded item summaries and result references; pool_result and pool_wait select poolId/itemId for full results. pool_wait without itemId observes aggregate completion without sealing. pool_drain returns up to 4 settled full results with an explicit replayable cursor, without waiting for earlier items, sealing admission or consuming results. pool_exchange atomically appends an optional task batch and optionally seals admission, then returns a drain page, admittedItemIds and a snapshot in one call. It validates controls and cursors before mutation; after a lost response, recover with pool_status/pool_drain instead of replaying the exchange. pool_close cancels all unfinished work. Pool identities and results survive eval kernel resets; original deadlines and session ownership remain fixed. Failed assignments are never replayed or transferred to replacement children.",
+            " Early item publication: pool_start may opt into yieldResults: true when maxBatchSize is above 1 and isolation is none or omitted. A private native yield tool then lets children submit terminal keyed data/error results before finishing the group. Each accepted result is immutable and immediately available through item reads and drains; later child failure or cancellation affects only unfinished work. The final envelope covers remaining keys, or an empty items array if all yielded. Physical reuse and aggregate completion still wait for the final RPC idle barrier. yieldResults defaults to false, is frozen at launch, and rejects worktree isolation."
         )
     }
 
@@ -700,6 +736,7 @@ impl Tool for SubagentTool {
                 "chain": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Sequential tasks; {previous} is replaced with the prior child output, and {{previous.data.<field.path>}} addresses the prior task's schema-validated data."},
                 "concurrency": {"type": "integer", "minimum": 1, "maximum": MAX_PARALLEL_TASKS},
                 "maxBatchSize": {"type": "integer", "minimum": 1, "maximum": 8, "default": 1, "description": "pool_start only: freeze the maximum queued items sharing one child prompt, bounded to 64 KiB of assignment text. Values above 1 use keyed final results; item identities, per-item schemas, deadlines and drain cursors stay unchanged. Groups may contain fewer items without waiting to fill."},
+                "yieldResults": {"type": "boolean", "default": false, "description": "pool_start only: allow grouped workers to submit terminal item results before the batch ends through a native yield tool. Requires maxBatchSize above 1 and no worktree isolation. Each accepted item remains settled if later work fails; the physical worker still waits for its RPC idle barrier before reuse."},
                 "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": deadline::MAX_TIMEOUT_SECS, "description": "Budget for this whole delegation request, including queueing, chained steps and corrective retries. May shorten, never extend, the host's limit."},
                 "scope": {"type": "string", "enum": ["both", "user", "project"], "default": "both", "description": "Select authored profile sources. Project profiles require host-established workspace trust; scope cannot grant it. Built-ins are always available. User scope never reads project profiles."}
             },
@@ -738,24 +775,19 @@ impl Tool for SubagentTool {
             .privacy
             .clone()
             .unwrap_or_else(|| crate::text_completion::AuxiliaryPrivacy::from_settings(None));
+        let snapshot =
+            crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(privacy.clone());
+        let mut invocation_tool = self.clone();
+        invocation_tool.workspace_privacy = Some(snapshot.clone());
         if worker::requested(&input)? {
-            return worker::execute(
-                self,
-                input,
-                crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(privacy),
-            )
-            .await;
+            return worker::execute(&invocation_tool, input, snapshot).await;
         }
         if background::requested(&input)? {
-            return background::start(
-                self,
-                input,
-                crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(privacy),
-            )
-            .await;
+            return background::start(&invocation_tool, input, snapshot).await;
         }
         let protect = |parts: &[&str]| crate::text_completion::redact_inputs(parts, &privacy);
-        self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, &protect)
+        invocation_tool
+            .execute_with_auxiliary_privacy(tool_call_id, input, on_update, &protect)
             .await
     }
 
@@ -766,13 +798,17 @@ impl Tool for SubagentTool {
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
         context: ToolInvocationContext<'_>,
     ) -> Result<ToolOutput> {
+        let privacy = (context.snapshot_privacy)();
+        let mut invocation_tool = self.clone();
+        invocation_tool.workspace_privacy = Some(privacy.clone());
         if worker::requested(&input)? {
-            return worker::execute(self, input, (context.snapshot_privacy)()).await;
+            return worker::execute(&invocation_tool, input, privacy).await;
         }
         if background::requested(&input)? {
-            return background::start(self, input, (context.snapshot_privacy)()).await;
+            return background::start(&invocation_tool, input, privacy).await;
         }
-        self.execute_with_auxiliary_privacy(tool_call_id, input, on_update, context.protect)
+        invocation_tool
+            .execute_with_auxiliary_privacy(tool_call_id, input, on_update, context.protect)
             .await
     }
 
@@ -826,6 +862,13 @@ impl Tool for SubagentTool {
             }
             return seance::execute(self, input, on_update.map(Arc::from), protect).await;
         }
+        if self.workspace_privacy.is_none() && !self.workspace.additional_roots().is_empty() {
+            return Err(Error::tool(
+                "subagent",
+                "PI_SUBAGENT_WORKSPACE_PRIVACY: delegated roots require an owned invocation privacy snapshot; use execute_with_invocation or standalone execute",
+            ));
+        }
+        workspace::protect_source_roots(&self.workspace, protect)?;
         if let Some(plan) = workflow::Plan::parse(&input)? {
             return plan.execute(self, on_update.map(Arc::from)).await;
         }
@@ -1079,27 +1122,10 @@ impl SubagentTask {
         previous: Option<&SubagentResult>,
     ) -> std::result::Result<(), &'static str> {
         let raw = previous.map_or("", |result| result.output.as_str());
-        let marker = concat!("{", "previous", "}");
-        let limit = task_file::MAX_BYTES;
-        // Count before replace allocates: a small repeated token can otherwise
-        // amplify a bounded file and bounded predecessor into gigabytes.
-        let count = self.task.matches(marker).count();
-        let unchanged = self.task.len() - count * marker.len();
-        if count
-            .checked_mul(raw.len())
-            .and_then(|bytes| bytes.checked_add(unchanged))
-            .is_none_or(|bytes| bytes > limit)
-        {
-            return Err(CHAIN_TASK_LIMIT);
-        }
-        let mut rendered = self.task.replace(marker, raw);
-        if let Some(data) = previous
+        let data = previous
             .filter(|result| result.schema_valid == Some(true))
-            .and_then(|result| result.data.as_ref())
-        {
-            rendered = render_previous_data_fields(&rendered, data, limit)?;
-        }
-        self.task = rendered;
+            .and_then(|result| result.data.as_ref());
+        self.task = render_chain_template(&self.task, raw, data, task_file::MAX_BYTES)?;
         Ok(())
     }
 }
@@ -1119,40 +1145,56 @@ fn push_chain_part(
     Ok(())
 }
 
-/// Replace `{{previous.data.<path>}}` tokens with values addressed out of the
-/// prior task's parsed `data`. Scalars render bare; objects/arrays render as
-/// compact JSON. Missing paths leave the token untouched.
-fn render_previous_data_fields(
+/// Interpret placeholders only in the authored template. Predecessor output
+/// and resolved field values are literal data, even when they contain another
+/// placeholder or form one together with adjacent template text. A closed
+/// typed candidate is one token, including any nested marker text, regardless
+/// of whether schema-valid data can resolve it. Bound every append before
+/// allocating an expanded prompt.
+fn render_chain_template(
     task: &str,
-    data: &Value,
+    raw: &str,
+    data: Option<&Value>,
     limit: usize,
 ) -> std::result::Result<String, &'static str> {
+    const RAW: &str = "{previous}";
     const OPEN: &str = "{{previous.data.";
     const CLOSE: &str = "}}";
-    let mut rendered = String::with_capacity(task.len());
+    let mut rendered = String::with_capacity(task.len().min(limit));
     let mut rest = task;
-    while let Some(start) = rest.find(OPEN) {
+    let mut typed_tokens_can_close = true;
+    while let Some(start) = rest.find('{') {
         push_chain_part(&mut rendered, &rest[..start], limit)?;
-        let after_open = &rest[start + OPEN.len()..];
-        let Some(end) = after_open.find(CLOSE) else {
-            push_chain_part(&mut rendered, &rest[start..], limit)?;
-            return Ok(rendered);
-        };
-        let path = &after_open[..end];
-        let pointer = format!("/{}", path.replace('.', "/"));
-        match data.pointer(&pointer) {
-            Some(Value::String(text)) => push_chain_part(&mut rendered, text, limit)?,
-            Some(Value::Null) | None => {
-                // Leave the token verbatim so the miss is visible.
-                push_chain_part(
-                    &mut rendered,
-                    &rest[start..start + OPEN.len() + end + CLOSE.len()],
-                    limit,
-                )?;
+        rest = &rest[start..];
+        if let Some(tail) = rest.strip_prefix(RAW) {
+            push_chain_part(&mut rendered, raw, limit)?;
+            rest = tail;
+        } else if typed_tokens_can_close && let Some(after_open) = rest.strip_prefix(OPEN) {
+            let Some(end) = after_open.find(CLOSE) else {
+                // No later typed token can close either. Stop searching for
+                // delimiters, but still expand later authored raw tokens.
+                typed_tokens_can_close = false;
+                continue;
+            };
+            let path = &after_open[..end];
+            let pointer = format!("/{}", path.replace('.', "/"));
+            match data.and_then(|value| value.pointer(&pointer)) {
+                Some(Value::String(text)) => push_chain_part(&mut rendered, text, limit)?,
+                Some(Value::Null) | None => {
+                    // Leave the token verbatim so the miss is visible.
+                    push_chain_part(
+                        &mut rendered,
+                        &rest[..OPEN.len() + end + CLOSE.len()],
+                        limit,
+                    )?;
+                }
+                Some(value) => push_chain_part(&mut rendered, &value.to_string(), limit)?, // ubs:ignore[rust.perf.string-alloc-in-loop] -- Each authored typed substitution serializes a predecessor-bounded value before enforcing the total prompt byte limit.
             }
-            Some(value) => push_chain_part(&mut rendered, &value.to_string(), limit)?, // ubs:ignore[rust.perf.string-alloc-in-loop] -- Each requested typed substitution serializes a predecessor-bounded value before enforcing the total prompt byte limit.
+            rest = &after_open[end + CLOSE.len()..];
+        } else {
+            push_chain_part(&mut rendered, "{", limit)?;
+            rest = &rest[1..];
         }
-        rest = &after_open[end + CLOSE.len()..];
     }
     push_chain_part(&mut rendered, rest, limit)?;
     Ok(rendered)
@@ -1750,6 +1792,9 @@ struct SubagentResult {
     /// and patches remain inspectable even when the final attempt succeeds.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     preserved_worktrees: Vec<crate::worktree_iso::IsoOutcome>,
+    /// Actual inherited, remapped and excluded additional-root grants.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_roots: Option<workspace::InheritedRoots>,
     session_isolation: &'static str,
     /// Agent-hub run id (bd-cv653.5.3) when the registry tracked this run.
     /// Serialized as `hubId`: callers revive, steer and correlate runs from
@@ -1798,6 +1843,7 @@ impl SubagentResult {
             schema_retries: None,
             iso: None,
             preserved_worktrees: Vec::new(),
+            workspace_roots: None,
             session_isolation: "ephemeral_no_session",
             hub_id: None,
             is_error: false,
@@ -1831,6 +1877,7 @@ impl SubagentResult {
             schema_retries: None,
             iso: None,
             preserved_worktrees: Vec::new(),
+            workspace_roots: None,
             session_isolation: "ephemeral_no_session",
             hub_id: None,
             is_error: true,
@@ -2384,7 +2431,7 @@ mod tests {
                     agent.name
                 );
                 let selected = cli.enabled_tools(&config);
-                let registry = if cli.builtin_tools_disabled() {
+                let registry = if cli.builtin_tools_disabled(&config) {
                     crate::tools::ToolRegistry::without_builtins(Some(&config))
                 } else {
                     crate::tools::ToolRegistry::with_builtin_tool_policy(
@@ -2395,7 +2442,7 @@ mod tests {
                         None,
                         false,
                         None,
-                        !cli.no_implicit_tools,
+                        cli.implicit_tools_allowed(&config),
                     )
                 };
                 let mut expected = agent
@@ -2547,6 +2594,109 @@ mod tests {
         invalid.data = Some(json!({"verdict": "pass"}));
         base.render_previous_result(Some(&invalid)).unwrap();
         assert!(base.task.contains("{{previous.data.verdict}}"));
+    }
+
+    #[test]
+    fn chain_substitutions_keep_predecessor_template_syntax_literal() {
+        let data = json!({
+            "value": "{{previous.data.number}} {previous}",
+            "number": 7,
+            "nested": {"text": "{{previous.data.number}}"},
+            "open": "{{"
+        });
+        let raw = "source: {previous} {{previous.data.number}} {{previous.data.";
+        let template =
+            "raw=[{previous}] value=[{{previous.data.value}}] nested=[{{previous.data.nested}}]";
+        assert_eq!(
+            render_chain_template(template, raw, Some(&data), 4096).unwrap(),
+            format!(
+                "raw=[{raw}] value=[{}] nested=[{}]",
+                data["value"].as_str().unwrap(),
+                data["nested"]
+            )
+        );
+        // Tokens assembled across substitution boundaries are also data.
+        assert_eq!(
+            render_chain_template("{previous}previous.data.number}}", "{{", Some(&data), 4096)
+                .unwrap(),
+            "{{previous.data.number}}"
+        );
+        assert_eq!(
+            render_chain_template(
+                "{{previous.data.open}}previous.data.number}}",
+                raw,
+                Some(&data),
+                4096,
+            )
+            .unwrap(),
+            "{{previous.data.number}}"
+        );
+    }
+
+    #[test]
+    fn chain_template_bounds_final_utf8_bytes_and_preserves_unresolved_tokens() {
+        let data = json!({"value": "雪", "missing": null});
+        let template = "{previous}{{previous.data.value}}";
+        assert_eq!(
+            render_chain_template(template, "雪", Some(&data), 6).unwrap(),
+            "雪雪"
+        );
+        assert_eq!(
+            render_chain_template(template, "雪", Some(&data), 5),
+            Err(CHAIN_TASK_LIMIT)
+        );
+        assert_eq!(
+            render_chain_template("雪雪", "unused", None, 5),
+            Err(CHAIN_TASK_LIMIT)
+        );
+        assert_eq!(
+            render_chain_template("{previous}".repeat(10).as_str(), "雪", None, 29),
+            Err(CHAIN_TASK_LIMIT)
+        );
+        for template in ["{{previous.data.absent}}", "{{previous.data.missing}}"] {
+            assert_eq!(
+                render_chain_template(template, "unused", Some(&data), 4096).unwrap(),
+                template
+            );
+        }
+        assert_eq!(
+            render_chain_template(
+                "{{previous.data.unclosed {previous}",
+                "literal",
+                Some(&data),
+                4096,
+            )
+            .unwrap(),
+            "{{previous.data.unclosed literal"
+        );
+    }
+
+    #[test]
+    fn closed_chain_field_candidates_are_atomic_with_or_without_schema_data() {
+        let data = json!({"value": "selected"});
+        for data in [Some(&data), None] {
+            for template in [
+                "{{previous.data.absent {previous}}}",
+                "{{previous.data.absent {{previous.data.value}}}}",
+            ] {
+                assert_eq!(
+                    render_chain_template(template, "raw evidence", data, 4096).unwrap(),
+                    template
+                );
+            }
+            // An unclosed candidate cannot consume a later raw token. The
+            // grammar is the same before and after a schema-valid result.
+            assert_eq!(
+                render_chain_template(
+                    "{{previous.data.unclosed {previous}",
+                    "raw evidence",
+                    data,
+                    4096,
+                )
+                .unwrap(),
+                "{{previous.data.unclosed raw evidence"
+            );
+        }
     }
 
     /// bd-cv653.5.1: JSON extraction tolerates prose/fence wrapping, and

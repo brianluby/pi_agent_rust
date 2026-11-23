@@ -96,6 +96,63 @@ tool JSON Schema. For `tasks`/`chain`, workspace options must be placed on each
 entry; top-level options are rejected rather than ignored or broadcast. These
 checks do not add path confinement or change authored-agent discovery roots.
 
+### Additional workspace roots
+
+Native delegation inherits the additional directories admitted through
+`--add-dir`, `/add-dir`, or the owning SDK `WorkspaceHandle`. This applies to
+single calls, parallel and chained calls, workflows, background delegation,
+retained workers and pools, `/tan`, schema retries, and explicit hub revival.
+SDK tools built independently of a session can attach their live handle with
+`SubagentTool::with_workspace`.
+
+Each request captures its grants when admitted. Adding another directory later
+does not widen queued work or an existing worker. Removing an inherited root
+refuses subsequent launches and revival, stops affected running or idle
+children at the next native control checkpoint, and prevents pending isolated
+writeback. Removing and re-adding the same path creates a new grant; it cannot
+reactivate an old child. Effects already performed are retained.
+
+For an unisolated child, the added directories retain their original paths.
+For a worktree-isolated child, directories inside the source repository map
+into the captured checkout. Roots outside that repository, including ancestor
+directories, are excluded. A directory missing from the capture, such as an
+empty or ignored-only directory, is also excluded. A mapped symlink that
+escapes the captured checkout refuses the launch. No additional-root grant
+points an isolated child back at the live source checkout or a live sibling
+repository.
+
+The child receives a host-generated description of these path mappings and
+exclusions. Result entries expose the same information under `workspaceRoots`:
+
+```json
+{
+  "schema": "pi.subagent.workspace.v1",
+  "inherited": [],
+  "mapped": [{"source": "/work/project/library", "path": "/tmp/pi-iso-run/library"}],
+  "excluded": [{"source": "/work/other-project", "reason": "outside_isolated_repository"}]
+}
+```
+
+Retained worker snapshots also expose `workspaceRoots`; pool snapshots include
+it in each `workerWorkspaces` entry. `TanCompletion.workspace_roots` carries
+the same optional description. These fields describe access and do not grant
+authority to a later invocation.
+
+Filesystem access does not grant workspace trust or load instructions,
+settings, skills, extensions, or agent profiles from the added directories.
+The parent's privacy policy screens the complete mapping before it enters the
+child's instructions; a mapping that would be redacted is refused rather than
+converted into different executable paths. SDK callers using a borrowed
+`execute_with_auxiliary_privacy` callback must use `execute_with_invocation`
+with an owned policy, or ordinary `execute`, when delegating additional roots.
+
+Native children receive the roots through one private bounded manifest,
+retained until their process is retired. Root count does not expand the
+command line. A launch supports at most 128 additional roots and a 256 KiB
+encoded manifest; malformed, noncanonical, unavailable, or unrepresentable
+root paths fail before child startup. The child uses the same ordinary root
+validation and native tool confinement as explicit `--add-dir`.
+
 ## Background delegation
 
 Add `"async": true` to a single, `tasks`, `chain`, or `workflow` request to release the
@@ -388,14 +445,23 @@ many items and 64 KiB of combined raw UTF-8 task text. The worker takes the
 available FIFO prefix without waiting for a full group. Pool item IDs, per-item
 privacy snapshots, dependencies, retained results and drain cursors stay separate.
 
-Grouped mode requires a keyed final envelope with exactly one `data` or
+By default, grouped mode requires a keyed final envelope with exactly one `data` or
 `error` result for every supplied worker turn key. The host validates the whole
 envelope after successful terminal completion and the idle barrier before
 accepting data. Malformed envelopes fail all group members; valid per-item
 errors or schema failures preserve successful peers, without retrying work.
 See [grouped result contracts](subagent-worker-schemas.md#group-several-assignments-into-one-child-turn).
-Default pools and standalone workers retain one prompt per item. Grouping does
-not install a child `yield` tool or accept intermediate streamed answers.
+Default pools and standalone workers retain one prompt per item.
+
+Grouped shared-workspace pools can additionally set `yieldResults: true` to
+install a native child `yield` tool. Its correlated receipts can settle each
+item before the physical turn ends, through the same schema, privacy and
+ownership checks as final results. The final envelope covers only unyielded
+keys. Accepted items survive later malformed output, child failure or
+cancellation; physical worker reuse and aggregate completion still wait for
+the final RPC idle barrier. The boolean is frozen at launch, defaults to
+false, requires `maxBatchSize > 1`, and rejects worktree isolation before
+admission. See [early terminal yields](subagent-worker-schemas.md#optional-early-terminal-yields).
 
 ### Native operations and result shapes
 
@@ -403,7 +469,7 @@ All controls use the `subagent` tool with an explicit `operation` field:
 
 | Operation | Fields and behavior |
 | --- | --- |
-| `pool_start` | Requires `agent`; accepts `tasks` (default empty), `concurrency` (default 4), frozen `maxBatchSize` (1–8, default 1), `cwd`, `scope`, `timeoutSeconds`, `isolation: "none" \| "worktree"`, and keep-only `isoApply`. Returns the new identity and admitted item IDs. |
+| `pool_start` | Requires `agent`; accepts `tasks` (default empty), `concurrency` (default 4), frozen `maxBatchSize` (1–8, default 1), frozen `yieldResults` (boolean, default false), `cwd`, `scope`, `timeoutSeconds`, `isolation: "none" \| "worktree"`, and keep-only `isoApply`. Early yields require grouping and shared-workspace execution. Returns the new identity and admitted item IDs. |
 | `pool_push` | Requires `poolId` and a nonempty `tasks` array. Returns all newly admitted item IDs; cannot change launch settings. |
 | `pool_status` | Requires `poolId`. Returns one bounded manifest with status, counts, ordered summaries and result references. |
 | `pool_result` | Requires `poolId` and `itemId`. Adds the selected item's status and full native result to the manifest. |
@@ -415,7 +481,7 @@ All controls use the `subagent` tool with an explicit `operation` field:
 
 Pool status is `open`, `draining`, `completed`, `failed` or `cancelled`.
 `sealed` reports whether further native admission is closed. The manifest
-includes `concurrency`, `maxBatchSize`, `admittedItems`, `queuedItems`,
+includes `concurrency`, `maxBatchSize`, `yieldResults`, `admittedItems`, `queuedItems`,
 `runningItems`, `completedItems`, `failedItems` and `remainingMs`. Failed counts include
 cancelled items. Counts describe logical items, so several running items may
 share one child prompt. Each manifest entry has this shape:
@@ -458,7 +524,7 @@ full results per page:
 The returned `details.schema` is `pi.subagent.pool.drain.v1`. Its `items` are
 `{id, workerIndex, status, result}` records in ascending item order among currently settled
 results. `result` is the full native `ToolOutput`. The page includes pool/job/
-agent identity, pool `status`, `sealed`, `maxBatchSize`, and `admittedItems`,
+agent identity, pool `status`, `sealed`, `maxBatchSize`, `yieldResults`, and `admittedItems`,
 `settledItems` and `pendingItems` counts.
 
 Only advance to `nextCursor` after processing the page:
@@ -570,6 +636,9 @@ runtime's error result rather than a successful aggregate manifest.
   child-process concurrency. Groups retain the same 64 KiB combined task-text
   ceiling and accept at most 32 KiB of keyed final JSON for the entire group.
   It is a launch-only pool option; standalone workers reject it.
+- `yieldResults` permits a separate bounded 32 KiB native receipt per item,
+  followed by a final envelope covering unyielded keys. It never renews a
+  deadline, replays an assignment, or releases a physical worker before idle.
 - Eval's JavaScript and Python `workpool()` helpers additionally cap the entire
   encoded batch request at 256 KiB and validate it before dispatch. Split larger
   submissions across pushes. Each accepted guest batch uses one host call, as

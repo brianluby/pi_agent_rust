@@ -805,8 +805,14 @@ impl Tool for EvalTool {
          Set maxBatchSize in JS or max_batch_size in Python to 1-8 (default 1) \
          to group queued assignments into fewer model turns. This limit is \
          frozen at launch. Grouped items retain separate keyed JSON results, \
-         available after the full turn settles; outputSchema / output_schema \
+         available after the full turn settles by default; outputSchema / output_schema \
          validates each item's data independently. \
+         Grouped shared-workspace pools may set yieldResults:true in JS or \
+         yield_results=True in Python to let children publish terminal item \
+         results early through a native yield tool. This frozen option requires \
+         a group limit above 1 and rejects worktree isolation. Accepted items \
+         survive later child failure; physical reuse and aggregate completion \
+         still wait for the final RPC idle barrier. \
          pool.items retains handles; await pool.peek() or pool.status() returns \
          one bounded summary manifest. Use item.output() or item.wait() for full \
          results. pool.drain({cursor,timeout,maxItems}) in JS or \
@@ -1146,7 +1152,7 @@ mod tests {
             let pid = sysinfo::Pid::from_u32(pid);
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
-                let mut system = sysinfo::System::new();
+                let mut system = sysinfo::System::new().expect("initialize sysinfo");
                 system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
                 if system.process(pid).is_none_or(|process| {
                     index != 0 && cfg!(unix) && process.status() == sysinfo::ProcessStatus::Zombie

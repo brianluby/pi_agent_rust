@@ -47,7 +47,9 @@ pub use crate::agent::{
 pub use crate::agent_cx::AgentCx;
 pub use crate::approval::{ApprovalMode, ApprovalState};
 pub use crate::ask::{AskAnswer, AskResponse};
-pub use crate::compaction::{AutoCompactionMethod, CompactionReader, ResolvedCompactionSettings};
+pub use crate::compaction::{
+    AutoCompactionMethod, CompactionReader, ManualCompactionMode, ResolvedCompactionSettings,
+};
 pub use crate::config::Config;
 pub use crate::error::{Error, Result};
 pub use crate::extension_dispatcher::ExtensionUiHandler;
@@ -4276,6 +4278,23 @@ impl AgentSessionHandle {
             .await
     }
 
+    /// Compact with an explicit policy for this request. Aggressive mode
+    /// halves the keep-recent window without changing automatic settings.
+    /// All modes preserve hooks, source validation and durable installation;
+    /// shake forwards instructions to hooks without a summary model request.
+    pub async fn compact_in_mode_with_abort(
+        &mut self,
+        mode: ManualCompactionMode,
+        instructions: Option<&str>,
+        abort: AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<bool> {
+        let on_event = self.make_combined_callback(on_event);
+        self.session
+            .compact_now_in_mode_with_abort(mode, instructions, &abort, on_event)
+            .await
+    }
+
     /// OMP `/shake`: compaction that drops bulky tool output from the older
     /// span instead of summarizing it with the model (no provider request).
     /// Returns whether it changed the session. Subscribers and the callback
@@ -5178,10 +5197,10 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         // The default registry carries an undo recorder (bd-cv653.3.13) so
         // SDK-driven surfaces (ftui, embedders) can offer /undo //redo too.
         || {
-            if cli.builtin_tools_disabled() {
+            if cli.builtin_tools_disabled(&config) {
                 return ToolRegistry::without_builtins(Some(&config));
             }
-            let mut registry = ToolRegistry::with_workspace_trust(
+            let mut registry = ToolRegistry::with_builtin_tool_policy(
                 &enabled_tools,
                 &cwd,
                 Some(&config),
@@ -5189,6 +5208,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
                 workspace.as_ref(),
                 workspace_trusted,
                 options.workspace_trust_guard.as_ref(),
+                cli.implicit_tools_allowed(&config),
             );
             registry.promote_tools(&cli.explicit_tools());
             registry
@@ -8579,6 +8599,127 @@ printf '{"type":"response","id":"rpc-5","command":"probe","success":true,"data":
         }
     }
 
+    #[test]
+    fn sdk_default_tools_reloads_as_a_builtin_ceiling() {
+        let mut settings = serde_json::json!({
+            "defaultTools": ["read"],
+            "tools": {
+                "enableEval": true,
+                "enableGithub": true,
+                "enableSecurityScan": true,
+                "enableSubagent": true,
+                "loadMode": { "write": "off" }
+            },
+            "browser": { "enableBrowser": true },
+            "computer": { "enableComputer": true },
+            "media": { "enableMedia": true, "enableReadMedia": true },
+            "memory": { "backend": "local" }
+        });
+        let (_tmp, options) = guarded_settings_fixture(true, &settings.to_string(), "{}");
+        let settings_path = options
+            .workspace_trust_guard
+            .as_ref()
+            .expect("fixture admission")
+            .global_dir()
+            .join("settings.json");
+        let cases: &[(&[&str], &[&str])] = &[
+            (&[" read ", "ast_grep", "read"], &["ast_grep", "read"]),
+            (&[], &[]),
+            (&["read", "write"], &["read"]),
+            (&["eval", "todo"], &["eval", "todo"]),
+            (&[" ", ""], &[]),
+        ];
+        for &(configured, expected) in cases {
+            settings["defaultTools"] = serde_json::json!(configured);
+            std::fs::write(&settings_path, settings.to_string()).expect("update global tools");
+            let handle = run_async(create_agent_session(options.clone()))
+                .expect("rebuild session with current defaultTools");
+            let registry = handle.session().agent.shared_tools().snapshot();
+            let mut actual = registry
+                .tools()
+                .iter()
+                .map(|tool| tool.name())
+                .filter(|name| *name != "xdev")
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "configured={configured:?}");
+            assert!(
+                registry
+                    .discoverable_index()
+                    .iter()
+                    .all(|(name, _)| expected.contains(&name.as_str())),
+                "excluded tools must not be callable through xdev"
+            );
+            if expected.is_empty() {
+                assert!(registry.builtins_disabled());
+                assert!(registry.tools().is_empty());
+            }
+            assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+        }
+    }
+
+    #[test]
+    fn sdk_explicit_tool_selection_overrides_default_tools() {
+        for selected in [vec!["read".to_string()], Vec::new()] {
+            let (_tmp, mut options) = guarded_settings_fixture(
+                true,
+                r#"{
+                    "defaultTools":["eval"],
+                    "tools":{"enableGithub":true},
+                    "media":{"enableMedia":true}
+                }"#,
+                "{}",
+            );
+            options.enabled_tools = Some(selected.clone());
+            let handle = run_async(create_agent_session(options))
+                .expect("explicit SDK selection overrides settings");
+            assert!(!handle.has_tool("eval"));
+            assert!(!handle.has_tool("github"));
+            assert_eq!(handle.has_tool("read"), !selected.is_empty());
+            // An explicit SDK list keeps its existing automatic-tool policy;
+            // defaultTools must not silently turn it into a strict factory.
+            assert_session_media_tools(
+                &handle,
+                if selected.is_empty() {
+                    &[]
+                } else {
+                    &["inspect_image", "generate_image", "tts"]
+                },
+            );
+            if selected.is_empty() {
+                assert!(
+                    handle
+                        .session()
+                        .agent
+                        .shared_tools()
+                        .snapshot()
+                        .tools()
+                        .is_empty()
+                );
+            }
+            assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+        }
+    }
+
+    #[test]
+    fn sdk_project_default_tools_follow_workspace_admission() {
+        for trusted in [false, true] {
+            let (_tmp, options) = guarded_settings_fixture(
+                trusted,
+                r#"{"defaultTools":["read"],"browser":{"enableBrowser":true}}"#,
+                r#"{"default_tools":["bash","eval"]}"#,
+            );
+            let handle = run_async(create_agent_session(options))
+                .expect("resolve admitted project tool selection");
+            assert_eq!(handle.has_tool("read"), !trusted);
+            assert_eq!(handle.has_tool("bash"), trusted);
+            assert_eq!(handle.has_tool("eval"), trusted);
+            assert!(!handle.has_tool("browser"));
+            assert!(!handle.has_tool("manage_skill"));
+            assert!(run_async(handle.shutdown_owned_resources()).completed_cleanly());
+        }
+    }
+
     fn assert_session_media_tools(handle: &AgentSessionHandle, expected: &[&str]) {
         let registry = handle.session().agent.shared_tools().snapshot();
         let discoverable = registry.discoverable_index();
@@ -9226,7 +9367,7 @@ printf sdk-owned-command-key
             "credential helper root must be reaped before the call settles"
         );
         let child = sysinfo::Pid::from_u32(read_pid("credential-child.pid"));
-        let mut processes = sysinfo::System::new();
+        let mut processes = sysinfo::System::new().expect("initialize sysinfo");
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             processes.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[child]), true);

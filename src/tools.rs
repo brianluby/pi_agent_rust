@@ -18487,7 +18487,9 @@ mod win_job {
             return;
         }
         let pids: Vec<sysinfo::Pid> = map.keys().map(|&pid| sysinfo::Pid::from_u32(pid)).collect();
-        let mut sys = sysinfo::System::new();
+        let Ok(mut sys) = sysinfo::System::new() else {
+            return;
+        };
         sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
         let dead: Vec<u32> = pids
             .iter()
@@ -18778,19 +18780,21 @@ fn kill_process_tree_with(pid: Option<u32>, signal: sysinfo::Signal, include_pro
 
     let root = sysinfo::Pid::from_u32(pid);
 
-    let mut sys = sysinfo::System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-
-    let mut children_map: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
-    for (p, proc_) in sys.processes() {
-        if let Some(parent) = proc_.parent() {
-            children_map.entry(parent).or_default().push(*p);
-        }
-    }
-
+    let mut sys = sysinfo::System::new().ok();
     let mut to_kill = Vec::new();
-    let mut visited = std::collections::HashSet::new();
-    collect_process_tree(root, &children_map, &mut to_kill, &mut visited);
+    if let Some(sys) = sys.as_mut() {
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+        let mut children_map: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
+        for (p, proc_) in sys.processes() {
+            if let Some(parent) = proc_.parent() {
+                children_map.entry(parent).or_default().push(*p);
+            }
+        }
+
+        let mut visited = std::collections::HashSet::new();
+        collect_process_tree(root, &children_map, &mut to_kill, &mut visited);
+    }
 
     if include_process_group {
         // Some subprocess surfaces isolate the child into its own process group.
@@ -18813,12 +18817,14 @@ fn kill_process_tree_with(pid: Option<u32>, signal: sysinfo::Signal, include_pro
     }
 
     // Kill children first.
-    for pid in to_kill.into_iter().rev() {
-        if let Some(proc_) = sys.process(pid) {
-            match proc_.kill_with(signal) {
-                Some(true) => {}
-                Some(false) | None => {
-                    let _ = proc_.kill();
+    if let Some(sys) = sys.as_ref() {
+        for pid in to_kill.into_iter().rev() {
+            if let Some(proc_) = sys.process(pid) {
+                match proc_.kill_with(signal) {
+                    Some(true) => {}
+                    Some(false) | None => {
+                        let _ = proc_.kill();
+                    }
                 }
             }
         }
@@ -29937,7 +29943,8 @@ mod known_tool_name_tests {
         // `--tools`' own default must not contain a name pi drops.
         use clap::Parser as _;
         let cli = crate::cli::Cli::parse_from(["pi"]);
-        let requested = cli.enabled_tools(&Config::default());
+        let config = Config::default();
+        let requested = cli.enabled_tools(&config);
         assert!(!requested.is_empty(), "the default set should not be empty");
         assert!(
             unknown_tool_names(&requested).is_empty(),

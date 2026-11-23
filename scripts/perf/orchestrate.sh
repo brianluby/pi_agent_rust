@@ -641,10 +641,10 @@ with manifest_path.open("rb") as handle:
 release = manifest.get("profile", {}).get("release", {})
 opt_level = release.get("opt-level")
 strip = release.get("strip")
-if opt_level != "z" or strip is not True:
+if opt_level not in (3, "3") or strip is not True:
     raise SystemExit(
         "release binary measurement control requires Cargo.toml "
-        "[profile.release] opt-level='z' and strip=true"
+        "[profile.release] opt-level=3 and strip=true"
     )
 
 digest = hashlib.sha256()
@@ -664,7 +664,7 @@ payload = {
     "size_bytes": binary_path.stat().st_size,
     "cargo_profile": "release",
     "compiled_profile_family": "release",
-    "compiled_opt_level": "z",
+    "compiled_opt_level": "3",
     "strip": True,
     "profile_source": "Cargo.toml#profile.release",
     "build_command": "cargo build --bin pi --release",
@@ -840,10 +840,10 @@ correlation_id = sys.argv[7]
 
 with manifest_path.open("rb") as handle:
     release = tomllib.load(handle).get("profile", {}).get("release", {})
-if release.get("opt-level") != "z" or release.get("strip") is not True:
+if release.get("opt-level") not in (3, "3") or release.get("strip") is not True:
     raise SystemExit(
         "idle RSS measurement requires Cargo.toml [profile.release] "
-        "opt-level='z' and strip=true"
+        "opt-level=3 and strip=true"
     )
 if source_dirty:
     raise SystemExit("idle RSS release evidence requires source_dirty=false")

@@ -661,13 +661,21 @@ impl ExtensionManager {
             return QuotaCheckResult::Allowed;
         };
 
-        // Resolve quota config: per-extension override > global default.
-        let quota_config = policy
+        // Package-specific configuration may tighten or replace the global
+        // default, but cannot discard a bound on the old filename identity.
+        let exact_quota = policy
             .per_extension
             .get(ext_id)
-            .and_then(|ovr| ovr.quota.as_ref())
+            .and_then(|ovr| ovr.quota.as_ref());
+        let inherited_quota = package_extension_policy_alias(ext_id)
+            .and_then(|alias| policy.per_extension.get(alias))
+            .and_then(|ovr| ovr.quota.as_ref());
+        let mut quota_config = exact_quota
             .cloned()
             .unwrap_or_else(|| guard.quota_config.clone());
+        if let Some(inherited) = inherited_quota {
+            quota_config.restrict_to(inherited);
+        }
 
         let state = guard.quota_states.entry(ext_id.to_string()).or_default();
 
@@ -680,12 +688,7 @@ impl ExtensionManager {
                 extension_id: ext_id.to_string(),
                 capability: capability.to_string(),
                 reason: reason.clone(),
-                quota_config_source: if policy
-                    .per_extension
-                    .get(ext_id)
-                    .and_then(|ovr| ovr.quota.as_ref())
-                    .is_some()
-                {
+                quota_config_source: if exact_quota.is_some() || inherited_quota.is_some() {
                     "per_extension"
                 } else {
                     "global"
@@ -2468,6 +2471,9 @@ impl ExtensionManager {
     /// Check if the reactor mesh is enabled.
     #[must_use]
     pub fn hostcall_reactor_enabled(&self) -> bool {
+        if !HostcallReactorMesh::any_active() {
+            return false;
+        }
         self.inner
             .lock()
             .is_ok_and(|guard| guard.hostcall_reactor.is_some())
@@ -2484,6 +2490,9 @@ impl ExtensionManager {
         opcode: CommonHostcallOpcode,
         params: Value,
     ) -> Option<std::result::Result<HostcallReactorRequest, HostcallReactorBackpressure>> {
+        if !HostcallReactorMesh::any_active() {
+            return None;
+        }
         let mut guard = self.inner.lock().ok()?;
         let reactor = guard.hostcall_reactor.as_mut()?;
         let result = reactor.submit(call_id, opcode, params);
@@ -2491,8 +2500,36 @@ impl ExtensionManager {
         Some(result)
     }
 
+    /// Submit a fast-lane hostcall without allocating or locking when no reactor is active.
+    ///
+    /// Checks the process-wide RAII active counter first, and even when another
+    /// manager has a reactor enabled, confirms `self.inner.hostcall_reactor.is_some()`
+    /// before cloning `call_id` or stripping `"op"` from `params`.
+    pub(crate) fn reactor_submit_lazy(
+        &self,
+        call_id: &str,
+        opcode: CommonHostcallOpcode,
+        params: &Value,
+    ) -> Option<std::result::Result<HostcallReactorRequest, HostcallReactorBackpressure>> {
+        if !HostcallReactorMesh::any_active() {
+            return None;
+        }
+        let mut guard = self.inner.lock().ok()?;
+        let reactor = guard.hostcall_reactor.as_mut()?;
+        let result = reactor.submit(
+            call_id.to_string(),
+            opcode,
+            params_without_key(params, "op"),
+        );
+        drop(guard);
+        Some(result)
+    }
+
     /// Record completion for a fast-lane hostcall that was dispatched directly.
     pub(crate) fn reactor_record_completion(&self, shard_id: usize, global_seq: u64) -> bool {
+        if !HostcallReactorMesh::any_active() {
+            return false;
+        }
         self.inner
             .lock()
             .ok()
@@ -2525,6 +2562,9 @@ impl ExtensionManager {
         shard_id: usize,
         budget: usize,
     ) -> Vec<HostcallReactorRequest> {
+        if !HostcallReactorMesh::any_active() {
+            return Vec::new();
+        }
         self.inner
             .lock()
             .ok()
@@ -2539,6 +2579,9 @@ impl ExtensionManager {
 
     /// Drain pending requests in deterministic global sequence order.
     pub fn reactor_drain_global(&self, budget: usize) -> Vec<HostcallReactorRequest> {
+        if !HostcallReactorMesh::any_active() {
+            return Vec::new();
+        }
         self.inner
             .lock()
             .ok()
@@ -2554,6 +2597,9 @@ impl ExtensionManager {
     /// Get reactor mesh telemetry snapshot.
     #[must_use]
     pub fn reactor_telemetry(&self) -> Option<HostcallReactorTelemetry> {
+        if !HostcallReactorMesh::any_active() {
+            return None;
+        }
         self.inner.lock().ok().and_then(|guard| {
             guard
                 .hostcall_reactor
@@ -3152,7 +3198,7 @@ impl ExtensionManager {
         extension_id: &str,
         capability: &str,
     ) -> Option<bool> {
-        let (decision, extension_version) = {
+        let (decision, inherited, extension_version) = {
             let guard = self
                 .inner
                 .lock()
@@ -3162,20 +3208,29 @@ impl ExtensionManager {
                 .get(extension_id)
                 .and_then(|by_cap| by_cap.get(capability))
                 .cloned();
+            let inherited = package_extension_policy_alias(extension_id)
+                .and_then(|alias| guard.policy_prompt_cache.get(alias))
+                .and_then(|by_cap| by_cap.get(capability))
+                .filter(|decision| !decision.allow)
+                .cloned();
             let extension_version = guard.extension_versions.get(extension_id).cloned();
             drop(guard);
-            (decision, extension_version)
+            (decision, inherited, extension_version)
         };
-        let dec = decision?;
-
-        if let Some(range) = &dec.version_range {
-            let version = extension_version?;
-            if !check_version_constraint(&version, range) {
-                return None;
-            }
+        let applies = |decision: &PersistedDecision| {
+            decision.version_range.as_ref().is_none_or(|range| {
+                extension_version
+                    .as_ref()
+                    .is_some_and(|version| check_version_constraint(version, range))
+            })
+        };
+        // A saved filename denial remains restrictive for both newly named
+        // packages, while a saved filename allow never crosses that boundary.
+        // Version-scoped decisions retain their original applicability rules.
+        if inherited.as_ref().is_some_and(applies) {
+            return Some(false);
         }
-
-        Some(dec.allow)
+        decision.filter(applies).map(|decision| decision.allow)
     }
 
     /// Cache using the manager's default persistence scope.
