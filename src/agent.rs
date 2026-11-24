@@ -1891,6 +1891,47 @@ impl AbortSignal {
     }
 }
 
+/// Keep both cancellation sources live while a provider is silent. Receiving
+/// on an unsent channel subscribes to owner cancellation without spawning a
+/// task; the timer also observes budgets that expire without a notification.
+/// An optional UI abort signal never replaces the invoking owner's lifetime.
+async fn wait_for_provider_cancellation(
+    owner: &crate::agent_cx::AgentCx,
+    abort: Option<&AbortSignal>,
+) {
+    let owner_cancelled = async {
+        let (sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+        let _ = receiver.recv(owner.cx()).await;
+        drop(sender);
+    }
+    .fuse();
+    let explicit_abort = async {
+        if let Some(signal) = abort {
+            signal.wait().await;
+        } else {
+            futures::future::pending::<()>().await;
+        }
+    }
+    .fuse();
+    futures::pin_mut!(owner_cancelled, explicit_abort);
+    let cancelled = futures::future::select(owner_cancelled, explicit_abort).fuse();
+    futures::pin_mut!(cancelled);
+    let time = owner.time();
+    loop {
+        if owner.checkpoint().is_err() || abort.is_some_and(AbortSignal::is_aborted) {
+            return;
+        }
+        let tick = time.sleep(Duration::from_millis(25)).fuse();
+        futures::pin_mut!(tick);
+        if matches!(
+            futures::future::select(cancelled.as_mut(), tick).await,
+            futures::future::Either::Left(_)
+        ) {
+            return;
+        }
+    }
+}
+
 /// Compaction window for a model entry, with a reported zero treated as
 /// "unknown" rather than "no room".
 ///
@@ -2110,6 +2151,11 @@ pub struct Agent {
     /// message index it has not received.
     turn_checkpoint: Option<TurnCheckpoint>,
     turn_checkpoint_cursor: usize,
+
+    /// Tool dispatch may have effects before the owning Session receives the
+    /// complete result span. Shared with the native turn's drop guard so an
+    /// abandoned future cannot rehydrate an older history and replay the work.
+    unpersisted_tool_effects: Arc<AtomicBool>,
 
     /// Fetchers for queued steering messages (interrupts).
     steering_fetchers: Vec<RegisteredMessageFetcher>,
@@ -2386,6 +2432,7 @@ impl Agent {
             authored_queue_delivery_indices: Vec::new(),
             turn_checkpoint: None,
             turn_checkpoint_cursor: 0,
+            unpersisted_tool_effects: Arc::new(AtomicBool::new(false)),
             steering_fetchers: Vec::new(),
             initial_follow_up_fetcher: None,
             follow_up_fetchers: Vec::new(),
@@ -2833,6 +2880,10 @@ impl Agent {
         self.turn_checkpoint_cursor = end;
         self.authored_queue_delivery_indices
             .retain(|index| *index >= end);
+        if end == self.messages.len() {
+            self.unpersisted_tool_effects
+                .store(false, Ordering::Release);
+        }
     }
 
     /// Add a message to the history.
@@ -4774,6 +4825,7 @@ impl Agent {
                             &mut new_messages,
                             abort.clone(),
                             Arc::clone(&turn_latency),
+                            compatible_tool_parallelism_limit(),
                         )
                         .await
                     {
@@ -5529,36 +5581,39 @@ impl Agent {
         }
 
         let request_started_at = Instant::now();
-        let stream_fut = provider.stream(&context, &stream_options);
-        let mut stream = if let Some(signal) = abort.as_ref() {
-            let abort_fut = signal.wait().fuse();
-            let stream_fut = stream_fut.fuse();
-            futures::pin_mut!(abort_fut, stream_fut);
-            match futures::future::select(abort_fut, stream_fut).await {
-                futures::future::Either::Left(((), _)) => {
-                    let abort_arc = Arc::new(self.build_abort_message(None));
-                    on_event(AgentEvent::MessageStart {
-                        message: Message::Assistant(Arc::clone(&abort_arc)),
-                    });
-                    self.messages
-                        .push(Message::Assistant(Arc::clone(&abort_arc)));
-                    on_event(AgentEvent::MessageUpdate {
-                        message: Message::Assistant(Arc::clone(&abort_arc)),
-                        assistant_message_event: AssistantMessageEvent::Error {
-                            reason: StopReason::Aborted,
-                            error: Arc::clone(&abort_arc),
-                        },
-                    });
-                    return Ok(self.finalize_assistant_message(
-                        Arc::try_unwrap(abort_arc).unwrap_or_else(|a| (*a).clone()),
-                        &on_event,
-                        true,
-                    ));
-                }
-                futures::future::Either::Right((res, _)) => res?,
+        let cancelled = wait_for_provider_cancellation(checkpoint_cx, abort.as_ref()).fuse();
+        let stream_fut = provider.stream(&context, &stream_options).fuse();
+        futures::pin_mut!(cancelled, stream_fut);
+        let mut stream = match futures::future::select(cancelled.as_mut(), stream_fut).await {
+            // The provider poll may itself request cancellation before
+            // returning, including while producing an opening error. Recheck
+            // after that poll before interpreting its result as a failure.
+            futures::future::Either::Right((res, _))
+                if checkpoint_cx.checkpoint().is_ok()
+                    && !abort.as_ref().is_some_and(AbortSignal::is_aborted) =>
+            {
+                res?
             }
-        } else {
-            stream_fut.await?
+            _ => {
+                let abort_arc = Arc::new(self.build_abort_message(None));
+                on_event(AgentEvent::MessageStart {
+                    message: Message::Assistant(Arc::clone(&abort_arc)),
+                });
+                self.messages
+                    .push(Message::Assistant(Arc::clone(&abort_arc)));
+                on_event(AgentEvent::MessageUpdate {
+                    message: Message::Assistant(Arc::clone(&abort_arc)),
+                    assistant_message_event: AssistantMessageEvent::Error {
+                        reason: StopReason::Aborted,
+                        error: Arc::clone(&abort_arc),
+                    },
+                });
+                return Ok(self.finalize_assistant_message(
+                    Arc::try_unwrap(abort_arc).unwrap_or_else(|a| (*a).clone()),
+                    &on_event,
+                    true,
+                ));
+            }
         };
 
         let mut added_partial = false;
@@ -5617,12 +5672,11 @@ impl Agent {
                 ));
             }
 
-            let event_result = if let Some(signal) = abort.as_ref() {
-                let abort_fut = signal.wait().fuse();
+            let event_result = {
                 let event_fut = stream.next().fuse();
-                futures::pin_mut!(abort_fut, event_fut);
+                futures::pin_mut!(event_fut);
 
-                match futures::future::select(abort_fut, event_fut).await {
+                match futures::future::select(cancelled.as_mut(), event_fut).await {
                     futures::future::Either::Left(((), _event_fut)) => {
                         let last_partial = if added_partial {
                             match self
@@ -5664,28 +5718,16 @@ impl Agent {
                     }
                     futures::future::Either::Right((event, _abort_fut)) => event,
                 }
-            } else {
-                let event_fut = stream.next().fuse();
-                futures::pin_mut!(event_fut);
-                loop {
-                    let now = checkpoint_cx
-                        .cx()
-                        .timer_driver()
-                        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-                    let tick_fut =
-                        asupersync::time::sleep(now, std::time::Duration::from_millis(25)).fuse();
-                    futures::pin_mut!(tick_fut);
-
-                    match futures::future::select(tick_fut, &mut event_fut).await {
-                        futures::future::Either::Left(((), _event_fut)) => {
-                            if checkpoint_cx.checkpoint().is_err() {
-                                continue 'stream;
-                            }
-                        }
-                        futures::future::Either::Right((result, _tick_fut)) => break result,
-                    }
-                }
             };
+
+            // Cancellation can occur inside the provider poll that returns
+            // EOF or an error. It takes precedence before either outcome is
+            // consumed, just as it does for a successfully decoded event.
+            if checkpoint_cx.checkpoint().is_err()
+                || abort.as_ref().is_some_and(AbortSignal::is_aborted)
+            {
+                continue 'stream;
+            }
 
             let Some(event_result) = event_result else {
                 break;
@@ -5715,11 +5757,6 @@ impl Agent {
                 }
             };
 
-            if checkpoint_cx.checkpoint().is_err()
-                || abort.as_ref().is_some_and(AbortSignal::is_aborted)
-            {
-                continue 'stream;
-            }
             if let Some((rule, retry)) = self.stream_rule_interruption(&event) {
                 let partial = match &event {
                     StreamEvent::Start { partial } => Some(partial),
@@ -6418,12 +6455,22 @@ impl Agent {
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
         latency: SharedTurnLatencyAccumulator,
+        parallelism: usize,
     ) -> Vec<(usize, (ToolOutput, bool))> {
-        let parallelism = compatible_tool_parallelism_limit();
+        // Classification precedes secret restoration and policy callbacks.
+        // Calls sharing an execution slot with peers must remain read/network
+        // only at admission, even when a callback replaces their tool handle.
+        let parallel_only = batch.len() > 1 && parallelism > 1;
         let futures = batch.into_iter().map(|(idx, tc)| {
             let on_event = Arc::clone(&on_event);
             let latency = Arc::clone(&latency);
-            async move { (idx, self.execute_tool_owned(tc, on_event, latency).await) }
+            async move {
+                (
+                    idx,
+                    self.execute_tool_in_session(tc, on_event, latency, None, parallel_only)
+                        .await,
+                )
+            }
         });
 
         if let Some(signal) = abort.as_ref() {
@@ -6463,7 +6510,13 @@ impl Agent {
         new_messages: &mut Vec<Message>,
         abort: Option<AbortSignal>,
         latency: SharedTurnLatencyAccumulator,
+        parallelism: usize,
     ) -> Result<ToolExecutionOutcome> {
+        // Arm before callbacks as well as dispatch: either may unwind, and a
+        // later compatible-effect batch can be pending after an earlier write.
+        if !tool_calls.is_empty() {
+            self.unpersisted_tool_effects.store(true, Ordering::Release);
+        }
         // A cancelled/abandoned batch must never donate evidence to a later
         // request. Nested host calls contribute only while this batch runs.
         self.take_prewalk_evidence();
@@ -6521,6 +6574,7 @@ impl Agent {
                     Arc::clone(&on_event),
                     abort.clone(),
                     Arc::clone(&latency),
+                    parallelism,
                 )
                 .await;
             batch_results.sort_by_key(|(idx, _)| *idx);
@@ -6739,7 +6793,10 @@ impl Agent {
         // A batch plan was made before secret restoration and policy awaits.
         // Never run a reclassified mutation or ordered call beside its peers.
         if parallel_only && !self.effects_for_call(&tool_call).parallel_safe() {
-            return (Self::parallel_tool_admission_changed(), true);
+            return (
+                Self::parallel_tool_admission_changed(expected_session),
+                true,
+            );
         }
 
         // Resolve before any policy await: an invalid route must not acquire
@@ -7129,15 +7186,6 @@ impl Agent {
         }
     }
 
-    async fn execute_tool_owned(
-        &self,
-        tool_call: ToolCall,
-        on_event: AgentEventHandler,
-        latency: SharedTurnLatencyAccumulator,
-    ) -> (ToolOutput, bool) {
-        self.execute_tool(tool_call, on_event, latency).await
-    }
-
     /// Resolve only an admitted xdev execution route. The same resolver runs
     /// before policy callbacks and against the executor's current snapshot.
     fn resolve_xdev_run(
@@ -7200,6 +7248,8 @@ impl Agent {
         &self,
         tool_call: &ToolCall,
         on_event: AgentEventHandler,
+        expected_session: Option<&str>,
+        parallel_only: bool,
     ) -> Option<ToolOutput> {
         // The dispatcher must itself be mounted. Keep the same snapshot for
         // its target so a disabled xdev cannot execute or promote other tools.
@@ -7218,6 +7268,12 @@ impl Agent {
                     return Some(Self::tool_not_found_output(&inner_call.name));
                 };
                 let inner_args = &inner_call.arguments;
+                // Retain the same handle for this check and execution. A
+                // policy await may have replaced the previously read-only
+                // discovery target with an ordered or mutating tool.
+                if parallel_only && !inner.effects_for_input(inner_args).parallel_safe() {
+                    return Some(Self::parallel_tool_admission_changed(expected_session));
+                }
                 let protect = |parts: &[&str]| {
                     let privacy = crate::text_completion::AuxiliaryPrivacy::from_settings(
                         self.config.secrets.as_ref(),
@@ -7240,13 +7296,23 @@ impl Agent {
                         None,
                         crate::tools::ToolInvocationContext {
                             protect: &protect,
-                            host: Some(&host),
+                            host: if expected_session.is_none() {
+                                Some(&host)
+                            } else {
+                                None
+                            },
                             snapshot_privacy: &snapshot_privacy,
                         },
                     )
                     .await
                     .unwrap_or_else(|err| Self::xdev_text_output(&err.to_string(), true));
-                self.record_prewalk_evidence(inner, inner_args, &output);
+                if self
+                    .check_invocation_session(expected_session)
+                    .await
+                    .is_ok()
+                {
+                    self.record_prewalk_evidence(inner, inner_args, &output);
+                }
                 Some(output)
             }
             "promote" => {
@@ -7387,7 +7453,14 @@ impl Agent {
         // run/promote actions. The policy pipeline has already admitted both
         // the dispatcher and the resolved target; this lookup rechecks routing.
         if tool_call.name == "xdev"
-            && let Some(output) = self.dispatch_xdev(tool_call, Arc::clone(&on_event)).await
+            && let Some(output) = self
+                .dispatch_xdev(
+                    tool_call,
+                    Arc::clone(&on_event),
+                    expected_session,
+                    parallel_only,
+                )
+                .await
         {
             let is_error = output.is_error;
             return (output, is_error);
@@ -7461,7 +7534,10 @@ impl Agent {
         // is no await between this check and execution; replacing the registry
         // cannot swap in a writer after the check.
         if parallel_only && !tool.effects_for_input(&tool_call.arguments).parallel_safe() {
-            return (Self::parallel_tool_admission_changed(), true);
+            return (
+                Self::parallel_tool_admission_changed(expected_session),
+                true,
+            );
         }
         let outcome = tool
             .execute_with_invocation(
@@ -7504,9 +7580,16 @@ impl Agent {
         }
     }
 
-    fn parallel_tool_admission_changed() -> ToolOutput {
+    fn parallel_tool_admission_changed(expected_session: Option<&str>) -> ToolOutput {
+        let code = if expected_session.is_some() {
+            "EVAL_BRIDGE_EFFECTS_CHANGED"
+        } else {
+            "TOOL_BATCH_EFFECTS_CHANGED"
+        };
         Self::xdev_text_output(
-            "EVAL_BRIDGE_EFFECTS_CHANGED: tool is no longer safe for parallel execution; submit it in a new batch or call it individually",
+            &format!(
+                "{code}: tool is no longer safe for parallel execution; submit it in a new batch or call it individually"
+            ),
             true,
         )
     }
@@ -8078,6 +8161,9 @@ pub(crate) fn append_advisor_input_reset(
 struct AdvisorTurn {
     on_event: AgentEventHandler,
     terminal: Option<Arc<StdMutex<Option<AgentEvent>>>>,
+    unpersisted_tool_effects: Arc<AtomicBool>,
+    admission: ProviderAdmissionGate,
+    cost_budget: Option<crate::cost::CostBudget>,
     started: Instant,
     max_time: Option<Duration>,
 }
@@ -8090,6 +8176,9 @@ impl AdvisorTurn {
                 .advisor
                 .as_ref()
                 .map(|_| Arc::new(StdMutex::new(None))),
+            unpersisted_tool_effects: Arc::clone(&session.agent.unpersisted_tool_effects),
+            admission: session.provider_admission.clone(),
+            cost_budget: session.agent.cost_budget().cloned(),
             started: session
                 .agent
                 .run_budget
@@ -8179,6 +8268,21 @@ impl AdvisorTurn {
 
 impl Drop for AdvisorTurn {
     fn drop(&mut self) {
+        if self.unpersisted_tool_effects.load(Ordering::Acquire) {
+            let message = "PI_NATIVE_TOOL_TURN_INTERRUPTED: tool execution was interrupted before its results reached Session persistence";
+            let mut reason = self
+                .admission
+                .reason
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reason.get_or_insert_with(|| message.to_string());
+            drop(reason);
+            // Retained tools share the account without consulting Session
+            // admission. Existing owned requests may still settle their bills.
+            if let Some(budget) = &self.cost_budget {
+                budget.quarantine(message);
+            }
+        }
         let Some(terminal) = &self.terminal else {
             return;
         };
@@ -10739,7 +10843,7 @@ mod extensions_integration_tests {
     use std::time::{Duration, Instant};
 
     async fn wait_for_session_action_generation_capture(gate: &SessionActionAdmissionGate) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while gate.pending_generation_check_count() == 0 {
             assert!(
                 Instant::now() < deadline,
@@ -10750,7 +10854,7 @@ mod extensions_integration_tests {
     }
 
     async fn wait_for_session_action_generation_release(gate: &SessionActionAdmissionGate) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while gate.pending_generation_check_count() != 0 {
             assert!(
                 Instant::now() < deadline,
@@ -11203,6 +11307,274 @@ mod extensions_integration_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn top_level_batches_recheck_replaced_native_and_xdev_targets_after_approval() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for via_dispatcher in [false, true] {
+                for parallelism in [1, 2] {
+                    let root = tempfile::tempdir().expect("workspace");
+                    std::fs::write(root.path().join("peer.txt"), "unchanged peer")
+                        .expect("peer fixture");
+                    let config: crate::config::Config = serde_json::from_value(json!({
+                        "tools": { "loadMode": { "read": "discoverable" } },
+                    }))
+                    .expect("discovery config");
+                    let tools = ToolRegistry::with_builtin_tool_policy(
+                        &["read", "ls"],
+                        root.path(),
+                        Some(&config),
+                        None,
+                        None,
+                        false,
+                        None,
+                        false,
+                    );
+                    assert!(tools.is_discoverable("read"));
+                    let mut agent =
+                        Agent::new(Arc::new(NoopProvider), tools, AgentConfig::default());
+                    let registry = agent.tools.clone();
+                    let cwd = root.path().to_path_buf();
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let entered = Arc::clone(&calls);
+                    let approvals = Arc::new(StdMutex::new(Vec::new()));
+                    let approved = Arc::clone(&approvals);
+                    let (release, released) = futures::channel::oneshot::channel::<()>();
+                    let pending_approval = Arc::new(StdMutex::new(Some(released)));
+                    agent.config.tool_approval = Some(Arc::new(move |request| {
+                        approved
+                            .lock()
+                            .expect("approvals")
+                            .push(request.tool_call_id.clone());
+                        let pending = if request.tool_call_id == "replaced"
+                            && request.tool_name == "read"
+                        {
+                            pending_approval.lock().expect("pending approval").take()
+                        } else {
+                            None
+                        };
+                        let registry = registry.clone();
+                        let cwd = cwd.clone();
+                        let entered = Arc::clone(&entered);
+                        Box::pin(async move {
+                            if let Some(pending) = pending {
+                                pending.await.expect("release policy callback");
+                                registry.update(|tools| {
+                                    tools.push(Box::new(ReclassifiedNativeTool {
+                                        cwd,
+                                        writes: true,
+                                        calls: entered,
+                                    }));
+                                });
+                            }
+                            ToolApprovalDecision::Allow
+                        })
+                    }));
+                    let arguments = json!({
+                        "path": "result.txt", "content": "native writer ran"
+                    });
+                    let tool_calls = [
+                        ToolCall {
+                            id: "replaced".into(),
+                            name: if via_dispatcher { "xdev" } else { "read" }.into(),
+                            arguments: if via_dispatcher {
+                                json!({ "action": "run", "name": "read", "args": arguments })
+                            } else {
+                                arguments
+                            },
+                            thought_signature: None,
+                        },
+                        ToolCall {
+                            id: "peer".into(),
+                            name: "ls".into(),
+                            arguments: json!({ "path": "." }),
+                            thought_signature: None,
+                        },
+                    ];
+                    assert!(
+                        tool_calls
+                            .iter()
+                            .all(|call| agent.effects_for_call(call).parallel_safe())
+                    );
+                    let events = Arc::new(StdMutex::new(Vec::new()));
+                    let recorded = Arc::clone(&events);
+                    let on_event: AgentEventHandler = Arc::new(move |event| match event {
+                        AgentEvent::ToolExecutionStart { tool_call_id, .. } => recorded
+                            .lock()
+                            .expect("events")
+                            .push(("start", tool_call_id, false)),
+                        AgentEvent::ToolExecutionEnd {
+                            tool_call_id,
+                            is_error,
+                            ..
+                        } => recorded
+                            .lock()
+                            .expect("events")
+                            .push(("end", tool_call_id, is_error)),
+                        _ => {}
+                    });
+                    let mut new_messages = Vec::new();
+                    let mut execution = Box::pin(agent.execute_tool_calls(
+                        &tool_calls,
+                        on_event,
+                        &mut new_messages,
+                        None,
+                        test_turn_latency(),
+                        parallelism,
+                    ));
+                    assert!(futures::poll!(execution.as_mut()).is_pending());
+                    let parallel = parallelism > 1;
+                    assert_eq!(
+                        approvals
+                            .lock()
+                            .expect("approvals")
+                            .iter()
+                            .any(|id| id == "peer"),
+                        parallel,
+                        "a pending policy callback must not serialize compatible peers"
+                    );
+                    release.send(()).expect("release replacement");
+                    let outcome = execution.await.expect("batch outcome");
+                    assert_eq!(outcome.tool_results.len(), 2);
+                    let replaced = &outcome.tool_results[0];
+                    let peer = &outcome.tool_results[1];
+                    assert_eq!(replaced.tool_call_id, "replaced");
+                    assert_eq!(peer.tool_call_id, "peer");
+                    assert_eq!(replaced.is_error, parallel);
+                    assert!(!peer.is_error);
+                    assert!(peer.content.iter().any(|block| {
+                        matches!(block, ContentBlock::Text(text) if text.text.contains("peer.txt"))
+                    }));
+                    if parallel {
+                        assert!(replaced.content.iter().any(|block| {
+                            matches!(block, ContentBlock::Text(text) if text.text.contains("TOOL_BATCH_EFFECTS_CHANGED"))
+                        }));
+                        assert_eq!(calls.load(Ordering::SeqCst), 0);
+                        assert!(!root.path().join("result.txt").exists());
+                    } else {
+                        assert_eq!(calls.load(Ordering::SeqCst), 1);
+                        assert_eq!(
+                            std::fs::read_to_string(root.path().join("result.txt"))
+                                .expect("native output"),
+                            "native writer ran"
+                        );
+                    }
+                    assert_eq!(
+                        *events.lock().expect("events"),
+                        [
+                            ("start", "replaced".to_string(), false),
+                            ("start", "peer".to_string(), false),
+                            ("end", "replaced".to_string(), parallel),
+                            ("end", "peer".to_string(), false),
+                        ]
+                    );
+                    assert_eq!(new_messages.len(), 2);
+                    for (message, result) in new_messages.iter().zip(&outcome.tool_results) {
+                        let Message::ToolResult(recorded) = message else {
+                            panic!("every planned call retains its transcript result");
+                        };
+                        assert!(Arc::ptr_eq(recorded, result));
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn top_level_batches_recheck_secret_restored_resource_effects_before_policy() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for via_dispatcher in [false, true] {
+                let root = tempfile::tempdir().expect("workspace");
+                std::fs::write(root.path().join("peer.txt"), "unchanged peer")
+                    .expect("peer fixture");
+                let config: crate::config::Config = serde_json::from_value(json!({
+                    "tools": { "loadMode": { "grep": "discoverable" } },
+                }))
+                .expect("discovery config");
+                let tools = ToolRegistry::with_builtin_tool_policy(
+                    &["grep", "read"],
+                    root.path(),
+                    Some(&config),
+                    None,
+                    None,
+                    false,
+                    None,
+                    false,
+                );
+                let approvals = Arc::new(StdMutex::new(Vec::new()));
+                let approved = Arc::clone(&approvals);
+                let mut agent = Agent::new(
+                    Arc::new(NoopProvider),
+                    tools,
+                    AgentConfig {
+                        secrets: Some(crate::secrets::SecretsSettings {
+                            extra_patterns: Some(vec![regex::escape("conflict://*")]),
+                            ..crate::secrets::SecretsSettings::default()
+                        }),
+                        tool_approval: Some(Arc::new(move |request| {
+                            approved.lock().expect("approvals").push(request.tool_call_id);
+                            Box::pin(async { ToolApprovalDecision::Allow })
+                        })),
+                        ..AgentConfig::default()
+                    },
+                );
+                let placeholder = agent
+                    .secrets_transform_outbound_text("conflict://*")
+                    .expect("hide configured resource");
+                assert_ne!(placeholder, "conflict://*");
+                let arguments = json!({ "pattern": "needle", "path": placeholder });
+                let tool_calls = [
+                    ToolCall {
+                        id: "restored".into(),
+                        name: if via_dispatcher { "xdev" } else { "grep" }.into(),
+                        arguments: if via_dispatcher {
+                            json!({ "action": "run", "name": "grep", "args": arguments })
+                        } else {
+                            arguments
+                        },
+                        thought_signature: None,
+                    },
+                    ToolCall {
+                        id: "peer".into(),
+                        name: "read".into(),
+                        arguments: json!({ "path": "peer.txt" }),
+                        thought_signature: None,
+                    },
+                ];
+                assert!(agent.effects_for_call(&tool_calls[0]).parallel_safe());
+                let restored = agent
+                    .restore_secrets_inbound(tool_calls[0].clone())
+                    .expect("restore configured resource");
+                assert!(agent.effects_for_call(&restored).processes());
+                let mut new_messages = Vec::new();
+                let outcome = agent
+                    .execute_tool_calls(
+                        &tool_calls,
+                        Arc::new(|_| {}),
+                        &mut new_messages,
+                        None,
+                        test_turn_latency(),
+                        2,
+                    )
+                    .await
+                    .expect("batch outcome");
+                assert_eq!(*approvals.lock().expect("approvals"), ["peer"]);
+                assert_eq!(outcome.tool_results.len(), 2);
+                assert!(outcome.tool_results[0].is_error);
+                assert!(outcome.tool_results[0].content.iter().any(|block| {
+                    matches!(block, ContentBlock::Text(text) if text.text.contains("TOOL_BATCH_EFFECTS_CHANGED"))
+                }));
+                assert!(!outcome.tool_results[1].is_error);
+                assert!(outcome.tool_results[1].content.iter().any(|block| {
+                    matches!(block, ContentBlock::Text(text) if text.text.contains("unchanged peer"))
+                }));
+                assert_eq!(new_messages.len(), 2);
+            }
+        });
     }
 
     #[test]
@@ -11734,7 +12106,7 @@ mod extensions_integration_tests {
                 };
                 let result = session
                     .agent
-                    .dispatch_xdev(&call, Arc::new(|_| {}))
+                    .dispatch_xdev(&call, Arc::new(|_| {}), None, false)
                     .await
                     .expect("native xdev execution");
                 assert!(!result.is_error);
@@ -11749,7 +12121,7 @@ mod extensions_integration_tests {
                 };
                 let result = session
                     .agent
-                    .dispatch_xdev(&promote, Arc::new(|_| {}))
+                    .dispatch_xdev(&promote, Arc::new(|_| {}), None, false)
                     .await
                     .expect("native xdev promotion");
                 assert!(!result.is_error);
@@ -15800,15 +16172,17 @@ mod extensions_integration_tests {
 
                 let delayed_manager = extension_manager.clone();
                 let hostcall = runtime_handle.spawn(async move {
+                    // Leave ample headroom on saturated builders for the JS thread to reach
+                    // SessionActionAdmissionGate before the command deadline fires.
                     delayed_manager
-                        .execute_command("deadline-held", "", 500)
+                        .execute_command("deadline-held", "", 1_500)
                         .await
                 });
                 wait_for_session_action_generation_capture(&session_action_admission).await;
 
                 let err = asupersync::time::timeout(
                     asupersync::time::wall_now(),
-                    Duration::from_secs(5),
+                    Duration::from_secs(15),
                     Box::pin(hostcall),
                 )
                 .await
@@ -15868,7 +16242,7 @@ mod extensions_integration_tests {
                     .expect("reuse command on the same shard");
                 assert_eq!(reuse, Value::String("reused".to_string()));
                 assert!(
-                    js_runtime.shutdown(Duration::from_secs(1)).await,
+                    js_runtime.shutdown(Duration::from_secs(5)).await,
                     "deadline test runtime did not shut down with AMAC {amac_enabled}"
                 );
             }
@@ -16574,6 +16948,7 @@ mod extensions_integration_tests {
             let mut new_messages = Vec::new();
             let mut execution = Box::pin(agent.execute_tool_calls(
                 &calls, on_event, &mut new_messages, None, test_turn_latency(),
+                compatible_tool_parallelism_limit(),
             ));
             assert!(futures::poll!(execution.as_mut()).is_pending());
             // With concurrent read-effect scheduling, B and view would pass
@@ -17712,6 +18087,216 @@ mod abort_tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum PendingProviderPhase {
+        Opening,
+        Reading,
+    }
+
+    struct ProviderDropProbe(Arc<AtomicUsize>);
+
+    impl Drop for ProviderDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct EventsThenPending {
+        events: std::vec::IntoIter<StreamEvent>,
+        pending: Arc<AtomicBool>,
+        _drop_probe: ProviderDropProbe,
+    }
+
+    impl Stream for EventsThenPending {
+        type Item = crate::error::Result<StreamEvent>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            if let Some(event) = self.events.next() {
+                return Poll::Ready(Some(Ok(event)));
+            }
+            self.pending.store(true, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
+
+    #[derive(Debug)]
+    struct PendingProvider {
+        phase: PendingProviderPhase,
+        pending: Arc<AtomicBool>,
+        drops: Arc<AtomicUsize>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for PendingProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let drop_probe = ProviderDropProbe(Arc::clone(&self.drops));
+            if matches!(self.phase, PendingProviderPhase::Opening) {
+                self.pending.store(true, Ordering::SeqCst);
+                futures::future::pending::<()>().await;
+                unreachable!("opening is interrupted only by dropping its future");
+            }
+            Ok(Box::pin(EventsThenPending {
+                events: vec![
+                    StreamEvent::Start {
+                        partial: PhasedProvider::base_message(),
+                    },
+                    StreamEvent::TextDelta {
+                        content_index: 0,
+                        delta: "already shown".to_string(),
+                    },
+                    // A complete tool block is still provisional until the
+                    // provider supplies a successful terminal response.
+                    StreamEvent::ToolCallEnd {
+                        content_index: 1,
+                        tool_call: ToolCall {
+                            id: "pending-write".to_string(),
+                            name: "write".to_string(),
+                            arguments: json!({
+                                "path": "must-not-exist.txt",
+                                "content": "cancelled provider must not authorize this write",
+                            }),
+                            thought_signature: None,
+                        },
+                    },
+                ]
+                .into_iter(),
+                pending: Arc::clone(&self.pending),
+                _drop_probe: drop_probe,
+            }))
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReadyProviderResult {
+        OpeningError,
+        StreamError,
+        StreamEof,
+    }
+
+    #[derive(Clone, Debug)]
+    enum ProviderPollCancellation {
+        Owner(crate::agent_cx::AgentCx),
+        Explicit(AbortHandle),
+    }
+
+    impl ProviderPollCancellation {
+        fn request(&self) {
+            match self {
+                Self::Owner(owner) => owner.set_cancel_requested(true),
+                Self::Explicit(handle) => handle.abort(),
+            }
+        }
+    }
+
+    struct CancelOnReadyStream {
+        partial: Option<AssistantMessage>,
+        result: ReadyProviderResult,
+        cancellation: ProviderPollCancellation,
+        _drop_probe: ProviderDropProbe,
+    }
+
+    impl Stream for CancelOnReadyStream {
+        type Item = crate::error::Result<StreamEvent>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            if let Some(partial) = self.partial.take() {
+                return Poll::Ready(Some(Ok(StreamEvent::Start { partial })));
+            }
+            self.cancellation.request();
+            match self.result {
+                ReadyProviderResult::StreamError => {
+                    Poll::Ready(Some(Err(Error::api("ready stream failure"))))
+                }
+                ReadyProviderResult::StreamEof => Poll::Ready(None),
+                ReadyProviderResult::OpeningError => {
+                    unreachable!("opening failed before streaming")
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct CancelOnReadyProvider {
+        result: ReadyProviderResult,
+        cancellation: ProviderPollCancellation,
+        drops: Arc<AtomicUsize>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for CancelOnReadyProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let drop_probe = ProviderDropProbe(Arc::clone(&self.drops));
+            if matches!(self.result, ReadyProviderResult::OpeningError) {
+                self.cancellation.request();
+                return Err(Error::api("ready opening failure"));
+            }
+            let mut partial = PhasedProvider::base_message();
+            partial.content = vec![
+                ContentBlock::Text(TextContent::new("already shown")),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "ready-write".to_string(),
+                    name: "write".to_string(),
+                    arguments: json!({"path": "must-not-exist.txt", "content": "withheld"}),
+                    thought_signature: None,
+                }),
+            ];
+            Ok(Box::pin(CancelOnReadyStream {
+                partial: Some(partial),
+                result: self.result,
+                cancellation: self.cancellation.clone(),
+                _drop_probe: drop_probe,
+            }))
+        }
+    }
+
     #[derive(Debug)]
     struct CountingProvider {
         calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -18347,6 +18932,267 @@ mod abort_tests {
             assert_eq!(message.stop_reason, StopReason::Aborted);
             assert_eq!(message.error_message.as_deref(), Some("Aborted"));
         });
+    }
+
+    fn assert_aborted_provider_lifecycle(
+        agent: &Agent,
+        message: &AssistantMessage,
+        events: &[AgentEvent],
+    ) {
+        assert_eq!(message.stop_reason, StopReason::Aborted);
+        assert_eq!(message.error_message.as_deref(), Some("Aborted"));
+        let expected = serde_json::to_value(message).unwrap();
+        let [Message::User(_), Message::Assistant(retained)] = agent.messages() else {
+            panic!("cancellation must retain exactly the user and one assistant message");
+        };
+        assert_eq!(serde_json::to_value(retained).unwrap(), expected);
+
+        let mut lifecycle = Vec::new();
+        for event in events {
+            match event {
+                AgentEvent::MessageStart {
+                    message: Message::Assistant(_),
+                } => lifecycle.push("start"),
+                AgentEvent::MessageUpdate {
+                    assistant_message_event: AssistantMessageEvent::Error { reason, error },
+                    ..
+                } => {
+                    assert_eq!(*reason, StopReason::Aborted);
+                    assert_eq!(serde_json::to_value(error).unwrap(), expected);
+                    lifecycle.push("aborted");
+                }
+                AgentEvent::MessageEnd {
+                    message: Message::Assistant(ended),
+                } => {
+                    assert_eq!(serde_json::to_value(ended).unwrap(), expected);
+                    lifecycle.push("message_end");
+                }
+                AgentEvent::TurnEnd {
+                    message: Message::Assistant(ended),
+                    tool_results,
+                    ..
+                } => {
+                    assert_eq!(serde_json::to_value(ended).unwrap(), expected);
+                    assert!(tool_results.is_empty());
+                    lifecycle.push("turn_end");
+                }
+                AgentEvent::AgentEnd { error, .. } => {
+                    assert_eq!(error.as_deref(), Some("Aborted"));
+                    lifecycle.push("agent_end");
+                }
+                AgentEvent::MessageUpdate {
+                    assistant_message_event: AssistantMessageEvent::Done { .. },
+                    ..
+                }
+                | AgentEvent::ToolExecutionStart { .. }
+                | AgentEvent::ToolExecutionEnd { .. }
+                | AgentEvent::ProviderError { .. }
+                | AgentEvent::AutoRetryStart { .. }
+                | AgentEvent::FailoverStart { .. } => {
+                    panic!("cancelled provider must not succeed, execute, or recover: {event:?}");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            lifecycle,
+            ["start", "aborted", "message_end", "turn_end", "agent_end"]
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn assert_pending_provider_cancellation(
+        phase: PendingProviderPhase,
+        with_abort_signal: bool,
+        cancel_owner: bool,
+    ) {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tool fixture directory");
+            let pending = Arc::new(AtomicBool::new(false));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(PendingProvider {
+                phase,
+                pending: Arc::clone(&pending),
+                drops: Arc::clone(&drops),
+                calls: AtomicUsize::new(0),
+            });
+            let tools =
+                ToolRegistry::from_tools(vec![Box::new(crate::tools::WriteTool::new(temp.path()))]);
+            let mut agent = Agent::new(provider.clone(), tools, AgentConfig::default());
+            let owner = crate::agent_cx::AgentCx::for_testing();
+            let (abort_handle, abort_signal) = AbortHandle::new();
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let event_sink = Arc::clone(&events);
+            let message = {
+                let mut turn = Box::pin(owner.with_current(agent.run_with_abort(
+                    "keep the partial response",
+                    with_abort_signal.then(|| abort_signal.clone()),
+                    move |event| event_sink.lock().unwrap().push(event),
+                )));
+                // The fixture does not observe cancellation or arrange any
+                // provider wakeup. Wait until the exact open/read is pending
+                // before cancelling; a startup-only check cannot pass this.
+                let reached_pending = futures::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(turn.as_mut(), cx).is_pending());
+                    if pending.load(Ordering::SeqCst) {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                });
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_secs(5),
+                    reached_pending,
+                )
+                .await
+                .expect("provider must reach its pending operation");
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+                assert!(!abort_signal.is_aborted());
+                assert!(!owner.is_cancel_requested());
+
+                if cancel_owner {
+                    owner.set_cancel_requested(true);
+                } else {
+                    abort_handle.abort();
+                }
+                asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_secs(5),
+                    turn.as_mut(),
+                )
+                .await
+                .expect("cancellation must interrupt a silent provider")
+                .expect("cancelled agent turn")
+            };
+
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(abort_signal.is_aborted(), !cancel_owner);
+            assert_eq!(owner.is_cancel_requested(), cancel_owner);
+            assert!(!temp.path().join("must-not-exist.txt").exists());
+            match phase {
+                PendingProviderPhase::Opening => assert!(message.content.is_empty()),
+                PendingProviderPhase::Reading => {
+                    assert!(matches!(
+                        message.content.as_slice(),
+                        [ContentBlock::Text(text), ContentBlock::ToolCall(call)]
+                            if text.text == "already shown" && call.id == "pending-write"
+                    ));
+                }
+            }
+            let events = events.lock().unwrap().clone();
+            assert_aborted_provider_lifecycle(&agent, &message, &events);
+        });
+    }
+
+    #[test]
+    fn owner_cancellation_interrupts_pending_provider_open_with_optional_abort() {
+        for with_abort_signal in [false, true] {
+            assert_pending_provider_cancellation(
+                PendingProviderPhase::Opening,
+                with_abort_signal,
+                true,
+            );
+        }
+    }
+
+    #[test]
+    fn owner_cancellation_interrupts_silent_stream_with_optional_abort() {
+        for with_abort_signal in [false, true] {
+            assert_pending_provider_cancellation(
+                PendingProviderPhase::Reading,
+                with_abort_signal,
+                true,
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_abort_interrupts_pending_provider_open_and_stream() {
+        for phase in [PendingProviderPhase::Opening, PendingProviderPhase::Reading] {
+            assert_pending_provider_cancellation(phase, true, false);
+        }
+    }
+
+    fn assert_provider_poll_cancellation(result: ReadyProviderResult, cancel_owner: bool) {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tool fixture directory");
+            let owner = crate::agent_cx::AgentCx::for_testing();
+            let (abort_handle, abort_signal) = AbortHandle::new();
+            let drops = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(CancelOnReadyProvider {
+                result,
+                cancellation: if cancel_owner {
+                    ProviderPollCancellation::Owner(owner.clone())
+                } else {
+                    ProviderPollCancellation::Explicit(abort_handle)
+                },
+                drops: Arc::clone(&drops),
+                calls: AtomicUsize::new(0),
+            });
+            let tools =
+                ToolRegistry::from_tools(vec![Box::new(crate::tools::WriteTool::new(temp.path()))]);
+            let mut agent = Agent::new(provider.clone(), tools, AgentConfig::default());
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            let event_sink = Arc::clone(&events);
+            // Cancellation occurs inside the poll that returns a ready error
+            // or EOF, after select has polled its cancellation arm as healthy.
+            // Every fixture result is immediately ready: no timer can conceal
+            // a missing recheck at the provider-result boundary.
+            let message = owner
+                .with_current(agent.run_with_abort(
+                    "preserve cancellation over provider failure",
+                    Some(abort_signal.clone()),
+                    move |event| event_sink.lock().unwrap().push(event),
+                ))
+                .await
+                .expect("cancellation wins over a simultaneous provider failure");
+
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(owner.is_cancel_requested(), cancel_owner);
+            assert_eq!(abort_signal.is_aborted(), !cancel_owner);
+            assert!(!temp.path().join("must-not-exist.txt").exists());
+            match result {
+                ReadyProviderResult::OpeningError => assert!(message.content.is_empty()),
+                ReadyProviderResult::StreamError | ReadyProviderResult::StreamEof => {
+                    assert!(matches!(
+                        message.content.as_slice(),
+                        [ContentBlock::Text(text), ContentBlock::ToolCall(call)]
+                            if text.text == "already shown" && call.id == "ready-write"
+                    ));
+                }
+            }
+            let events = events.lock().unwrap().clone();
+            assert_aborted_provider_lifecycle(&agent, &message, &events);
+        });
+    }
+
+    #[test]
+    fn cancellation_during_provider_opening_error_wins_over_failure() {
+        for cancel_owner in [false, true] {
+            assert_provider_poll_cancellation(ReadyProviderResult::OpeningError, cancel_owner);
+        }
+    }
+
+    #[test]
+    fn cancellation_during_stream_error_or_eof_preserves_aborted_partial() {
+        for result in [
+            ReadyProviderResult::StreamError,
+            ReadyProviderResult::StreamEof,
+        ] {
+            for cancel_owner in [false, true] {
+                assert_provider_poll_cancellation(result, cancel_owner);
+            }
+        }
     }
 
     #[test]
@@ -27031,6 +27877,9 @@ impl AgentSession {
                 budget.checkpoint(&mut session)?;
             }
         }
+        self.agent
+            .unpersisted_tool_effects
+            .store(false, Ordering::Release);
         Ok(())
     }
 }

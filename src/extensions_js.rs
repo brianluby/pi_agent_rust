@@ -13409,6 +13409,10 @@ const __pi_vfs = (() => {
     nextFd: 100,
     nextInode: 1,
   };
+  // Descriptor writes grow an owned backing store geometrically. Keeping it
+  // separate from public read buffers avoids retaining every stream chunk or
+  // copying the entire accumulated file again for each acknowledged write.
+  const writeStorage = new WeakMap();
   const extensionTmpRoot = "/__pi_extension_tmp";
   const windowsPaths = globalThis.process && globalThis.process.platform === "win32";
   const metadataClock = typeof globalThis.__pi_now_ms_native === "function"
@@ -13704,6 +13708,7 @@ const __pi_vfs = (() => {
     let file = state.files.get(path);
     if (file) {
       file.bytes = bytes;
+      writeStorage.delete(file);
     } else {
       file = { bytes, metadata: ensureMetadata(path, "file", seed), path };
       state.files.set(path, file);
@@ -13724,6 +13729,27 @@ const __pi_vfs = (() => {
 
   function replaceFileBytes(file, bytes) {
     file.bytes = bytes;
+    writeStorage.delete(file);
+    file.metadata.mtimeMs = file.metadata.ctimeMs = metadataTime();
+  }
+
+  function writeFileChunk(file, cursor, chunk) {
+    if (chunk.byteLength === 0) return;
+    const required = cursor + chunk.byteLength;
+    if (!Number.isSafeInteger(required)) {
+      throw new RangeError("file write exceeds the safe integer range");
+    }
+    const current = file.bytes;
+    let storage = writeStorage.get(file);
+    if (!storage || required > storage.byteLength) {
+      const capacity = Math.max(required, current.byteLength, storage ? storage.byteLength * 2 : 4096);
+      const next = new Uint8Array(capacity);
+      next.set(current);
+      storage = next;
+      writeStorage.set(file, storage);
+    }
+    storage.set(chunk, cursor);
+    file.bytes = storage.subarray(0, Math.max(current.byteLength, required));
     file.metadata.mtimeMs = file.metadata.ctimeMs = metadataTime();
   }
 
@@ -13910,6 +13936,10 @@ const __pi_vfs = (() => {
       if (isPersistentPath(resolved) && (!error || error.code !== "ENOENT")) {
         throw error;
       }
+      // A present host file that cannot be read is not a missing overlay.
+      // In particular, do not hide rejected special files, directory reads,
+      // permission failures or failed descriptor captures behind ENOENT.
+      if (error && error.code !== undefined && error.code !== "ENOENT") throw error;
       // A standalone realm may use an unrestricted virtual overlay, but host
       // reads remain confined. Treat a denied host probe as an absent overlay
       // entry so create/write operations can proceed entirely in the VFS.
@@ -14421,6 +14451,7 @@ const __pi_vfs = (() => {
   state.setFile = setFile;
   state.unlinkFile = unlinkFile;
   state.replaceFileBytes = replaceFileBytes;
+  state.writeFileChunk = writeFileChunk;
   state.toBytes = toBytes;
   state.decodeBytes = decodeBytes;
   state.readHostBytes = readHostBytes;
@@ -15065,12 +15096,7 @@ export function writeSync(fd, buffer, offset, length, position) {
   if (entry.append) cursor = entry.file.bytes.byteLength;
   else if (!explicitPosition) cursor = entry.position;
 
-  const current = entry.file.bytes;
-  const required = cursor + chunk.byteLength;
-  const next = new Uint8Array(Math.max(current.byteLength, required));
-  next.set(current, 0);
-  next.set(chunk, cursor);
-  if (chunk.byteLength > 0) __pi_vfs.replaceFileBytes(entry.file, next);
+  __pi_vfs.writeFileChunk(entry.file, cursor, chunk);
 
   if (!explicitPosition) {
     entry.position = cursor + chunk.byteLength;
@@ -15341,121 +15367,211 @@ function __queueMicrotaskPolyfill(fn) {
   Promise.resolve().then(fn);
 }
 export function createReadStream(path, opts) {
-  const options = opts && typeof opts === "object" ? opts : {};
+  const options = typeof opts === "string" ? { encoding: opts }
+    : opts && typeof opts === "object" ? opts : {};
   const encoding = typeof options.encoding === "string" ? options.encoding : null;
-  const highWaterMark =
-    Number.isInteger(options.highWaterMark) && options.highWaterMark > 0
-      ? options.highWaterMark
-      : 64 * 1024;
+  const highWaterMark = options.highWaterMark ?? 64 * 1024;
+  const start = options.start === undefined ? 0 : options.start;
+  const end = options.end === undefined ? Infinity : options.end;
+  if (!Number.isSafeInteger(start) || start < 0) {
+    throw new RangeError("read stream start must be a nonnegative safe integer");
+  }
+  if ((end !== Infinity && (!Number.isSafeInteger(end) || end < 0)) || end < start) {
+    throw new RangeError("read stream end must be at least start or Infinity");
+  }
 
-  const stream = new Readable({ encoding: encoding || undefined, autoDestroy: false });
-  stream.path = __pi_vfs.normalizePath(path);
-
-  __queueMicrotaskPolyfill(() => {
+  // Capture authority and the uncollapsed path before deferred demand. The
+  // descriptor still rechecks owner/path authority on every subsequent read.
+  const owner = { extensionId: __pi_vfs.currentExtensionId() };
+  const sourcePath = __pi_vfs.absoluteInputPath(String(path ?? ""));
+  let ownedFd = null;
+  let fdEntry = null;
+  let position = start;
+  const closeOwnedFd = () => {
+    const fd = ownedFd;
+    const entry = fdEntry;
+    ownedFd = null;
+    fdEntry = null;
     try {
-      const bytes = readFileSync(path, "buffer");
-      const source =
-        bytes instanceof Uint8Array
-          ? bytes
-          : (typeof Buffer !== "undefined" && Buffer.from
-              ? Buffer.from(bytes)
-              : __pi_vfs.toBytes(bytes));
-
-      if (source.byteLength === 0) {
-        stream.push(null);
+      if (fd === null || __pi_vfs.fds.get(fd) !== entry) return;
+      try { closeSync(fd); }
+      finally {
+        // Cleanup may run under a different principal or after lifecycle
+        // scrubbing. Release only this stream's exact descriptor entry.
+        if (__pi_vfs.fds.get(fd) === entry) __pi_vfs.fds.delete(fd);
+      }
+    } finally {
+      // A frozen or throwing public field cannot prevent private cleanup.
+      try { stream.fd = null; } catch (_) {}
+    }
+  };
+  const stream = new Readable({
+    encoding: encoding || undefined,
+    highWaterMark,
+    read() {
+      if (this.destroyed || this._readableState.ended) return;
+      __pi_vfs.assertFdOwner(owner, "read");
+      if (ownedFd === null) {
+        // The existing host bridge captures a bounded whole-file snapshot;
+        // demand controls when it is opened and how much reaches the queue.
+        ownedFd = openSync(sourcePath, "r");
+        fdEntry = __pi_vfs.getFdEntry(ownedFd);
+        this.fd = ownedFd;
+      }
+      if (__pi_vfs.fds.get(ownedFd) !== fdEntry) {
+        throw new Error(`EBADF: bad file descriptor, fd ${String(ownedFd)}`);
+      }
+      const remaining = Math.max(0, fstatSync(ownedFd).size - position);
+      const length = Math.min(highWaterMark, end - position + 1, remaining);
+      if (length <= 0) {
+        this.push(null);
         return;
       }
-
-      let offset = 0;
-      while (offset < source.byteLength) {
-        const nextOffset = Math.min(source.byteLength, offset + highWaterMark);
-        const slice = source.subarray(offset, nextOffset);
-        if (encoding && typeof Buffer !== "undefined" && Buffer.from) {
-          stream.push(Buffer.from(slice).toString(encoding));
-        } else {
-          stream.push(slice);
-        }
-        offset = nextOffset;
-      }
-      stream.push(null);
-    } catch (err) {
-      stream.emit("error", err instanceof Error ? err : new Error(String(err)));
-    }
+      const bytes = Buffer.alloc(length);
+      const count = readSync(ownedFd, bytes, 0, length, position);
+      position += count;
+      this.bytesRead += count;
+      // Readable owns cross-chunk decoding, pressure and the next pull.
+      if (count > 0) this.push(bytes.subarray(0, count));
+      if (count === 0 || position > end || count === remaining) this.push(null);
+    },
+    destroy(error, callback) {
+      // Teardown only releases an already owned virtual handle. A changed
+      // principal must not turn successful cleanup into a new read error.
+      try { closeOwnedFd(); } catch (_) {}
+      callback(error);
+    },
   });
-
+  stream.path = __pi_vfs.normalizePath(sourcePath);
+  stream.fd = null;
+  stream.bytesRead = 0;
   return stream;
 }
 export function createWriteStream(path, opts) {
-  const options = opts && typeof opts === "object" ? opts : {};
-  const encoding = typeof options.encoding === "string" ? options.encoding : "utf8";
-  const flags = typeof options.flags === "string" ? options.flags : "w";
-  const fd = openSync(path, flags, options.mode);
-  const fdEntry = __pi_vfs.getFdEntry(fd);
-  const bufferedChunks = [];
+  const options = typeof opts === "string" ? { encoding: opts }
+    : opts && typeof opts === "object" ? opts : {};
+  const encoding = options.encoding ?? "utf8";
+  const flags = options.flags ?? "w";
+  const highWaterMark = options.highWaterMark ?? 64 * 1024;
+  const autoClose = options.autoClose ?? true;
+  const suppliedFd = options.fd ?? null;
+  let position = options.start ?? null;
+  if (typeof encoding !== "string" || !Buffer.isEncoding(encoding)) {
+    throw new TypeError("write stream encoding must be a supported Buffer encoding");
+  }
+  if (position !== null && (!Number.isSafeInteger(position) || position < 0)) {
+    throw new RangeError("write stream start must be a nonnegative safe integer");
+  }
+  if (typeof autoClose !== "boolean") {
+    throw new TypeError("write stream autoClose must be a boolean");
+  }
+  if (suppliedFd !== null && (!Number.isSafeInteger(suppliedFd) || suppliedFd < 0)) {
+    throw new TypeError("write stream fd must be a nonnegative integer");
+  }
+  const owner = { extensionId: __pi_vfs.currentExtensionId() };
+  // Supplied descriptors ignore path, including its coercion and authority.
+  const sourcePath = suppliedFd === null
+    ? __pi_vfs.absoluteInputPath(String(path ?? "").replace(/\\/g, "/")) : null;
+  let fd = null;
+  let fdEntry = null;
+  let bytesWritten = 0;
   let closed = false;
+  let openError = null;
 
-  // A stream owns the descriptor it opened. Close it at most once, and only
-  // while that exact descriptor is still registered. Lifecycle scrubs keep
-  // descriptor IDs monotonic, so a stale stream must never close a newer entry.
+  const requireOpen = () => {
+    if (openError) throw openError;
+    __pi_vfs.assertFdOwner(owner, "write");
+    if (closed) throw new Error("EBADF: write stream descriptor is closed");
+    if (fd === null) {
+      if (suppliedFd !== null) {
+        const entry = __pi_vfs.getFdEntry(suppliedFd);
+        // Never claim a foreign handle, even for error-path cleanup.
+        __pi_vfs.assertFdOwner(entry, "write");
+        fd = suppliedFd;
+        fdEntry = entry;
+      } else {
+        fd = openSync(sourcePath, flags, options.mode);
+        fdEntry = __pi_vfs.getFdEntry(fd);
+      }
+      stream.fd = fd;
+    }
+    if (__pi_vfs.fds.get(fd) !== fdEntry) {
+      throw new Error("EBADF: bad file descriptor, fd " + String(fd));
+    }
+    return fd;
+  };
+
+  // An acknowledged write already changed the owned VFS file. Teardown only
+  // releases its exact descriptor; it never commits buffered foreign writes.
   const closeOwnedFd = () => {
     if (closed) return;
     closed = true;
-    if (__pi_vfs.fds.get(fd) !== fdEntry) return;
     try {
-      closeSync(fd);
-    } finally {
-      // A stream owns its exact descriptor even if cleanup runs under a
-      // different callback principal. Never release a reused numeric handle.
-      if (__pi_vfs.fds.get(fd) === fdEntry) {
-        __pi_vfs.fds.delete(fd);
+      if (fd === null || __pi_vfs.fds.get(fd) !== fdEntry) return;
+      try { closeSync(fd); }
+      finally {
+        if (__pi_vfs.fds.get(fd) === fdEntry) __pi_vfs.fds.delete(fd);
       }
+    } finally {
+      fd = null;
+      fdEntry = null;
+      try { stream.fd = null; } catch (_) {}
     }
   };
 
   const stream = new Writable({
-    autoDestroy: false,
+    highWaterMark,
+    autoDestroy: autoClose,
     write(chunk, chunkEncoding, callback) {
       try {
-        const normalizedEncoding =
-          typeof chunkEncoding === "string" && chunkEncoding
-            ? chunkEncoding
-            : encoding;
-        const bytes = __pi_vfs.toBytes(chunk, normalizedEncoding);
-        bufferedChunks.push(bytes);
-        this.bytesWritten += bytes.byteLength;
+        const descriptor = requireOpen();
+        const bytes = typeof chunk === "string"
+          ? Buffer.from(chunk, chunkEncoding || encoding)
+          : __pi_vfs.toBytes(chunk, chunkEncoding || encoding);
+        const count = writeSync(descriptor, bytes, 0, bytes.byteLength, position);
+        if (position !== null) position += count;
+        bytesWritten += count;
         callback(null);
       } catch (err) {
-        const original = err instanceof Error ? err : new Error(String(err));
-        try { closeOwnedFd(); } catch (_) {}
-        callback(original);
+        callback(err instanceof Error ? err : new Error(String(err)));
       }
     },
     final(callback) {
       try {
-        for (const bytes of bufferedChunks) {
-          writeSync(fd, bytes, 0, bytes.byteLength, null);
-        }
-        closeOwnedFd();
+        // end() with no writes still creates/truncates an empty output file.
+        requireOpen();
+        if (autoClose) closeOwnedFd();
         callback(null);
       } catch (err) {
-        const original = err instanceof Error ? err : new Error(String(err));
-        try { closeOwnedFd(); } catch (_) {}
-        callback(original);
+        callback(err instanceof Error ? err : new Error(String(err)));
       }
     },
+    destroy(error, callback) {
+      // autoClose:false leaves even a failed descriptor with its caller.
+      try { if (autoClose) closeOwnedFd(); } catch (_) {}
+      callback(error);
+    },
   });
-  stream.path = __pi_vfs.normalizePath(path);
-  stream.fd = fd;
-  stream.bytesWritten = 0;
+  stream.path = sourcePath === null ? undefined : __pi_vfs.normalizePath(sourcePath);
+  stream.fd = null;
+  Object.defineProperty(stream, "bytesWritten", { get: () => bytesWritten });
+  // Writable must count strings with the configured encoding as well as pass
+  // that encoding to the write hook, so pressure measures output bytes.
+  const baseWrite = stream.write;
+  stream.write = function(chunk, chunkEncoding, callback) {
+    const cb = typeof chunkEncoding === "function" ? chunkEncoding : callback;
+    const enc = typeof chunkEncoding === "string" ? chunkEncoding : encoding;
+    return baseWrite.call(this, chunk, enc, cb);
+  };
   stream.cork = () => stream;
   stream.uncork = () => stream;
-  const baseDestroy = stream.destroy.bind(stream);
-  stream.destroy = (err) => {
-    // Preserve Stream.destroy's observable error/close behavior; descriptor
-    // cleanup is best-effort and must not replace an error supplied by caller.
-    try { closeOwnedFd(); } catch (_) {}
-    return baseDestroy(err);
-  };
+  // Validate Writable options before opening/truncating any file. Open errors
+  // are observable by listeners attached immediately after construction.
+  try { requireOpen(); }
+  catch (error) {
+    openError = error;
+    __queueMicrotaskPolyfill(() => stream.destroy(error));
+  }
   return stream;
 }
 export function readFile(path, optOrCb, cb) {
@@ -17112,6 +17228,7 @@ export default { test, describe, it, before, after, beforeEach, afterEach, run, 
         "node:stream".to_string(),
         compressed_js_literal!(r#"
 import EventEmitter from "node:events";
+import { StringDecoder } from "node:string_decoder";
 
 function __streamToError(err) {
   return err instanceof Error ? err : new Error(String(err ?? "stream error"));
@@ -17188,7 +17305,18 @@ class Stream extends EventEmitter {
 class Readable extends Stream {
   constructor(opts = {}) {
     super(opts);
-    this._readableState = { flowing: null, ended: false, endEmitted: false, encoding: opts.encoding || null };
+    const objectMode = !!(opts.readableObjectMode ?? opts.objectMode);
+    const highWaterMark = opts.readableHighWaterMark ?? opts.highWaterMark ?? (objectMode ? 16 : 16384);
+    if (!Number.isSafeInteger(highWaterMark) || highWaterMark < 0) {
+      throw new RangeError("readable highWaterMark must be a nonnegative safe integer");
+    }
+    this._readableState = {
+      flowing: null, ended: false, endEmitted: false, encoding: null,
+      objectMode, highWaterMark, length: 0, reading: false,
+    };
+    this._readImpl = typeof opts.read === "function" ? opts.read.bind(this) : null;
+    this._readScheduled = false;
+    this._decoder = null;
     this.readable = true;
     this._queue = [];
     this._flowing = false;
@@ -17198,11 +17326,84 @@ class Readable extends Stream {
     this._readWaiter = null;
     this._pipeCleanup = new Map();
     this._autoDestroy = opts.autoDestroy !== false;
+    if (opts.encoding) this.setEncoding(opts.encoding);
   }
 
   get readableEnded() { return this._readableState.endEmitted; }
   get readableFlowing() { return this._readableState.flowing; }
+  get readableEncoding() { return this._readableState.encoding; }
+  get readableLength() { return this._readableState.length; }
+  get readableHighWaterMark() { return this._readableState.highWaterMark; }
+  get readableObjectMode() { return this._readableState.objectMode; }
   isPaused() { return this._readableState.flowing === false; }
+
+  _chunkLength(chunk) {
+    if (this._readableState.objectMode) return 1;
+    if (typeof chunk !== "string") return (chunk && chunk.byteLength) || 0;
+    if (this._readableState.encoding) return chunk.length;
+    return typeof Buffer !== "undefined" && typeof Buffer.byteLength === "function"
+      ? Buffer.byteLength(chunk) : new TextEncoder().encode(chunk).byteLength;
+  }
+
+  _shiftChunk() {
+    const chunk = this._queue.shift();
+    this._readableState.length -= this._chunkLength(chunk);
+    return chunk;
+  }
+
+  _read(size) {
+    if (this._readImpl) this._readImpl(size);
+  }
+
+  _canRead() {
+    const state = this._readableState;
+    return !this.destroyed && !state.ended && !state.reading &&
+      (state.flowing === true || this._readRequested) &&
+      (state.length < state.highWaterMark || state.length === 0);
+  }
+
+  _scheduleRead() {
+    // Push-only streams remain valid. Pull sources must supply read() or
+    // override _read(); adapters using _waitForRead own their own pump.
+    if ((!this._readImpl && this._read === Readable.prototype._read) ||
+        this._readScheduled || !this._canRead()) return;
+    this._readScheduled = true;
+    __streamQueueMicrotask(() => {
+      this._readScheduled = false;
+      if (!this._canRead()) return;
+      this._readRequested = false;
+      this._readableState.reading = true;
+      try { this._read(this._readableState.highWaterMark); }
+      catch (error) { this.destroy(__streamToError(error)); }
+      // push() ends this pull. A source that produces asynchronously keeps
+      // ownership until then; a hook that supplies nothing is not busy-polled.
+    });
+  }
+
+  setEncoding(encoding) {
+    // Construct first so an invalid encoding cannot discard queued bytes or
+    // the partial character retained by the current decoder.
+    const decoder = new StringDecoder(encoding);
+    if (this._decoder && this._readableState.encoding === decoder.encoding) return this;
+    const decoded = [];
+    for (const chunk of this._queue) {
+      const text = typeof chunk === "string" ? chunk : decoder.write(chunk);
+      if (text.length) decoded.push(text);
+    }
+    if (this._readableState.ended) {
+      const tail = decoder.end();
+      if (tail.length) decoded.push(tail);
+    }
+    this._queue = decoded;
+    this._decoder = decoder;
+    this._readableState.encoding = decoder.encoding;
+    this._readableState.length = decoded.reduce((length, chunk) => length + this._chunkLength(chunk), 0);
+    if (this._queue.length === 0 && !this._readableState.ended &&
+        this.listenerCount("readable") > 0) this._readRequested = true;
+    this._wakeRead();
+    this._maybeEnd();
+    return this;
+  }
 
   on(event, listener) {
     super.on(event, listener);
@@ -17236,6 +17437,7 @@ class Readable extends Stream {
     const wake = this._readWaiter;
     this._readWaiter = null;
     if (wake) wake();
+    this._scheduleRead();
   }
 
   // Only the source adapter waits here. A paused iterator or pipe must not
@@ -17273,7 +17475,7 @@ class Readable extends Stream {
       while (!this.destroyed && this._readableState.flowing === true && this._queue.length > 0) {
         // Relinquish the queued copy before invoking consumers. Flowing
         // streams must not retain every byte of a long-lived response.
-        this.emit("data", this._queue.shift());
+        this.emit("data", this._shiftChunk());
       }
     } finally {
       this._flowing = false;
@@ -17285,31 +17487,71 @@ class Readable extends Stream {
   push(chunk) {
     if (this.destroyed || this._readableState.ended) return false;
     if (chunk === null) {
+      this._readableState.reading = false;
+      const tail = this._decoder ? this._decoder.end() : "";
+      if (tail.length) {
+        this._queue.push(tail);
+        this._readableState.length += this._chunkLength(tail);
+      }
       this._readableState.ended = true;
+      if (tail.length) {
+        if (this._readableState.flowing === true) this._flow();
+        else this.emit("readable");
+      }
       this._maybeEnd();
       this._wakeRead();
       return false;
     }
-    const normalized = __normalizeChunk(chunk, this._readableState.encoding);
-    this._queue.push(normalized);
-    if (this._readableState.flowing === true) this._flow();
-    else this.emit("readable");
-    return this._queue.length === 0;
-  }
-
-  read(_size) {
-    const value = this._queue.length > 0 ? this._queue.shift() : null;
-    if (this._queue.length === 0) {
+    const bytes = __normalizeChunk(chunk, null);
+    if (!this._readableState.objectMode) {
+      if (bytes === undefined || ((typeof bytes === "string" || bytes instanceof Uint8Array) && bytes.length === 0)) {
+        // Empty bytes do not complete an outstanding _read(). Re-entering
+        // its hook here would spin forever on a temporarily empty source.
+        // Adapter pumps still retain the consumer's unsatisfied demand.
+        this._readRequested = true;
+        this._wakeRead();
+        return this._readableState.length < this._readableState.highWaterMark;
+      }
+      if (typeof bytes !== "string" && !(bytes instanceof Uint8Array)) {
+        this.destroy(__streamError("ERR_INVALID_ARG_TYPE", "readable chunk must be a string or byte buffer"));
+        return false;
+      }
+    }
+    this._readableState.reading = false;
+    const normalized = this._decoder && typeof bytes !== "string"
+      ? this._decoder.write(bytes) : bytes;
+    if (this._decoder && normalized.length === 0) {
+      // A readable-mode consumer cannot ask for its next chunk until a whole
+      // character is available. Preserve its demand across partial bytes.
       this._readRequested = true;
       this._wakeRead();
-      this._maybeEnd();
+      return this._queue.length === 0;
     }
+    this._queue.push(normalized);
+    this._readableState.length += this._chunkLength(normalized);
+    if (this._readableState.flowing === true) this._flow();
+    else this.emit("readable");
+    this._wakeRead();
+    return !this.destroyed && !this._readableState.ended &&
+      this._readableState.length < this._readableState.highWaterMark;
+  }
+
+  read(size) {
+    const value = size !== 0 && this._queue.length > 0 ? this._shiftChunk() : null;
+    if (this._readableState.length < this._readableState.highWaterMark || this._queue.length === 0) {
+      this._readRequested = true;
+      this._wakeRead();
+    }
+    this._maybeEnd();
     return value;
   }
 
   destroy(error) {
     if (this.destroyed) return this;
     this._queue.length = 0;
+    this._readableState.length = 0;
+    this._readableState.reading = false;
+    this._decoder = null;
     this._readRequested = false;
     this.readable = false;
     this._wakeRead();
@@ -17491,7 +17733,7 @@ class Readable extends Stream {
     if (!iterator || typeof iterator.next !== "function") {
       throw new TypeError("Readable.from expects an iterable");
     }
-    const readable = new Readable(opts);
+    const readable = new Readable({ objectMode: true, ...opts });
     let complete = false;
     let returned = false;
     const closeIterator = () => {
@@ -17577,7 +17819,9 @@ class Readable extends Stream {
             readable.push(null);
             break;
           }
-          const normalized = __normalizeChunk(value, readable._readableState.encoding);
+          // Decoding belongs to push(), whose decoder retains partial
+          // characters across reads and flushes them only at EOF.
+          const normalized = __normalizeChunk(value, null);
           const chunk = !opts.objectMode && typeof normalized !== 'string' &&
               typeof Buffer !== 'undefined' && !Buffer.isBuffer(normalized)
             ? Buffer.from(normalized)
@@ -17612,31 +17856,103 @@ class Readable extends Stream {
     if (!nodeReadable || typeof nodeReadable.on !== "function") {
       throw new Error("Readable.toWeb expects a Node Readable stream");
     }
+    let controller;
+    let settled = false;
+    let cancellation = null;
+    let resolveCancellation;
+    let rejectCancellation;
+    const stopFlow = () => {
+      nodeReadable.pause?.();
+      nodeReadable.removeListener?.("data", onData);
+      nodeReadable.removeListener?.("end", onEnd);
+    };
+    const cleanup = () => {
+      stopFlow();
+      nodeReadable.removeListener?.("error", onError);
+      nodeReadable.removeListener?.("close", onClose);
+    };
+    const prematureClose = () => __streamError(
+      "ERR_STREAM_PREMATURE_CLOSE", "Node readable closed before the end of the stream");
+    const onData = (chunk) => {
+      // The Web bridge closes its controller before invoking cancel(). A
+      // queued Node flow task must not enqueue into that closed controller.
+      if (settled || controller.desiredSize <= 0) {
+        nodeReadable.pause?.();
+        return;
+      }
+      controller.enqueue(chunk);
+      if (controller.desiredSize <= 0) nodeReadable.pause?.();
+    };
+    const onEnd = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      controller.close();
+    };
+    const onError = (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      controller.error(__streamToError(error));
+    };
+    const onClose = () => {
+      cleanup();
+      if (!settled) {
+        settled = true;
+        controller.error(nodeReadable.errored || prematureClose());
+      }
+      const resolve = resolveCancellation;
+      resolveCancellation = rejectCancellation = undefined;
+      if (resolve) resolve();
+    };
     return new ReadableStream({
-      start(controller) {
-        const onData = (chunk) => controller.enqueue(chunk);
-        const onEnd = () => {
-          cleanup();
-          controller.close();
-        };
-        const onError = (err) => {
-          cleanup();
-          controller.error(__streamToError(err));
-        };
-        const cleanup = () => {
-          nodeReadable.removeListener?.("data", onData);
-          nodeReadable.removeListener?.("end", onEnd);
-          nodeReadable.removeListener?.("error", onError);
-        };
+      start(webController) {
+        controller = webController;
+        // Adding a data listener normally starts flowing. Preserve demand
+        // ownership until the Web reader pulls, then pause at its queue bound.
+        nodeReadable.pause?.();
         nodeReadable.on("data", onData);
         nodeReadable.on("end", onEnd);
         nodeReadable.on("error", onError);
-        if (typeof nodeReadable.resume === "function") nodeReadable.resume();
+        nodeReadable.on("close", onClose);
+        if (nodeReadable.readableEnded && !nodeReadable.errored) {
+          onEnd();
+        } else if (nodeReadable.destroyed || nodeReadable.closed) {
+          settled = true;
+          stopFlow();
+          controller.error(nodeReadable.errored || prematureClose());
+          // A pending destroy hook still owns its eventual error/close pair.
+          if (nodeReadable.closed) cleanup();
+        } else if (nodeReadable.errored) {
+          onError(nodeReadable.errored);
+        }
+      },
+      pull() {
+        if (!settled) nodeReadable.resume?.();
       },
       cancel(reason) {
-        if (typeof nodeReadable.destroy === "function") {
-          nodeReadable.destroy(__streamToError(reason ?? "stream cancelled"));
+        if (cancellation) return cancellation;
+        settled = true;
+        stopFlow();
+        if (nodeReadable.closed || typeof nodeReadable.destroy !== "function") {
+          cleanup();
+          return;
         }
+        cancellation = new Promise((resolve, reject) => {
+          resolveCancellation = resolve;
+          rejectCancellation = reject;
+        });
+        // Keep our error listener until close: asynchronous destroy hooks can
+        // report the cancellation reason after the Web side has settled.
+        try {
+          nodeReadable.destroy(__streamToError(reason ?? "stream cancelled"));
+          if (nodeReadable.closed) onClose();
+        } catch (error) {
+          cleanup();
+          if (rejectCancellation) rejectCancellation(error);
+          resolveCancellation = rejectCancellation = undefined;
+        }
+        return cancellation;
       },
     });
   }
@@ -18008,6 +18324,7 @@ class Transform extends Duplex {
     super(opts);
     this._transformImpl = typeof opts.transform === "function" ? opts.transform.bind(this) : null;
     this._flushImpl = typeof opts.flush === "function" ? opts.flush.bind(this) : null;
+    this._transformCallback = null;
   }
 
   _transform(chunk, encoding, callback) {
@@ -18024,8 +18341,29 @@ class Transform extends Duplex {
       if (completed) return;
       completed = true;
       if (!error && data !== undefined && data !== null) this.push(data);
-      callback(error);
+      // Writable pressure alone cannot bound a transform: acknowledging
+      // input while its output is paused drains the upstream source into an
+      // unbounded readable queue. Hold this write until output has capacity.
+      const state = this._readableState;
+      if (error || this.destroyed || state.length < state.highWaterMark || state.length === 0) {
+        callback(error);
+      } else {
+        this._transformCallback = callback;
+      }
     });
+  }
+
+  _read() {
+    const callback = this._transformCallback;
+    this._transformCallback = null;
+    if (callback) callback(null);
+  }
+
+  destroy(error) {
+    // Stream.destroy settles the active writable entry exactly once. Do not
+    // retain or revive its completion closure after cancellation.
+    this._transformCallback = null;
+    return super.destroy(error);
   }
 
   _flush(callback) {
@@ -22487,11 +22825,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// mistaken for an ordinary workspace path. This method deliberately
     /// does not update `allowed_read_roots`, resolver roots, source tiers, or
     /// package scopes.
-    pub(crate) fn register_foreign_extension_root_boundary(
-        &self,
-        root: &Path,
-        owner_extension_id: &str,
-    ) {
+    pub fn register_foreign_extension_root_boundary(&self, root: &Path, owner_extension_id: &str) {
         let owner_extension_id = owner_extension_id.trim();
         if owner_extension_id.is_empty() {
             tracing::warn!(
@@ -24017,9 +24351,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     ));
                                 }
 
-                                // Authorize before probing, then verify the opened handle's
-                                // path to close the check/open TOCTOU window.
-                                let file = match std::fs::File::open(&requested_abs) {
+                                // Authorize before probing, then open without waiting on a
+                                // FIFO/device and verify the opened handle's authorized path.
+                                // The shared opener checks regular-file identity across open
+                                // so a type or symlink swap cannot pin this runtime thread.
+                                let file = match crate::tools::open_regular_file_for_capped_read(&requested_abs) {
                                     Ok(file) => file,
                                     Err(err)
                                         if err.kind() == std::io::ErrorKind::NotFound
@@ -24046,10 +24382,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         return apply_missing_asset_fallback(&checked_path, &err.to_string());
                                     }
                                     Err(err) => {
-                                        return Err(rquickjs::Error::new_loading_message(
-                                            &path,
-                                            format!("host read open: {err}"),
-                                        ));
+                                        return Err(storage::filesystem_error(&ctx, &path, "open", &err));
                                     }
                                 };
 
@@ -24057,12 +24390,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     "/proc/self/fd/{}",
                                     file.as_raw_fd()
                                 ))
-                                .map_err(|err| {
-                                    rquickjs::Error::new_loading_message(
-                                        &path,
-                                        format!("host read verify: {err}"),
-                                    )
-                                })?;
+                                .map_err(|err| storage::filesystem_error(&ctx, &path, "open", &err))?;
                                 let secure_path =
                                     crate::extensions::strip_unc_prefix(secure_path_buf);
 
@@ -24100,20 +24428,17 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                                 let mut reader = file.take(MAX_SYNC_READ_SIZE + 1);
                                 let mut buffer = Vec::new();
-                                reader.read_to_end(&mut buffer).map_err(|err| {
-                                    rquickjs::Error::new_loading_message(
-                                        &path,
-                                        format!("host read content: {err}"),
-                                    )
-                                })?;
+                                reader.read_to_end(&mut buffer)
+                                    .map_err(|err| storage::filesystem_error(&ctx, &path, "read", &err))?;
 
                                 if buffer.len() as u64 > MAX_SYNC_READ_SIZE {
-                                    return Err(rquickjs::Error::new_loading_message(
-                                        &path,
+                                    let error = std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
                                         format!(
                                             "host read failed: file exceeds {MAX_SYNC_READ_SIZE} bytes"
                                         ),
-                                    ));
+                                    );
+                                    return Err(storage::filesystem_error(&ctx, &path, "read", &error));
                                 }
 
                                 Ok(BASE64_STANDARD.encode(buffer))
@@ -24159,16 +24484,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     ));
                                 }
 
-                                let file = match std::fs::File::open(&checked_path) {
+                                let file = match crate::tools::open_regular_file_for_capped_read(&checked_path) {
                                     Ok(file) => file,
                                     Err(err) => {
                                         if err.kind() == std::io::ErrorKind::NotFound && in_ext_root && configured_repair_mode.should_apply() {
                                             return apply_missing_asset_fallback(&checked_path, &err.to_string());
                                         }
-                                        return Err(rquickjs::Error::new_loading_message(
-                                            &path,
-                                            format!("host read: {err}"),
-                                        ));
+                                        return Err(storage::filesystem_error(&ctx, &path, "open", &err));
                                     }
                                 };
 
@@ -24180,18 +24502,15 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                                 let mut reader = file.take(MAX_SYNC_READ_SIZE + 1);
                                 let mut buffer = Vec::new();
-                                reader.read_to_end(&mut buffer).map_err(|err| {
-                                    rquickjs::Error::new_loading_message(
-                                        &path,
-                                        format!("host read content: {err}"),
-                                    )
-                                })?;
+                                reader.read_to_end(&mut buffer)
+                                    .map_err(|err| storage::filesystem_error(&ctx, &path, "read", &err))?;
 
                                 if buffer.len() as u64 > MAX_SYNC_READ_SIZE {
-                                    return Err(rquickjs::Error::new_loading_message(
-                                        &path,
+                                    let error = std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
                                         format!("host read failed: file exceeds {MAX_SYNC_READ_SIZE} bytes"),
-                                    ));
+                                    );
+                                    return Err(storage::filesystem_error(&ctx, &path, "read", &error));
                                 }
 
                                 Ok(BASE64_STANDARD.encode(buffer))
@@ -31220,16 +31539,24 @@ mod tests {
     /// forms stop later handlers before they can erase an earlier veto.
     /// Atomic virtual directory rename and parent-link resolution add 4_342
     /// filesystem bytes, covered by identity, admission, and watcher tests.
+    /// Stateful readable decoding adds 1_875 stream bytes and removes 22
+    /// filesystem bytes by eliminating adapter-side chunk decoding. The
+    /// filesystem literal already had 311 bytes of receipt drift at 7ddfa2ac;
+    /// only the two deliberately changed modules are re-pinned here.
     const JS_SOURCE_RECEIPTS: &[(&str, usize, &str)] = &[
         (
             BRIDGE_RECEIPT,
             271_442,
             "1d90f2b0398f5cb6ab4ccc060c48cf6d87df9bddaf37d01c92606f805fd34c22",
         ),
+        // Demand-driven file reads add byte ranges and owned descriptor cleanup.
+        // Incremental write acknowledgements, descriptor ownership and amortized
+        // VFS growth are covered by the file-stream progress/storage regressions.
+        // The existing bounded whole-file host snapshot is unchanged.
         (
             "node:fs",
-            87_318,
-            "cb0143953b7cee99b4bd41f3cfe60bd7047716c28d5f0d3dcb1784745c8b4004",
+            92_779,
+            "6dab1836cdc391f53d1cc1c9a791421392c537c84601d51da4cccceef3cdf9e6",
         ),
         (
             "@mariozechner/pi-ai",
@@ -31241,12 +31568,12 @@ mod tests {
             39_043,
             "c496331afa268ea323d999aae67693ce6900c3975d89cffb1557de1f8e77ee06",
         ),
-        // Completion observers and owned reader teardown add 9_516 bytes.
+        // Read hooks, readable capacity, and transform backpressure are intentional.
         // Only this deliberately changed module is re-pinned.
         (
             "node:stream",
-            41_648,
-            "414b4dd3b5e7e0f10aa2a09881b0e6ebe882074ce56cc52eb8c23566e6b88589",
+            50_718,
+            "068c9bb73c68c4febc53dfcd10933d92408991dfb03aaf7f5348ddc93f8d19de",
         ),
         // Re-pinned with native tool factory execution + bash spawnHook support.
         (
@@ -44801,6 +45128,286 @@ globalThis.__spawn_abort_result = result;
     }
 
     #[test]
+    fn pijs_readable_pull_hooks_follow_demand_and_settle_errors() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r"
+                    globalThis.readablePull = { done: false };
+                    (async () => {
+                        const { Readable } = await import('node:stream');
+                        const settle = async () => {
+                            for (let i = 0; i < 30; i++) await Promise.resolve();
+                        };
+                        const collect = async stream => {
+                            const chunks = [];
+                            for await (const chunk of stream) chunks.push(chunk);
+                            return chunks;
+                        };
+                        let index = 0;
+                        const sizes = [];
+                        const source = new Readable({ highWaterMark: 2, read(size) {
+                            sizes.push(size);
+                            this.push(index < 3 ? Buffer.from([65 + index++]) : null);
+                        } });
+                        await settle();
+                        const beforeConsumer = sizes.length;
+                        const text = (await collect(source)).map(String).join('');
+                        await settle();
+
+                        class ObjectSource extends Readable {
+                            constructor() { super({ objectMode: true, highWaterMark: 2 }); this.index = 0; }
+                            _read() { this.push(this.index < 3 ? { index: this.index++ } : null); }
+                        }
+                        const objects = await collect(new ObjectSource());
+
+                        let pendingCalls = 0;
+                        let deliver;
+                        const pending = new Readable({ read() {
+                            pendingCalls++;
+                            deliver = () => this.push('one');
+                        } });
+                        const iterator = pending[Symbol.asyncIterator]();
+                        const next = iterator.next();
+                        await settle();
+                        for (let i = 0; i < 5; i++) pending.resume();
+                        await settle();
+                        const inFlight = pendingCalls;
+                        deliver();
+                        const first = String((await next).value);
+                        await settle();
+                        const pausedCalls = pendingCalls;
+                        await iterator.return();
+                        const latePush = deliver();
+                        pending.read(0);
+                        pending.resume();
+                        await settle();
+
+                        const failure = new Readable({ read() { throw new Error('source failed'); } });
+                        let failureText = '';
+                        try { await failure[Symbol.asyncIterator]().next(); }
+                        catch (error) { failureText = error.message; }
+                        await settle();
+                        globalThis.readablePull = {
+                            done: true, beforeConsumer, text, sizes, objects,
+                            inFlight, first, pausedCalls, pendingCalls, latePush,
+                            pendingClosed: pending.closed, failureText, failureClosed: failure.closed,
+                        };
+                    })().catch(error => { globalThis.readablePull.error = String(error); });
+                    ",
+                )
+                .await
+                .expect("evaluate readable pull hooks");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "readablePull").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["beforeConsumer"], json!(0));
+            assert_eq!(result["text"], json!("ABC"));
+            assert_eq!(result["sizes"], json!([2, 2, 2, 2]));
+            assert_eq!(
+                result["objects"],
+                json!([{ "index": 0 }, { "index": 1 }, { "index": 2 }])
+            );
+            assert_eq!(result["inFlight"], json!(1));
+            assert_eq!(result["first"], json!("one"));
+            assert_eq!(result["pausedCalls"], json!(1));
+            assert_eq!(result["pendingCalls"], json!(1));
+            assert_eq!(result["latePush"], json!(false));
+            assert_eq!(result["pendingClosed"], json!(true));
+            assert_eq!(result["failureText"], json!("source failed"));
+            assert_eq!(result["failureClosed"], json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_readable_capacity_validates_chunks_and_suppresses_empty_pull_spins() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r"
+                    globalThis.readableCapacity = { done: false };
+                    (async () => {
+                        const { Readable } = await import('node:stream');
+                        const bytes = new Readable({ highWaterMark: 4 });
+                        const accepts = [bytes.push('é'), bytes.push('é')];
+                        const byteLength = bytes.readableLength;
+                        bytes.setEncoding('utf8');
+                        const decodedLength = bytes.readableLength;
+                        const zeroRead = bytes.read(0);
+                        const afterZero = bytes.readableLength;
+                        const read = bytes.read();
+                        const afterRead = bytes.readableLength;
+                        bytes.destroy();
+
+                        let invalidOptions = 0;
+                        for (const highWaterMark of [-1, 1.5, Infinity, NaN]) {
+                            try { new Readable({ highWaterMark }); }
+                            catch (error) { if (error instanceof RangeError) invalidOptions++; }
+                        }
+                        const invalid = new Readable();
+                        let invalidCode = '';
+                        invalid.on('error', error => { invalidCode = error.code; });
+                        const invalidAccepted = invalid.push({ unexpected: true });
+
+                        let emptyCalls = 0;
+                        const empty = new Readable({ read() {
+                            emptyCalls++;
+                            this.push(Buffer.alloc(0));
+                            this.push('');
+                            this.push(undefined);
+                        } });
+                        empty.resume();
+                        for (let i = 0; i < 100; i++) await Promise.resolve();
+                        const emptyLength = empty.readableLength;
+                        empty.destroy();
+
+                        const iterable = Readable.from([{ value: 1 }, false, undefined]);
+                        const objects = [];
+                        for await (const chunk of iterable) objects.push(chunk);
+                        let zeroCalls = 0;
+                        const zero = new Readable({ highWaterMark: 0, read(size) {
+                            if (size !== 0) throw new Error('zero high water mark lost');
+                            this.push(zeroCalls++ === 0 ? 'z' : null);
+                        } });
+                        let zeroText = '';
+                        for await (const chunk of zero) zeroText += chunk;
+                        globalThis.readableCapacity = {
+                            done: true, accepts, byteLength, decodedLength, zeroRead, afterZero,
+                            read, afterRead, invalidOptions, invalidCode, invalidAccepted,
+                            invalidClosed: invalid.closed, emptyCalls, emptyLength,
+                            objects, objectMode: iterable.readableObjectMode, zeroText, zeroCalls,
+                        };
+                    })().catch(error => { globalThis.readableCapacity.error = String(error); });
+                    ",
+                )
+                .await
+                .expect("evaluate readable capacity and empty pulls");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "readableCapacity").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["accepts"], json!([true, false]));
+            assert_eq!(result["byteLength"], json!(4));
+            assert_eq!(result["decodedLength"], json!(2));
+            assert_eq!(result["zeroRead"], serde_json::Value::Null);
+            assert_eq!(result["afterZero"], json!(2));
+            assert_eq!(result["read"], json!("é"));
+            assert_eq!(result["afterRead"], json!(1));
+            assert_eq!(result["invalidOptions"], json!(4));
+            assert_eq!(result["invalidCode"], json!("ERR_INVALID_ARG_TYPE"));
+            assert_eq!(result["invalidAccepted"], json!(false));
+            assert_eq!(result["invalidClosed"], json!(true));
+            assert_eq!(result["emptyCalls"], json!(1));
+            assert_eq!(result["emptyLength"], json!(0));
+            assert_eq!(result["objects"], json!([{ "value": 1 }, false, null]));
+            assert_eq!(result["objectMode"], json!(true));
+            assert_eq!(result["zeroText"], json!("z"));
+            assert_eq!(result["zeroCalls"], json!(2));
+        });
+    }
+
+    #[test]
+    fn pijs_transform_readable_pressure_bounds_upstream_and_cancels_held_writes() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r"
+                    globalThis.transformPressure = { done: false };
+                    (async () => {
+                        const { Readable, PassThrough } = await import('node:stream');
+                        const settle = async () => {
+                            for (let i = 0; i < 100; i++) await Promise.resolve();
+                        };
+                        let pulls = 0;
+                        let returned = 0;
+                        const source = Readable.from((function* () {
+                            try {
+                                for (let index = 0; index < 256; index++) {
+                                    pulls++;
+                                    yield { index };
+                                }
+                            } finally { returned++; }
+                        })());
+                        const transform = new PassThrough({ objectMode: true, highWaterMark: 4 });
+                        source.pipe(transform);
+                        await settle();
+                        const blockedPulls = pulls;
+                        const blockedLength = transform.readableLength;
+                        await settle();
+                        const stillBlocked = pulls === blockedPulls;
+                        let received = 0;
+                        let ordered = true;
+                        for await (const chunk of transform) {
+                            ordered = ordered && chunk.index === received++;
+                        }
+                        await settle();
+
+                        const held = new PassThrough({ objectMode: true, highWaterMark: 1 });
+                        const callbacks = [];
+                        const errors = [];
+                        let finished = 0;
+                        held.on('error', error => errors.push(error.message));
+                        held.on('finish', () => finished++);
+                        held.write({ value: 1 }, error => callbacks.push(error ? error.message : 'ok'));
+                        held.end({ value: 2 }, error => callbacks.push(error ? error.message : 'ok'));
+                        await settle();
+                        const beforeCancel = callbacks.length;
+                        held.destroy(new Error('cancelled while paused'));
+                        held.read(0);
+                        held.resume();
+                        await settle();
+                        globalThis.transformPressure = {
+                            done: true, blockedPulls, blockedLength, stillBlocked,
+                            received, ordered, returned, finalLength: transform.readableLength,
+                            finalFinished: transform.writableFinished,
+                            beforeCancel, callbacks, errors, finished,
+                            cancelledLength: held.readableLength, cancelledClosed: held.closed,
+                        };
+                    })().catch(error => { globalThis.transformPressure.error = String(error); });
+                    ",
+                )
+                .await
+                .expect("evaluate transform readable pressure");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "transformPressure").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert!(
+                result["blockedPulls"]
+                    .as_u64()
+                    .is_some_and(|count| (4..=8).contains(&count)),
+                "upstream must stop at the two bounded buffers: {result}"
+            );
+            assert_eq!(result["blockedLength"], json!(4));
+            assert_eq!(result["stillBlocked"], json!(true));
+            assert_eq!(result["received"], json!(256));
+            assert_eq!(result["ordered"], json!(true));
+            assert_eq!(result["returned"], json!(1));
+            assert_eq!(result["finalLength"], json!(0));
+            assert_eq!(result["finalFinished"], json!(true));
+            assert_eq!(result["beforeCancel"], json!(0));
+            assert_eq!(
+                result["callbacks"],
+                json!(["cancelled while paused", "cancelled while paused"])
+            );
+            assert_eq!(result["errors"], json!(["cancelled while paused"]));
+            assert_eq!(result["finished"], json!(0));
+            assert_eq!(result["cancelledLength"], json!(0));
+            assert_eq!(result["cancelledClosed"], json!(true));
+        });
+    }
+
+    #[test]
     fn pijs_readable_delayed_consumers_preserve_data_before_end() {
         futures::executor::block_on(async {
             let clock = Arc::new(DeterministicClock::new(0));
@@ -44866,6 +45473,189 @@ globalThis.__spawn_abort_result = result;
                 assert_eq!(result["received"][name]["order"], json!(["end", "close"]));
                 assert_eq!(result["received"][name]["buffered"], json!(0));
             }
+        });
+    }
+
+    #[test]
+    fn pijs_readable_decoding_preserves_split_bytes_across_all_sources() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.readableDecoding = { done: false };
+                    (async () => {
+                        const { Readable, PassThrough } = await import("node:stream");
+                        const fs = await import("node:fs");
+                        const collect = async stream => {
+                            const chunks = [];
+                            for await (const chunk of stream) chunks.push(chunk);
+                            return chunks;
+                        };
+                        const results = [];
+                        for (const [encoding, bytes] of [
+                            ['utf8', Buffer.from('Aé中😀Z')],
+                            ['utf16le', Buffer.from('Aé中😀Z', 'utf16le')],
+                            ['base64', Buffer.from([0, 1, 2, 3, 254, 255, 7])],
+                            ['base64url', Buffer.from([251, 255, 239, 3, 4])],
+                        ]) {
+                            const chunks = Array.from(bytes, byte => Buffer.from([byte]));
+                            const direct = new Readable({ encoding });
+                            for (const chunk of chunks) direct.push(chunk);
+                            direct.push(null);
+                            const transformed = new PassThrough({ encoding });
+                            for (const chunk of chunks) transformed.write(chunk);
+                            transformed.end();
+                            const web = Readable.fromWeb(new ReadableStream({
+                                start(controller) {
+                                    for (const chunk of chunks) controller.enqueue(chunk);
+                                    controller.close();
+                                },
+                            }), { encoding });
+                            fs.writeFileSync('/tmp/encoded-' + encoding, bytes);
+                            const sources = {
+                                direct, transformed, web,
+                                iterable: Readable.from(chunks, { encoding }),
+                                file: fs.createReadStream('/tmp/encoded-' + encoding, {
+                                    encoding, highWaterMark: 1,
+                                }),
+                            };
+                            const outputs = {};
+                            for (const [name, stream] of Object.entries(sources)) {
+                                const seen = await collect(stream);
+                                outputs[name] = {
+                                    text: seen.join(''), strings: seen.every(chunk => typeof chunk === 'string'),
+                                    noEmpty: seen.every(chunk => chunk.length > 0),
+                                };
+                            }
+                            results.push({ encoding, outputs });
+                        }
+                        const binary = await collect(Readable.fromWeb(new ReadableStream({
+                            start(controller) {
+                                controller.enqueue(new Uint8Array([0, 255, 128, 1]));
+                                controller.close();
+                            },
+                        })));
+                        globalThis.readableDecoding = {
+                            done: true, results,
+                            binary: Array.from(Buffer.concat(binary)),
+                            binaryBuffers: binary.every(chunk => Buffer.isBuffer(chunk)),
+                        };
+                    })().catch(error => { globalThis.readableDecoding.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate split stream decoding");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "readableDecoding").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            for (index, expected) in ["Aé中😀Z", "Aé中😀Z", "AAECA/7/Bw==", "-__vAwQ"]
+                .into_iter()
+                .enumerate()
+            {
+                for source in ["direct", "transformed", "web", "iterable", "file"] {
+                    assert_eq!(
+                        result["results"][index]["outputs"][source],
+                        json!({"text": expected, "strings": true, "noEmpty": true}),
+                        "source={source}, encoding index={index}: {result}"
+                    );
+                }
+            }
+            assert_eq!(result["binary"], json!([0, 255, 128, 1]));
+            assert_eq!(result["binaryBuffers"], json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_readable_decoding_handles_late_encoding_eof_and_readable_demand() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.readableDecodingLifecycle = { done: false };
+                    (async () => {
+                        const { Readable } = await import("node:stream");
+                        const collect = async stream => {
+                            const chunks = [];
+                            for await (const chunk of stream) chunks.push(chunk);
+                            return chunks.join('');
+                        };
+                        const late = new Readable();
+                        late.push(Buffer.from([0xf0, 0x9f]));
+                        const chained = late.setEncoding('UTF-8') === late;
+                        let invalid = false;
+                        try { late.setEncoding('not-an-encoding'); }
+                        catch (_) { invalid = true; }
+                        late.setEncoding('utf8');
+                        late.push(Buffer.from([0x98, 0x80]));
+                        late.push(null);
+                        const lateText = await collect(late);
+
+                        const ended = new Readable();
+                        ended.push(Buffer.from([0xc3]));
+                        ended.push(Buffer.from([0xa9, 0xe2, 0x82]));
+                        ended.push(null);
+                        ended.setEncoding('utf8');
+                        const endedText = await collect(ended);
+
+                        const truncated = new Readable({ encoding: 'utf8' });
+                        const events = [];
+                        truncated.on('data', chunk => events.push(chunk));
+                        truncated.on('end', () => events.push('end'));
+                        truncated.on('close', () => events.push('close'));
+                        truncated.push(Buffer.from([0xe2, 0x82]));
+                        const beforeEof = [...events];
+                        truncated.push(null);
+                        truncated.push(null);
+                        for (let i = 0; i < 20; i++) await Promise.resolve();
+
+                        const bytes = [0xe4, 0xb8, 0xad, 0xf0, 0x9f, 0x98, 0x80];
+                        let reads = 0;
+                        const demanded = Readable.fromWeb({ getReader() { return {
+                            read() {
+                                const index = reads++;
+                                return Promise.resolve(index < bytes.length
+                                    ? { done: false, value: new Uint8Array([bytes[index]]) }
+                                    : { done: true });
+                            },
+                            releaseLock() {}, cancel() {},
+                        }; } }, { encoding: 'utf8' });
+                        for (let i = 0; i < 20; i++) await Promise.resolve();
+                        const readsWithoutConsumer = reads;
+                        let demandText = '';
+                        demanded.on('readable', () => {
+                            let chunk;
+                            while ((chunk = demanded.read()) !== null) demandText += chunk;
+                        });
+                        await new Promise((resolve, reject) => demanded.on('end', resolve).on('error', reject));
+                        globalThis.readableDecodingLifecycle = {
+                            done: true, chained, invalid, lateText, endedText,
+                            beforeEof, events, readsWithoutConsumer, reads, demandText,
+                        };
+                    })().catch(error => { globalThis.readableDecodingLifecycle.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate decoder lifecycle and demand");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "readableDecodingLifecycle").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["chained"], json!(true));
+            assert_eq!(result["invalid"], json!(true));
+            assert_eq!(result["lateText"], json!("😀"));
+            assert_eq!(result["endedText"], json!("é�"));
+            assert_eq!(result["beforeEof"], json!([]));
+            assert_eq!(result["events"], json!(["�", "end", "close"]));
+            assert_eq!(result["readsWithoutConsumer"], json!(0));
+            assert_eq!(result["reads"], json!(8));
+            assert_eq!(result["demandText"], json!("中😀"));
         });
     }
 
@@ -46357,6 +47147,285 @@ globalThis.__spawn_abort_result = result;
     }
 
     #[test]
+    fn pijs_fs_read_stream_waits_for_demand_and_honors_byte_ranges() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r"
+                    globalThis.fsReadDemand = { done: false };
+                    (async () => {
+                        const fs = await import('node:fs');
+                        const settle = async () => {
+                            for (let i = 0; i < 30; i++) await Promise.resolve();
+                        };
+                        const collect = async stream => {
+                            const chunks = [];
+                            for await (const chunk of stream) chunks.push(chunk);
+                            return chunks;
+                        };
+                        const data = Buffer.from(Array.from({ length: 4096 }, (_, i) => i % 256));
+                        fs.writeFileSync('/tmp/read-demand.bin', data);
+                        const source = fs.createReadStream('/tmp/read-demand.bin', { highWaterMark: 16 });
+                        await settle();
+                        const before = { bytes: source.bytesRead, length: source.readableLength, fd: source.fd };
+                        source.read(0);
+                        await settle();
+                        const buffered = { bytes: source.bytesRead, length: source.readableLength };
+                        await settle();
+                        const stillBuffered = source.bytesRead === buffered.bytes;
+                        const copied = Buffer.concat(await collect(source));
+                        await settle();
+
+                        fs.writeFileSync('/tmp/read-range.txt', '0Aé中😀Z9');
+                        fs.writeFileSync('/tmp/read-empty.txt', '');
+                        const range = fs.createReadStream('/tmp/read-range.txt', {
+                            start: 2, end: 10, highWaterMark: 1, encoding: 'utf8',
+                        });
+                        const rangeText = (await collect(range)).join('');
+                        const single = (await collect(fs.createReadStream('/tmp/read-range.txt', {
+                            start: 11, end: 11, encoding: 'utf8',
+                        }))).join('');
+                        const partial = (await collect(fs.createReadStream('/tmp/read-range.txt', {
+                            start: 2, end: 2, encoding: 'utf8',
+                        }))).join('');
+                        const beyond = await collect(fs.createReadStream('/tmp/read-range.txt', { start: 99 }));
+                        const empty = await collect(fs.createReadStream('/tmp/read-empty.txt'));
+                        const zero = await collect(fs.createReadStream('/tmp/read-range.txt', { highWaterMark: 0 }));
+                        const shorthand = (await collect(fs.createReadStream('/tmp/read-range.txt', 'utf8'))).join('');
+                        const largeMark = Buffer.concat(await collect(fs.createReadStream('/tmp/read-range.txt', {
+                            highWaterMark: Number.MAX_SAFE_INTEGER,
+                        }))).toString();
+                        let invalidOptions = 0;
+                        for (const options of [
+                            { start: -1 }, { start: 1.5 }, { start: Infinity },
+                            { end: -1 }, { end: NaN }, { start: 3, end: 2 },
+                            { highWaterMark: -1 }, { highWaterMark: 1.5 },
+                        ]) {
+                            try { fs.createReadStream('/tmp/read-range.txt', options); }
+                            catch (error) { if (error instanceof RangeError) invalidOptions++; }
+                        }
+                        globalThis.fsReadDemand = {
+                            done: true, before, buffered, stillBuffered,
+                            copied: copied.length === data.length && copied.every((value, i) => value === data[i]),
+                            bytesRead: source.bytesRead, closed: source.closed, fd: source.fd,
+                            rangeText, rangeBytes: range.bytesRead, single, partial,
+                            beyond: beyond.length, empty: empty.length, zero: zero.length,
+                            shorthand, largeMark, invalidOptions,
+                        };
+                    })().catch(error => { globalThis.fsReadDemand.error = String(error); });
+                    ",
+                )
+                .await
+                .expect("evaluate file stream demand and ranges");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fsReadDemand").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(
+                result["before"],
+                json!({ "bytes": 0, "length": 0, "fd": null })
+            );
+            assert_eq!(result["buffered"], json!({ "bytes": 16, "length": 16 }));
+            assert_eq!(result["stillBuffered"], json!(true));
+            assert_eq!(result["copied"], json!(true));
+            assert_eq!(result["bytesRead"], json!(4096));
+            assert_eq!(result["closed"], json!(true));
+            assert_eq!(result["fd"], serde_json::Value::Null);
+            assert_eq!(result["rangeText"], json!("é中😀"));
+            assert_eq!(result["rangeBytes"], json!(9));
+            assert_eq!(result["single"], json!("Z"));
+            assert_eq!(result["partial"], json!("�"));
+            assert_eq!(result["beyond"], json!(0));
+            assert_eq!(result["empty"], json!(0));
+            assert_eq!(result["zero"], json!(0));
+            assert_eq!(result["shorthand"], json!("0Aé中😀Z9"));
+            assert_eq!(result["largeMark"], json!("0Aé中😀Z9"));
+            assert_eq!(result["invalidOptions"], json!(8));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_read_stream_cancellation_and_errors_release_owned_descriptors() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r"
+                    globalThis.fsReadCleanup = { done: false };
+                    (async () => {
+                        const fs = await import('node:fs');
+                        const settle = async () => {
+                            for (let i = 0; i < 30; i++) await Promise.resolve();
+                        };
+                        const released = fd => {
+                            try { fs.fstatSync(fd); return false; }
+                            catch (error) { return String(error).includes('EBADF'); }
+                        };
+                        const unopened = fs.createReadStream('/tmp/read-never-opened.txt');
+                        const unopenedEvents = [];
+                        unopened.on('error', () => unopenedEvents.push('error'));
+                        unopened.on('close', () => unopenedEvents.push('close'));
+                        unopened.destroy();
+                        unopened.resume();
+                        await settle();
+
+                        fs.writeFileSync('/tmp/read-cancel.txt', 'abcdefghi');
+                        const cancelled = fs.createReadStream('/tmp/read-cancel.txt', { highWaterMark: 3 });
+                        let first = '', cancelledFd;
+                        for await (const chunk of cancelled) {
+                            first = String(chunk);
+                            cancelledFd = cancelled.fd;
+                            break;
+                        }
+                        cancelled.read(0);
+                        cancelled.resume();
+                        await settle();
+
+                        const missing = fs.createReadStream('/tmp/read-does-not-exist.txt');
+                        const missingEvents = [];
+                        missing.on('error', () => missingEvents.push('error'));
+                        missing.on('end', () => missingEvents.push('end'));
+                        missing.on('close', () => missingEvents.push('close'));
+                        let missingError = '';
+                        try { await missing[Symbol.asyncIterator]().next(); }
+                        catch (error) { missingError = String(error); }
+                        missing.destroy();
+                        await settle();
+                        const protectedFields = [];
+                        for (const mode of ['frozen', 'throwing']) {
+                            const protectedStream = fs.createReadStream('/tmp/read-cancel.txt', {
+                                highWaterMark: 3,
+                            });
+                            const protectedIterator = protectedStream[Symbol.asyncIterator]();
+                            await protectedIterator.next();
+                            const owned = protectedStream.fd;
+                            if (mode === 'frozen') {
+                                Object.defineProperty(protectedStream, 'fd', { writable: false });
+                            } else {
+                                Object.defineProperty(protectedStream, 'fd', {
+                                    get() { return owned; },
+                                    set() { throw new Error('public descriptor is unavailable'); },
+                                });
+                            }
+                            const events = [];
+                            protectedStream.on('error', () => events.push('error'));
+                            protectedStream.on('close', () => events.push('close'));
+                            protectedStream.destroy();
+                            await settle();
+                            protectedFields.push({ mode, released: released(owned), events });
+                        }
+                        globalThis.fsReadCleanup = {
+                            done: true, unopenedEvents, unopenedFd: unopened.fd,
+                            unopenedBytes: unopened.bytesRead, first,
+                            cancelledBytes: cancelled.bytesRead, cancelledClosed: cancelled.closed,
+                            cancelledFd: cancelled.fd, cancelledReleased: released(cancelledFd),
+                            missingEvents, missingError: missingError.includes('ENOENT'),
+                            missingClosed: missing.closed, missingFd: missing.fd,
+                            protectedFields,
+                        };
+                    })().catch(error => { globalThis.fsReadCleanup.error = String(error); });
+                    ",
+                )
+                .await
+                .expect("evaluate file stream cancellation and errors");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fsReadCleanup").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["unopenedEvents"], json!(["close"]));
+            assert_eq!(result["unopenedFd"], serde_json::Value::Null);
+            assert_eq!(result["unopenedBytes"], json!(0));
+            assert_eq!(result["first"], json!("abc"));
+            assert_eq!(result["cancelledBytes"], json!(3));
+            assert_eq!(result["cancelledClosed"], json!(true));
+            assert_eq!(result["cancelledFd"], serde_json::Value::Null);
+            assert_eq!(result["cancelledReleased"], json!(true));
+            assert_eq!(result["missingEvents"], json!(["error", "close"]));
+            assert_eq!(result["missingError"], json!(true));
+            assert_eq!(result["missingClosed"], json!(true));
+            assert_eq!(result["missingFd"], serde_json::Value::Null);
+            assert_eq!(
+                result["protectedFields"],
+                json!([
+                    { "mode": "frozen", "released": true, "events": ["close"] },
+                    { "mode": "throwing", "released": true, "events": ["close"] }
+                ])
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_fs_read_stream_rechecks_owner_before_open_and_later_pulls() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            let script = r"
+                globalThis.fsReadOwner = { done: false };
+                (async () => {
+                    const fs = await import('node:fs');
+                    let unopened, active, iterator, activeFd, first;
+                    await __pi_with_extension_async(__pi_test_secret, 'ext.a', async () => {
+                        fs.writeFileSync('/tmp/read-owner.txt', 'owner-secret');
+                        unopened = fs.createReadStream('/tmp/read-owner.txt');
+                        active = fs.createReadStream('/tmp/read-owner.txt', { highWaterMark: 3 });
+                        iterator = active[Symbol.asyncIterator]();
+                        first = String((await iterator.next()).value);
+                        activeFd = active.fd;
+                    });
+                    let beforeOpenDenied = false, laterPullDenied = false, unrelatedKept = false;
+                    await __pi_with_extension_async(__pi_test_secret, 'ext.b', async () => {
+                        fs.writeFileSync('/tmp/read-owner.txt', 'other');
+                        const unrelated = fs.openSync('/tmp/read-owner.txt', 'r');
+                        // The public descriptor field cannot redirect owned cleanup.
+                        active.fd = unrelated;
+                        try { await unopened[Symbol.asyncIterator]().next(); }
+                        catch (error) { beforeOpenDenied = String(error).includes('host read denied'); }
+                        try { await iterator.next(); }
+                        catch (error) { laterPullDenied = String(error).includes('host read denied'); }
+                        const bytes = Buffer.alloc(5);
+                        unrelatedKept = fs.readSync(unrelated, bytes, 0, 5, 0) === 5 && String(bytes) === 'other';
+                        fs.closeSync(unrelated);
+                    });
+                    let released = false;
+                    await __pi_with_extension_async(__pi_test_secret, 'ext.a', async () => {
+                        try { fs.closeSync(activeFd); }
+                        catch (error) { released = String(error).includes('EBADF'); }
+                    });
+                    globalThis.fsReadOwner = {
+                        done: true, first, beforeOpenDenied, laterPullDenied, unrelatedKept, released,
+                        unopenedBytes: unopened.bytesRead, unopenedClosed: unopened.closed,
+                        activeBytes: active.bytesRead, activeClosed: active.closed, activeFd: active.fd,
+                    };
+                })().catch(error => { globalThis.fsReadOwner.error = String(error); });
+            ";
+            runtime
+                .eval(&privileged_test_script(&runtime, script))
+                .await
+                .expect("evaluate file stream owner handoff");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fsReadOwner").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["first"], json!("own"));
+            assert_eq!(result["beforeOpenDenied"], json!(true));
+            assert_eq!(result["laterPullDenied"], json!(true));
+            assert_eq!(result["unrelatedKept"], json!(true));
+            assert_eq!(result["released"], json!(true));
+            assert_eq!(result["unopenedBytes"], json!(0));
+            assert_eq!(result["unopenedClosed"], json!(true));
+            assert_eq!(result["activeBytes"], json!(3));
+            assert_eq!(result["activeClosed"], json!(true));
+            assert_eq!(result["activeFd"], serde_json::Value::Null);
+        });
+    }
+
+    #[test]
     fn pijs_fs_create_stream_pipeline_copies_content() {
         futures::executor::block_on(async {
             let clock = Arc::new(DeterministicClock::new(0));
@@ -46486,6 +47555,591 @@ globalThis.__spawn_abort_result = result;
                     .is_some_and(|error| error.contains("intentional stream destroy error"))
             );
             assert_eq!(result["destroyFdReleased"], serde_json::json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_write_stream_acknowledges_visible_bytes_and_honors_options() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+globalThis.fsWriteProgress = { done: false };
+(async () => {
+    const fs = await import("node:fs");
+    const write = (stream, chunk) => new Promise((resolve, reject) => {
+        stream.write(chunk, error => error ? reject(error) : resolve());
+    });
+    const end = (stream, chunk) => new Promise((resolve, reject) => {
+        stream.end(chunk, error => error ? reject(error) : resolve());
+    });
+    const stream = fs.createWriteStream("/tmp/write-progress", { highWaterMark: 4 });
+    const events = [];
+    stream.on("finish", () => events.push("finish"));
+    stream.on("close", () => events.push("close"));
+    let visibleInCallback = "", bytesInCallback = 0, pressured;
+    const input = Buffer.from("abcd");
+    await new Promise((resolve, reject) => {
+        pressured = !stream.write(input, error => {
+            if (error) { reject(error); return; }
+            visibleInCallback = fs.readFileSync("/tmp/write-progress", "utf8");
+            bytesInCallback = stream.bytesWritten;
+            resolve();
+        });
+    });
+    const snapshot = fs.readFileSync("/tmp/write-progress");
+    input[0] = 120;
+    await write(stream, "ef");
+    const beforeFinish = fs.readFileSync("/tmp/write-progress", "utf8");
+    await end(stream);
+    const afterFinish = fs.readFileSync("/tmp/write-progress", "utf8");
+
+    const cancelled = fs.createWriteStream("/tmp/write-cancelled");
+    await write(cancelled, "retained");
+    cancelled.destroy();
+    const afterDestroy = fs.readFileSync("/tmp/write-cancelled", "utf8");
+
+    const update = fs.createWriteStream("/tmp/write-progress", { flags: "r+", start: 2 });
+    await write(update, "XY");
+    await end(update, "Z");
+    const updated = fs.readFileSync("/tmp/write-progress", "utf8");
+    const append = fs.createWriteStream("/tmp/write-progress", { flags: "a", start: 0 });
+    await end(append, "!");
+    const appended = fs.readFileSync("/tmp/write-progress", "utf8");
+
+    const hole = fs.createWriteStream("/tmp/write-hole", { start: 3 });
+    await end(hole, "A");
+    const holeHex = fs.readFileSync("/tmp/write-hole", "hex");
+    const encoded = fs.createWriteStream("/tmp/write-encoding", "utf16le");
+    await end(encoded, "AΩ");
+    const encodedHex = fs.readFileSync("/tmp/write-encoding", "hex");
+    const base64 = fs.createWriteStream("/tmp/write-base64", { encoding: "base64", highWaterMark: 3 });
+    const base64Pressure = !base64.write("YWJj");
+    await end(base64);
+    const decoded = fs.readFileSync("/tmp/write-base64", "utf8");
+
+    fs.writeFileSync("/tmp/write-options", "keep");
+    const invalid = [];
+    for (const options of [
+        { highWaterMark: -1 }, { highWaterMark: 1.5 }, { start: -1 },
+        { start: Number.MAX_SAFE_INTEGER + 1 }, { encoding: "not-an-encoding" },
+        { autoClose: "yes" }, { fd: -1 },
+    ]) {
+        try { fs.createWriteStream("/tmp/write-options", options); invalid.push(false); }
+        catch (_) { invalid.push(fs.readFileSync("/tmp/write-options", "utf8") === "keep"); }
+    }
+
+    fs.mkdirSync("/tmp/write-open-error");
+    const failedOpen = fs.createWriteStream("/tmp/write-open-error");
+    let failedOpenEvents = 0;
+    failedOpen.on("error", () => { failedOpenEvents++; });
+    fs.rmdirSync("/tmp/write-open-error");
+    let failedOpenError = "";
+    try { await write(failedOpen, "must-not-write"); }
+    catch (error) { failedOpenError = String(error); }
+    const failedOpenDidNotCreate = !fs.existsSync("/tmp/write-open-error");
+
+    globalThis.fsWriteProgress = {
+        done: true, pressured, highWaterMark: stream.writableHighWaterMark,
+        visibleInCallback, bytesInCallback, beforeFinish, afterFinish, events,
+        snapshot: String(snapshot), afterDestroy, cancelledClosed: cancelled.closed,
+        bytesWritten: stream.bytesWritten, fd: stream.fd, updated, appended,
+        holeHex, encodedHex, base64Pressure, decoded, invalid,
+        failedOpenDenied: failedOpenError.includes("EISDIR"), failedOpenDidNotCreate, failedOpenEvents,
+    };
+})().catch(error => { globalThis.fsWriteProgress.error = String(error); });
+"#,
+                )
+                .await
+                .expect("evaluate incremental file stream writes");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fsWriteProgress").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["pressured"], json!(true));
+            assert_eq!(result["highWaterMark"], json!(4));
+            assert_eq!(result["visibleInCallback"], json!("abcd"));
+            assert_eq!(result["bytesInCallback"], json!(4));
+            assert_eq!(result["beforeFinish"], json!("abcdef"));
+            assert_eq!(result["afterFinish"], json!("abcdef"));
+            assert_eq!(result["events"], json!(["finish", "close"]));
+            assert_eq!(result["snapshot"], json!("abcd"));
+            assert_eq!(result["afterDestroy"], json!("retained"));
+            assert_eq!(result["cancelledClosed"], json!(true));
+            assert_eq!(result["bytesWritten"], json!(6));
+            assert_eq!(result["fd"], serde_json::Value::Null);
+            assert_eq!(result["updated"], json!("abXYZf"));
+            assert_eq!(result["appended"], json!("abXYZf!"));
+            assert_eq!(result["holeHex"], json!("00000041"));
+            assert_eq!(result["encodedHex"], json!("4100a903"));
+            assert_eq!(result["base64Pressure"], json!(true));
+            assert_eq!(result["decoded"], json!("abc"));
+            assert_eq!(
+                result["invalid"],
+                json!([true, true, true, true, true, true, true])
+            );
+            assert_eq!(result["failedOpenDenied"], json!(true));
+            assert_eq!(result["failedOpenDidNotCreate"], json!(true));
+            assert_eq!(result["failedOpenEvents"], json!(1));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_write_stream_preserves_descriptor_ownership_and_retention() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            let script = r#"
+globalThis.fsWriteOwnership = { done: false };
+(async () => {
+    const fs = await import("node:fs");
+    const write = (stream, chunk) => new Promise(resolve => {
+        stream.write(chunk, error => resolve(error ? String(error) : ""));
+    });
+    const end = (stream, chunk) => new Promise(resolve => {
+        stream.end(chunk, error => resolve(error ? String(error) : ""));
+    });
+    let stream, ownedFd, foreignFd;
+    const result = {};
+    await __pi_with_extension_async(__pi_test_secret, "ext.writer.a", async () => {
+        stream = fs.createWriteStream("/tmp/owner-write");
+        stream.on("error", () => {});
+        ownedFd = stream.fd;
+        result.firstError = await write(stream, "safe");
+        fs.writeFileSync("/tmp/foreign-fd", "foreign");
+        foreignFd = fs.openSync("/tmp/foreign-fd", "r+");
+    });
+    await __pi_with_extension_async(__pi_test_secret, "ext.writer.b", async () => {
+        fs.writeFileSync("/tmp/owner-write", "other");
+        const unrelated = fs.openSync("/tmp/owner-write", "r+");
+        stream.fd = unrelated;
+        result.denied = (await write(stream, "EVIL")).includes("host write denied");
+        result.closed = stream.closed;
+        result.bytesWritten = stream.bytesWritten;
+        const buf = Buffer.alloc(5);
+        result.unrelatedKept = fs.readSync(unrelated, buf, 0, 5, 0) === 5
+            && String(buf) === "other";
+        fs.closeSync(unrelated);
+        const foreign = fs.createWriteStream("/tmp/not-created", { fd: foreignFd });
+        foreign.on("error", () => {});
+        result.foreignDenied = (await write(foreign, "EVIL")).includes("host write denied");
+        result.pathIgnored = !fs.existsSync("/tmp/not-created");
+    });
+    await __pi_with_extension_async(__pi_test_secret, "ext.writer.a", async () => {
+        result.ownedContent = fs.readFileSync("/tmp/owner-write", "utf8");
+        try { fs.closeSync(ownedFd); result.ownedReleased = false; }
+        catch (error) { result.ownedReleased = String(error).includes("EBADF"); }
+        result.foreignKept = fs.fstatSync(foreignFd).size === 7;
+        fs.closeSync(foreignFd);
+
+        const retainedFd = fs.openSync("/tmp/retained-fd", "w+");
+        fs.writeSync(retainedFd, "a");
+        const retained = fs.createWriteStream({
+            toString() { throw new Error("supplied fd must ignore path"); }
+        }, { fd: retainedFd, autoClose: false });
+        result.retainedError = await end(retained, "b");
+        result.retainedOpen = fs.fstatSync(retainedFd).size === 2;
+        result.retainedClosed = retained.closed;
+        fs.writeSync(retainedFd, "c");
+        result.retainedContent = fs.readFileSync("/tmp/retained-fd", "utf8");
+        fs.closeSync(retainedFd);
+
+        const failedFd = fs.openSync("/tmp/failed-retained", "w+");
+        const failed = fs.createWriteStream(null, { fd: failedFd, autoClose: false });
+        failed.on("error", () => {});
+        result.failedError = (await write(failed, {
+            toString() { throw new Error("conversion failure"); }
+        })).includes("conversion failure");
+        result.failedRetained = fs.fstatSync(failedFd).size === 0;
+        result.failedBytes = failed.bytesWritten;
+        fs.closeSync(failedFd);
+
+        const guarded = fs.createWriteStream("/tmp/guarded-fd");
+        const guardedFd = guarded.fd;
+        await write(guarded, "ok");
+        Object.defineProperty(guarded, "fd", {
+            get() { return 123456; },
+            set() { throw new Error("public fd setter"); },
+        });
+        guarded.destroy();
+        try { fs.closeSync(guardedFd); result.guardedReleased = false; }
+        catch (error) { result.guardedReleased = String(error).includes("EBADF"); }
+    });
+    globalThis.fsWriteOwnership = { done: true, ...result };
+})().catch(error => { globalThis.fsWriteOwnership.error = String(error); });
+"#;
+            runtime
+                .eval(&privileged_test_script(&runtime, script))
+                .await
+                .expect("evaluate file stream descriptor ownership");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fsWriteOwnership").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["firstError"], json!(""));
+            assert_eq!(result["denied"], json!(true));
+            assert_eq!(result["closed"], json!(true));
+            assert_eq!(result["bytesWritten"], json!(4));
+            assert_eq!(result["unrelatedKept"], json!(true));
+            assert_eq!(result["foreignDenied"], json!(true));
+            assert_eq!(result["pathIgnored"], json!(true));
+            assert_eq!(result["ownedContent"], json!("safe"));
+            assert_eq!(result["ownedReleased"], json!(true));
+            assert_eq!(result["foreignKept"], json!(true));
+            assert_eq!(result["retainedError"], json!(""));
+            assert_eq!(result["retainedOpen"], json!(true));
+            assert_eq!(result["retainedClosed"], json!(false));
+            assert_eq!(result["retainedContent"], json!("abc"));
+            assert_eq!(result["failedError"], json!(true));
+            assert_eq!(result["failedRetained"], json!(true));
+            assert_eq!(result["failedBytes"], json!(0));
+            assert_eq!(result["guardedReleased"], json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_write_stream_storage_preserves_identity_with_linear_copy_work() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+globalThis.fsWriteStorage = { done: false };
+(async () => {
+    const fs = await import("node:fs");
+    const supplied = new Uint8Array([65, 66, 67, 68]);
+    fs.writeFileSync("/tmp/write-storage", supplied.buffer);
+    const fd = fs.openSync("/tmp/write-storage", "r+");
+    const peer = fs.openSync("/tmp/write-storage", "r+");
+    const before = fs.readFileSync("/tmp/write-storage");
+    fs.writeSync(fd, "Q", 0);
+    const callerUnchanged = Array.from(supplied);
+    const snapshotUnchanged = String(before);
+    const peerView = Buffer.alloc(4);
+    fs.readSync(peer, peerView, 0, 4, 0);
+    fs.ftruncateSync(fd, 2);
+    fs.writeSync(peer, "Z", 5);
+    const afterTruncate = fs.readFileSync("/tmp/write-storage", "hex");
+    fs.writeFileSync("/tmp/write-storage", "AB");
+    fs.writeSync(fd, "Y", 4);
+    const afterReplace = fs.readFileSync("/tmp/write-storage", "hex");
+    fs.renameSync("/tmp/write-storage", "/tmp/write-moved");
+    fs.writeSync(peer, "!", 5);
+    const afterRename = fs.readFileSync("/tmp/write-moved", "hex");
+    fs.unlinkSync("/tmp/write-moved");
+    fs.writeSync(fd, "?", 6);
+    const unlinkedNotRecreated = !fs.existsSync("/tmp/write-moved")
+        && !fs.existsSync("/tmp/write-storage") && fs.fstatSync(fd).size === 7;
+    fs.closeSync(fd);
+    fs.closeSync(peer);
+
+    // Count bytes copied, not elapsed wall time. Small writes and
+    // slow CI hosts cannot hide quadratic copies behind a timing threshold.
+    const chunk = Buffer.alloc(256, 120);
+    const count = 256;
+    const totalBytes = chunk.length * count;
+    const originalSet = Uint8Array.prototype.set;
+    let copiedBytes = 0;
+    const output = fs.createWriteStream("/tmp/write-many", { highWaterMark: 256 });
+    let everyCallbackVisible = true;
+    try {
+        Uint8Array.prototype.set = function(source, offset) {
+            copiedBytes += source.length;
+            return originalSet.call(this, source, offset);
+        };
+        for (let index = 0; index < count; index++) {
+            await new Promise((resolve, reject) => {
+                output.write(chunk, error => {
+                    if (error) { reject(error); return; }
+                    everyCallbackVisible = everyCallbackVisible
+                        && fs.statSync("/tmp/write-many").size === (index + 1) * chunk.length;
+                    resolve();
+                });
+            });
+        }
+        await new Promise((resolve, reject) => {
+            output.end(error => error ? reject(error) : resolve());
+        });
+    } finally { Uint8Array.prototype.set = originalSet; }
+    const bytes = fs.readFileSync("/tmp/write-many");
+    globalThis.fsWriteStorage = {
+        done: true, callerUnchanged, snapshotUnchanged, peerView: String(peerView),
+        afterTruncate, afterReplace, afterRename, unlinkedNotRecreated,
+        everyCallbackVisible, linearCopies: copiedBytes < totalBytes * 8,
+        copiedBytes, totalBytes, size: bytes.length,
+        allBytes: bytes.every(byte => byte === 120),
+    };
+})().catch(error => { globalThis.fsWriteStorage.error = String(error); });
+"#,
+                )
+                .await
+                .expect("evaluate file stream storage and copy work");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "fsWriteStorage").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["callerUnchanged"], json!([65, 66, 67, 68]));
+            assert_eq!(result["snapshotUnchanged"], json!("ABCD"));
+            assert_eq!(result["peerView"], json!("QBCD"));
+            assert_eq!(result["afterTruncate"], json!("51420000005a"));
+            assert_eq!(result["afterReplace"], json!("4142000059"));
+            assert_eq!(result["afterRename"], json!("414200005921"));
+            assert_eq!(result["unlinkedNotRecreated"], json!(true));
+            assert_eq!(result["everyCallbackVisible"], json!(true));
+            assert_eq!(result["linearCopies"], json!(true), "{result}");
+            assert_eq!(result["totalBytes"], json!(65_536));
+            assert_eq!(result["size"], json!(65_536));
+            assert_eq!(result["allBytes"], json!(true));
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_node_readable_to_web_bounds_idle_and_slow_consumers() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.toWebDemand = { done: false };
+                    (async () => {
+                        const { Readable } = await import("node:stream");
+                        const flush = async () => {
+                            for (let index = 0; index < 32; index++) await Promise.resolve();
+                        };
+                        const detached = stream => ["data", "end", "error", "close"]
+                            .every(event => stream.listenerCount(event) === 0);
+                        let produced = 0;
+                        let returned = 0;
+                        const source = Readable.from((function* () {
+                            try {
+                                for (let index = 0; index < 256; index++) {
+                                    produced++;
+                                    yield Uint8Array.of(index);
+                                }
+                            } finally {
+                                returned++;
+                            }
+                        })(), { objectMode: false, highWaterMark: 2 });
+                        const web = Readable.toWeb(source);
+                        await flush();
+                        const idleBounded = produced <= 1;
+                        const reader = web.getReader();
+                        const observed = [];
+                        let slowBounded = true;
+                        for (let index = 0; index < 8; index++) {
+                            const result = await reader.read();
+                            observed.push(result.done ? -1 : result.value[0]);
+                            await flush();
+                            slowBounded = slowBounded && produced <= observed.length + 1;
+                        }
+                        const beforeCancel = produced;
+                        await reader.cancel(new Error("reader finished early"));
+                        await flush();
+                        const cancelled = source.destroyed && source.closed && returned === 1;
+                        const stopped = produced === beforeCancel;
+                        const cancellationDetached = detached(source);
+                        reader.releaseLock();
+
+                        const complete = Readable.from(["first", "second", "third"]);
+                        const externalError = () => {};
+                        complete.on("error", externalError);
+                        const completeReader = Readable.toWeb(complete).getReader();
+                        const completeChunks = [];
+                        while (true) {
+                            const result = await completeReader.read();
+                            if (result.done) break;
+                            completeChunks.push(String(result.value));
+                        }
+                        await flush();
+                        const completionDetached = ["data", "end", "close"]
+                            .every(event => complete.listenerCount(event) === 0) &&
+                            complete.listeners("error").length === 1 &&
+                            complete.listeners("error")[0] === externalError;
+                        completeReader.releaseLock();
+                        globalThis.toWebDemand = {
+                            done: true, idleBounded, slowBounded, observed, cancelled, stopped,
+                            cancellationDetached, completeChunks, completionDetached,
+                        };
+                    })().catch(error => { globalThis.toWebDemand.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("eval Node-to-Web demand fixture");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "toWebDemand").await;
+            assert_eq!(
+                result,
+                serde_json::json!({
+                    "done": true,
+                    "idleBounded": true,
+                    "slowBounded": true,
+                    "observed": [0, 1, 2, 3, 4, 5, 6, 7],
+                    "cancelled": true,
+                    "stopped": true,
+                    "cancellationDetached": true,
+                    "completeChunks": ["first", "second", "third"],
+                    "completionDetached": true,
+                }),
+            );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_node_readable_to_web_owns_cancellation_and_terminal_listeners() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.toWebLifecycle = { done: false };
+                    (async () => {
+                        const { Readable } = await import("node:stream");
+                        const flush = async () => {
+                            for (let index = 0; index < 32; index++) await Promise.resolve();
+                        };
+                        const detached = stream => ["data", "end", "error", "close"]
+                            .every(event => stream.listenerCount(event) === 0);
+                        const result = {};
+
+                        let finishDestroy;
+                        let destructionCount = 0;
+                        let destructionReason;
+                        const delayed = new Readable({
+                            read() {},
+                            destroy(error, callback) {
+                                destructionCount++;
+                                destructionReason = error;
+                                finishDestroy = () => callback(error);
+                            },
+                        });
+                        const delayedReader = Readable.toWeb(delayed).getReader();
+                        const pending = delayedReader.read();
+                        const reason = new Error("cancel owns deferred destruction");
+                        let cancellationDone = false;
+                        const cancellation = delayedReader.cancel(reason).then(() => {
+                            cancellationDone = true;
+                        });
+                        await flush();
+                        result.waitsForClose = !cancellationDone && delayed.destroyed && !delayed.closed;
+                        result.teardownListeners = delayed.listenerCount("data") === 0 &&
+                            delayed.listenerCount("end") === 0 && delayed.listenerCount("error") === 1 &&
+                            delayed.listenerCount("close") === 1;
+                        finishDestroy();
+                        await cancellation;
+                        result.pendingCancelled = (await pending).done;
+                        result.reasonPreserved = destructionReason === reason;
+                        await delayedReader.cancel(new Error("ignored repeat cancellation"));
+                        result.destroyedOnce = destructionCount === 1;
+                        result.cancelDetached = detached(delayed);
+                        delayedReader.releaseLock();
+
+                        // The bridge closes synchronously but defers its source.cancel callback.
+                        // A previously queued Node producer must not throw into that gap.
+                        const racing = new Readable({ read() {} });
+                        const racingReader = Readable.toWeb(racing).getReader();
+                        const racingRead = racingReader.read();
+                        await flush();
+                        let latePushError = "";
+                        const latePush = Promise.resolve().then(() => {
+                            try { racing.push("late bytes"); }
+                            catch (error) { latePushError = String(error); }
+                        });
+                        await Promise.all([latePush, racingReader.cancel()]);
+                        result.cancelRaceSafe = latePushError === "" && (await racingRead).done;
+                        result.cancelRaceDetached = detached(racing);
+                        racingReader.releaseLock();
+
+                        const observeRead = async (stream, action) => {
+                            const reader = Readable.toWeb(stream).getReader();
+                            let observation = "pending";
+                            const pendingRead = reader.read().then(
+                                value => { observation = value.done ? "end" : "data"; },
+                                error => { observation = error.code || error.message || String(error); },
+                            );
+                            if (action) action();
+                            await flush();
+                            const observed = observation;
+                            if (observation === "pending") await reader.cancel();
+                            await pendingRead;
+                            reader.releaseLock();
+                            return observed;
+                        };
+                        const premature = new Readable({ read() {} });
+                        result.premature = await observeRead(premature, () => premature.destroy());
+                        result.prematureDetached = detached(premature);
+                        const failed = new Readable({ read() {} });
+                        result.failure = await observeRead(failed, () => failed.destroy(new Error("source failure")));
+                        result.failureDetached = detached(failed);
+
+                        const ended = new Readable({ read() {} });
+                        ended.push(null);
+                        await flush();
+                        result.alreadyEnded = await observeRead(ended);
+                        result.alreadyEndedDetached = detached(ended);
+                        const closed = new Readable({ read() {} });
+                        closed.destroy();
+                        result.alreadyClosed = await observeRead(closed);
+                        result.alreadyClosedDetached = detached(closed);
+
+                        let finishEarlyDestroy;
+                        const destroying = new Readable({
+                            read() {},
+                            destroy(error, callback) { finishEarlyDestroy = () => callback(error); },
+                        });
+                        destroying.destroy(new Error("already destroying"));
+                        result.alreadyDestroying = await observeRead(destroying);
+                        result.earlyDestroyOwned = destroying.listenerCount("error") === 1 &&
+                            destroying.listenerCount("close") === 1;
+                        finishEarlyDestroy();
+                        await flush();
+                        result.earlyDestroyDetached = detached(destroying);
+                        globalThis.toWebLifecycle = { done: true, ...result };
+                    })().catch(error => { globalThis.toWebLifecycle.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("eval Node-to-Web lifecycle fixture");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "toWebLifecycle").await;
+            assert_eq!(
+                result,
+                serde_json::json!({
+                    "done": true,
+                    "waitsForClose": true,
+                    "teardownListeners": true,
+                    "pendingCancelled": true,
+                    "reasonPreserved": true,
+                    "destroyedOnce": true,
+                    "cancelDetached": true,
+                    "cancelRaceSafe": true,
+                    "cancelRaceDetached": true,
+                    "premature": "ERR_STREAM_PREMATURE_CLOSE",
+                    "prematureDetached": true,
+                    "failure": "source failure",
+                    "failureDetached": true,
+                    "alreadyEnded": "end",
+                    "alreadyEndedDetached": true,
+                    "alreadyClosed": "ERR_STREAM_PREMATURE_CLOSE",
+                    "alreadyClosedDetached": true,
+                    "alreadyDestroying": "already destroying",
+                    "earlyDestroyOwned": true,
+                    "earlyDestroyDetached": true,
+                }),
+            );
         });
     }
 
