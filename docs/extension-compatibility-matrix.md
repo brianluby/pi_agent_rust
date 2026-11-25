@@ -26,8 +26,22 @@ capability-gated hostcall interface.
 | `node:http` | Partial | `request`, `get`, `STATUS_CODES`, `METHODS`, `IncomingMessage`, `ClientRequest`; outbound calls use `pi.http()`, explicit loopback `createServer` listeners are private in-memory routes |
 | `node:url` | Partial | `URL` (globalThis), `URLSearchParams`, `parse`, `format`, `resolve`, `fileURLToPath`, `pathToFileURL` |
 | `node:stream` | Partial | `Readable`, `Writable`, `Transform`, `PassThrough`, `Duplex`, `pipeline`, `finished` |
+| `node:stream/web` | Partial | `ReadableStream`, `WritableStream`, `TransformStream`, `TextEncoderStream`, `TextDecoderStream`, `ByteLengthQueuingStrategy`, `CountQueuingStrategy` |
 | `node:net` | Stub | `createConnection` (stub), `Socket` (stub); `createServer` throws -- network APIs outside sandbox |
 | `node:readline` | Partial | `createInterface`, `promises.createInterface` -- questions use `pi.ui('input')` when available and resolve to empty strings otherwise |
+
+### Web Streams
+
+The global Web Streams constructors and `node:stream/web` exports support
+`pipeTo`/`pipeThrough`, ordered asynchronous sink writes, transform/flush
+callbacks, reader/writer locks and completion promises, backpressure, and
+abort/error propagation. Cancellation waits for owned writes to settle before
+releasing pipe locks, including when `preventAbort` is selected.
+
+Text streams preserve UTF-8 characters across chunk boundaries; decoding
+supports fatal errors and BOM handling. Other decoder encodings and byte/BYOB
+streams are explicitly unsupported. These are JavaScript sandbox streams;
+underlying I/O continues to use the existing authorized host interfaces.
 
 ### `node:fs` Detail
 
@@ -60,7 +74,7 @@ routes `readFileSync` and `statSync` calls through the hostcall boundary
 | `createReadStream` | Real | Returns Readable stream |
 | `createWriteStream` | Real | Returns Writable stream |
 | `watchFile`/`unwatchFile` | Partial | Real authorized stat polling, default 5007 ms; current/previous metadata, missing-file and recreation events, selective listener removal, close/stop/ref/unref. Bounded to 128 watchers and 32 listeners per watcher; `bigint: true` is explicitly unsupported. |
-| `watch` | Unsupported | Throws `ERR_FEATURE_UNAVAILABLE`; native filesystem notifications are unavailable. Use `watchFile` for polling. |
+| `watch` | Partial | Authorized polling of files and shallow directories, every 250 ms by default (`interval` may be set to 50 ms or longer). Emits `change` for metadata changes and `rename` for child additions/removals/replacements; deleting or replacing the watched root emits `rename` and closes it. Supports filename encodings, close/ref/unref/hasRef and owner-scoped cleanup; an `AbortSignal` is checked at each poll. Shares the 128-handle limit with `watchFile`; each directory permits 4,096 visible children and all watch snapshots share an 8,192-entry limit. Polling may coalesce or miss changes between scans; `recursive: true` explicitly fails. |
 | Callback variants (`readFile`, `writeFile`, etc.) | Real | 9 callback-style functions |
 
 ### `node:crypto` Detail

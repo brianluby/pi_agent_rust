@@ -2256,7 +2256,13 @@ fn fs_watch_file_validates_options_and_bounds_watchers_and_listeners() {
                     listener: refused(() => fs.watchFile('/options', {})),
                     unwatchListener: refused(() => fs.unwatchFile('/options', false)),
                 };
-                try { fs.watch('/options'); } catch (error) { watchValidation.native = error.code === 'ERR_FEATURE_UNAVAILABLE'; }
+                try { fs.watch('/options', { recursive: true }); } catch (error) { watchValidation.recursiveUnavailable = error.code === 'ERR_FEATURE_UNAVAILABLE'; }
+                try { fs.watch('/options'); } catch (error) { watchValidation.missingEnoent = error.code === 'ENOENT'; }
+                fs.writeFileSync('/options', 'ok');
+                const shallowWatch = fs.watch('/options');
+                watchValidation.shallowWatch = typeof shallowWatch.close === 'function';
+                shallowWatch.close();
+                fs.unlinkSync('/options');
                 const watcher = fs.watchFile('/bounded-0', () => {});
                 for (let index = 1; index < 32; index++) watcher.on('change', () => {});
                 watchValidation.listenerLimit = refused(() => watcher.on('change', () => {}));
@@ -2267,7 +2273,7 @@ fn fs_watch_file_validates_options_and_bounds_watchers_and_listeners() {
             });
         "#).await.unwrap();
         let checks = runtime.read_global_json("watchValidation").await.unwrap();
-        assert_eq!(checks.as_object().unwrap().len(), 10);
+        assert_eq!(checks.as_object().unwrap().len(), 12);
         for (name, check) in checks.as_object().unwrap() {
             assert_eq!(check, &serde_json::Value::Bool(true), "{name}: {checks}");
         }
@@ -3843,8 +3849,11 @@ fn fs_persistent_inputs_are_checked_before_normalization() {
                 const denied = actions.map((action) => {{ try {{ action(); return false; }} catch (_) {{ return true; }} }});
                 let promiseDenied = false;
                 try {{ await fs.promises.readFile(raw, 'utf8'); }} catch (_) {{ promiseDenied = true; }}
-                let callbackDenied = false;
-                fs.readFile(raw, 'utf8', (error) => {{ callbackDenied = !!error; }});
+                const callbackDenied = await new Promise(resolve => {{
+                    let returned = false;
+                    fs.readFile(raw, 'utf8', error => resolve(!!error && returned));
+                    returned = true;
+                }});
 
                 fs.mkdirSync(workspace, {{ recursive: true }});
                 fs.symlinkSync(raw, workspace + '/virtual-alias');
@@ -4154,5 +4163,59 @@ fn fs_persistent_namespace_rejects_existing_and_late_symlink_escapes() {
                 .add_persistent_storage_root(symlink_root, "storage.owner")
                 .is_err()
         );
+    });
+}
+
+#[test]
+fn fs_readdir_sync_host_fallback_succeeds_without_watch_limit() {
+    futures::executor::block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = pi::extensions::safe_canonicalize(temp.path());
+        let prompts_dir = workspace.join(".pi").join("prompts");
+        std::fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+        std::fs::write(prompts_dir.join("model-mode.md"), "hello-prompt\n")
+            .expect("write prompt fixture");
+
+        let config = PiJsRuntimeConfig {
+            cwd: workspace.display().to_string(),
+            ..default_config()
+        };
+        let runtime =
+            PiJsRuntime::with_clock_and_config(Arc::new(DeterministicClock::new(0)), config)
+                .await
+                .expect("create runtime");
+        let dir_json = serde_json::to_string(&prompts_dir.display().to_string()).expect("dir json");
+        let script = format!(
+            r"
+            import('node:fs').then((fs) => {{
+                const dir = {dir_json};
+                const names = fs.readdirSync(dir);
+                const entries = fs.readdirSync(dir, {{ withFileTypes: true }});
+                const text = fs.readFileSync(dir + '/model-mode.md', 'utf8');
+                globalThis.hostReaddirCheck = {{
+                    names,
+                    entries: entries.map((entry) => ({{
+                        name: entry.name,
+                        isFile: entry.isFile(),
+                        isDir: entry.isDirectory(),
+                    }})),
+                    text,
+                }};
+            }});
+            "
+        );
+        runtime.eval(&script).await.expect("eval host readdirSync");
+        runtime.drain_microtasks().await.expect("drain microtasks");
+
+        let result = runtime
+            .read_global_json("hostReaddirCheck")
+            .await
+            .expect("read hostReaddirCheck");
+        assert_eq!(result["names"], serde_json::json!(["model-mode.md"]));
+        assert_eq!(
+            result["entries"],
+            serde_json::json!([{"name": "model-mode.md", "isFile": true, "isDir": false}])
+        );
+        assert_eq!(result["text"], serde_json::json!("hello-prompt\n"));
     });
 }

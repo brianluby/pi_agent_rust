@@ -318,6 +318,22 @@ pub struct ArtifactCleanupOutcome {
 }
 
 impl ArtifactCleanupOutcome {
+    fn retention_error(&self, error: Error, operation: &str) -> Error {
+        self.with_partial_cleanup(match error {
+            Error::Io(source) => Error::tool("bash", format!("{operation}: {source}")),
+            admission_error => admission_error,
+        })
+    }
+
+    fn with_partial_cleanup(&self, mut error: Error) -> Error {
+        if self.removed_files > 0
+            && let Error::Tool { message, .. } = &mut error
+        {
+            message.push_str(&self.setup_failure_context());
+        }
+        error
+    }
+
     fn setup_failure_context(&self) -> String {
         format!(
             "; artifact cleanup before setup failure: policy={}, removedFiles={}, reclaimedBytes={}",
@@ -1097,9 +1113,14 @@ fn is_managed_job_artifact_name(name: &OsStr) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactCleanupCandidate>> {
+fn artifact_cleanup_candidates(
+    jobs_dir: &Path,
+    checkpoint: &dyn Fn() -> Result<()>,
+) -> Result<Vec<ArtifactCleanupCandidate>> {
+    checkpoint()?;
     let mut candidates = Vec::new();
     for entry in std::fs::read_dir(jobs_dir)? {
+        checkpoint()?;
         let entry = entry?;
         if !is_managed_job_artifact_name(&entry.file_name()) {
             continue;
@@ -1117,12 +1138,12 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
         {
             Ok(artifact) => artifact,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         };
         match fs4::FileExt::try_lock(&artifact) {
             Ok(()) => {}
             Err(fs4::TryLockError::WouldBlock) => continue,
-            Err(fs4::TryLockError::Error(err)) => return Err(err),
+            Err(fs4::TryLockError::Error(err)) => return Err(err.into()),
         }
         let opened = artifact.metadata()?;
         let opened_identity = FileIdentity::of_open_file(&artifact)?;
@@ -1132,7 +1153,7 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
                 fs4::FileExt::unlock(&artifact)?;
                 continue;
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         };
         let current_identity = match FileIdentity::of_path_nofollow(&path) {
             Ok(identity) => identity,
@@ -1140,7 +1161,7 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
                 fs4::FileExt::unlock(&artifact)?;
                 continue;
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         };
         if !current.file_type().is_file()
             || opened_identity != current_identity
@@ -1157,6 +1178,7 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
             identity: opened_identity,
         });
     }
+    checkpoint()?;
     candidates.sort_by(|left, right| {
         left.modified
             .cmp(&right.modified)
@@ -1165,17 +1187,21 @@ fn artifact_cleanup_candidates(jobs_dir: &Path) -> std::io::Result<Vec<ArtifactC
     Ok(candidates)
 }
 
-fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Result<Option<u64>> {
+fn remove_unlocked_artifact(
+    candidate: &ArtifactCleanupCandidate,
+    checkpoint: &dyn Fn() -> Result<()>,
+) -> Result<Option<u64>> {
+    checkpoint()?;
     match std::fs::symlink_metadata(&candidate.path) {
         Ok(metadata) if metadata.file_type().is_file() => {}
         Ok(_) => return Ok(None),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err),
+        Err(err) => return Err(err.into()),
     }
     let before_identity = match FileIdentity::of_path_nofollow(&candidate.path) {
         Ok(identity) => identity,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err),
+        Err(err) => return Err(err.into()),
     };
     if candidate.identity != before_identity {
         return Ok(None);
@@ -1187,12 +1213,12 @@ fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Re
     {
         Ok(artifact) => artifact,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err),
+        Err(err) => return Err(err.into()),
     };
     match fs4::FileExt::try_lock(&artifact) {
         Ok(()) => {}
         Err(fs4::TryLockError::WouldBlock) => return Ok(None),
-        Err(fs4::TryLockError::Error(err)) => return Err(err),
+        Err(fs4::TryLockError::Error(err)) => return Err(err.into()),
     }
     let opened = artifact.metadata()?;
     let opened_identity = FileIdentity::of_open_file(&artifact)?;
@@ -1202,15 +1228,18 @@ fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Re
             fs4::FileExt::unlock(&artifact)?;
             return Ok(None);
         }
-        Err(err) => return Err(err),
+        Err(err) => return Err(err.into()),
     };
+    // Admission may block. Recheck the pathname identity after cancellation
+    // is checked and before unlink, while still holding the original file.
+    checkpoint()?;
     let current_identity = match FileIdentity::of_path_nofollow(&candidate.path) {
         Ok(identity) => identity,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             fs4::FileExt::unlock(&artifact)?;
             return Ok(None);
         }
-        Err(err) => return Err(err),
+        Err(err) => return Err(err.into()),
     };
     if !current.file_type().is_file()
         || before_identity != current_identity
@@ -1220,9 +1249,8 @@ fn remove_unlocked_artifact(candidate: &ArtifactCleanupCandidate) -> std::io::Re
         return Ok(None);
     }
     let removed_bytes = opened.len();
-    let remove_result = std::fs::remove_file(&candidate.path);
-    fs4::FileExt::unlock(&artifact)?;
-    remove_result?;
+    std::fs::remove_file(&candidate.path)?;
+    drop(artifact);
     Ok(Some(removed_bytes))
 }
 
@@ -1269,10 +1297,15 @@ fn artifact_file_reserved_bytes(
     }
 }
 
-fn artifact_directory_usage(jobs_dir: &Path) -> std::io::Result<(u64, usize)> {
+fn artifact_directory_usage(
+    jobs_dir: &Path,
+    checkpoint: &dyn Fn() -> Result<()>,
+) -> Result<(u64, usize)> {
+    checkpoint()?;
     let mut bytes = 0u64;
     let mut entries = 0usize;
     for entry in std::fs::read_dir(jobs_dir)? {
+        checkpoint()?;
         let entry = entry?;
         if entry.file_name() == ".artifact-budget.lock" {
             continue;
@@ -1303,44 +1336,39 @@ fn enforce_artifact_retention(
     max_bytes: u64,
     max_entries: usize,
     min_retained: usize,
+    checkpoint: &dyn Fn() -> Result<()>,
 ) -> Result<ArtifactCleanupOutcome> {
-    let (mut stored_bytes, mut stored_entries) =
-        artifact_directory_usage(jobs_dir).map_err(|err| {
-            Error::tool(
-                "bash",
-                format!("Failed to inspect jobs artifact dir: {err}"),
-            )
-        })?;
     let mut outcome = ArtifactCleanupOutcome {
         policy: policy.as_str().to_string(),
         removed_files: 0,
         reclaimed_bytes: 0,
     };
+    let (mut stored_bytes, mut stored_entries) = artifact_directory_usage(jobs_dir, checkpoint)
+        .map_err(|err| outcome.retention_error(err, "Failed to inspect jobs artifact dir"))?;
     if artifact_capacity_available(stored_bytes, stored_entries, max_bytes, max_entries) {
+        checkpoint()?;
         return Ok(outcome);
     }
 
     if policy == ArtifactRetentionPolicy::Rotate {
-        let candidates = artifact_cleanup_candidates(jobs_dir).map_err(|err| {
-            Error::tool(
-                "bash",
-                format!("Failed to inspect jobs artifact retention candidates: {err}"),
-            )
+        let candidates = artifact_cleanup_candidates(jobs_dir, checkpoint).map_err(|err| {
+            outcome.retention_error(err, "Failed to inspect jobs artifact retention candidates")
         })?;
         let removable = candidates.len().saturating_sub(min_retained);
         for candidate in candidates.into_iter().take(removable) {
             if artifact_capacity_available(stored_bytes, stored_entries, max_bytes, max_entries) {
                 break;
             }
-            let removed_bytes = remove_unlocked_artifact(&candidate).map_err(|err| {
-                Error::tool(
-                    "bash",
-                    format!(
-                        "Failed to rotate jobs artifact {}: {err}",
-                        candidate.path.display()
-                    ),
-                )
-            })?;
+            let removed_bytes =
+                remove_unlocked_artifact(&candidate, checkpoint).map_err(|err| {
+                    outcome.retention_error(
+                        err,
+                        &format!(
+                            "Failed to rotate jobs artifact {}",
+                            candidate.path.display()
+                        ),
+                    )
+                })?;
             if let Some(removed_bytes) = removed_bytes {
                 stored_bytes = stored_bytes.saturating_sub(removed_bytes);
                 stored_entries = stored_entries.saturating_sub(1);
@@ -1350,8 +1378,9 @@ fn enforce_artifact_retention(
         }
     }
 
-    (stored_bytes, stored_entries) = artifact_directory_usage(jobs_dir)
-        .map_err(|err| Error::tool("bash", format!("Failed to verify jobs artifact dir: {err}")))?;
+    (stored_bytes, stored_entries) = artifact_directory_usage(jobs_dir, checkpoint)
+        .map_err(|err| outcome.retention_error(err, "Failed to verify jobs artifact dir"))?;
+    checkpoint().map_err(|err| outcome.retention_error(err, "Failed to reserve job artifact"))?;
     if !artifact_capacity_available(stored_bytes, stored_entries, max_bytes, max_entries) {
         return Err(Error::tool(
             "bash",
@@ -1375,6 +1404,7 @@ fn ensure_artifact_budget(jobs_dir: &Path, max_bytes: u64, max_entries: usize) -
         max_bytes,
         max_entries,
         MIN_RETAINED_ARTIFACT_FILES,
+        &|| Ok(()),
     )
     .map(|_| ())
 }
@@ -2154,10 +2184,11 @@ fn spawn_managed(
     std::fs::create_dir_all(&jobs_dir)
         .map_err(|e| Error::tool("bash", format!("Failed to create jobs artifact dir: {e}")))?;
 
-    let artifact_budget_lock = acquire_artifact_budget_lock(&jobs_dir, || {
+    let check_admission = || {
         check_shell_job_admission(&owner, &cancelled)?;
         ensure_session_spawn_generation(owner_session_id, spawn_generation)
-    })?;
+    };
+    let artifact_budget_lock = acquire_artifact_budget_lock(&jobs_dir, check_admission)?;
     let retention_policy = ArtifactRetentionPolicy::from_environment()?;
     let artifact_cleanup = enforce_artifact_retention(
         &jobs_dir,
@@ -2165,6 +2196,7 @@ fn spawn_managed(
         MAX_TOTAL_ARTIFACT_BYTES,
         MAX_ARTIFACT_FILES,
         MIN_RETAINED_ARTIFACT_FILES,
+        &check_admission,
     )?;
     let cleanup_failure_context = artifact_cleanup.setup_failure_context();
     let (artifact_path, artifact) = create_job_artifact(&jobs_dir, &id).map_err(|e| {
@@ -3416,6 +3448,19 @@ fn record_job_settlement(
     job.process_live = false;
     job.output_complete = output_complete;
     job.settled_sequence = Some(settled_sequence);
+    if !output_complete {
+        // A pump can still own the sink after its drain deadline. Its file
+        // must stay locked until that writer releases it, but a retained
+        // terminal descriptor must not extend the full live-job reservation.
+        // Keep only the artifact state observed at publication for snapshots.
+        job.artifact = Arc::new(Mutex::new(ArtifactSink {
+            file: None,
+            bytes_written: 0,
+            cap: 0,
+            truncated: snapshot.artifact_truncated,
+            write_error: snapshot.artifact_error.clone(),
+        }));
+    }
     // The monitor may have captured a foreground-sized snapshot before
     // promotion won the registry lock. The final delivery mode is decisive.
     if job.delivery == JobDelivery::Background {
@@ -4199,6 +4244,7 @@ impl Drop for SessionShutdownWorker {
     }
 }
 
+#[cfg_attr(test, allow(clippy::significant_drop_tightening))]
 async fn request_session_shutdown(
     owner_session_id: &str,
 ) -> Result<(SessionShutdownAttempt, Vec<JobWaitHandle>)> {
@@ -4208,41 +4254,46 @@ async fn request_session_shutdown(
             "PI_JOBS_SESSION_UNAVAILABLE: current agent session identity is unavailable",
         ));
     }
-    // The uncontended path only snapshots in-memory state. Do not allocate a
-    // thread or consume the bounded waiting lane for an immediately available
-    // fence, including ordinary empty-session teardown.
-    if let Ok(lifecycle) = lifecycle_lock().try_lock() {
+    let receiver = {
+        #[cfg(test)]
+        let _shutdown_isolation = acquire_shutdown_capacity_read_guard();
+        // The uncontended path only snapshots in-memory state. Do not allocate a
+        // thread or consume the bounded waiting lane for an immediately available
+        // fence, including ordinary empty-session teardown.
+        if let Ok(lifecycle) = lifecycle_lock().try_lock() {
+            let attempt = SessionShutdownAttempt::begin(owner_session_id)?;
+            let handles = session_shutdown_handles(owner_session_id)?;
+            drop(lifecycle);
+            return Ok((attempt, handles));
+        }
+        let worker = SessionShutdownWorker::reserve()?;
+        // Publish cancellation before the worker waits behind an unrelated launch.
+        // The attempt travels with the result: losing either the worker or its
+        // receiver leaves the same fail-closed fence as an interrupted settlement.
         let attempt = SessionShutdownAttempt::begin(owner_session_id)?;
-        let handles = session_shutdown_handles(owner_session_id)?;
-        drop(lifecycle);
-        return Ok((attempt, handles));
-    }
-    let worker = SessionShutdownWorker::reserve()?;
-    // Publish cancellation before the worker waits behind an unrelated launch.
-    // The attempt travels with the result: losing either the worker or its
-    // receiver leaves the same fail-closed fence as an interrupted settlement.
-    let attempt = SessionShutdownAttempt::begin(owner_session_id)?;
-    let started = Instant::now();
-    let (sender, receiver) = futures::channel::oneshot::channel();
-    // spawn_blocking runs inline without a runtime blocking pool. A dedicated,
-    // capacity-limited worker keeps this fence off even a current-thread
-    // executor; thread creation failure must never fall back to inline work.
-    std::thread::Builder::new()
-        .name("pi-jobs-session-shutdown".to_string())
-        .spawn(move || {
-            let result =
-                snapshot_session_shutdown(attempt, started, SESSION_SHUTDOWN_TIMEOUT, || {
-                    sender.is_canceled()
-                });
-            let _ = sender.send(result);
-            drop(worker);
-        })
-        .map_err(|error| {
-            Error::tool(
-                "jobs",
-                format!("PI_JOBS_SESSION_SHUTDOWN_WORKER: failed to start worker: {error}"),
-            )
-        })?;
+        let started = Instant::now();
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        // spawn_blocking runs inline without a runtime blocking pool. A dedicated,
+        // capacity-limited worker keeps this fence off even a current-thread
+        // executor; thread creation failure must never fall back to inline work.
+        std::thread::Builder::new()
+            .name("pi-jobs-session-shutdown".to_string())
+            .spawn(move || {
+                let result =
+                    snapshot_session_shutdown(attempt, started, SESSION_SHUTDOWN_TIMEOUT, || {
+                        sender.is_canceled()
+                    });
+                let _ = sender.send(result);
+                drop(worker);
+            })
+            .map_err(|error| {
+                Error::tool(
+                    "jobs",
+                    format!("PI_JOBS_SESSION_SHUTDOWN_WORKER: failed to start worker: {error}"),
+                )
+            })?;
+        receiver
+    };
     // Teardown remains usable after its invoking task has been cancelled.
     // Dropping this future still closes the receiver and retires a waiting
     // worker without clearing the cancellation fence prematurely.
@@ -4440,6 +4491,56 @@ pub fn kill_all() {
             TERMINATE_GRACE + OUTPUT_DRAIN_GRACE + Duration::from_secs(1),
         );
     }
+}
+
+#[cfg(test)]
+fn shutdown_capacity_isolation_lock() -> &'static std::sync::RwLock<()> {
+    static ISOLATION: std::sync::RwLock<()> = std::sync::RwLock::new(());
+    &ISOLATION
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static HOLDS_SHUTDOWN_CAPACITY_ISOLATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct ShutdownCapacityIsolationGuard {
+    _guard: std::sync::RwLockWriteGuard<'static, ()>,
+    previous: bool,
+}
+
+#[cfg(test)]
+impl ShutdownCapacityIsolationGuard {
+    pub(crate) fn acquire() -> Self {
+        let guard = shutdown_capacity_isolation_lock()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = HOLDS_SHUTDOWN_CAPACITY_ISOLATION.with(|flag| flag.replace(true));
+        Self {
+            _guard: guard,
+            previous,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ShutdownCapacityIsolationGuard {
+    fn drop(&mut self) {
+        HOLDS_SHUTDOWN_CAPACITY_ISOLATION.with(|flag| flag.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+fn acquire_shutdown_capacity_read_guard() -> Option<std::sync::RwLockReadGuard<'static, ()>> {
+    if HOLDS_SHUTDOWN_CAPACITY_ISOLATION.with(std::cell::Cell::get) {
+        return None;
+    }
+    Some(
+        shutdown_capacity_isolation_lock()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
 #[cfg(test)]
@@ -6021,7 +6122,7 @@ mod tests {
 
         let live_reservation = u64::try_from(MAX_ARTIFACT_BYTES).expect("artifact cap fits");
         assert_eq!(
-            artifact_directory_usage(temp.path()).expect("account for live artifact"),
+            artifact_directory_usage(temp.path(), &|| Ok(())).expect("account for live artifact"),
             (live_reservation, 1),
             "stored bytes are part of the live reservation, not an additional charge"
         );
@@ -6107,6 +6208,7 @@ mod tests {
             u64::try_from(MAX_ARTIFACT_BYTES).expect("artifact cap fits"),
             10,
             0,
+            &|| Ok(()),
         )
         .expect_err("preservation refuses capacity instead of deleting");
         assert!(error.to_string().contains("retention policy: preserve"));
@@ -6117,12 +6219,90 @@ mod tests {
     }
 
     #[test]
+    fn artifact_inventory_stops_during_both_directory_passes() {
+        let temp = tempfile::tempdir().expect("artifact directory");
+        for index in 0..8 {
+            std::fs::write(temp.path().join(format!("job-{index:032x}.log")), b"log")
+                .expect("settled artifact");
+        }
+        for scan_candidates in [false, true] {
+            let visits = std::cell::Cell::new(0);
+            let checkpoint = || {
+                visits.set(visits.get() + 1);
+                if visits.get() == 3 {
+                    return Err(shell_job_cancelled_error());
+                }
+                Ok(())
+            };
+            let result = if scan_candidates {
+                artifact_cleanup_candidates(temp.path(), &checkpoint).map(|_| ())
+            } else {
+                artifact_directory_usage(temp.path(), &checkpoint).map(|_| ())
+            };
+            assert!(matches!(result, Err(Error::Tool { tool, message })
+                if tool == "jobs" && message.contains("PI_JOBS_CANCELLED")));
+            assert_eq!(visits.get(), 3);
+        }
+    }
+
+    #[test]
+    fn cancelled_rotation_preserves_locked_candidate_and_reports_prior_removals() {
+        let temp = tempfile::tempdir().expect("artifact directory");
+        let paths: Vec<_> = (0..3)
+            .map(|index| {
+                let path = temp.path().join(format!("job-{index:032x}.log"));
+                std::fs::write(&path, b"data").expect("settled artifact");
+                filetime::set_file_mtime(
+                    &path,
+                    filetime::FileTime::from_unix_time(1_700_000_000 + index, 0),
+                )
+                .expect("ordered artifacts");
+                path
+            })
+            .collect();
+        // An independent handle observes the checkpoint inside the locked
+        // unlink. The earlier candidate has already been removed by then.
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&paths[1])
+            .expect("probe second artifact");
+        let checkpoint = || match fs4::FileExt::try_lock(&probe) {
+            Ok(()) => fs4::FileExt::unlock(&probe).map_err(Error::from),
+            Err(fs4::TryLockError::WouldBlock) => Err(Error::tool(
+                "jobs",
+                "PI_JOBS_TASK_TIMEOUT: original launch deadline elapsed",
+            )),
+            Err(fs4::TryLockError::Error(error)) => Err(error.into()),
+        };
+        let error = enforce_artifact_retention(
+            temp.path(),
+            ArtifactRetentionPolicy::Rotate,
+            u64::MAX,
+            2,
+            1,
+            &checkpoint,
+        )
+        .expect_err("deadline inside final identity check must preserve this file");
+        let Error::Tool { tool, message } = error else {
+            panic!("lost task admission error: {error}");
+        };
+        assert_eq!(tool, "jobs");
+        assert!(message.starts_with("PI_JOBS_TASK_TIMEOUT"));
+        assert!(message.contains("removedFiles=1, reclaimedBytes=4"));
+        assert!(!paths[0].exists());
+        assert_eq!(std::fs::read(&paths[1]).expect("cancelled unlink"), b"data");
+        assert_eq!(std::fs::read(&paths[2]).expect("retention floor"), b"data");
+        fs4::FileExt::try_lock(&probe).expect("cancelled rotation released its lock");
+    }
+
+    #[test]
     fn artifact_cleanup_candidate_identity_rejects_same_name_replacement() {
         let _guard = process_test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("job-00000000000000000000000000000000.log");
         std::fs::write(&path, b"old!").expect("old artifact");
-        let candidate = artifact_cleanup_candidates(temp.path())
+        let candidate = artifact_cleanup_candidates(temp.path(), &|| Ok(()))
             .expect("candidate inventory")
             .pop()
             .expect("managed candidate");
@@ -6131,12 +6311,52 @@ mod tests {
         std::fs::write(&path, b"new!").expect("same-name replacement");
 
         assert_eq!(
-            remove_unlocked_artifact(&candidate).expect("identity check"),
+            remove_unlocked_artifact(&candidate, &|| Ok(())).expect("identity check"),
             None
         );
         assert_eq!(
             std::fs::read_to_string(path).expect("replacement preserved"),
             "new!"
+        );
+    }
+
+    #[test]
+    fn artifact_rotation_rechecks_identity_after_the_locked_admission_check() {
+        let directory = tempfile::tempdir().expect("artifact directory");
+        let path = directory
+            .path()
+            .join("job-00000000000000000000000000000000.log");
+        let displaced = directory.path().join("displaced");
+        std::fs::write(&path, b"old").expect("settled artifact");
+        let candidate = artifact_cleanup_candidates(directory.path(), &|| Ok(()))
+            .expect("inventory")
+            .pop()
+            .expect("managed artifact");
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("independent handle");
+        let checkpoint = || match fs4::FileExt::try_lock(&probe) {
+            Ok(()) => fs4::FileExt::unlock(&probe).map_err(Error::from),
+            Err(fs4::TryLockError::WouldBlock) => {
+                std::fs::rename(&path, &displaced)?;
+                std::fs::write(&path, b"replacement")?;
+                Ok(())
+            }
+            Err(fs4::TryLockError::Error(error)) => Err(error.into()),
+        };
+        assert_eq!(
+            remove_unlocked_artifact(&candidate, &checkpoint).expect("check locked identity"),
+            None
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("replacement preserved"),
+            b"replacement"
+        );
+        assert_eq!(
+            std::fs::read(displaced).expect("old file preserved"),
+            b"old"
         );
     }
 
@@ -6165,6 +6385,7 @@ mod tests {
             reserved + 8,
             10,
             2,
+            &|| Ok(()),
         )
         .expect("rotation admits one new artifact");
         assert_eq!(
@@ -6186,6 +6407,7 @@ mod tests {
             reserved + 8,
             10,
             2,
+            &|| Ok(()),
         )
         .expect("the retained restart state remains within budget");
         assert_eq!(restart_outcome.removed_files, 0);
@@ -6215,6 +6437,7 @@ mod tests {
             reserved.saturating_add(4),
             10,
             2,
+            &|| Ok(()),
         )
         .expect_err("the recent-artifact floor prevents sufficient reclamation");
         let message = error.to_string();
@@ -6263,6 +6486,7 @@ mod tests {
             reserved.saturating_mul(2).saturating_add(4),
             10,
             1,
+            &|| Ok(()),
         )
         .expect("one unlocked settled artifact is reclaimable");
         assert_eq!(outcome.removed_files, 1);
@@ -6294,6 +6518,7 @@ mod tests {
             u64::MAX,
             1,
             0,
+            &|| Ok(()),
         )
         .expect_err("a symlink cannot become a cleanup candidate");
         assert!(error.to_string().contains("PI_JOBS_ARTIFACT_CAPACITY"));
@@ -6587,23 +6812,29 @@ mod tests {
         record_final_shutdown_fixture_completion();
     }
 
-    fn wait_for_shutdown_workers_to_retire() {
-        let deadline = Instant::now() + Duration::from_secs(2);
+    fn wait_for_shutdown_workers_to_retire_within(timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
         loop {
             if registry()
                 .lock()
-                .expect("shutdown worker registry")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .shutdown_workers
                 == 0
             {
-                return;
+                return true;
             }
-            assert!(
-                Instant::now() < deadline,
-                "abandoned shutdown workers must retire without waiting for the lifecycle lock"
-            );
+            if Instant::now() >= deadline {
+                return false;
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn wait_for_shutdown_workers_to_retire() {
+        assert!(
+            wait_for_shutdown_workers_to_retire_within(Duration::from_secs(5)),
+            "abandoned shutdown workers must retire without waiting for the lifecycle lock"
+        );
     }
 
     #[test]
@@ -6612,6 +6843,7 @@ mod tests {
         use std::task::{Context, Poll};
 
         let _guard = process_test_guard();
+        let _shutdown_isolation = ShutdownCapacityIsolationGuard::acquire();
         wait_for_shutdown_workers_to_retire();
         let workers = (0..MAX_SESSION_SHUTDOWN_WORKERS)
             .map(|_| SessionShutdownWorker::reserve().expect("reserve waiting lane"))
@@ -6639,6 +6871,7 @@ mod tests {
         use std::task::Context;
 
         let _guard = process_test_guard();
+        let _shutdown_isolation = ShutdownCapacityIsolationGuard::acquire();
         wait_for_shutdown_workers_to_retire();
         let root = temp_root();
         let owner = format!("shutdown-yield-{}", uuid::Uuid::new_v4().simple());
@@ -6661,27 +6894,44 @@ mod tests {
         // Poll on this thread without any runtime blocking pool. The old
         // spawn_blocking fallback waits here until the lifecycle timeout and
         // returns Ready(Err); this must yield while we still hold the lock.
+        let first_poll_pending = shutdown.as_mut().poll(&mut task).is_pending();
+        let (owner_closing, job_cancel_requested, peer_cancel_requested, peer_closing) = {
+            let reg = registry().lock().expect("observe shutdown fence");
+            (
+                reg.closing_owners.contains_key(&owner),
+                reg.jobs[&id].cancel_requested,
+                reg.jobs[&peer_id].cancel_requested,
+                reg.closing_owners.contains_key(&peer),
+            )
+        };
+        let admission_blocked = ensure_session_accepting_jobs(&owner).is_err();
+        settle_job_without_notice(&id, JobStatus::Killed, None, true);
+        // Release before assertions so any failure cannot poison lifecycle_lock().
+        drop(lifecycle);
+        let shutdown_result = futures::executor::block_on(shutdown);
+        wait_for_shutdown_workers_to_retire();
+        let (owner_cleared, peer_still_uncancelled) = {
+            let mut reg = registry().lock().expect("retire shutdown fixtures");
+            let state = (
+                !reg.closing_owners.contains_key(&owner),
+                !reg.jobs[&peer_id].cancel_requested,
+            );
+            reg.jobs.remove(&id);
+            reg.jobs.remove(&peer_id);
+            state
+        };
         assert!(
-            shutdown.as_mut().poll(&mut task).is_pending(),
+            first_poll_pending,
             "session teardown must yield before another task can release the lifecycle fence"
         );
-        {
-            let reg = registry().lock().expect("observe shutdown fence");
-            assert!(reg.closing_owners.contains_key(&owner));
-            assert!(reg.jobs[&id].cancel_requested);
-            assert!(!reg.jobs[&peer_id].cancel_requested);
-            assert!(!reg.closing_owners.contains_key(&peer));
-        }
-        assert!(ensure_session_accepting_jobs(&owner).is_err());
-        settle_job_without_notice(&id, JobStatus::Killed, None, true);
-        drop(lifecycle);
-        futures::executor::block_on(shutdown).expect("owner teardown completes after release");
-        wait_for_shutdown_workers_to_retire();
-        let mut reg = registry().lock().expect("retire shutdown fixtures");
-        assert!(!reg.closing_owners.contains_key(&owner));
-        assert!(!reg.jobs[&peer_id].cancel_requested);
-        reg.jobs.remove(&id);
-        reg.jobs.remove(&peer_id);
+        assert!(owner_closing);
+        assert!(job_cancel_requested);
+        assert!(!peer_cancel_requested);
+        assert!(!peer_closing);
+        assert!(admission_blocked);
+        shutdown_result.expect("owner teardown completes after release");
+        assert!(owner_cleared);
+        assert!(peer_still_uncancelled);
     }
 
     #[test]
@@ -6691,26 +6941,62 @@ mod tests {
         use std::task::{Context, Poll};
 
         let _guard = process_test_guard();
+        let _shutdown_isolation = ShutdownCapacityIsolationGuard::acquire();
         wait_for_shutdown_workers_to_retire();
         let owners = (0..MAX_SESSION_SHUTDOWN_WORKERS)
             .map(|_| format!("shutdown-drop-{}", uuid::Uuid::new_v4().simple()))
             .collect::<Vec<_>>();
+        let excess_owner = format!("shutdown-excess-{}", uuid::Uuid::new_v4().simple());
         let lifecycle = lifecycle_lock().lock().expect("pause admission");
         let mut shutdowns = owners
             .iter()
             .map(|owner| Box::pin(kill_session(owner)))
             .collect::<Vec<_>>();
         let mut task = Context::from_waker(futures::task::noop_waker_ref());
-        for shutdown in &mut shutdowns {
-            assert!(shutdown.as_mut().poll(&mut task).is_pending());
-        }
-        assert_eq!(
-            registry().lock().expect("worker capacity").shutdown_workers,
-            MAX_SESSION_SHUTDOWN_WORKERS
-        );
-        let excess_owner = format!("shutdown-excess-{}", uuid::Uuid::new_v4().simple());
+        let all_pending = shutdowns
+            .iter_mut()
+            .all(|shutdown| shutdown.as_mut().poll(&mut task).is_pending());
+        let workers_at_capacity = registry().lock().expect("worker capacity").shutdown_workers;
         let mut excess = Box::pin(kill_session(&excess_owner));
-        let Poll::Ready(Err(error)) = excess.as_mut().poll(&mut task) else {
+        let excess_poll = excess.as_mut().poll(&mut task);
+        let (excess_workers_count, excess_not_closing, excess_no_generation) = {
+            let reg = registry().lock().expect("capacity rejection state");
+            (
+                reg.shutdown_workers,
+                !reg.closing_owners.contains_key(&excess_owner),
+                !reg.owner_shutdown_generations.contains_key(&excess_owner),
+            )
+        };
+
+        drop(shutdowns);
+        // Keep the lock held: dropping the receivers, rather than lock release
+        // or the ten-second timeout, must be what retires all eight workers.
+        let workers_retired_before_release =
+            wait_for_shutdown_workers_to_retire_within(Duration::from_secs(5));
+        let abandoned_states = {
+            let reg = registry().lock().expect("abandoned shutdown fences");
+            owners
+                .iter()
+                .map(|owner| {
+                    (
+                        reg.closing_owners
+                            .get(owner)
+                            .map(|state| state.active_attempts),
+                        reg.owner_shutdown_generations.contains_key(owner),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let admissions_blocked = owners
+            .iter()
+            .map(|owner| ensure_session_accepting_jobs(owner).is_err())
+            .collect::<Vec<_>>();
+        // Release before assertions so any failure cannot poison lifecycle_lock().
+        drop(lifecycle);
+
+        assert!(all_pending);
+        assert_eq!(workers_at_capacity, MAX_SESSION_SHUTDOWN_WORKERS);
+        let Poll::Ready(Err(error)) = excess_poll else {
             panic!("a full worker lane must reject without allocating another thread");
         };
         assert!(
@@ -6718,28 +7004,20 @@ mod tests {
                 .to_string()
                 .contains("PI_JOBS_SESSION_SHUTDOWN_AT_CAPACITY")
         );
-        {
-            let reg = registry().lock().expect("capacity rejection state");
-            assert_eq!(reg.shutdown_workers, MAX_SESSION_SHUTDOWN_WORKERS);
-            assert!(!reg.closing_owners.contains_key(&excess_owner));
-            assert!(!reg.owner_shutdown_generations.contains_key(&excess_owner));
+        assert_eq!(excess_workers_count, MAX_SESSION_SHUTDOWN_WORKERS);
+        assert!(excess_not_closing);
+        assert!(excess_no_generation);
+        assert!(
+            workers_retired_before_release,
+            "abandoned shutdown workers must retire without waiting for the lifecycle lock"
+        );
+        for (active_attempts, has_generation) in abandoned_states {
+            assert_eq!(active_attempts, Some(0));
+            assert!(has_generation);
         }
-
-        drop(shutdowns);
-        // Keep the lock held: dropping the receivers, rather than lock release
-        // or the ten-second timeout, must be what retires all eight workers.
-        wait_for_shutdown_workers_to_retire();
-        {
-            let reg = registry().lock().expect("abandoned shutdown fences");
-            for owner in &owners {
-                assert_eq!(reg.closing_owners[owner].active_attempts, 0);
-                assert!(reg.owner_shutdown_generations.contains_key(owner));
-            }
+        for blocked in admissions_blocked {
+            assert!(blocked);
         }
-        for owner in &owners {
-            assert!(ensure_session_accepting_jobs(owner).is_err());
-        }
-        drop(lifecycle);
         for owner in &owners {
             ensure_session_accepting_jobs(owner).expect("safe abandoned-fence reconciliation");
         }
@@ -7222,6 +7500,7 @@ mod tests {
     #[test]
     fn session_shutdown_lifecycle_fence_acquisition_is_bounded() {
         let _guard = process_test_guard();
+        let _shutdown_isolation = ShutdownCapacityIsolationGuard::acquire();
         let owner = format!("shutdown-lock-{}", uuid::Uuid::new_v4().simple());
         let lifecycle_guard = lifecycle_lock()
             .lock()
@@ -7245,6 +7524,15 @@ mod tests {
                 panic!("shutdown fence acquisition did not remain bounded: {err}");
             }
         };
+        let closing_while_held = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closing_owners
+            .contains_key(&owner);
+        let admission_blocked_while_held = ensure_session_accepting_jobs(&owner).is_err();
+        // Release before assertions so any failure cannot poison lifecycle_lock().
+        drop(lifecycle_guard);
+        request.join().expect("shutdown-fence request thread");
         let error = match request_result {
             Err(error) => error,
             Ok((_attempt, _handles)) => {
@@ -7258,19 +7546,13 @@ mod tests {
             "unexpected lifecycle-timeout error: {error}"
         );
         assert!(
-            registry()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .closing_owners
-                .contains_key(&owner),
+            closing_while_held,
             "a timed-out fence must keep rejecting late owner spawns"
         );
         assert!(
-            ensure_session_accepting_jobs(&owner).is_err(),
+            admission_blocked_while_held,
             "an in-flight lifecycle owner must prevent premature fence reconciliation"
         );
-        drop(lifecycle_guard);
-        request.join().expect("shutdown-fence request thread");
         ensure_session_accepting_jobs(&owner).expect("safe stale-fence reconciliation");
         assert!(
             !registry()
@@ -7286,6 +7568,7 @@ mod tests {
     #[allow(clippy::significant_drop_tightening)]
     fn session_shutdown_timeout_still_reaps_owned_shell_and_preserves_peer() {
         let _guard = process_test_guard();
+        let _shutdown_isolation = ShutdownCapacityIsolationGuard::acquire();
         let root = temp_root();
         let owner = format!("shutdown-running-{}", uuid::Uuid::new_v4().simple());
         let peer_owner = format!("shutdown-peer-{}", uuid::Uuid::new_v4().simple());
@@ -7354,9 +7637,9 @@ mod tests {
     #[test]
     fn settlement_is_bounded_when_artifact_state_is_busy() {
         let _guard = process_test_guard();
-        let root = temp_root();
+        let root = tempfile::tempdir().expect("isolated budget");
         let id = format!("job-busy-artifact-{}", uuid::Uuid::new_v4().simple());
-        let entry = synthetic_entry(&id, root.join(format!("{id}.log")), 0, false);
+        let entry = synthetic_entry(&id, root.path().join(format!("{id}.log")), 0, false);
         let artifact = Arc::clone(&entry.artifact);
         let handle = JobWaitHandle {
             owner_session_id: TEST_SESSION_ID.to_string(),
@@ -7372,6 +7655,8 @@ mod tests {
             .insert(id.clone(), entry);
 
         let artifact_guard = artifact.lock().expect("artifact lock");
+        fs4::FileExt::lock(artifact_guard.file.as_ref().expect("live artifact"))
+            .expect("reserve artifact for the outstanding writer");
         settle_job_and_enqueue_notice(&id, JobStatus::Exited, Some(0), false);
         let snapshot = settled_snapshot(&handle).expect("terminal snapshot");
         assert_eq!(snapshot.status, "exited");
@@ -7384,6 +7669,20 @@ mod tests {
             Some("artifact state unavailable while snapshotting")
         );
         drop(artifact_guard);
+        let budget = u64::try_from(MAX_ARTIFACT_BYTES).expect("artifact cap fits");
+        assert!(
+            ensure_artifact_budget(root.path(), budget, 2).is_err(),
+            "the outstanding writer must keep its reservation after publication"
+        );
+        drop(artifact);
+        ensure_artifact_budget(root.path(), budget, 2)
+            .expect("releasing the last writer must admit the next job while history is retained");
+        assert_eq!(
+            wait(TEST_SESSION_ID, &id, Duration::ZERO)
+                .expect("settled job still visible")
+                .artifact_error,
+            snapshot.artifact_error
+        );
 
         registry()
             .lock()
