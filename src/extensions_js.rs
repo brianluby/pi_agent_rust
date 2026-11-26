@@ -17659,7 +17659,8 @@ class Readable extends Stream {
     this._readRequested = false;
     this._readSize = 0;
     this._readWaiter = null;
-    this._pipeCleanup = new Map();
+    this._pipeConnections = new Set();
+    this._pipeBlocked = new Set();
     this._autoDestroy = opts.autoDestroy !== false;
     if (opts.encoding) this.setEncoding(opts.encoding);
   }
@@ -17941,64 +17942,130 @@ class Readable extends Stream {
       throw new Error("stream.pipe destination must implement write()");
     }
 
+    let active = true;
+    let attached = true;
+    const connection = { dest, cleanup: null };
+    const resumeAfterDrain = () => {
+      if (this._pipeBlocked.size === 0 && this.listenerCount("data") > 0) this.resume();
+    };
     const onData = (chunk) => {
+      if (!active || !attached) return;
       const writable = dest.write(chunk);
-      if (writable === false && typeof this.pause === "function") {
+      // A write can synchronously close or unpipe its destination. Only a
+      // still-attached sink can acquire pressure over subsequent chunks.
+      if (active && attached && writable === false) {
+        this._pipeBlocked.add(connection);
         this.pause();
       }
     };
     const onDrain = () => {
-      if (typeof this.resume === "function") this.resume();
+      if (!active || !attached || !this._pipeBlocked.delete(connection)) return;
+      // Every attached sink must have capacity. A fast sink's drain cannot
+      // acknowledge a different sink's outstanding write.
+      resumeAfterDrain();
     };
-    const onEnd = () => {
-      if (typeof dest.end === "function") dest.end();
-      cleanup();
-    };
-    const onError = (err) => {
-      cleanup();
-      if (typeof dest.destroy === "function") {
-        dest.destroy(err);
-      } else if (typeof dest.emit === "function") {
-        dest.emit("error", err);
-      }
-    };
-    const cleanup = () => {
+    const detachSource = () => {
+      if (!attached) return;
+      attached = false;
       this.removeListener("data", onData);
       this.removeListener("end", onEnd);
       this.removeListener("error", onError);
+      this.removeListener("close", cleanup);
+      const released = this._pipeBlocked.delete(connection);
+      if (this.listenerCount("data") === 0) this.pause();
+      else if (released) resumeAfterDrain();
+    };
+    const onEnd = () => {
+      if (!active || !attached) return;
+      detachSource();
+      try {
+        if (typeof dest.end === "function") dest.end();
+        if (typeof dest.on !== "function" || typeof dest.end !== "function" || dest.closed) cleanup();
+        else if (dest.writableFinished) onDestinationFinish();
+      } catch (error) {
+        cleanup();
+        throw error;
+      }
+    };
+    const onError = (err) => {
+      if (!active) return;
+      detachSource();
+      if (typeof dest.destroy === "function") {
+        try { dest.destroy(err); }
+        finally { if (dest.closed || !__streamEmitsClose(dest)) cleanup(); }
+      } else {
+        cleanup();
+        if (typeof dest.emit === "function") dest.emit("error", err);
+      }
+    };
+    const onDestinationError = (err) => {
+      if (!active) return;
+      cleanup();
+      // Unpipe before consumer error handlers run, without turning an
+      // otherwise-unhandled destination failure into successful delivery.
+      if (typeof dest.listenerCount === "function" && dest.listenerCount("error") === 0 &&
+          typeof dest.emit === "function") dest.emit("error", err);
+    };
+    const onDestinationFinish = () => {
+      if (!active) return;
+      detachSource();
+      // finish/EOF can precede asynchronous destruction. Keep the sink's
+      // error observer until that owner closes, including finalizer failures.
+      const allSidesComplete = !__streamHasReadable(dest) || __streamReadComplete(dest);
+      if (!dest.closed && __streamEmitsClose(dest) &&
+          (dest.destroyed || (__streamAutoDestroys(dest) && allSidesComplete))) return;
+      cleanup();
+    };
+    const cleanup = () => {
+      if (!active) return;
+      active = false;
+      detachSource();
       if (typeof dest.removeListener === "function") {
         dest.removeListener("drain", onDrain);
+        dest.removeListener("error", onDestinationError);
+        dest.removeListener("close", cleanup);
+        dest.removeListener("finish", onDestinationFinish);
       }
-      this._pipeCleanup.delete(dest);
+      this._pipeConnections.delete(connection);
     };
 
-    this.on("data", onData);
-    this.on("end", onEnd);
-    this.on("error", onError);
-    if (typeof dest.on === "function") {
-      dest.on("drain", onDrain);
+    connection.cleanup = cleanup;
+    this._pipeConnections.add(connection);
+    try {
+      if (typeof dest.on === "function") {
+        dest.on("drain", onDrain);
+        dest.on("close", cleanup);
+        dest.on("finish", onDestinationFinish);
+        if (typeof dest.prependListener === "function") dest.prependListener("error", onDestinationError);
+        else dest.on("error", onDestinationError);
+      }
+      this.on("end", onEnd);
+      this.on("error", onError);
+      this.on("close", cleanup);
+      this.on("data", onData);
+      if (dest.destroyed || dest.closed || dest.writableEnded || dest.writableFinished) cleanup();
+      else if (this.readableEnded) __streamQueueMicrotask(onEnd);
+      else if (this.destroyed || this.closed) cleanup();
+      else this.resume();
+    } catch (error) {
+      cleanup();
+      throw error;
     }
-    this._pipeCleanup.set(dest, cleanup);
-    this.resume();
     return dest;
   }
 
   unpipe(dest) {
-    if (dest) {
-      const cleanup = this._pipeCleanup.get(dest);
-      if (cleanup) cleanup();
-      if (this._pipeCleanup.size === 0) this.pause();
-      return this;
+    for (const connection of this._pipeConnections) {
+      if (!dest || connection.dest === dest) connection.cleanup();
     }
-    for (const cleanup of this._pipeCleanup.values()) {
-      cleanup();
-    }
-    this._pipeCleanup.clear();
-    this.pause();
+    if (!dest || this.listenerCount("data") === 0) this.pause();
     return this;
   }
 
   resume() {
+    // A queued or stale drain (and attaching another data consumer) cannot
+    // restart a cancelled source or bypass another pipe's backpressure.
+    if (this.destroyed || this.readableEnded || this._pipeBlocked.size > 0) return this;
     this._readableState.flowing = true;
     // Defer buffered delivery until callers have installed their end/error
     // listeners too (notably readline and stream.pipe).
@@ -18673,19 +18740,52 @@ class Writable extends Stream {
     }
     let controller;
     let completed = false;
+    let failure = null;
+    let pendingWrite = null;
     let pendingClose = null;
+    let cancellation = null;
     const cleanup = () => {
       nodeWritable.removeListener?.("error", onError);
       nodeWritable.removeListener?.("close", onClose);
+      nodeWritable.removeListener?.("drain", onDrain);
+      controller.signal?.removeEventListener("abort", onAbort);
     };
-    const onError = (error) => {
-      const failure = __streamToError(error);
-      controller.error(failure);
+    const rejectPending = (error) => {
+      if (pendingWrite) {
+        const pending = pendingWrite;
+        pendingWrite = null;
+        pending.reject(error);
+      }
       if (pendingClose) {
         const pending = pendingClose;
         pendingClose = null;
-        pending.reject(failure);
+        pending.reject(error);
       }
+    };
+    const onError = (error) => {
+      if (cancellation) {
+        if (error !== cancellation.reason && !cancellation.failure) {
+          cancellation.failure = __streamToError(error);
+        }
+        return;
+      }
+      failure = failure || __streamToError(error);
+      controller.error(failure);
+      // A foreign Node stream may emit error/close without ever invoking its
+      // write callback. Those events must release the active Web write too.
+      rejectPending(failure);
+    };
+    const finishWrite = () => {
+      const pending = pendingWrite;
+      if (!pending || !pending.started || !pending.written || pending.needsDrain) return;
+      pendingWrite = null;
+      pending.resolve();
+    };
+    const onDrain = () => {
+      if (!pendingWrite) return;
+      pendingWrite.drained = true;
+      pendingWrite.needsDrain = false;
+      finishWrite();
     };
     const finishClose = () => {
       completed = true;
@@ -18696,39 +18796,96 @@ class Writable extends Stream {
       }
       cleanup();
     };
+    const finishCancellation = () => {
+      if (!cancellation || cancellation.settled) return;
+      cancellation.settled = true;
+      if (nodeWritable.errored && nodeWritable.errored !== cancellation.reason && !cancellation.failure) {
+        cancellation.failure = __streamToError(nodeWritable.errored);
+      }
+      cleanup();
+      if (cancellation.failure) cancellation.reject(cancellation.failure);
+      else cancellation.resolve();
+    };
     const onClose = () => {
+      if (cancellation) { finishCancellation(); return; }
       if (nodeWritable.errored) onError(nodeWritable.errored);
-      else if (!completed && !nodeWritable.writableFinished && !nodeWritable._writableState?.finished) {
-        onError(nodeWritable.errored || __streamError("ERR_STREAM_PREMATURE_CLOSE", "premature stream close"));
+      else if (pendingWrite || (!completed && !__streamWriteComplete(nodeWritable))) {
+        onError(__streamError("ERR_STREAM_PREMATURE_CLOSE", "premature stream close"));
       } else finishClose();
       cleanup();
+    };
+    const cancel = (reason) => {
+      if (cancellation) return cancellation.promise;
+      let resolve, reject;
+      const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+      cancellation = {
+        promise, resolve, reject, settled: false, failure: null,
+        // An omitted abort reason must not mask an asynchronous destroy-hook
+        // failure behind a synthetic error passed to Stream.destroy().
+        reason: reason == null ? null : __streamToError(reason),
+      };
+      promise.catch(() => {});
+      rejectPending(cancellation.reason || __streamError("ABORT_ERR", "stream aborted"));
+      if (nodeWritable.closed || typeof nodeWritable.destroy !== "function") {
+        finishCancellation();
+      } else {
+        try {
+          nodeWritable.destroy(cancellation.reason);
+          if (nodeWritable.closed) finishCancellation();
+        } catch (error) {
+          cancellation.failure = __streamToError(error);
+          finishCancellation();
+        }
+      }
+      return promise;
+    };
+    const onAbort = () => {
+      // AbortSignal invents an AbortError for an omitted reason. Only release
+      // the in-flight Web operation here; sink.abort receives the original
+      // reason and owns destruction without that synthetic error masking a
+      // real cleanup failure. A late Node callback can no longer revive it.
+      rejectPending(failure || controller.signal.reason);
     };
     return new WritableStream({
       start(value) {
         controller = value;
         nodeWritable.on?.("error", onError);
         nodeWritable.on?.("close", onClose);
+        nodeWritable.on?.("drain", onDrain);
+        // Web abort waits for an in-flight sink.write before invoking sink.abort.
+        // The signal is the earlier cancellation seam that can release a stuck
+        // Web write and let sink.abort take ownership of the Node resource.
+        controller.signal?.addEventListener("abort", onAbort);
         if (nodeWritable.errored) onError(nodeWritable.errored);
         else if (nodeWritable.closed) onClose();
       },
       write(chunk) {
         return new Promise((resolve, reject) => {
+          if (failure) { reject(failure); return; }
+          if (controller.signal?.aborted) { reject(controller.signal.reason); return; }
+          const pending = { resolve, reject, started: false, written: false, drained: false, needsDrain: false };
+          pendingWrite = pending;
           try {
             const ok = nodeWritable.write(chunk, (err) => {
-              if (err) {
-                onError(err);
-                reject(__streamToError(err));
-              }
-              else resolve();
+              if (pendingWrite !== pending) return;
+              if (err) onError(err);
+              else { pending.written = true; finishWrite(); }
             });
-            if (ok === true) resolve();
+            if (pendingWrite !== pending) return;
+            // true reports queue capacity, not completion. A false return also
+            // owns its drain notification; neither signal replaces the callback.
+            pending.started = true;
+            pending.needsDrain = ok === false && !pending.drained;
+            finishWrite();
           } catch (err) {
-            reject(__streamToError(err));
+            onError(err);
           }
         });
       },
       close() {
         return new Promise((resolve, reject) => {
+          if (failure) { reject(failure); return; }
+          if (controller.signal?.aborted) { reject(controller.signal.reason); return; }
           pendingClose = { resolve, reject };
           try {
             nodeWritable.end((err) => {
@@ -18751,20 +18908,7 @@ class Writable extends Stream {
         });
       },
       abort(reason) {
-        return new Promise((resolve, reject) => {
-          const done = () => { cleanup(); resolve(); };
-          if (nodeWritable.closed || typeof nodeWritable.destroy !== "function") {
-            done();
-            return;
-          }
-          nodeWritable.once?.("close", done);
-          try { nodeWritable.destroy(__streamToError(reason ?? "stream aborted")); }
-          catch (error) {
-            nodeWritable.removeListener?.("close", done);
-            cleanup();
-            reject(__streamToError(error));
-          }
-        });
+        return cancel(reason);
       },
     });
   }
@@ -33013,10 +33157,12 @@ mod tests {
         // Sized reads preserve frame boundaries and demand across adapters;
         // iterators retain terminal-error ownership through asynchronous cleanup.
         // Iterable adapters also own pending next/value and return cleanup.
+        // Pipe fanout waits for every sink and retains asynchronous teardown errors.
+        // Web writable bridges await write callbacks and own abort cleanup.
         (
             "node:stream",
-            57_901,
-            "52a80ed36a67974d7b69efeedd64f0a67fb58202964309e6e25d6ae49f1f5927",
+            64_783,
+            "3e7b1706a96c120e2b19c7940e2b256a82fe786db241a82005ad7de0b16960bf",
         ),
         // Re-pinned with native tool factory execution + bash spawnHook support.
         (
@@ -49131,6 +49277,157 @@ globalThis.__spawn_abort_result = result;
     }
 
     #[test]
+    fn pijs_writable_to_web_waits_for_write_callbacks_and_drain() {
+        assert_web_stream_fixture(
+            r"
+const { Writable } = await import('node:stream');
+for (const highWaterMark of [1, 64]) {
+    const writes = [], callbacks = [], outcomes = [];
+    let closing = 'pending';
+    const sink = new Writable({ highWaterMark,
+        write(chunk, _encoding, callback) { writes.push(String(chunk)); callbacks.push(callback); },
+    });
+    const writer = Writable.toWeb(sink).getWriter();
+    writer.closed.catch(() => {});
+    const first = writer.write('first').then(() => outcomes.push('first'));
+    const second = writer.write('second').then(() => outcomes.push('second'));
+    const close = writer.close().then(() => { closing = 'closed'; });
+    await tick();
+    check(writes.join(',') === 'first', 'Web writes admit only one active Node write');
+    check(outcomes.length === 0 && closing === 'pending', 'queue capacity never acknowledges an incomplete write');
+    callbacks[0](null);
+    await tick();
+    check(outcomes.join(',') === 'first' && writes.join(',') === 'first,second', 'callback and drain release only the completed write');
+    check(closing === 'pending', 'Web close waits for the last write callback');
+    callbacks[1](null);
+    await success(Promise.all([first, second, close]), 'ordered write and close');
+    check(outcomes.join(',') === 'first,second' && closing === 'closed', 'both capacity paths preserve completion order');
+    check(sink.closed && sink.listenerCount('error') === 0 && sink.listenerCount('drain') === 0,
+        'successful writer retirement releases its listeners');
+    writer.releaseLock();
+}
+let finish;
+const reason = new Error('asynchronous write failure');
+const failed = new Writable({ write(_chunk, _encoding, callback) { finish = callback; } });
+const writer = Writable.toWeb(failed).getWriter();
+writer.closed.catch(() => {});
+let outcome = 'pending';
+const write = writer.write('never acknowledged');
+write.then(() => { outcome = 'success'; }, () => { outcome = 'failed'; });
+await tick();
+check(outcome === 'pending', 'async failure remains observable while the Node callback is outstanding');
+finish(reason);
+await rejectsWith(write, reason, 'write rejects its originating callback failure');
+check(outcome === 'failed' && failed.closed, 'failed work is never acknowledged as successful');
+writer.releaseLock();
+return checks;
+",
+            15,
+        );
+    }
+
+    #[test]
+    fn pijs_writable_to_web_abort_interrupts_writes_and_retains_cleanup() {
+        assert_web_stream_fixture(
+            r"
+const { Writable } = await import('node:stream');
+for (const failCleanup of [false, true]) {
+    const writes = [], outcomes = [];
+    let finishWrite, finishDestroy, destroyReason, destroys = 0, closes = 0, aborted = 'pending';
+    const sink = new Writable({
+        write(chunk, _encoding, callback) { writes.push(String(chunk)); finishWrite = callback; },
+        destroy(reason, callback) { destroys++; destroyReason = reason; finishDestroy = callback; },
+    });
+    sink.on('close', () => closes++);
+    const writer = Writable.toWeb(sink).getWriter();
+    writer.closed.catch(() => {});
+    for (const chunk of ['active', 'queued']) {
+        writer.write(chunk).then(() => outcomes.push('success'), () => outcomes.push('failed'));
+    }
+    await tick();
+    check(writes.join(',') === 'active' && outcomes.length === 0, 'abort fixture starts with one uncompleted write');
+    const abort = writer.abort();
+    abort.then(() => { aborted = 'success'; }, () => { aborted = 'failed'; });
+    await tick();
+    check(destroys === 1 && !sink.closed && aborted === 'pending', 'abort reaches a blocked writer and waits for destroy cleanup');
+    check(destroyReason === null, 'omitted abort reason cannot mask a cleanup error');
+    check(outcomes.join(',') === 'failed,failed' && writes.join(',') === 'active', 'aborting rejects active and queued writes without dispatching more work');
+    const reason = new Error('owned abort cleanup failed');
+    finishDestroy(failCleanup ? reason : null);
+    const result = await settle(abort, 'owned writer abort');
+    check(failCleanup ? !result.ok && result.error === reason : result.ok, 'abort reports its actual cleanup result');
+    finishWrite(null);
+    finishWrite(new Error('late callback must stay retired'));
+    finishDestroy(new Error('duplicate cleanup must stay retired'));
+    await tick();
+    check(closes === 1 && destroys === 1 && sink.listenerCount('error') === 0 && sink.listenerCount('drain') === 0,
+        'late callbacks do not resurrect writes or retain cleanup listeners');
+    writer.releaseLock();
+}
+let passedReason, complete;
+const requested = new Error('caller cancellation');
+const explicit = new Writable({ destroy(reason, callback) { passedReason = reason; complete = callback; } });
+const writer = Writable.toWeb(explicit).getWriter();
+writer.closed.catch(() => {});
+const abort = writer.abort(requested);
+await tick();
+check(passedReason === requested, 'explicit abort reason reaches its Node owner');
+complete(requested);
+await success(abort, 'expected cancellation reason');
+check(explicit.closed && explicit.listenerCount('error') === 0, 'the expected cancellation reason does not become a cleanup failure');
+writer.releaseLock();
+let dispatched = 0;
+const early = new Writable({ write(_chunk, _encoding, callback) { dispatched++; callback(null); } });
+const earlyWriter = Writable.toWeb(early).getWriter();
+earlyWriter.closed.catch(() => {});
+earlyWriter.write('cancel before sink admission').catch(() => {});
+await success(earlyWriter.abort(), 'abort before write dispatch');
+check(dispatched === 0 && early.closed, 'abort before the sink microtask cannot start Node work afterward');
+earlyWriter.releaseLock();
+return checks;
+",
+            15,
+        );
+    }
+
+    #[test]
+    fn pijs_writable_to_web_terminal_events_retire_missing_callbacks() {
+        assert_web_stream_fixture(
+            r"
+const { Writable } = await import('node:stream');
+for (const event of ['error', 'close']) {
+    const sink = new Writable();
+    let callback, outcome = 'pending';
+    // Foreign writers may report terminal state without completing write().
+    // Keep the real stream's event/destruction machinery for this seam.
+    sink.write = (_chunk, done) => { callback = done; return true; };
+    const writer = Writable.toWeb(sink).getWriter();
+    writer.closed.catch(() => {});
+    const write = writer.write('pending');
+    write.then(() => { outcome = 'success'; }, () => { outcome = 'failed'; });
+    await tick();
+    check(outcome === 'pending', 'a foreign writer must acknowledge through its callback');
+    const reason = new Error('foreign write failure');
+    if (event === 'error') sink.emit('error', reason);
+    else sink.destroy();
+    const result = await settle(write, 'terminal event without callback');
+    check(!result.ok && (event === 'error' ? result.error === reason : result.error.code === 'ERR_STREAM_PREMATURE_CLOSE'),
+        'terminal events reject the otherwise stranded Web write');
+    callback(null);
+    callback(new Error('late error'));
+    if (!sink.destroyed) sink.destroy();
+    await tick();
+    check(outcome === 'failed' && sink.listenerCount('error') === 0 && sink.listenerCount('drain') === 0,
+        'late foreign callbacks cannot change the terminal result');
+    writer.releaseLock();
+}
+return checks;
+",
+            6,
+        );
+    }
+
+    #[test]
     fn pijs_writable_to_web_awaits_owned_cleanup_and_reports_late_failure() {
         futures::executor::block_on(async {
             let clock = Arc::new(DeterministicClock::new(0));
@@ -49955,6 +50252,375 @@ globalThis.__spawn_abort_result = result;
                 result["normal"],
                 json!({"reads":1,"cancels":0,"releases":1,"hooks":1,"closes":1})
             );
+        });
+    }
+
+    #[test]
+    fn pijs_node_pipe_fanout_waits_for_every_destination() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.pipeFanout = { done: false };
+                    (async () => {
+                        const { Readable, Writable, promises } = await import("node:stream");
+                        let checks = 0;
+                        const check = (ok, message) => {
+                            checks++;
+                            if (!ok) throw new Error(message);
+                        };
+                        const settle = async () => {
+                            for (let i = 0; i < 100; i++) await Promise.resolve();
+                        };
+                        const listeners = stream => stream.eventNames()
+                            .reduce((count, name) => count + stream.listenerCount(name), 0);
+                        const expected = Array.from({ length: 256 }, (_, index) => index);
+                        const cases = [];
+                        for (const objectMode of [true, false]) {
+                            let pulls = 0, release;
+                            const slowValues = [], fastValues = [], lateValues = [];
+                            const value = chunk => objectMode ? chunk.index : chunk[0];
+                            const source = Readable.from((function* () {
+                                for (const index of expected) {
+                                    pulls++;
+                                    yield objectMode ? { index } : new Uint8Array([index]);
+                                }
+                            })(), { objectMode, highWaterMark: 1 });
+                            const slow = new Writable({
+                                objectMode, highWaterMark: 1,
+                                write(chunk, encoding, callback) {
+                                    slowValues.push(value(chunk));
+                                    if (!release) release = callback;
+                                    else callback(null);
+                                },
+                            });
+                            const fast = new Writable({
+                                objectMode, highWaterMark: 1,
+                                write(chunk, encoding, callback) {
+                                    fastValues.push(value(chunk));
+                                    Promise.resolve().then(() => callback(null));
+                                },
+                            });
+                            source.pipe(slow);
+                            source.pipe(fast);
+                            await settle();
+                            check(slow.writableLength === 1, "a fast drain bypassed slow sink pressure");
+                            check(fastValues.length === 1, "fast sink consumed past the held write");
+                            check(pulls > 0 && pulls <= 2, "fanout pulled an unbounded producer");
+                            check(source.isPaused(), "fanout did not pause under pressure");
+                            const held = pulls;
+
+                            const late = new Writable({
+                                objectMode, highWaterMark: 1,
+                                write(chunk, encoding, callback) {
+                                    lateValues.push(value(chunk));
+                                    callback(null);
+                                },
+                            });
+                            source.pipe(late);
+                            source.resume();
+                            await settle();
+                            check(pulls === held, "new pipe or resume bypassed existing sink pressure");
+                            check(slow.writableLength === 1, "new pipe expanded the blocked queue");
+                            check(fastValues.length === 1, "new pipe restarted the fast consumer");
+                            check(lateValues.length === 0, "late sink ran before the slow sink drained");
+
+                            release(null);
+                            await Promise.all([slow, fast, late].map(stream => promises.finished(stream)));
+                            check(JSON.stringify(slowValues) === JSON.stringify(expected), "slow sink lost or reordered data");
+                            check(JSON.stringify(fastValues) === JSON.stringify(expected), "fast sink lost or reordered data");
+                            check(JSON.stringify(lateValues) === JSON.stringify(expected.slice(1)), "late sink received wrong bytes");
+                            check(pulls === expected.length, "producer did not complete exactly once");
+                            check(listeners(source) === 0, "source retained pipe listeners after EOF");
+                            check([slow, fast, late].every(stream => listeners(stream) === 0), "sinks retained pipe listeners");
+                            cases.push({ objectMode, held, delivered: slowValues.length, late: lateValues.length });
+                        }
+                        globalThis.pipeFanout = { done: true, checks, cases };
+                    })().catch(error => { globalThis.pipeFanout.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate bounded pipe fanout");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "pipeFanout").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["checks"], json!(28), "{result}");
+        });
+    }
+
+    #[test]
+    fn pijs_node_pipe_detaches_terminal_sinks_without_stale_pressure() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.pipeDetach = { done: false };
+                    (async () => {
+                        const { Readable, Writable, promises } = await import("node:stream");
+                        let checks = 0;
+                        const check = (ok, message) => {
+                            checks++;
+                            if (!ok) throw new Error(message);
+                        };
+                        const settle = async () => {
+                            for (let i = 0; i < 100; i++) await Promise.resolve();
+                        };
+                        const expected = Array.from({ length: 32 }, (_, index) => index);
+                        const cases = [];
+                        for (const action of ["close", "error", "finish", "unpipe"]) {
+                            let pulls = 0, releaseDropped, releaseKept;
+                            const droppedValues = [], keptValues = [], errors = [];
+                            const source = Readable.from((function* () {
+                                for (const value of expected) { pulls++; yield value; }
+                            })(), { objectMode: true, highWaterMark: 1 });
+                            const dropped = new Writable({
+                                objectMode: true, highWaterMark: 1,
+                                write(chunk, encoding, callback) {
+                                    droppedValues.push(chunk);
+                                    releaseDropped = callback;
+                                },
+                            });
+                            const kept = new Writable({
+                                objectMode: true, highWaterMark: 1,
+                                write(chunk, encoding, callback) {
+                                    keptValues.push(chunk);
+                                    if (!releaseKept) releaseKept = callback;
+                                    else callback(null);
+                                },
+                            });
+                            const userDrain = () => {};
+                            const userError = error => errors.push(error.message);
+                            dropped.on("drain", userDrain);
+                            dropped.on("error", userError);
+                            source.pipe(dropped);
+                            source.pipe(kept);
+                            await settle();
+                            const held = pulls;
+                            check(held > 0 && held <= 2 && kept.writableLength === 1, action + " setup was not bounded");
+                            const staleDrains = dropped.rawListeners("drain").filter(listener => listener !== userDrain);
+                            if (action === "unpipe") source.unpipe(dropped);
+                            else if (action === "finish") { dropped.end(); releaseDropped(null); }
+                            else dropped.destroy(action === "error" ? new Error("sink failed") : undefined);
+                            await settle();
+                            check(pulls === held, action + " released a different sink's pressure");
+                            for (const drain of staleDrains) drain();
+                            dropped.emit("drain");
+                            await settle();
+                            check(pulls === held && kept.writableLength === 1, action + " stale drain restarted the source");
+                            check(source.isPaused(), action + " stale drain changed paused state");
+                            check(dropped.listeners("drain").length === 1 && dropped.listeners("drain")[0] === userDrain,
+                                action + " retained pipe drain listeners or removed the caller's");
+                            check(dropped.listeners("error").length === 1 && dropped.listeners("error")[0] === userError,
+                                action + " retained pipe error listeners or removed the caller's");
+
+                            releaseKept(null);
+                            await promises.finished(kept);
+                            check(JSON.stringify(keptValues) === JSON.stringify(expected), action + " stopped the surviving sink");
+                            check(JSON.stringify(droppedValues) === "[0]", action + " wrote after detachment");
+                            check(JSON.stringify(errors) === JSON.stringify(action === "error" ? ["sink failed"] : []),
+                                action + " lost or duplicated the sink error");
+                            if (!dropped.destroyed) dropped.destroy();
+                            cases.push({ action, delivered: keptValues.length, dropped: droppedValues.length });
+                        }
+
+                        const synchronous = [];
+                        for (const action of ["close", "error", "finish", "unpipe"]) {
+                            const source = Readable.from(expected, { objectMode: true, highWaterMark: 1 });
+                            const dropped = new Writable({ objectMode: true });
+                            const errors = [], received = [];
+                            let writes = 0;
+                            dropped.on("error", error => errors.push(error.message));
+                            // A foreign sink can emit a terminal event or unpipe synchronously
+                            // inside write(), then return false to its now-stale caller.
+                            dropped.write = () => {
+                                writes++;
+                                if (action === "unpipe") source.unpipe(dropped);
+                                else if (action === "finish") dropped.emit("finish");
+                                else dropped.destroy(action === "error" ? new Error("sync failure") : undefined);
+                                return false;
+                            };
+                            const kept = new Writable({
+                                objectMode: true, highWaterMark: 1,
+                                write(chunk, encoding, callback) { received.push(chunk); callback(null); },
+                            });
+                            source.pipe(dropped);
+                            source.pipe(kept);
+                            for (let i = 0; i < 1000; i++) await Promise.resolve();
+                            check(kept.writableFinished, action + " false return reacquired pressure after detachment");
+                            check(JSON.stringify(received) === JSON.stringify(expected), action + " reentrant detach lost data");
+                            check(writes === 1, action + " received another write after reentrant detachment");
+                            check(JSON.stringify(errors) === JSON.stringify(action === "error" ? ["sync failure"] : []),
+                                action + " changed the reentrant error");
+                            if (!dropped.destroyed) dropped.destroy();
+                            synchronous.push({ action, writes, delivered: received.length });
+                        }
+
+                        let pulls = 0;
+                        const repeatedSource = Readable.from((function* () {
+                            for (const value of expected) { pulls++; yield value; }
+                        })(), { objectMode: true, highWaterMark: 1 });
+                        const repeatedSink = new Writable({
+                            objectMode: true, highWaterMark: 1, write(chunk, encoding, callback) {},
+                        });
+                        repeatedSource.pipe(repeatedSink);
+                        repeatedSource.pipe(repeatedSink);
+                        await settle();
+                        const held = pulls;
+                        const stale = repeatedSink.rawListeners("drain").slice();
+                        repeatedSource.unpipe(repeatedSink);
+                        for (const drain of stale) drain();
+                        repeatedSink.emit("drain");
+                        await settle();
+                        check(pulls === held && repeatedSource.isPaused(), "duplicate pipe left an active drain callback");
+                        check(repeatedSource.listenerCount("data") === 0, "duplicate pipe orphaned a source listener");
+                        check(repeatedSink.listenerCount("drain") === 0, "duplicate pipe orphaned a sink listener");
+                        repeatedSource.destroy();
+                        repeatedSink.destroy();
+                        globalThis.pipeDetach = { done: true, checks, cases, synchronous };
+                    })().catch(error => { globalThis.pipeDetach.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate pipe terminal and reentrant detachment");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "pipeDetach").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["checks"], json!(55), "{result}");
+        });
+    }
+
+    #[test]
+    fn pijs_node_pipe_retains_async_cleanup_error_ownership() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.pipeCleanup = { done: false };
+                    (async () => {
+                        const { Readable, Writable, promises } = await import("node:stream");
+                        let checks = 0;
+                        const check = (ok, message) => {
+                            checks++;
+                            if (!ok) throw new Error(message);
+                        };
+                        const settle = async () => {
+                            for (let i = 0; i < 100; i++) await Promise.resolve();
+                        };
+                        const cases = [];
+                        for (const failure of ["final", "cleanup"]) {
+                            let releaseFinal, releaseDestroy;
+                            const errors = [];
+                            const source = Readable.from([1]);
+                            const sink = new Writable({
+                                objectMode: true,
+                                write(chunk, encoding, callback) { callback(null); },
+                                final(callback) { releaseFinal = callback; },
+                                destroy(error, callback) { releaseDestroy = callback; },
+                            });
+                            const userError = error => errors.push(error.message);
+                            sink.on("error", userError);
+                            source.pipe(sink);
+                            await settle();
+                            check(source.readableEnded && source.closed, failure + " source did not finish");
+                            check(sink.listenerCount("error") === 2, failure + " EOF detached the sink error observer early");
+                            releaseFinal(failure === "final" ? new Error("final failed") : null);
+                            await settle();
+                            check(sink.destroyed && !sink.closed, failure + " cleanup was not held");
+                            check(sink.listenerCount("error") === 2, failure + " finish detached cleanup error ownership");
+                            check(errors.length === 0, failure + " reported an error before cleanup completed");
+                            releaseDestroy(failure === "cleanup" ? new Error("cleanup failed") : null);
+                            await settle();
+                            check(sink.closed, failure + " sink did not close");
+                            check(JSON.stringify(errors) === JSON.stringify([failure + " failed"]), failure + " error was lost or duplicated");
+                            check(sink.listeners("error").length === 1 && sink.listeners("error")[0] === userError,
+                                failure + " retained the pipe error observer or removed the caller's");
+                            check(source.eventNames().length === 0 && sink.listenerCount("drain") === 0,
+                                failure + " leaked source or drain listeners");
+                            cases.push({ failure, errors, closed: sink.closed });
+                        }
+
+                        const independent = new Writable({ objectMode: true, autoDestroy: false });
+                        const keptError = () => {};
+                        independent.on("error", keptError);
+                        Readable.from([1, 2]).pipe(independent);
+                        await promises.finished(independent);
+                        check(independent.writableFinished && !independent.closed, "autoDestroy:false was not preserved");
+                        check(independent.listenerCount("error") === 1 && independent.listenerCount("drain") === 0,
+                            "finish retained observers on an independently owned sink");
+                        independent.destroy();
+
+                        let reads = 0, releaseSource;
+                        const source = new Readable({
+                            objectMode: true, highWaterMark: 1,
+                            read() { reads++; this.push(reads); },
+                            destroy(error, callback) { releaseSource = callback; },
+                        });
+                        const cancelled = new Writable({
+                            objectMode: true, highWaterMark: 1, write(chunk, encoding, callback) {},
+                        });
+                        const userDrain = () => {};
+                        cancelled.on("drain", userDrain);
+                        source.pipe(cancelled);
+                        await settle();
+                        const before = reads;
+                        const staleDrains = cancelled.rawListeners("drain").filter(listener => listener !== userDrain);
+                        source.destroy();
+                        for (const drain of staleDrains) drain();
+                        source.resume();
+                        await settle();
+                        check(reads === before && source.isPaused(), "pending source cleanup was resumed by a drain");
+                        check(source.destroyed && !source.closed, "source destruction did not retain its pending cleanup");
+                        releaseSource(null);
+                        await settle();
+                        for (const drain of staleDrains) drain();
+                        cancelled.emit("drain");
+                        await settle();
+                        check(source.closed && reads === before && source.isPaused(), "cancelled source restarted after close");
+                        check(source.listenerCount("data") === 0 && source.listenerCount("error") === 0,
+                            "source cancellation retained pipe listeners");
+                        check(cancelled.listeners("drain").length === 1 && cancelled.listeners("drain")[0] === userDrain,
+                            "source cancellation removed a caller listener or leaked its own");
+                        check(cancelled.listenerCount("error") === 0, "source cancellation retained the sink error observer");
+                        cancelled.destroy();
+
+                        let releaseFailedSink;
+                        const failedSource = new Readable({ objectMode: true, read() {} });
+                        const failedErrors = [];
+                        const failedSink = new Writable({
+                            objectMode: true, destroy(error, callback) { releaseFailedSink = callback; },
+                        });
+                        failedSink.on("error", error => failedErrors.push(error.message));
+                        failedSource.pipe(failedSink);
+                        failedSource.destroy(new Error("source failed"));
+                        await settle();
+                        check(failedSource.closed && failedSink.destroyed && !failedSink.closed, "source failure lost sink cleanup");
+                        check(failedSink.listenerCount("error") === 2, "source close dropped pending sink error ownership");
+                        releaseFailedSink(null);
+                        await settle();
+                        check(JSON.stringify(failedErrors) === '["source failed"]', "forwarded source failure was lost");
+                        check(failedSink.closed && failedSink.listenerCount("error") === 1, "failed sink retained pipe observers");
+                        globalThis.pipeCleanup = { done: true, checks, cases, cancelledReads: reads };
+                    })().catch(error => { globalThis.pipeCleanup.error = String(error); });
+                    "#,
+                )
+                .await
+                .expect("evaluate pipe asynchronous cleanup ownership");
+            drain_until_idle(&runtime, &clock).await;
+            let result = get_global_json(&runtime, "pipeCleanup").await;
+            assert_eq!(result["done"], json!(true), "{result}");
+            assert_eq!(result["checks"], json!(30), "{result}");
         });
     }
 
