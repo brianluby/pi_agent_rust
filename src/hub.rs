@@ -553,6 +553,12 @@ struct Ring {
     cap: usize,
     ready_log: Option<regex::Regex>,
     ready_log_passed: bool,
+    /// Bytes and lines appended since the last readiness scan. Scanning before
+    /// half the ring can evict guarantees every match up to `RING_BYTE_CAP / 2`
+    /// is observed in amortized O(N) time instead of rescanning the full 1 MiB
+    /// ring on every 8 KiB chunk.
+    ready_unscanned_bytes: usize,
+    ready_unscanned_lines: usize,
     capture: LogCapture,
 }
 
@@ -568,31 +574,93 @@ impl Ring {
             cap,
             ready_log: None,
             ready_log_passed: true,
+            ready_unscanned_bytes: 0,
+            ready_unscanned_lines: 0,
             capture: LogCapture::default(),
         }
     }
 
+    fn scan_readiness(&mut self) -> bool {
+        if !self.ready_log_passed {
+            self.ready_log_passed = self
+                .ready_log
+                .as_ref()
+                .is_none_or(|re| re.is_match(&self.text()));
+        }
+        self.ready_unscanned_bytes = 0;
+        self.ready_unscanned_lines = 0;
+        self.ready_log_passed
+    }
+
     fn watch_readiness(&mut self, pattern: Option<regex::Regex>) {
-        self.ready_log_passed = pattern.as_ref().is_none_or(|re| re.is_match(&self.text()));
         self.ready_log = pattern;
+        self.ready_log_passed = false;
+        self.scan_readiness();
     }
 
     fn push_chunk(&mut self, chunk: &str) {
+        let mut partial_added = 0usize;
         for fragment in chunk.split_inclusive('\n') {
             if let Some(text) = fragment.strip_suffix('\n') {
                 self.push_partial(text);
                 self.finish_line();
             } else {
                 self.push_partial(fragment);
+                partial_added = partial_added.saturating_add(fragment.len());
             }
         }
-        // Observe at the stream seam, before a later burst can evict the
-        // readiness marker. Once observed, the log gate remains satisfied.
-        if !self.ready_log_passed {
-            self.ready_log_passed = self
-                .ready_log
-                .as_ref()
-                .is_some_and(|re| re.is_match(&self.text()));
+        self.ready_unscanned_bytes = self.ready_unscanned_bytes.saturating_add(partial_added);
+        // Observe small streams immediately and noisy bursts at half-ring
+        // intervals before eviction can discard the readiness marker.
+        if !self.ready_log_passed
+            && self.ready_log.is_some()
+            && (self.bytes < 64 * 1024 || self.ready_unscanned_bytes >= RING_BYTE_CAP / 2)
+        {
+            self.scan_readiness();
+        }
+    }
+
+    fn scan_partial_before_truncation(&mut self, incoming: &str) {
+        if self.ready_log_passed {
+            return;
+        }
+        let Some(re) = self.ready_log.as_ref() else {
+            return;
+        };
+        if self.partial.is_empty() && (self.partial_truncated || self.lines.is_empty()) {
+            if re.is_match(incoming) {
+                self.ready_log_passed = true;
+            }
+            return;
+        }
+        let seam_len = incoming.floor_char_boundary(incoming.len().min(RING_LINE_BYTE_CAP));
+        let prev_len = if self.partial_truncated {
+            0
+        } else {
+            self.lines.back().map_or(0, |line| line.len() + 1)
+        };
+        let mut window = String::with_capacity(prev_len + self.partial.len() + seam_len);
+        if !self.partial_truncated
+            && let Some(prev_line) = self.lines.back()
+        {
+            let prev = if self
+                .truncated_lines
+                .back()
+                .is_some_and(|&truncated| truncated)
+            {
+                prev_line
+                    .strip_prefix(TRUNCATED_LINE_PREFIX)
+                    .unwrap_or(prev_line)
+            } else {
+                prev_line
+            };
+            window.push_str(prev);
+            window.push('\n');
+        }
+        window.push_str(&self.partial);
+        window.push_str(&incoming[..seam_len]);
+        if re.is_match(&window) || (incoming.len() > seam_len && re.is_match(incoming)) {
+            self.ready_log_passed = true;
         }
     }
 
@@ -600,6 +668,7 @@ impl Ring {
         let limit = RING_LINE_BYTE_CAP - TRUNCATED_LINE_PREFIX.len();
         let total = self.partial.len().saturating_add(text.len());
         if total > limit {
+            self.scan_partial_before_truncation(text);
             self.partial_truncated = true;
             let discard = total - limit;
             if discard >= self.partial.len() {
@@ -632,6 +701,15 @@ impl Ring {
         if self.cap == 0 {
             return;
         }
+        let will_evict = self.lines.len() >= self.cap || self.bytes + line.len() > RING_BYTE_CAP;
+        if will_evict
+            && !self.ready_log_passed
+            && self.ready_log.is_some()
+            && (self.ready_unscanned_bytes >= RING_BYTE_CAP / 2
+                || self.ready_unscanned_lines >= (self.cap / 2).max(1))
+        {
+            self.scan_readiness();
+        }
         while self.lines.len() >= self.cap || self.bytes + line.len() > RING_BYTE_CAP {
             let Some(evicted) = self.lines.pop_front() else {
                 break;
@@ -639,7 +717,10 @@ impl Ring {
             self.truncated_lines.pop_front();
             self.bytes -= evicted.len();
         }
-        self.bytes += line.len();
+        let line_len = line.len();
+        self.bytes += line_len;
+        self.ready_unscanned_bytes = self.ready_unscanned_bytes.saturating_add(line_len);
+        self.ready_unscanned_lines = self.ready_unscanned_lines.saturating_add(1);
         self.lines.push_back(line);
         self.truncated_lines.push_back(truncated);
     }
@@ -649,6 +730,7 @@ impl Ring {
         if !self.partial.is_empty() || self.partial_truncated {
             self.finish_line();
         }
+        self.scan_readiness();
     }
 
     /// Readiness sees only service text, never our truncation annotations.
@@ -1611,7 +1693,7 @@ fn start_inner(spec: &LaunchSpec, request: &ServiceRequest) -> Result<ServiceSna
                 ),
             ));
         }
-        let log_passed = ring.lock().map_err(|_| registry_err())?.ready_log_passed;
+        let log_passed = ring.lock().map_err(|_| registry_err())?.scan_readiness();
         let remaining = deadline.saturating_duration_since(Instant::now());
         let port_passed = ready.port.is_none_or(|port| {
             if remaining.is_zero() {
@@ -1667,17 +1749,15 @@ fn start_inner(spec: &LaunchSpec, request: &ServiceRequest) -> Result<ServiceSna
 }
 
 fn spawn_pty(spec: &LaunchSpec, request: &ServiceRequest) -> Result<SpawnedService> {
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use portable_pty::{CommandBuilder, PtySize};
 
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 40,
-            cols: 120,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| Error::tool("hub", format!("Failed to allocate PTY: {e}")))?;
+    let pair = crate::tools::open_pty_pair(PtySize {
+        rows: 40,
+        cols: 120,
+        pixel_width: 0,
+        pixel_height: 0,
+    })
+    .map_err(|e| Error::tool("hub", format!("Failed to allocate PTY: {e}")))?;
 
     let mut cmd = CommandBuilder::new(&spec.program);
     cmd.args(&spec.args);
@@ -1708,9 +1788,7 @@ fn spawn_pty(spec: &LaunchSpec, request: &ServiceRequest) -> Result<SpawnedServi
         reg.ensure_accepting_starts()?;
         reg.check_request(request)?;
     }
-    let child = pair
-        .slave
-        .spawn_command(cmd)
+    let child = crate::tools::spawn_pty_command(pair.slave.as_ref(), cmd)
         .map_err(|e| Error::tool("hub", format!("Failed to spawn service: {e}")))?;
     drop(pair.slave);
     Ok(SpawnedService {
@@ -3854,6 +3932,40 @@ mod tests {
         assert!(
             ring.ready_log_passed,
             "literal service output still matches"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::trivial_regex)]
+    fn long_unterminated_line_after_noisy_prefix_still_latches_readiness() {
+        // Fill past the 64 KiB fast-path threshold so amortized scanning is active.
+        let mut ring = Ring::new(2048);
+        ring.watch_readiness(Some(
+            regex::Regex::new("READY_IN_LONG_LINE").expect("regex"),
+        ));
+        let noise_line = format!("{}\n", "n".repeat(128));
+        for _ in 0..600 {
+            ring.push_chunk(&noise_line);
+        }
+        assert!(ring.bytes >= 64 * 1024);
+        assert!(!ring.ready_log_passed);
+
+        // Emit readiness split across chunks inside an oversized single line (>16 KiB)
+        // so push_partial must truncate before any newline or 512 KiB boundary.
+        ring.push_chunk("prefix READY_IN_");
+        ring.push_chunk(&format!("LONG_LINE{}", "x".repeat(RING_LINE_BYTE_CAP * 2)));
+        assert!(
+            ring.ready_log_passed,
+            "readiness split across partial truncation boundary must still latch"
+        );
+
+        // Single oversized chunk starting with the marker on an empty ring must also latch.
+        let mut single_chunk_ring = Ring::new(8);
+        single_chunk_ring.watch_readiness(Some(regex::Regex::new("READY_SINGLE").expect("regex")));
+        single_chunk_ring.push_chunk(&format!("READY_SINGLE{}", "y".repeat(RING_LINE_BYTE_CAP)));
+        assert!(
+            single_chunk_ring.ready_log_passed,
+            "readiness in discarded prefix of oversized chunk must still latch"
         );
     }
 

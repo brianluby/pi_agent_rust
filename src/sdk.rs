@@ -1883,9 +1883,7 @@ impl RpcTransportClient {
         command_payload.insert("id".to_string(), Value::String(request_id.clone()));
         command_payload.extend(payload);
 
-        let mut operation = RpcOperation::new(&self.owner)?;
-        self.write_json_line(&Value::Object(command_payload))
-            .await?;
+        let mut operation = self.dispatch_frame(Value::Object(command_payload)).await?;
         let response = self
             .wait_for_response(&request_id, command, on_event)
             .await?;
@@ -2558,8 +2556,7 @@ impl RpcTransportClient {
                 Value::String(streaming_behavior.to_string()),
             );
         }
-        let mut operation = RpcOperation::new(&self.owner)?;
-        self.write_json_line(&Value::Object(payload)).await?;
+        let mut operation = self.dispatch_frame(Value::Object(payload)).await?;
 
         let mut saw_ack = false;
         // Annotated, not inferred: the first USE of the element type is
@@ -2666,9 +2663,13 @@ impl RpcTransportClient {
     // The writer guard spans the "still open" check and the enqueue, so
     // `RpcSubprocessOwner::close` cannot take the sender between them.
     #[allow(clippy::significant_drop_tightening)]
-    async fn write_json_line(&self, payload: &Value) -> Result<()> {
+    async fn dispatch_frame(&self, payload: Value) -> Result<RpcOperation> {
         self.owner.ensure_open()?;
-        let encoded = encode_rpc_json_line(payload)?;
+        let encoded = encode_rpc_json_line(&payload)?;
+        drop(payload);
+        // An oversized frame never reaches stdin. Arm the interruption guard
+        // only after local validation, so a refused command leaves Pi live.
+        let operation = RpcOperation::new(&self.owner)?;
         let (completed, completion) = futures::channel::oneshot::channel();
         {
             let writer = self
@@ -2683,9 +2684,10 @@ impl RpcTransportClient {
                 .try_send(RpcWriteRequest { encoded, completed })
                 .map_err(|_| Error::api("RPC subprocess writer is unavailable"))?;
         }
-        completion
-            .await
-            .map_err(|_| Error::api("RPC subprocess writer stopped before completing the frame"))?
+        completion.await.map_err(|_| {
+            Error::api("RPC subprocess writer stopped before completing the frame")
+        })??;
+        Ok(operation)
     }
 
     async fn read_json_line(&mut self) -> Result<Value> {
@@ -2742,7 +2744,13 @@ fn prepare_rpc_pipe(pipe: &impl std::os::fd::AsFd) -> Result<()> {
 }
 
 fn encode_rpc_json_line(payload: &Value) -> Result<Vec<u8>> {
-    let mut encoded = serde_json::to_vec(payload).map_err(|err| Error::Json(Box::new(err)))?;
+    let mut encoded = Vec::new();
+    crate::rpc::write_bounded_rpc_json(
+        &mut encoded,
+        payload,
+        crate::rpc::MAX_RPC_INPUT_FRAME_BYTES,
+        "RPC command",
+    )?;
     encoded.push(b'\n');
     Ok(encoded)
 }
@@ -2826,6 +2834,22 @@ fn rpc_error_from_response(response: &Value, command: &str) -> Error {
         .get("error")
         .and_then(Value::as_str)
         .unwrap_or("RPC command failed");
+    // The server sends the displayed Session error, including this stable
+    // marker. Match it only at the start so provider text quoting a previous
+    // failure cannot change the classification of the current request.
+    let message = error.strip_prefix("Session error: ").unwrap_or(error);
+    if let Some(detail) = message.strip_prefix(Error::SESSION_PERSISTENCE_PREFIX) {
+        return Error::session_persistence(format!("RPC {command} failed: {detail}"));
+    }
+    if response.get("errorCode").and_then(Value::as_str) == Some("cost_cap")
+        && let Some(cap) = response.get("costCap")
+        && let Some(spent) = cap.get("spent").and_then(Value::as_f64)
+        && let Some(limit) = cap.get("cap").and_then(Value::as_f64)
+        && spent >= 0.0
+        && limit >= 0.0
+    {
+        return Error::CostCap { spent, cap: limit };
+    }
     Error::api(format!("RPC {command} failed: {error}"))
 }
 

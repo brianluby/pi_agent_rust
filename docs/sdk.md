@@ -912,9 +912,11 @@ without blocking the caller's executor. A slow reader, a partial JSON response,
 or a quiet provider stream leaves other futures on the same executor able to run.
 Each connection owns a stdin worker and a stdout worker. The stdin queue holds
 one pending frame; the stdout pump retains at most one queued frame and one
-additional frame it is preparing or delivering. The existing 128 MiB per-frame
-and pre-acknowledgement limits still apply. The completed event vector remains a
-caller-visible transcript and is not covered by the pump's queue bound.
+additional frame it is preparing or delivering. Each inbound or outbound JSON
+frame can contain up to 128 MiB before its newline. This includes JSON escaping,
+request IDs, and command metadata. An oversized command returns a local validation
+error before dispatch, so the same connection and control handles remain usable.
+The collecting methods also retain delivered events for their return value.
 
 Dropping an in-flight request or prompt future closes the entire connection,
 revokes retained control handles, and starts owned process-tree cleanup. This is
@@ -923,7 +925,10 @@ truncated frames, or transport failure. Reconnect before making another request;
 an interrupted exchange cannot safely donate its delayed response or terminal
 events to the next operation. The SDK does not replay interrupted operations,
 whose tool effects may already have happened. A well-formed server refusal
-completes that request and leaves the connection usable.
+completes that request and leaves the connection usable. For a rejected command
+or prompt acknowledgement, `Error::is_session_persistence()` identifies an
+indeterminate save. Reconcile the session before starting another turn.
+A structured budget refusal returns `Error::CostCap { spent, cap }`.
 
 To abort a turn while keeping its session and connection, keep polling the prompt
 future and send `RpcControlHandle::abort()` instead. Continue consuming through

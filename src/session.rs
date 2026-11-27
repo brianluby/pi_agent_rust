@@ -17,8 +17,9 @@ use crate::model::{
     UserContent, UserMessage,
 };
 use crate::session_index::{
-    SessionIndex, SessionIndexRefreshSummary, begin_session_index_namespace_change,
-    enqueue_session_index_snapshot_update, is_session_file_path, session_file_stats,
+    DiscoveryWorkspace, SessionIndex, SessionIndexRefreshSummary,
+    begin_session_index_namespace_change, enqueue_session_index_snapshot_update,
+    is_session_file_path, session_file_stats,
 };
 use crate::session_store_v2::{self, SessionStoreV2};
 use crate::tui::PiConsole;
@@ -2669,7 +2670,7 @@ pub(crate) fn validate_session_entry_graph(entries: &[SessionEntry]) -> Result<(
 /// caches while retaining the existing orphan diagnostics for read-only
 /// recovery. Sessions with missing parents are marked non-persistable by the
 /// caller; duplicate IDs and cycles fail before replay can observe them.
-fn validate_loaded_session_entry_graph(entries: &[SessionEntry]) -> Result<()> {
+pub(crate) fn validate_loaded_session_entry_graph(entries: &[SessionEntry]) -> Result<()> {
     validate_session_entry_graph_inner(entries, true)
 }
 
@@ -3822,6 +3823,15 @@ fn select_v2_open_mode_for_resume(
 }
 
 impl SessionOpenDiagnostics {
+    fn record_orphaned_parents(&mut self, orphans: Vec<(String, String)>) {
+        self.orphaned_parent_links.extend(orphans.into_iter().map(
+            |(entry_id, missing_parent_id)| SessionOpenOrphanedParentLink {
+                entry_id,
+                missing_parent_id,
+            },
+        ));
+    }
+
     fn warning_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         for skipped in &self.skipped_entries {
@@ -4358,12 +4368,13 @@ impl Session {
         let project_session_dir = base_dir.join(&encoded_cwd);
 
         let base_dir_clone = base_dir.clone();
-        let cwd_display = cwd.display().to_string();
+        let workspace = DiscoveryWorkspace::new(&cwd);
+        let lookup_workspace = workspace.clone();
         let (tx, mut rx) = oneshot::channel();
 
         let handle = thread::spawn(move || {
             let index = SessionIndex::for_sessions_root(&base_dir_clone);
-            let indexed_meta = index.discover_sessions(&cwd_display);
+            let indexed_meta = index.discover_sessions_for_workspace(&lookup_workspace);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), Ok(indexed_meta));
         });
@@ -4404,7 +4415,7 @@ impl Session {
         merge_scanned_session_entries(&mut by_path, scanned.entries);
         let mut entries = by_path
             .into_values()
-            .filter(|entry| Path::new(&entry.cwd) == cwd)
+            .filter(|entry| workspace.matches(&entry.cwd))
             .collect::<Vec<_>>();
 
         if entries.is_empty() {
@@ -4835,8 +4846,7 @@ impl Session {
         {
             #[cfg(feature = "sqlite-sessions")]
             {
-                let session = Self::open_sqlite(&path).await?;
-                return Ok((session, SessionOpenDiagnostics::default()));
+                return Self::open_sqlite(&path).await;
             }
 
             #[cfg(not(feature = "sqlite-sessions"))]
@@ -5286,11 +5296,13 @@ impl Session {
     }
 
     #[cfg(feature = "sqlite-sessions")]
-    async fn open_sqlite(path: &Path) -> Result<Self> {
-        let (header, mut entries) = crate::session_sqlite::load_session(path).await?;
+    async fn open_sqlite(path: &Path) -> Result<(Self, SessionOpenDiagnostics)> {
+        let (header, entries) = crate::session_sqlite::load_session(path).await?;
         let persisted_header = Some(header.clone());
         let (header, normalized_header_dirty) = normalize_loaded_header(header);
-        let finalized = finalize_loaded_entries(&mut entries);
+        let finalized = finalize_normalized_loaded_entries(&entries);
+        let mut diagnostics = SessionOpenDiagnostics::default();
+        diagnostics.record_orphaned_parents(finalized.orphans);
         let entry_count = entries.len();
         let natural_leaf_id = finalized.leaf_id.clone();
         let leaf_id = resolve_loaded_leaf_id(
@@ -5301,34 +5313,37 @@ impl Session {
 
         let resolved_persisted_path =
             resolve_session_persistence_path(path).unwrap_or_else(|_| path.to_path_buf());
-        Ok(Self {
-            header,
-            entries,
-            path: Some(path.to_path_buf()),
-            persisted_path: Some(resolved_persisted_path),
-            persisted_header,
-            reserved_path: None,
-            leaf_id: leaf_id.clone(),
-            session_dir: None,
-            store_kind: SessionStoreKind::Sqlite,
-            entry_ids: finalized.entry_ids,
-            is_linear: finalized.is_linear && leaf_id.eq(&natural_leaf_id),
-            entry_index: finalized.entry_index,
-            cached_message_count: finalized.message_count,
-            cached_name: finalized.name,
-            autosave_queue: AutosaveQueue::new(),
-            autosave_durability: AutosaveDurabilityMode::from_env(),
-            persisted_entry_count: Arc::new(AtomicUsize::new(entry_count)),
-            source_integrity_failed: false,
-            header_dirty: normalized_header_dirty,
-            appends_since_checkpoint: 0,
-            v2_sidecar_root: None,
-            v2_partial_hydration: false,
-            v2_resume_mode: None,
-            v2_sidecar_stale: false,
-            v2_message_count_offset: 0,
-            v2_live_sync: false,
-        })
+        Ok((
+            Self {
+                header,
+                entries,
+                path: Some(path.to_path_buf()),
+                persisted_path: Some(resolved_persisted_path),
+                persisted_header,
+                reserved_path: None,
+                leaf_id: leaf_id.clone(),
+                session_dir: None,
+                store_kind: SessionStoreKind::Sqlite,
+                entry_ids: finalized.entry_ids,
+                is_linear: finalized.is_linear && leaf_id.eq(&natural_leaf_id),
+                entry_index: finalized.entry_index,
+                cached_message_count: finalized.message_count,
+                cached_name: finalized.name,
+                autosave_queue: AutosaveQueue::new(),
+                autosave_durability: AutosaveDurabilityMode::from_env(),
+                persisted_entry_count: Arc::new(AtomicUsize::new(entry_count)),
+                source_integrity_failed: !diagnostics.orphaned_parent_links.is_empty(),
+                header_dirty: normalized_header_dirty,
+                appends_since_checkpoint: 0,
+                v2_sidecar_root: None,
+                v2_partial_hydration: false,
+                v2_resume_mode: None,
+                v2_sidecar_stale: false,
+                v2_message_count_offset: 0,
+                v2_live_sync: false,
+            },
+            diagnostics,
+        ))
     }
 
     /// Continue the most recent session, or start a new one when there is
@@ -5384,18 +5399,18 @@ impl Session {
     ) -> Result<Option<(Self, PathBuf)>> {
         let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
         let cwd = std::env::current_dir()?;
-        let cwd_display = cwd.display().to_string();
+        let workspace = DiscoveryWorkspace::new(&cwd);
         let encoded_cwd = encode_cwd(&cwd);
         let project_session_dir = base_dir.join(&encoded_cwd);
 
         // Prefer the session index for fast lookup.
         let base_dir_clone = base_dir.clone();
-        let cwd_display_clone = cwd_display.clone();
+        let lookup_workspace = workspace.clone();
         let (tx, mut rx) = oneshot::channel();
 
         let handle = thread::spawn(move || {
             let index = SessionIndex::for_sessions_root(&base_dir_clone);
-            let indexed_sessions = index.discover_sessions(&cwd_display_clone);
+            let indexed_sessions = index.discover_sessions_for_workspace(&lookup_workspace);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), Ok(indexed_sessions));
         });
@@ -5439,7 +5454,7 @@ impl Session {
 
         let mut candidates = by_path
             .into_values()
-            .filter(|entry| Path::new(&entry.cwd) == cwd)
+            .filter(|entry| workspace.matches(&entry.cwd))
             .collect::<Vec<_>>();
         candidates.sort_by_key(|entry| std::cmp::Reverse(entry.last_modified_ms));
 
@@ -8407,6 +8422,15 @@ pub struct CustomEntry {
 /// Encode a working directory path for use in session directory names.
 pub fn encode_cwd(path: &std::path::Path) -> String {
     let s = path.display().to_string();
+    // canonicalize() returns an extended-length path on Windows. The namespace
+    // marker belongs to the path API, not to the project directory name: its
+    // question mark is illegal inside a filename. Preserve the spelling in the
+    // session header while using the same bucket as the ordinary drive or UNC.
+    #[cfg(windows)]
+    let s = s
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| s.strip_prefix(r"\\?\"))
+        .unwrap_or(&s);
     let s = s.trim_start_matches(['/', '\\']);
     let s = s.replace(['/', '\\', ':'], "-");
     format!("--{s}--")
@@ -9264,14 +9288,7 @@ fn open_jsonl_blocking_with_entry_limit(
     validate_loaded_session_entry_graph(&entries)?;
     // --- Single-pass load finalization (Gap F) ---
     let finalized = finalize_normalized_loaded_entries(&entries);
-    for orphan in &finalized.orphans {
-        diagnostics
-            .orphaned_parent_links
-            .push(SessionOpenOrphanedParentLink {
-                entry_id: orphan.0.clone(),
-                missing_parent_id: orphan.1.clone(),
-            });
-    }
+    diagnostics.record_orphaned_parents(finalized.orphans);
 
     let entry_count = entries.len();
     let natural_leaf_id = finalized.leaf_id.clone();
@@ -10413,7 +10430,7 @@ struct LoadFinalization {
 }
 
 /// Assign stable IDs to legacy rows before graph validation or cache building.
-fn normalize_loaded_entry_ids(entries: &mut [SessionEntry]) {
+pub(crate) fn normalize_loaded_entry_ids(entries: &mut [SessionEntry]) {
     // Re-opening the same JSONL must synthesize the same IDs so a later
     // multi-writer merge recognizes the persisted prefix instead of duplicating it.
     let mut entry_ids: HashSet<String> = entries
@@ -18657,6 +18674,68 @@ mod tests {
             ordinary.push(component.as_os_str());
         }
         [ordinary, canonical]
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_workspace_can_save_in_the_ordinary_project_directory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let [ordinary, canonical] = windows_session_lock_test_roots(temp.path());
+        let sessions_root = temp.path().join("sessions");
+        let mut session = Session::create_with_dir(Some(sessions_root.clone()));
+        session.header.cwd = canonical.to_str().expect("UTF-8 fixture").to_owned();
+        session.append_message(make_test_message("first turn"));
+        run_async(async { session.save().await }).expect("save canonical workspace");
+
+        let saved = session.path.as_deref().expect("saved path");
+        assert_eq!(
+            saved.parent(),
+            Some(sessions_root.join(encode_cwd(&ordinary)).as_path())
+        );
+        let reopened = run_async(async { Session::open(saved.to_str().unwrap()).await })
+            .expect("reopen canonical workspace");
+        assert_eq!(reopened.header.cwd, session.header.cwd);
+        assert_eq!(reopened.entries.len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_workspace_can_continue_and_pick_a_canonical_session() {
+        let _lock = current_dir_lock();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).expect("workspace");
+        let [ordinary, canonical] = windows_session_lock_test_roots(&project);
+        let sessions = temp.path().join("sessions");
+        let mut saved = Session::create_with_dir(Some(sessions.clone()));
+        saved.header.cwd = canonical.to_str().expect("UTF-8 fixture").to_owned();
+        saved.append_message(make_test_message("persisted turn"));
+        run_async(saved.save()).expect("save canonical workspace");
+
+        let _guard = CurrentDirGuard::new(&ordinary);
+        let config = Config::default();
+        let continued = run_async(Session::continue_recent_in_dir(Some(&sessions), &config))
+            .expect("continue saved workspace");
+        let picked = run_async(Session::resume_with_picker(
+            Some(&sessions),
+            &config,
+            Some("1".to_owned()),
+        ))
+        .expect("select saved workspace");
+        for reopened in [continued, picked] {
+            assert_eq!(reopened.path, saved.path);
+            assert_eq!(reopened.header.id, saved.header.id);
+            assert_eq!(reopened.to_messages().len(), 1);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_unc_workspaces_keep_the_existing_unc_bucket() {
+        let ordinary = Path::new(r"\\server\share\work");
+        let canonical = Path::new(r"\\?\UNC\server\share\work");
+        assert_eq!(encode_cwd(ordinary), "--server-share-work--");
+        assert_eq!(encode_cwd(canonical), encode_cwd(ordinary));
     }
 
     #[cfg(windows)]

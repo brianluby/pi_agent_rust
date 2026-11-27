@@ -111,7 +111,8 @@ complete -c pi -f -a '(__pi_dynamic)' 2>/dev/null || true
 /// Named validation error for unknown flags.
 pub fn complete(flag: &str, prefix: &str, out: &mut dyn std::io::Write) -> Result<()> {
     let candidates = match flag {
-        "--model" | "--provider" | "--smol" | "--slow" => model_candidates(prefix),
+        "--model" | "--smol" | "--slow" => model_candidates(prefix),
+        "--provider" => provider_candidates(prefix),
         "--session" | "--resume" => session_candidates(prefix),
         other => {
             return Err(crate::error::Error::validation(format!(
@@ -120,18 +121,48 @@ pub fn complete(flag: &str, prefix: &str, out: &mut dyn std::io::Write) -> Resul
             )));
         }
     };
-    for candidate in candidates {
-        let _ = std::io::Write::write_fmt(out, format_args!("{candidate}\n"));
+    write_candidates(candidates, out)
+}
+
+fn write_candidates(candidates: Vec<String>, out: &mut dyn std::io::Write) -> Result<()> {
+    for mut candidate in candidates {
+        candidate.push('\n');
+        if !write_ignoring_broken_pipe(out, candidate.as_bytes())? {
+            break;
+        }
     }
     Ok(())
 }
 
+fn collect_provider_candidates<'a>(
+    providers: impl IntoIterator<Item = &'a str>,
+    prefix: &str,
+) -> Vec<String> {
+    let lowered = prefix.to_ascii_lowercase();
+    let mut unique = std::collections::BTreeSet::new();
+    for provider in providers {
+        if lowered.is_empty() || provider.to_ascii_lowercase().contains(&lowered) {
+            unique.insert(provider);
+        }
+    }
+    unique.into_iter().map(str::to_owned).collect()
+}
+
+fn provider_candidates(prefix: &str) -> Vec<String> {
+    let registry =
+        crate::models::ModelRegistry::load_for_listing_with_credential_resolver(None, |_| None);
+    collect_provider_candidates(
+        registry
+            .models()
+            .iter()
+            .map(|entry| entry.model.provider.as_str()),
+        prefix,
+    )
+}
+
 fn model_candidates(prefix: &str) -> Vec<String> {
-    let auth_path = crate::config::Config::global_dir().join("auth.json");
-    let Ok(auth) = crate::auth::AuthStorage::load(auth_path) else {
-        return Vec::new();
-    };
-    let registry = crate::models::ModelRegistry::load(&auth, None);
+    let registry =
+        crate::models::ModelRegistry::load_for_listing_with_credential_resolver(None, |_| None);
     let lowered = prefix.to_ascii_lowercase();
     let mut out = Vec::new();
     for entry in registry.models() {
@@ -150,10 +181,20 @@ fn model_candidates(prefix: &str) -> Vec<String> {
 
 fn session_candidates(prefix: &str) -> Vec<String> {
     let index = crate::session_index::SessionIndex::new();
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|path| path.display().to_string());
-    let sessions = index.list_sessions(cwd.as_deref()).unwrap_or_default();
+    let cwd = std::env::current_dir().ok();
+    session_candidates_in(&index, cwd.as_deref(), prefix)
+}
+
+fn session_candidates_in(
+    index: &crate::session_index::SessionIndex,
+    cwd: Option<&std::path::Path>,
+    prefix: &str,
+) -> Vec<String> {
+    let sessions = match cwd {
+        Some(dir) => index.list_sessions_for_workspace(dir),
+        None => index.list_sessions(None),
+    }
+    .unwrap_or_default();
     let lowered = prefix.to_ascii_lowercase();
     let mut out = Vec::new();
     for meta in sessions {
@@ -167,7 +208,7 @@ fn session_candidates(prefix: &str) -> Vec<String> {
                 .to_ascii_lowercase()
                 .contains(&lowered)
         {
-            out.push(meta.path.clone());
+            out.push(meta.path);
         }
     }
     out
@@ -199,9 +240,12 @@ mod tests {
 
     #[test]
     fn print_script_ignores_broken_pipe_without_panicking() -> Result<()> {
-        struct BrokenPipeWriter;
-        impl std::io::Write for BrokenPipeWriter {
+        struct CountingBrokenPipeWriter {
+            writes: usize,
+        }
+        impl std::io::Write for CountingBrokenPipeWriter {
             fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
                 Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "broken pipe",
@@ -212,9 +256,80 @@ mod tests {
             }
         }
         for shell in ["bash", "zsh", "fish"] {
-            print_script(shell, &mut BrokenPipeWriter)?;
+            let mut writer = CountingBrokenPipeWriter { writes: 0 };
+            print_script(shell, &mut writer)?;
+            assert_eq!(writer.writes, 1, "{shell} should stop on first BrokenPipe");
         }
+        let mut writer = CountingBrokenPipeWriter { writes: 0 };
+        write_candidates(
+            vec!["anthropic".to_string(), "openai".to_string()],
+            &mut writer,
+        )?;
+        assert_eq!(writer.writes, 1, "complete should stop on first BrokenPipe");
+        let mut model_writer = CountingBrokenPipeWriter { writes: 0 };
+        complete("--model", "", &mut model_writer)?;
+        let mut provider_writer = CountingBrokenPipeWriter { writes: 0 };
+        complete("--provider", "", &mut provider_writer)?;
         Ok(())
+    }
+
+    #[test]
+    fn print_script_propagates_non_broken_pipe_io_errors() {
+        struct PermissionDeniedWriter;
+        impl std::io::Write for PermissionDeniedWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "write denied",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // ubs:ignore[rust.panic.assert-macros] -- Test-only completion regression oracle.
+        assert!(print_script("bash", &mut PermissionDeniedWriter).is_err());
+        // ubs:ignore[rust.panic.assert-macros] -- Test-only completion regression oracle.
+        assert!(
+            write_candidates(vec!["anthropic".to_string()], &mut PermissionDeniedWriter).is_err()
+        );
+    }
+
+    #[test]
+    fn provider_candidates_returns_unique_provider_names_only() {
+        assert_eq!(
+            collect_provider_candidates(["openai", "anthropic", "openai", "google"], ""),
+            vec![
+                "anthropic".to_string(),
+                "google".to_string(),
+                "openai".to_string(),
+            ]
+        );
+        assert_eq!(
+            collect_provider_candidates(["openai", "anthropic", "openai", "google"], "ANTH"),
+            vec!["anthropic".to_string()]
+        );
+
+        let providers = provider_candidates("");
+        // ubs:ignore[rust.panic.assert-macros] -- Test-only completion regression oracle.
+        assert!(
+            !providers.is_empty(),
+            "built-in catalog should always provide completion providers"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Test-only completion regression oracle.
+        assert!(
+            providers.iter().any(|name| name == "anthropic"),
+            "built-in provider list should include anthropic: {providers:?}"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Test-only completion regression oracle.
+        assert!(
+            providers.iter().all(|name| !name.contains('/')),
+            "provider completions must not include provider/model paths: {providers:?}"
+        );
+        let mut sorted = providers.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(providers, sorted);
     }
 
     #[test]
@@ -230,5 +345,55 @@ mod tests {
         let all = model_candidates("");
         let filtered = model_candidates("ANTHROPIC");
         assert!(filtered.len() <= all.len());
+    }
+
+    #[test]
+    fn session_candidates_match_canonical_workspace_spellings() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("project");
+        let other = tmp.path().join("other");
+        let storage = tmp.path().join("sessions");
+        std::fs::create_dir(&project).expect("project dir");
+        std::fs::create_dir(&other).expect("other dir");
+        std::fs::create_dir(&storage).expect("storage dir");
+
+        let canonical_project = project.canonicalize().expect("canonical project");
+        let canonical_other = other.canonicalize().expect("canonical other");
+        let index = crate::session_index::SessionIndex::for_sessions_root(&storage);
+        index
+            .upsert_session_meta(crate::session_index::SessionMeta {
+                path: storage.join("target.jsonl").display().to_string(),
+                id: "sess-target".to_string(),
+                cwd: canonical_project.display().to_string(),
+                timestamp: "2026-11-27T00:00:00Z".to_string(),
+                message_count: 2,
+                last_modified_ms: 2_000,
+                size_bytes: 128,
+                name: Some("Alpha Work".to_string()),
+            })
+            .expect("upsert target");
+        index
+            .upsert_session_meta(crate::session_index::SessionMeta {
+                path: storage.join("other.jsonl").display().to_string(),
+                id: "sess-other".to_string(),
+                cwd: canonical_other.display().to_string(),
+                timestamp: "2026-11-27T00:00:00Z".to_string(),
+                message_count: 1,
+                last_modified_ms: 1_000,
+                size_bytes: 64,
+                name: Some("Other".to_string()),
+            })
+            .expect("upsert other");
+
+        let dot_spelling = project.join(".");
+        let matched = session_candidates_in(&index, Some(&dot_spelling), "alpha");
+        assert_eq!(
+            matched,
+            vec![storage.join("target.jsonl").display().to_string()]
+        );
+        assert!(
+            session_candidates_in(&index, Some(&dot_spelling), "other").is_empty(),
+            "unrelated workspace sessions must not leak into completion candidates"
+        );
     }
 }

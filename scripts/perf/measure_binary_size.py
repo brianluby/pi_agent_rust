@@ -4,10 +4,11 @@
 Canonical release binary-size measurement control
 (`src/perf_build.rs::BinarySizeMeasurementControl`, `#[serde(deny_unknown_fields)]`).
 
-Inspects an existing release `pi` binary (or builds with `--build` when
-explicitly requested), verifies that the binary is stripped, and atomically
-writes the exact 15-field `pi.perf.binary_size_measurement.v1` control artifact
-consumed by `src/perf_build.rs::verify_binary_size_measurement_control`.
+Inspects an existing release `pi` binary (passing `--no-build`), or builds
+`cargo build --locked --bin pi --release` by default, verifies that the binary
+is stripped, and atomically writes the exact 15-field
+`pi.perf.binary_size_measurement.v1` control artifact consumed by
+`src/perf_build.rs::verify_binary_size_measurement_control`.
 
 Exit 0 = artifact written, schema valid, binary stripped and within budget.
 Exit 1 = binary missing, unstripped, build failed, or over budget.
@@ -76,28 +77,33 @@ def is_stripped(path: Path) -> bool:
         return False
     nm = shutil.which("nm")
     if nm is not None:
-        proc = subprocess.run(
-            [nm, "--no-sort-by-size", str(path)],
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-        )
-        combined = f"{proc.stdout}\n{proc.stderr}".lower()
-        if "no symbols" in combined:
-            return True
-        if proc.returncode == 0:
-            return not any(line.strip() for line in proc.stdout.splitlines())
-        return False
+        try:
+            proc = subprocess.run(
+                [nm, "-p", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+            combined = f"{proc.stdout}\n{proc.stderr}".lower()
+            if "no symbols" in combined:
+                return True
+            if proc.returncode == 0:
+                return not any(line.strip() for line in proc.stdout.splitlines())
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     file_bin = shutil.which("file")
     if file_bin is not None:
-        proc = subprocess.run(
-            [file_bin, str(path)],
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-        )
-        out = proc.stdout.lower()
-        return proc.returncode == 0 and "stripped" in out and "not stripped" not in out
+        try:
+            proc = subprocess.run(
+                [file_bin, str(path)],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+            )
+            out = proc.stdout.lower()
+            return proc.returncode == 0 and "stripped" in out and "not stripped" not in out
+        except (OSError, subprocess.TimeoutExpired):
+            return False
     return False
 
 
@@ -181,6 +187,7 @@ def run_self_test() -> int:
                 assert run_cli(["--binary", str(copied), "--no-build", "--threshold-mb", "0", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
                 assert run_cli(["--binary", str(copied), "--no-build", "--threshold-mb", "nan", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
                 assert run_cli(["--binary", str(copied), "--no-build", "--run-id", "a", "--correlation-id", "b", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
+                assert run_cli(["--binary", str(copied), "--no-build", "--run-id", "   ", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
                 assert run_cli(["--binary", str(copied), "--no-build", "--out", str(neg_out), "--source-commit", "0" * 40]) == 1
                 assert not neg_out.exists()
     finally:
@@ -219,22 +226,34 @@ def run_cli(argv: list[str] | None = None) -> int:
     if not math.isfinite(args.threshold_mb) or args.threshold_mb <= 0.0:
         print(f"FAIL: --threshold-mb must be finite and > 0, got {args.threshold_mb}", file=sys.stderr)
         return 1
-    if args.run_id and args.correlation_id and args.run_id != args.correlation_id:
+    if args.run_id is not None and not args.run_id.strip():
+        print("FAIL: --run-id must be non-empty when specified", file=sys.stderr)
+        return 1
+    if args.correlation_id is not None and not args.correlation_id.strip():
+        print("FAIL: --correlation-id must be non-empty when specified", file=sys.stderr)
+        return 1
+    explicit_run_id = args.run_id.strip() if args.run_id is not None else None
+    explicit_corr_id = args.correlation_id.strip() if args.correlation_id is not None else None
+    if explicit_run_id and explicit_corr_id and explicit_run_id != explicit_corr_id:
         print(
-            f"FAIL: --run-id ({args.run_id!r}) and --correlation-id ({args.correlation_id!r}) must match",
+            f"FAIL: --run-id ({explicit_run_id!r}) and --correlation-id ({explicit_corr_id!r}) must match",
             file=sys.stderr,
         )
         return 1
 
     binary = (args.binary or default_release_binary(args.workdir, no_build=args.no_build)).resolve()
     if not args.no_build:
-        print(f"building {binary} with cargo build --bin pi --release...", file=sys.stderr)
-        proc = subprocess.run(
-            ["cargo", "build", "--bin", "pi", "--release"],
-            cwd=args.workdir,
-            capture_output=True,
-            text=True,
-        )
+        print(f"building {binary} with cargo build --locked --bin pi --release...", file=sys.stderr)
+        try:
+            proc = subprocess.run(
+                ["cargo", "build", "--locked", "--bin", "pi", "--release"],
+                cwd=args.workdir,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            print(f"FAIL: could not invoke cargo: {exc} (no artifact written)", file=sys.stderr)
+            return 1
         if proc.returncode != 0:
             print(
                 f"FAIL: cargo build failed (rc={proc.returncode}); no artifact written:\n{proc.stderr[-2000:]}",
@@ -275,8 +294,8 @@ def run_cli(argv: list[str] | None = None) -> int:
         )
 
     default_id = f"binary-size-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
-    run_id = args.run_id or args.correlation_id or default_id
-    correlation_id = args.correlation_id or run_id
+    run_id = explicit_run_id or explicit_corr_id or default_id
+    correlation_id = explicit_corr_id or run_id
 
     size_bytes = binary.stat().st_size
     size_mb = size_bytes / (1024.0 * 1024.0)
@@ -309,9 +328,13 @@ def run_cli(argv: list[str] | None = None) -> int:
     assert tuple(sorted(artifact.keys())) == tuple(sorted(REQUIRED_FIELDS))
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = args.out.with_suffix(args.out.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
-    tmp_path.replace(args.out)
+    tmp_path = args.out.with_name(f".{args.out.name}.tmp.{os.getpid()}")
+    try:
+        tmp_path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+        tmp_path.replace(args.out)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     within_budget = size_mb <= args.threshold_mb
     status = "PASS" if within_budget else "OVER_BUDGET"

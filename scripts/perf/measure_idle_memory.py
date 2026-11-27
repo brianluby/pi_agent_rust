@@ -106,7 +106,10 @@ def rss_linux(pid: int) -> int | None:
         if line.startswith("VmRSS:"):
             parts = line.split()
             if len(parts) >= 2:
-                return int(parts[1]) * 1024
+                try:
+                    return int(parts[1]) * 1024
+                except ValueError:
+                    return None
     return None
 
 
@@ -116,7 +119,7 @@ def rss_macos(pid: int) -> int | None:
             ["ps", "-o", "rss=", "-p", str(pid)], text=True, timeout=2.0
         ).strip()
         return int(out) * 1024
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
         return None
 
 
@@ -185,7 +188,12 @@ def collect_bench_env(source_commit: str) -> tuple[dict[str, Any], str]:
     if meminfo:
         for line in meminfo.splitlines():
             if line.startswith("MemTotal:"):
-                mem_total_mb = int(line.split()[1]) // 1024
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        mem_total_mb = int(parts[1]) // 1024
+                    except ValueError:
+                        mem_total_mb = 0
                 break
     if mem_total_mb == 0:
         try:
@@ -212,8 +220,10 @@ def collect_bench_env(source_commit: str) -> tuple[dict[str, Any], str]:
         "config_hash": config_hash,
     }
     assert tuple(sorted(bench_env.keys())) == tuple(sorted(BENCH_ENV_FIELDS))
-    # Matches serde_json::to_value + serde_json::to_vec (BTreeMap sorted keys, compact JSON).
-    canonical = json.dumps(bench_env, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    # Matches serde_json::to_value + serde_json::to_vec (BTreeMap sorted keys, compact UTF-8 JSON).
+    canonical = json.dumps(
+        bench_env, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
     bench_env_sha256 = hashlib.sha256(canonical).hexdigest()
     return bench_env, bench_env_sha256
 
@@ -225,47 +235,54 @@ def measure_one_idle_process(
     agent_dir: Path,
 ) -> tuple[dict[str, Any] | None, str | None]:
     env = os.environ.copy()
+    env.pop("RUST_LOG", None)
     env["PI_CODING_AGENT_DIR"] = str(agent_dir)
     cmd = [str(binary), "--mode", "rpc", "--no-session"]
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        env=env,
-    )
+    # Redirect stderr to a temporary file rather than subprocess.PIPE so verbose
+    # startup diagnostics cannot fill a 64 KiB pipe buffer and deadlock the child.
+    stderr_file = tempfile.TemporaryFile()
     try:
-        time.sleep(settle_ms / 1000.0)
-        if proc.poll() is not None:
-            stderr_tail = (proc.stderr.read() if proc.stderr else b"").decode("utf-8", "replace")[-500:]
-            return (
-                None,
-                f"pi --mode rpc exited prematurely during settle window (rc={proc.returncode}): {stderr_tail}",
-            )
-        rss_val = sample_pid_rss(proc.pid)
-        if rss_val is None or rss_val <= 0:
-            return None, f"failed to read VmRSS for pid {proc.pid}"
-        return {"pid": proc.pid, "process_name": binary.name, "rss_bytes": rss_val}, None
-    finally:
-        if proc.stdin is not None:
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
         try:
-            proc.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            proc.terminate()
+            proc = subprocess.Popen(
+                cmd,
+                cwd=agent_dir,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_file,
+                env=env,
+            )
+        except OSError as exc:
+            return None, f"failed to spawn {binary}: {exc}"
+        try:
+            time.sleep(settle_ms / 1000.0)
+            if proc.poll() is not None:
+                stderr_file.seek(0)
+                stderr_tail = stderr_file.read().decode("utf-8", "replace")[-500:]
+                return (
+                    None,
+                    f"pi --mode rpc exited prematurely during settle window (rc={proc.returncode}): {stderr_tail}",
+                )
+            rss_val = sample_pid_rss(proc.pid)
+            if rss_val is None or rss_val <= 0:
+                return None, f"failed to read VmRSS for pid {proc.pid}"
+            return {"pid": proc.pid, "process_name": binary.name, "rss_bytes": rss_val}, None
+        finally:
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
             try:
                 proc.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=2.0)
-        if proc.stderr is not None:
-            try:
-                proc.stderr.close()
-            except OSError:
-                pass
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+    finally:
+        stderr_file.close()
 
 
 def is_lowercase_nonzero_git_sha(raw: str) -> bool:
@@ -339,7 +356,9 @@ def run_self_test() -> int:
             assert payload["rss_bytes"] == max_rss
             assert payload["rss_spread_bytes"] == max_rss - min_rss
             assert any(s["pid"] == payload["pid"] and s["rss_bytes"] == payload["rss_bytes"] for s in payload["samples"])
-            canonical_env = json.dumps(payload["bench_env"], sort_keys=True, separators=(",", ":")).encode("utf-8")
+            canonical_env = json.dumps(
+                payload["bench_env"], sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
             assert payload["bench_env_sha256"] == hashlib.sha256(canonical_env).hexdigest()
 
             # 3. Negative controls: invalid flags and premature exit fail closed and write nothing.
@@ -347,6 +366,7 @@ def run_self_test() -> int:
             assert run_cli(["--binary", str(fake_pi), "--samples", "4", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
             assert run_cli(["--binary", str(fake_pi), "--settle-ms", "50", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
             assert run_cli(["--binary", str(fake_pi), "--run-id", "a", "--correlation-id", "b", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
+            assert run_cli(["--binary", str(fake_pi), "--run-id", "   ", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
             assert run_cli(["--binary", str(fake_pi), "--out", str(neg_out), "--source-commit", "0" * 40]) == 1
             assert run_cli(["--binary", str(fake_pi), "--idle-state", "   ", "--out", str(neg_out), "--source-commit", "a" * 40]) == 1
             early_exit = root / "target/release/early_pi"
@@ -385,15 +405,29 @@ def run_cli(argv: list[str] | None = None) -> int:
     if args.self_test:
         return run_self_test()
 
-    if args.run_id and args.correlation_id and args.run_id != args.correlation_id:
+    if args.run_id is not None and not args.run_id.strip():
+        print("FAIL: --run-id must be non-empty when specified", file=sys.stderr)
+        return 1
+    if args.correlation_id is not None and not args.correlation_id.strip():
+        print("FAIL: --correlation-id must be non-empty when specified", file=sys.stderr)
+        return 1
+    explicit_run_id = args.run_id.strip() if args.run_id is not None else None
+    explicit_corr_id = args.correlation_id.strip() if args.correlation_id is not None else None
+    if explicit_run_id and explicit_corr_id and explicit_run_id != explicit_corr_id:
         print(
-            f"FAIL: --run-id ({args.run_id!r}) and --correlation-id ({args.correlation_id!r}) must match",
+            f"FAIL: --run-id ({explicit_run_id!r}) and --correlation-id ({explicit_corr_id!r}) must match",
             file=sys.stderr,
         )
         return 1
-    if not args.idle_state.strip():
+    idle_state = args.idle_state.strip()
+    if not idle_state:
         print("FAIL: --idle-state must be non-empty", file=sys.stderr)
         return 1
+    if idle_state != "startup_before_user_input":
+        print(
+            f"NOTE: --idle-state={idle_state!r} differs from canonical 'startup_before_user_input'",
+            file=sys.stderr,
+        )
     if args.samples < 5:
         print("FAIL: --samples must be >= 5 per src/perf_build.rs::verify_idle_rss_samples", file=sys.stderr)
         return 1
@@ -435,8 +469,8 @@ def run_cli(argv: list[str] | None = None) -> int:
         )
 
     default_id = f"idle-rss-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
-    run_id = args.run_id or args.correlation_id or default_id
-    correlation_id = args.correlation_id or run_id
+    run_id = explicit_run_id or explicit_corr_id or default_id
+    correlation_id = explicit_corr_id or run_id
 
     samples: list[dict[str, Any]] = []
     seen_pids: set[int] = set()
@@ -473,7 +507,7 @@ def run_cli(argv: list[str] | None = None) -> int:
         "binary_path": str(binary),
         "binary_sha256": sha256_file(binary),
         "rss_bytes": max_sample["rss_bytes"],
-        "idle_state": args.idle_state,
+        "idle_state": idle_state,
         "cargo_profile": "release",
         "build_command": "cargo build --bin pi --release",
         "sample_count": len(samples),
@@ -487,9 +521,13 @@ def run_cli(argv: list[str] | None = None) -> int:
     assert tuple(sorted(artifact.keys())) == tuple(sorted(REQUIRED_FIELDS))
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = args.out.with_suffix(args.out.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
-    tmp_path.replace(args.out)
+    tmp_path = args.out.with_name(f".{args.out.name}.tmp.{os.getpid()}")
+    try:
+        tmp_path.write_text(json.dumps(artifact, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        tmp_path.replace(args.out)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     print(
         f"wrote {args.out}: max_rss={max_sample['rss_bytes']} bytes "
