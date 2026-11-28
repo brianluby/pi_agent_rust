@@ -6822,6 +6822,19 @@ impl ToolRegistry {
         self.discoverable.contains(name)
     }
 
+    /// Whether this snapshot still owns the native discovery dispatcher.
+    /// A host or extension may replace the name; its own implementation and
+    /// effects must then govern execution instead of the native interception.
+    pub(crate) fn has_generated_dispatcher(&self) -> bool {
+        self.generated_dispatcher.as_ref().is_some_and(|generated| {
+            let owned: Arc<dyn Tool> = generated.clone();
+            self.tools
+                .iter()
+                .find(|tool| tool.name() == "xdev")
+                .is_some_and(|tool| Arc::ptr_eq(tool, &owned))
+        })
+    }
+
     /// Promote a discoverable tool into the live schema set.
     pub fn mark_promoted(&mut self, name: &str) {
         if self.discoverable.remove(name) {
@@ -7445,6 +7458,35 @@ impl std::fmt::Debug for SharedToolRegistry {
 // Read Tool
 // ============================================================================
 
+/// A direct SDK tool call has no Agent dispatcher to install its live parent.
+/// Keep the resolver cancellable, and never turn unavailable session authority
+/// into a read from the explicit standalone hub.
+async fn resolve_bound_tool_hub(
+    tool_name: &'static str,
+    scope: Option<&crate::jobs::JobSessionScope>,
+    owner: &AgentCx,
+) -> Result<crate::agent_hub::SharedHub> {
+    let cancelled = || Error::tool(tool_name, "Command cancelled while resolving session authority");
+    owner.checkpoint().map_err(|_| cancelled())?;
+    let Some(scope) = scope else {
+        return Ok(crate::agent_hub::current_registry());
+    };
+    let lookup = owner.with_current(scope.invocation_agent_hub());
+    let cancellation = async {
+        let (sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+        let _ = receiver.recv(owner.cx()).await;
+        drop(sender);
+    };
+    futures::pin_mut!(lookup, cancellation);
+    let hub = match futures::future::select(lookup, cancellation).await {
+        futures::future::Either::Left((resolved, _)) => resolved?,
+        futures::future::Either::Right(_) => return Err(cancelled()),
+    };
+    // A resolver may cancel its owner and return Ready in the same poll.
+    owner.checkpoint().map_err(|_| cancelled())?;
+    Ok(hub)
+}
+
 /// Input parameters for the read tool.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -7464,6 +7506,7 @@ struct ReadInput {
 pub struct ReadTool {
     cwd: PathBuf,
     text_file_client: TextFileClientScope,
+    job_session_scope: Option<crate::jobs::JobSessionScope>,
     /// Whether to auto-resize images to fit token limits.
     auto_resize: bool,
     block_images: bool,
@@ -7481,6 +7524,7 @@ impl ReadTool {
         Self {
             cwd: cwd.to_path_buf(),
             text_file_client: TextFileClientScope::default(),
+            job_session_scope: None,
             workspace: WorkspaceHandle::default(),
             auto_resize: true,
             block_images: false,
@@ -7502,6 +7546,7 @@ impl ReadTool {
         Self {
             cwd: cwd.to_path_buf(),
             text_file_client: TextFileClientScope::default(),
+            job_session_scope: None,
             workspace: WorkspaceHandle::default(),
             auto_resize,
             block_images,
@@ -7524,6 +7569,7 @@ impl ReadTool {
         Self {
             cwd: cwd.to_path_buf(),
             text_file_client: TextFileClientScope::default(),
+            job_session_scope: None,
             workspace: WorkspaceHandle::default(),
             auto_resize: true,
             block_images: false,
@@ -7541,6 +7587,7 @@ impl ReadTool {
         Self {
             cwd: cwd.to_path_buf(),
             text_file_client: TextFileClientScope::default(),
+            job_session_scope: None,
             workspace: WorkspaceHandle::default(),
             auto_resize: true,
             block_images: false,
@@ -7571,6 +7618,17 @@ where
 }
 
 impl ReadTool {
+    async fn resolve_scheme_document(&self, path: &str) -> Result<crate::url_router::ResolvedDoc> {
+        if !path.starts_with("agent://") {
+            return crate::url_router::resolve(path, &self.cwd);
+        }
+        let owner = AgentCx::for_current_or_request();
+        let hub = resolve_bound_tool_hub("read", self.job_session_scope.as_ref(), &owner).await?;
+        let _hub = crate::agent_hub::enter_registry(hub);
+        let _owner = owner.cx().clone().set_current_restricted();
+        crate::url_router::resolve(path, &self.cwd)
+    }
+
     async fn execute_json_query(
         &self,
         input: &ReadInput,
@@ -7600,7 +7658,8 @@ impl ReadTool {
             }
             outcome.content.into_bytes()
         } else if crate::url_router::has_scheme(&source) {
-            crate::url_router::resolve(&source, &self.cwd)?
+            self.resolve_scheme_document(&source)
+                .await?
                 .content
                 .into_bytes()
         } else {
@@ -7667,7 +7726,7 @@ impl ReadTool {
             })
             .await;
         }
-        let resolved = crate::url_router::resolve(&input.path, &self.cwd)?;
+        let resolved = self.resolve_scheme_document(&input.path).await?;
         let total_lines = resolved.content.lines().count();
         let start_line = input
             .offset
@@ -7970,6 +8029,10 @@ impl Tool for ReadTool {
 
     fn bind_text_file_client_scope(&mut self, scope: TextFileClientScope) {
         self.text_file_client = scope;
+    }
+
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.job_session_scope = Some(scope);
     }
 
     fn name(&self) -> &str {
@@ -8813,6 +8876,7 @@ pub struct BashTool {
     command_prefix: Option<String>,
     artifact_root: Option<PathBuf>,
     job_session_scope: crate::jobs::JobSessionScope,
+    hub_session_bound: bool,
     terminal_client: TerminalClientScope,
     /// Mediation settings (`bash.mediation*`, bd-cv653.1.7).
     mediation: Option<crate::config::BashSettings>,
@@ -9041,6 +9105,8 @@ async fn execute_bash_spawn(
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     use_pty: bool,
     shell_state: Option<&bash_session::ShellTransaction>,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+    cleanup: Option<&crate::jobs::JobScopeInvocation>,
 ) -> Result<BashRunResult> {
     if use_pty {
         run_bash_command_pty(
@@ -9051,6 +9117,8 @@ async fn execute_bash_spawn(
             timeout_secs,
             on_update,
             shell_state,
+            cancellation,
+            cleanup,
         )
         .await
     } else {
@@ -9062,6 +9130,8 @@ async fn execute_bash_spawn(
             timeout_secs,
             on_update,
             shell_state,
+            cancellation,
+            cleanup,
             None,
         )
         .await
@@ -9340,6 +9410,8 @@ pub(crate) async fn run_bash_command(
         on_update,
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -9373,6 +9445,10 @@ fn check_bash_wait_authority(owner: &AgentCx) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn bash_invocation_cancelled(cancellation: Option<&std::sync::atomic::AtomicBool>) -> bool {
+    cancellation.is_some_and(|signal| signal.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// Report cancellation before any shell or extension hook has started.
@@ -9427,6 +9503,8 @@ pub(crate) async fn run_bash_command_with_control_timeout(
         timeout_secs,
         None,
         None,
+        None,
+        None,
         Some(control),
     )
     .await
@@ -9441,6 +9519,8 @@ async fn run_bash_command_with_state(
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     shell_state: Option<&bash_session::ShellTransaction>,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+    cleanup: Option<&crate::jobs::JobScopeInvocation>,
     mut control: Option<BashRunControl<'_>>,
 ) -> Result<BashRunResult> {
     let timeout_secs = match timeout_secs {
@@ -9459,6 +9539,7 @@ async fn run_bash_command_with_state(
     if control
         .as_mut()
         .is_some_and(|control| (control.abort_requested)())
+        || bash_invocation_cancelled(cancellation)
         || cx.checkpoint().is_err()
     {
         return Ok(bash_cancelled_before_start(timeout_secs));
@@ -9527,6 +9608,7 @@ async fn run_bash_command_with_state(
     if control
         .as_mut()
         .is_some_and(|control| (control.abort_requested)())
+        || bash_invocation_cancelled(cancellation)
         || cx.checkpoint().is_err()
     {
         return Ok(bash_cancelled_before_start(timeout_secs));
@@ -9549,7 +9631,8 @@ async fn run_bash_command_with_state(
     // parent copies must not keep the Windows writers alive after shell exit.
     drop(cmd);
     let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ProcessGroupTree)
-        .with_shell_state(shell_state);
+        .with_shell_state(shell_state)
+        .with_scope_invocation(cleanup);
 
     #[cfg(not(windows))]
     let stdout = guard
@@ -9609,6 +9692,7 @@ async fn run_bash_command_with_state(
         if control
             .as_mut()
             .is_some_and(|control| (control.abort_requested)())
+            || bash_invocation_cancelled(cancellation)
         {
             cancelled = true;
             cancellation_reason = Some(BashCancellationReason::AmbientCancellation);
@@ -9895,7 +9979,7 @@ fn assemble_bash_run_result(
 /// interactive shell. The observable tool contract — output truncation,
 /// timeout/tree-kill, cancellation, streaming updates, `BashRunResult` — is
 /// identical to the pipe path.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn run_bash_command_pty(
     cwd: &Path,
     shell_path: Option<&str>,
@@ -9904,6 +9988,8 @@ pub(crate) async fn run_bash_command_pty(
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
     shell_state: Option<&bash_session::ShellTransaction>,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+    cleanup: Option<&crate::jobs::JobScopeInvocation>,
 ) -> Result<BashRunResult> {
     use portable_pty::{CommandBuilder, PtySize};
 
@@ -9913,7 +9999,7 @@ pub(crate) async fn run_bash_command_pty(
         Some(value) => Some(value),
     };
     let cx = AgentCx::for_current_or_request();
-    if cx.checkpoint().is_err() {
+    if bash_invocation_cancelled(cancellation) || cx.checkpoint().is_err() {
         return Ok(bash_cancelled_before_start(timeout_secs));
     }
     check_bash_spawn_authority(&cx)?;
@@ -9962,12 +10048,12 @@ pub(crate) async fn run_bash_command_pty(
     // portable-pty puts the child in its own session (setsid) on unix, so the
     // child pid is its process-group id and the shared tree-kill helpers work
     // exactly as they do for the pipe path's isolated process group.
-    if cx.checkpoint().is_err() {
+    if bash_invocation_cancelled(cancellation) || cx.checkpoint().is_err() {
         return Ok(bash_cancelled_before_start(timeout_secs));
     }
     let child = spawn_pty_command(pair.slave.as_ref(), pty_cmd)
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell {shell} on PTY: {e}")))?;
-    let mut child = PtyProcessGuard::new(child, shell_state);
+    let mut child = PtyProcessGuard::new(child, shell_state, cleanup);
     // Drop our handle to the slave side so the master sees EOF when the child
     // exits; otherwise the pump thread would block forever.
     drop(pair.slave);
@@ -9989,7 +10075,13 @@ pub(crate) async fn run_bash_command_pty(
         pumps
     };
     #[cfg(not(unix))]
-    let pty_thread = thread::spawn(move || pump_stream(reader, "pty", &tx, None));
+    let pty_thread = {
+        let cleanup = cleanup.cloned();
+        thread::spawn(move || {
+            pump_stream(reader, "pty", &tx, None);
+            drop(cleanup);
+        })
+    };
 
     let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
     let mut bash_output = BashOutputState::new(max_chunks_bytes);
@@ -10018,6 +10110,14 @@ pub(crate) async fn run_bash_command_pty(
 
         if updated {
             emit_bash_update(&bash_output, on_update)?;
+        }
+
+        if bash_invocation_cancelled(cancellation) {
+            cancelled = true;
+            cancellation_reason = Some(BashCancellationReason::AmbientCancellation);
+            let _ = child.kill();
+            exit_code = Some(-1);
+            break;
         }
 
         match child.try_wait() {
@@ -10156,6 +10256,7 @@ impl BashTool {
             command_prefix: None,
             artifact_root: None,
             job_session_scope: crate::jobs::JobSessionScope::default(),
+            hub_session_bound: false,
             terminal_client: TerminalClientScope::default(),
             mediation: None,
         }
@@ -10172,6 +10273,7 @@ impl BashTool {
             command_prefix,
             artifact_root: None,
             job_session_scope: crate::jobs::JobSessionScope::default(),
+            hub_session_bound: false,
             terminal_client: TerminalClientScope::default(),
             mediation: None,
         }
@@ -10498,6 +10600,7 @@ impl BashTool {
             command_prefix: None,
             artifact_root: Some(artifact_root.to_path_buf()),
             job_session_scope: crate::jobs::JobSessionScope::default(),
+            hub_session_bound: false,
             terminal_client: TerminalClientScope::default(),
             mediation: None,
         }
@@ -10634,13 +10737,13 @@ impl Tool for BashTool {
 
     fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
         self.job_session_scope = scope;
+        self.hub_session_bound = true;
     }
 
     fn bind_terminal_client_scope(&mut self, scope: TerminalClientScope) {
         self.terminal_client = scope;
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
         tool_call_id: &str,
@@ -10654,13 +10757,75 @@ impl Tool for BashTool {
         owner
             .checkpoint()
             .map_err(|_| Error::tool("bash", "Command cancelled before spawn"))?;
+        let cleanup = self
+            .hub_session_bound
+            .then(|| self.job_session_scope.begin_invocation())
+            .transpose()?;
+        let hub = resolve_bound_tool_hub(
+            "bash",
+            self.hub_session_bound.then_some(&self.job_session_scope),
+            &owner,
+        )
+        .await?;
+        let cancellation = self
+            .hub_session_bound
+            .then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let execution = crate::agent_hub::with_registry(
+            hub,
+            owner.with_current(self.execute_in_hub(
+                tool_call_id,
+                input,
+                on_update,
+                &owner,
+                cancellation.as_ref(),
+                cleanup.as_ref(),
+            )),
+        );
+        if !self.hub_session_bound {
+            return execution.await;
+        }
+        // Direct foreground/PTY calls do not enter the jobs registry. Retire
+        // them with their live scope too, retaining the original future so
+        // its process supervisor can kill, drain and reap during cancellation.
+        // Keep cancellation local: the caller's Cx can own another live
+        // registry whose foreground command must remain available.
+        // Poll shutdown first: a closed scope must not start more work. Normal
+        // completion only drops the observer; promoted jobs keep their owner.
+        let shutdown = self.job_session_scope.wait_for_shutdown();
+        futures::pin_mut!(shutdown, execution);
+        match futures::future::select(shutdown, execution).await {
+            futures::future::Either::Left(((), execution)) => {
+                if let Some(cancellation) = &cancellation {
+                    cancellation.store(true, std::sync::atomic::Ordering::Release);
+                }
+                execution.await
+            }
+            futures::future::Either::Right((output, _)) => output,
+        }
+    }
+}
+
+impl BashTool {
+    #[allow(clippy::too_many_lines)]
+    async fn execute_in_hub(
+        &self,
+        tool_call_id: &str,
+        input: BashInput,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        owner: &AgentCx,
+        cancellation: Option<&Arc<std::sync::atomic::AtomicBool>>,
+        cleanup: Option<&crate::jobs::JobScopeInvocation>,
+    ) -> Result<ToolOutput> {
+        if bash_invocation_cancelled(cancellation.map(Arc::as_ref)) {
+            return Err(Error::tool("bash", "Command cancelled before spawn"));
+        }
         let client_terminal = if input.background == Some(true) {
             None
         } else {
             self.terminal_client.get()?
         };
         if input.background != Some(true) && client_terminal.is_none() {
-            check_bash_wait_authority(&owner)?;
+            check_bash_wait_authority(owner)?;
         }
         // PTY auto-selection (bd-cv653.1.7): isatty-requiring commands get a
         // real pseudo-terminal when `bash.pty` is auto/always; the tool
@@ -10703,7 +10868,7 @@ impl Tool for BashTool {
                 .unwrap_or(true);
         let background_session_id =
             if input.background == Some(true) || auto_background || persistent {
-                Some(self.job_session_scope.session_id().await?)
+                Some(self.job_session_scope.invocation_session_id().await?)
             } else {
                 None
             };
@@ -10724,6 +10889,8 @@ impl Tool for BashTool {
                 .is_some_and(|name| name == "bash")
             {
                 match bash_session::acquire(
+                    self.hub_session_bound
+                        .then(|| self.job_session_scope.instance_id()),
                     background_session_id.as_deref().ok_or_else(|| {
                         Error::tool("bash", "session shell scope was not resolved")
                     })?,
@@ -10844,7 +11011,9 @@ impl Tool for BashTool {
 
         // Every execution route passes the same mediation gate above.
         if let Some(client) = client_terminal {
-            let command = self.client_terminal_command(&input)?;
+            let mut command = self.client_terminal_command(&input)?;
+            command.cancellation = cancellation.cloned();
+            command.cleanup = cleanup.cloned();
             owner
                 .checkpoint()
                 .map_err(|_| Error::tool("bash", "Command cancelled before client dispatch"))?;
@@ -10935,6 +11104,8 @@ impl Tool for BashTool {
             on_update.as_deref(),
             use_pty,
             shell_state.as_ref(),
+            cancellation.map(Arc::as_ref),
+            cleanup,
         )
         .await?;
 
@@ -10980,6 +11151,7 @@ struct JobsInput {
 /// registry (bd-cv653.5.4).
 pub struct JobsTool {
     job_session_scope: crate::jobs::JobSessionScope,
+    hub_session_bound: bool,
 }
 
 impl JobsTool {
@@ -10987,6 +11159,7 @@ impl JobsTool {
     pub fn new() -> Self {
         Self {
             job_session_scope: crate::jobs::JobSessionScope::default(),
+            hub_session_bound: false,
         }
     }
 }
@@ -11044,8 +11217,23 @@ impl Tool for JobsTool {
         ToolEffects::process()
     }
 
+    fn effects_for_input(&self, input: &serde_json::Value) -> ToolEffects {
+        let Ok(input) = JobsInput::deserialize(input) else {
+            return self.effects();
+        };
+        match input.action.trim().to_ascii_lowercase().as_str() {
+            "list" => ToolEffects::read(),
+            // A wait observes retained work without cancelling it or consuming
+            // its completion notice. Keep the wait in order so later calls can
+            // rely on the observed settlement, including during planning.
+            "wait" => ToolEffects::read().with_ordered_execution(),
+            _ => self.effects(),
+        }
+    }
+
     fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
         self.job_session_scope = scope;
+        self.hub_session_bound = true;
     }
 
     async fn execute(
@@ -11056,41 +11244,47 @@ impl Tool for JobsTool {
     ) -> Result<ToolOutput> {
         let input: JobsInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
-        let owner_session_id = self.job_session_scope.session_id().await?;
-        let action = input.action.trim().to_ascii_lowercase();
-        let payload = match action.as_str() {
-            "list" => {
-                let jobs = crate::jobs::list(&owner_session_id)?;
-                serde_json::json!({ "schema": crate::jobs::JOB_SCHEMA, "jobs": jobs })
-            }
-            "wait" => {
-                let job_id = input
-                    .job_id
-                    .as_deref()
-                    .ok_or_else(|| Error::validation("jobs wait requires jobId".to_string()))?;
-                let budget_ms = input.timeout_ms.unwrap_or(30_000).min(600_000);
-                let snapshot = crate::jobs::wait_async(
-                    &owner_session_id,
-                    job_id,
-                    std::time::Duration::from_millis(budget_ms),
-                )
-                .await?;
-                serde_json::to_value(&snapshot)?
-            }
-            "cancel" => {
-                let job_id = input
-                    .job_id
-                    .as_deref()
-                    .ok_or_else(|| Error::validation("jobs cancel requires jobId".to_string()))?;
-                let snapshot = crate::jobs::cancel_async(&owner_session_id, job_id).await?;
-                serde_json::to_value(&snapshot)?
-            }
-            other => {
-                return Err(Error::validation(format!(
-                    "Unknown jobs action '{other}'; expected list, wait, or cancel"
-                )));
-            }
+        let hub = if self.hub_session_bound {
+            self.job_session_scope.invocation_agent_hub().await?
+        } else {
+            crate::agent_hub::current_registry()
         };
+        let action = input.action.trim().to_ascii_lowercase();
+        let payload = crate::agent_hub::with_registry(hub, async {
+            let owner_session_id = self.job_session_scope.invocation_session_id().await?;
+            match action.as_str() {
+                "list" => {
+                    let jobs = crate::jobs::list(&owner_session_id)?;
+                    Ok(serde_json::json!({ "schema": crate::jobs::JOB_SCHEMA, "jobs": jobs }))
+                }
+                "wait" => {
+                    let job_id = input
+                        .job_id
+                        .as_deref()
+                        .ok_or_else(|| Error::validation("jobs wait requires jobId".to_string()))?;
+                    let budget_ms = input.timeout_ms.unwrap_or(30_000).min(600_000);
+                    let snapshot = crate::jobs::wait_async(
+                        &owner_session_id,
+                        job_id,
+                        std::time::Duration::from_millis(budget_ms),
+                    )
+                    .await?;
+                    Ok(serde_json::to_value(&snapshot)?)
+                }
+                "cancel" => {
+                    let job_id = input
+                        .job_id
+                        .as_deref()
+                        .ok_or_else(|| Error::validation("jobs cancel requires jobId".to_string()))?;
+                    let snapshot = crate::jobs::cancel_async(&owner_session_id, job_id).await?;
+                    Ok(serde_json::to_value(&snapshot)?)
+                }
+                other => Err(Error::validation(format!(
+                    "Unknown jobs action '{other}'; expected list, wait, or cancel"
+                ))),
+            }
+        })
+        .await?;
         let text = match action.as_str() {
             "list" => {
                 let count = payload["jobs"].as_array().map_or(0, Vec::len);
@@ -11543,6 +11737,7 @@ struct HubReadyInput {
 pub struct HubTool {
     cwd: PathBuf,
     job_session_scope: crate::jobs::JobSessionScope,
+    hub_session_bound: bool,
 }
 
 impl HubTool {
@@ -11550,6 +11745,7 @@ impl HubTool {
         Self {
             cwd: cwd.to_path_buf(),
             job_session_scope: crate::jobs::JobSessionScope::default(),
+            hub_session_bound: false,
         }
     }
 }
@@ -11641,6 +11837,7 @@ impl Tool for HubTool {
 
     fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
         self.job_session_scope = scope;
+        self.hub_session_bound = true;
     }
 
     #[allow(clippy::too_many_lines)]
@@ -11653,36 +11850,44 @@ impl Tool for HubTool {
         let input: HubInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
         let op = input.op.trim().to_ascii_lowercase();
-        let dispatched = if op == "agent"
-            && input
-                .action
-                .as_deref()
-                .is_some_and(|action| action.trim().eq_ignore_ascii_case("wait"))
-        {
-            Self::dispatch_agent_wait(&input).await
-        } else if op == "agent" && crate::agent_hub::ipc::inherited_channel_present() {
-            Self::dispatch_inherited_agent(&input).await
-        } else if op == "agent"
-            && input
-                .action
-                .as_deref()
-                .is_some_and(|action| action.eq_ignore_ascii_case("revive"))
-        {
-            match input.name.as_deref().filter(|id| !id.trim().is_empty()) {
-                Some(id) => crate::subagents::revive_child(id, on_update).await,
-                None => Err(Error::validation(
-                    "hub agent revive requires name (child run id)",
-                )),
-            }
+        let hub = if self.hub_session_bound {
+            self.job_session_scope.invocation_agent_hub().await?
         } else {
-            self.dispatch(&op, &input)
-                .await
-                .map(|(text, details)| ToolOutput {
-                    content: vec![ContentBlock::Text(TextContent::new(text))],
-                    details: Some(details),
-                    is_error: false,
-                })
+            crate::agent_hub::current_registry()
         };
+        let dispatched = crate::agent_hub::with_registry(hub, async {
+            if op == "agent"
+                && input
+                    .action
+                    .as_deref()
+                    .is_some_and(|action| action.trim().eq_ignore_ascii_case("wait"))
+            {
+                Self::dispatch_agent_wait(&input).await
+            } else if op == "agent" && crate::agent_hub::ipc::inherited_channel_present() {
+                Self::dispatch_inherited_agent(&input).await
+            } else if op == "agent"
+                && input
+                    .action
+                    .as_deref()
+                    .is_some_and(|action| action.eq_ignore_ascii_case("revive"))
+            {
+                match input.name.as_deref().filter(|id| !id.trim().is_empty()) {
+                    Some(id) => crate::subagents::revive_child(id, on_update).await,
+                    None => Err(Error::validation(
+                        "hub agent revive requires name (child run id)",
+                    )),
+                }
+            } else {
+                self.dispatch(&op, &input)
+                    .await
+                    .map(|(text, details)| ToolOutput {
+                        content: vec![ContentBlock::Text(TextContent::new(text))],
+                        details: Some(details),
+                        is_error: false,
+                    })
+            }
+        })
+        .await;
         Ok(match dispatched {
             Ok(output) => output,
             Err(err) => {
@@ -12126,7 +12331,7 @@ impl HubTool {
                 .await?
             }
             "jobs" => {
-                let owner_session_id = self.job_session_scope.session_id().await?;
+                let owner_session_id = self.job_session_scope.invocation_session_id().await?;
                 let action = input
                     .action
                     .clone()
@@ -12222,6 +12427,7 @@ impl HubTool {
     /// kill / revive / send / inbox over this session's subagent children.
     #[allow(clippy::too_many_lines)] // Cohesive action dispatcher: one arm per hub op.
     fn dispatch_agent(action: &str, input: &HubInput) -> Result<(String, serde_json::Value)> {
+        let hub = crate::agent_hub::current_registry();
         let id_required = |action: &str| -> Result<String> {
             input
                 .name
@@ -12234,7 +12440,7 @@ impl HubTool {
         let from = input.from.clone().unwrap_or_else(|| "parent".to_string());
         let (text, details) = match action {
             "roster" => {
-                let entries = crate::agent_hub::registry()
+                let entries = hub
                     .lock()
                     .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
                     .roster();
@@ -12266,7 +12472,7 @@ impl HubTool {
             }
             "transcript" => {
                 let id = id_required("transcript")?;
-                let page = crate::agent_hub::registry()
+                let page = hub
                     .lock()
                     .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
                     .transcript_page(&id)?;
@@ -12292,7 +12498,7 @@ impl HubTool {
                         Error::validation(format!("hub agent {action} requires text"))
                     })?;
                 let message = {
-                    let mut registry = crate::agent_hub::registry()
+                    let mut registry = hub
                         .lock()
                         .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?;
                     if action == "send" {
@@ -12314,7 +12520,7 @@ impl HubTool {
             "kill" => {
                 let id = id_required("kill")?;
                 {
-                    let mut reg = crate::agent_hub::registry()
+                    let mut reg = hub
                         .lock()
                         .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?;
                     let entry = reg
@@ -12344,7 +12550,7 @@ impl HubTool {
             }
             "inbox" => {
                 let id = id_required("inbox")?;
-                let page = crate::agent_hub::registry()
+                let page = hub
                     .lock()
                     .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
                     .inbox_page(&id, input.cursor)?;
@@ -14616,6 +14822,7 @@ pub struct GrepTool {
     backend: SearchBackend,
     allow_private_urls: bool,
     workspace: WorkspaceHandle,
+    job_session_scope: Option<crate::jobs::JobSessionScope>,
     #[cfg(test)]
     after_scope_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -14646,6 +14853,7 @@ impl GrepTool {
             backend,
             allow_private_urls: false,
             workspace: WorkspaceHandle::default(),
+            job_session_scope: None,
             #[cfg(test)]
             after_scope_hook: None,
         }
@@ -14659,6 +14867,7 @@ impl GrepTool {
             backend: SearchBackend::default(),
             allow_private_urls: false,
             workspace: WorkspaceHandle::default(),
+            job_session_scope: None,
             after_scope_hook: None,
         }
     }
@@ -14674,6 +14883,7 @@ impl GrepTool {
             backend: SearchBackend::default(),
             allow_private_urls: false,
             workspace: WorkspaceHandle::default(),
+            job_session_scope: None,
             after_scope_hook: Some(Arc::new(after_scope_hook)),
         }
     }
@@ -14681,7 +14891,11 @@ impl GrepTool {
     /// Resolve through the same admitted document surfaces as ReadTool. The
     /// worker retains the caller's restricted context and cancellation budget;
     /// agent results still use the authenticated immediate-parent resolver.
-    async fn resolve_grep_resource(&self, path: &str) -> Result<GrepResource> {
+    async fn resolve_grep_resource(
+        &self,
+        path: &str,
+        agent_hub: Option<&crate::agent_hub::SharedHub>,
+    ) -> Result<GrepResource> {
         let owner = AgentCx::for_current_or_request();
         owner
             .checkpoint()
@@ -14723,7 +14937,9 @@ impl GrepTool {
         }
         let path_owned = path.to_string();
         let cwd = self.cwd.clone();
+        let hub = agent_hub.map_or_else(crate::agent_hub::current_registry, Arc::clone);
         let resolved = asupersync::runtime::spawn_blocking(move || {
+            let _hub_scope = crate::agent_hub::enter_registry(hub);
             let _guard = owner.cx().clone().set_current_restricted();
             owner
                 .checkpoint()
@@ -14802,12 +15018,21 @@ impl GrepTool {
         let mut lines_truncated = false;
         let mut source_truncated = false;
         let owner = AgentCx::for_current_or_request();
+        // A semicolon batch is one observation. Resolve ownership once so a
+        // session switch between resource workers cannot mix parent results.
+        let agent_hub = if paths.iter().any(|path| path.starts_with("agent://")) {
+            Some(resolve_bound_tool_hub("grep", self.job_session_scope.as_ref(), &owner).await?)
+        } else {
+            None
+        };
 
         for path in paths {
             owner
                 .checkpoint()
                 .map_err(|_| Error::tool("grep", "Command cancelled"))?;
-            let mut resource = self.resolve_grep_resource(path).await?;
+            let mut resource = owner
+                .with_current(self.resolve_grep_resource(path, agent_hub.as_ref()))
+                .await?;
             if resource.content.len() > MAX_GREP_RESOURCE_BYTES {
                 return Err(Error::tool(
                     "grep",
@@ -15518,6 +15743,10 @@ fn rg_exit_failure(status: std::process::ExitStatus, stderr: &str) -> Option<Str
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for GrepTool {
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.job_session_scope = Some(scope);
+    }
+
     fn builtin_factory_context(&self) -> Option<(&Path, &WorkspaceHandle)> {
         Some((&self.cwd, &self.workspace))
     }
@@ -18074,6 +18303,7 @@ pub(crate) struct ProcessGuard {
     child: Option<std::process::Child>,
     cleanup_mode: ProcessCleanupMode,
     shell_process: Option<bash_session::ShellProcessLease>,
+    scope_invocation: Option<crate::jobs::JobScopeInvocation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18088,11 +18318,17 @@ impl ProcessGuard {
             child: Some(child),
             cleanup_mode,
             shell_process: None,
+            scope_invocation: None,
         }
     }
 
     fn with_shell_state(mut self, state: Option<&bash_session::ShellTransaction>) -> Self {
         self.shell_process = state.map(bash_session::ShellTransaction::retain_process);
+        self
+    }
+
+    fn with_scope_invocation(mut self, cleanup: Option<&crate::jobs::JobScopeInvocation>) -> Self {
+        self.scope_invocation = cleanup.cloned();
         self
     }
 
@@ -18115,7 +18351,9 @@ impl ProcessGuard {
             .map_or(Ok(None), std::process::Child::try_wait)?;
         if status.is_some()
             && self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
-            && (cfg!(windows) || self.shell_process.is_some())
+            && (cfg!(windows)
+                || self.shell_process.is_some()
+                || self.scope_invocation.is_some())
             && let Some(child) = &self.child
         {
             // Descendants can retain stdout after their root exits. Close the
@@ -18132,6 +18370,7 @@ impl ProcessGuard {
     pub(crate) fn kill(&mut self) -> Option<std::process::ExitStatus> {
         if let Some(mut child) = self.child.take() {
             let shell_process = self.shell_process.take();
+            let scope_invocation = self.scope_invocation.take();
             match child.try_wait() {
                 Ok(Some(status)) => {
                     if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree {
@@ -18156,8 +18395,13 @@ impl ProcessGuard {
                 }
             }
             dispatch_process_cleanup(move || {
-                let _ = child.wait();
+                if child.wait().is_err()
+                    && let Some(cleanup) = &scope_invocation
+                {
+                    cleanup.mark_unconfirmed();
+                }
                 drop(shell_process);
+                drop(scope_invocation);
             });
             // A live or unconfirmed child is reaped without blocking callers.
             return None;
@@ -18197,7 +18441,9 @@ impl ProcessGuard {
         // the child handle and its registered Windows Job available.
         let status = child.wait()?;
         if self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
-            && (cfg!(windows) || self.shell_process.is_some())
+            && (cfg!(windows)
+                || self.shell_process.is_some()
+                || self.scope_invocation.is_some())
         {
             terminate_reaped_child_discipline(child.id());
             self.cleanup_mode = ProcessCleanupMode::ChildOnly;
@@ -18223,7 +18469,7 @@ impl Drop for ProcessGuard {
             if matches!(status, Ok(Some(_))) {
                 if !cfg!(windows)
                     && self.cleanup_mode == ProcessCleanupMode::ProcessGroupTree
-                    && self.shell_process.is_some()
+                    && (self.shell_process.is_some() || self.scope_invocation.is_some())
                 {
                     terminate_reaped_child_discipline(child.id());
                 }
@@ -18231,13 +18477,19 @@ impl Drop for ProcessGuard {
             }
             let cleanup_mode = self.cleanup_mode;
             let shell_process = self.shell_process.take();
+            let scope_invocation = self.scope_invocation.take();
             dispatch_process_cleanup(move || {
                 if matches!(status, Ok(None)) {
                     cleanup_child(Some(child.id()), cleanup_mode);
                     let _ = child.kill();
                 }
-                let _ = child.wait();
+                if child.wait().is_err()
+                    && let Some(cleanup) = &scope_invocation
+                {
+                    cleanup.mark_unconfirmed();
+                }
                 drop(shell_process);
+                drop(scope_invocation);
             });
         }
     }
@@ -18287,18 +18539,21 @@ struct PtyProcessGuard {
     process_id: Option<u32>,
     group_active: bool,
     shell_process: Option<bash_session::ShellProcessLease>,
+    scope_invocation: Option<crate::jobs::JobScopeInvocation>,
 }
 
 impl PtyProcessGuard {
     fn new(
         child: Box<dyn portable_pty::Child + Send + Sync>,
         shell_state: Option<&bash_session::ShellTransaction>,
+        cleanup: Option<&crate::jobs::JobScopeInvocation>,
     ) -> Self {
         Self {
             process_id: child.process_id(),
             child: Some(child),
             group_active: true,
             shell_process: shell_state.map(bash_session::ShellTransaction::retain_process),
+            scope_invocation: cleanup.cloned(),
         }
     }
 
@@ -18361,13 +18616,19 @@ impl Drop for PtyProcessGuard {
             }
             let process_id = self.process_id;
             let shell_process = self.shell_process.take();
+            let scope_invocation = self.scope_invocation.take();
             dispatch_process_cleanup(move || {
                 if matches!(status, Ok(None)) {
                     cleanup_child(process_id, ProcessCleanupMode::ProcessGroupTree);
                     let _ = child.kill();
                 }
-                let _ = child.wait();
+                if child.wait().is_err()
+                    && let Some(cleanup) = &scope_invocation
+                {
+                    cleanup.mark_unconfirmed();
+                }
                 drop(shell_process);
+                drop(scope_invocation);
             });
         }
     }
@@ -24616,6 +24877,8 @@ mod tests {
                             None,
                             use_pty,
                             None,
+                            None,
+                            None,
                         ))
                         .await
                         .expect_err("the polling runtime cannot supply missing authority");
@@ -24635,6 +24898,8 @@ mod tests {
                 Some(5),
                 None,
                 false,
+                None,
+                None,
                 None,
             )
             .await
@@ -24674,6 +24939,8 @@ mod tests {
                             None,
                             use_pty,
                             None,
+                            None,
+                            None,
                         ))
                         .await
                         .expect("pre-cancellation must win before shell lookup or PTY startup");
@@ -24693,7 +24960,7 @@ mod tests {
     #[test]
     fn bash_tool_does_not_launch_after_its_session_resolver_cancels_the_owner() {
         asupersync::test_utils::run_test(|| async {
-            for background in [None, Some(true)] {
+            for background in [None, Some(false), Some(true)] {
                 let root = tempfile::tempdir().expect("isolated shell workspace");
                 let artifacts = root.path().join("artifacts");
                 let owner_id = format!("bash-resolver-cancel-{}", uuid::Uuid::new_v4().simple());
@@ -24957,7 +25224,18 @@ mod tests {
 
             for use_pty in [false, true] {
                 let result = if use_pty {
-                    run_bash_command_pty(tmp.path(), None, None, command, Some(1), None, None).await
+                    run_bash_command_pty(
+                        tmp.path(),
+                        None,
+                        None,
+                        command,
+                        Some(1),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
                 } else {
                     run_bash_command(tmp.path(), None, None, command, Some(1), None).await
                 }
@@ -24997,6 +25275,8 @@ mod tests {
                         command,
                         Some(30),
                         Some(&on_update),
+                        None,
+                        None,
                         None,
                     )
                     .await
@@ -26003,6 +26283,15 @@ mod tests {
             );
             let tool = GrepTool::new(temp.path());
             let path = format!("agent://{}/findings/0/path", accepted.id);
+            let read = ReadTool::new(temp.path())
+                .execute(
+                    "standalone-result",
+                    serde_json::json!({"path":path}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(get_text(&read.content).contains("src/needle.rs"));
             let output = tool
                 .execute(
                     "accepted-result",
@@ -26026,6 +26315,428 @@ mod tests {
                 }), None).await.unwrap_err();
                 assert!(error.to_string().contains(code), "{error}");
             }
+        });
+    }
+
+    fn direct_agent_resource_registry(cwd: &Path, session: &str, dir: &Path) -> ToolRegistry {
+        let registry = ToolRegistry::new(&["read", "grep"], cwd, None);
+        let session = session.to_string();
+        let captured = session.clone();
+        registry.bind_job_session_resolver(Arc::new(move || {
+            let session = captured.clone();
+            Box::pin(async move { Some(session) })
+        }));
+        std::fs::create_dir_all(dir).unwrap();
+        registry
+            .job_session_scope()
+            .agent_hub_for_session(&session)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .set_dir_for_tests(dir.to_path_buf());
+        registry
+    }
+
+    fn publish_direct_agent_resource(
+        hub: &crate::agent_hub::SharedHub,
+        name: &str,
+        marker: &str,
+    ) -> crate::agent_hub::ChildEntry {
+        let entry = {
+            let mut hub = hub.lock().unwrap();
+            let entry = hub.register(name, marker).unwrap();
+            hub.settle(&entry.id, crate::agent_hub::ChildStatus::Done);
+            hub.get(&entry.id).unwrap()
+        };
+        crate::url_router::agent::publish(
+            &entry,
+            marker,
+            Some(&serde_json::json!({
+                "needle": marker,
+                "record.json": {"needle": marker},
+            })),
+            Some(true),
+            None,
+        );
+        entry
+    }
+
+    #[test]
+    fn direct_registry_reads_and_searches_use_their_own_live_parent_results() {
+        asupersync::test_utils::run_test(|| async {
+            let root = tempfile::tempdir().unwrap();
+            let first = direct_agent_resource_registry(
+                root.path(),
+                "same-saved-session",
+                &root.path().join("first"),
+            );
+            let second = direct_agent_resource_registry(
+                root.path(),
+                "same-saved-session",
+                &root.path().join("second"),
+            );
+            let first_hub = first.job_session_scope().agent_hub().await.unwrap();
+            let second_hub = second.job_session_scope().agent_hub().await.unwrap();
+            let first_entry =
+                publish_direct_agent_resource(&first_hub, "shared", "first private needle");
+            let second_entry =
+                publish_direct_agent_resource(&second_hub, "shared", "second private needle");
+            let foreign =
+                publish_direct_agent_resource(&first_hub, "first-only", "foreign private needle");
+            assert_eq!(first_entry.id, second_entry.id);
+
+            for (registry, marker, absent) in [
+                (&first, "first private needle", "second private needle"),
+                (&second, "second private needle", "first private needle"),
+            ] {
+                for (name, input) in [
+                    (
+                        "read",
+                        serde_json::json!({"path":format!("agent://{}/needle", first_entry.id)}),
+                    ),
+                    (
+                        "grep",
+                        serde_json::json!({"pattern":"needle", "path":format!("agent://{}/needle", first_entry.id)}),
+                    ),
+                ] {
+                    let output = registry
+                        .get(name)
+                        .unwrap()
+                        .execute("direct-result", input, None)
+                        .await
+                        .unwrap();
+                    let text = get_text(&output.content);
+                    assert!(text.contains(marker), "{name}: {text}");
+                    assert!(!text.contains(absent), "{name}: {text}");
+                }
+            }
+            for name in ["read", "grep"] {
+                let path = format!("agent://{}/needle", foreign.id);
+                let input = if name == "read" {
+                    serde_json::json!({"path":path})
+                } else {
+                    serde_json::json!({"pattern":"needle", "path":path})
+                };
+                let tool = second.get(name).unwrap();
+                let error = crate::agent_hub::with_registry(
+                    Arc::clone(&first_hub),
+                    tool.execute("foreign-context", input, None),
+                )
+                .await
+                .unwrap_err();
+                assert!(error.to_string().contains("PI_URL_AGENT_NOT_FOUND"));
+                assert!(!error.to_string().contains("foreign private needle"));
+            }
+
+            // An Agent has already captured its owner before entering the tool.
+            // A later live resolver change must not retarget that invocation.
+            first.bind_job_session_resolver(Arc::new(|| Box::pin(async { None })));
+            let read = first.get("read").unwrap();
+            let output = crate::agent_hub::with_registry(
+                first_hub,
+                read.execute(
+                    "retained-owner",
+                    serde_json::json!({"path":format!("agent://{}/needle", first_entry.id)}),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(get_text(&output.content).contains("first private needle"));
+        });
+    }
+
+    #[test]
+    fn direct_grep_resource_batch_captures_one_parent_before_worker_dispatch() {
+        asupersync::test_utils::run_test(|| async {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let root = tempfile::tempdir().unwrap();
+            let registry = direct_agent_resource_registry(
+                root.path(),
+                "first-session",
+                &root.path().join("first"),
+            );
+            let scope = registry.job_session_scope();
+            let first = scope.agent_hub_for_session("first-session").unwrap();
+            let second = scope.agent_hub_for_session("second-session").unwrap();
+            std::fs::create_dir_all(root.path().join("second")).unwrap();
+            second
+                .lock()
+                .unwrap()
+                .set_dir_for_tests(root.path().join("second"));
+            let original = publish_direct_agent_resource(&first, "shared", "original needle");
+            let replacement = publish_direct_agent_resource(&second, "shared", "replacement needle");
+            assert_eq!(original.id, replacement.id);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            scope.bind(Arc::new(move || {
+                let first = observed.fetch_add(1, Ordering::SeqCst) == 0;
+                Box::pin(async move {
+                    Some(
+                        if first { "first-session" } else { "second-session" }
+                            .to_string(),
+                    )
+                })
+            }));
+            let output = registry
+                .get("grep")
+                .unwrap()
+                .execute(
+                    "one-parent",
+                    serde_json::json!({
+                        "pattern":"needle",
+                        "path":format!("agent://{0}/needle;agent://{0}/record.json", original.id),
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&output.content);
+            assert!(text.contains("original needle"));
+            assert!(!text.contains("replacement needle"));
+            assert_eq!(
+                output.details.as_ref().unwrap()["resources"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2,
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn direct_tool_session_lookup_fails_closed_and_remains_cancellable() {
+        asupersync::test_utils::run_test(|| async {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("visible.txt"), "ordinary needle").unwrap();
+            let mut registry = direct_agent_resource_registry(
+                root.path(),
+                "resource-owner",
+                &root.path().join("hub"),
+            );
+            registry.push(Box::new(BashTool::new(root.path())));
+            let scope = registry.job_session_scope();
+            let hub = scope.agent_hub_for_session("resource-owner").unwrap();
+            let entry = publish_direct_agent_resource(&hub, "shared", "private needle");
+            let request = |name: &str| {
+                let path = format!("agent://{}/needle", entry.id);
+                match name {
+                    "read" => serde_json::json!({"path":path}),
+                    "grep" => serde_json::json!({"pattern":"needle", "path":path}),
+                    "bash" => serde_json::json!({"command":"printf forbidden > started", "background":true}),
+                    _ => unreachable!("fixture tool"),
+                }
+            };
+            scope.bind(Arc::new(|| Box::pin(async { None })));
+            for name in ["read", "grep"] {
+                let tool = registry.get(name).unwrap();
+                let error = tool
+                    .execute("unavailable", request(name), None)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("PI_JOBS_SESSION_UNAVAILABLE"));
+                let local = if name == "read" {
+                    serde_json::json!({"path":"visible.txt"})
+                } else {
+                    serde_json::json!({"pattern":"needle", "path":"visible.txt"})
+                };
+                let output = tool.execute("local-resource", local, None).await.unwrap();
+                assert!(get_text(&output.content).contains("ordinary needle"));
+            }
+            let query_error = registry
+                .get("read")
+                .unwrap()
+                .execute(
+                    "query-owner",
+                    serde_json::json!({"path":format!("agent://{}/record.json?q=.needle", entry.id)}),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(query_error.to_string().contains("PI_JOBS_SESSION_UNAVAILABLE"));
+            let bash_error = registry
+                .get("bash")
+                .unwrap()
+                .execute("unavailable-shell", request("bash"), None)
+                .await
+                .unwrap_err();
+            assert!(bash_error.to_string().contains("PI_JOBS_SESSION_UNAVAILABLE"));
+
+            for name in ["read", "grep", "bash"] {
+                scope.bind(Arc::new(|| Box::pin(futures::future::pending())));
+                let owner = AgentCx::for_request();
+                let tool = registry.get(name).unwrap();
+                let mut pending = Box::pin(owner.with_current(tool.execute(
+                    "pending-owner",
+                    request(name),
+                    None,
+                )));
+                assert!(futures::poll!(pending.as_mut()).is_pending());
+                owner.set_cancel_requested(true);
+                let std::task::Poll::Ready(Err(error)) = futures::poll!(pending.as_mut()) else {
+                    panic!("cancelled session lookup must retire without waiting for its resolver");
+                };
+                assert!(error.to_string().contains("cancelled"));
+                drop(pending);
+
+                let owner = AgentCx::for_request();
+                let resolver_owner = owner.clone();
+                scope.bind(Arc::new(move || {
+                    resolver_owner.set_cancel_requested(true);
+                    Box::pin(async { Some("resource-owner".to_string()) })
+                }));
+                let error = owner
+                    .with_current(tool.execute("ready-cancelled", request(name), None))
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("cancelled"));
+            }
+            assert!(!root.path().join("started").exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_registry_can_read_and_search_a_child_it_actually_launched() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        asupersync::test_utils::run_test(|| async {
+            let root = tempfile::tempdir().unwrap();
+            let global = root.path().join("global");
+            std::fs::create_dir_all(global.join("agents")).unwrap();
+            std::fs::write(
+                global.join("agents/scout.md"),
+                "---\nname: scout\ndescription: direct SDK result fixture\n---\nComplete the task.\n",
+            )
+            .unwrap();
+            let child = root.path().join("child.sh");
+            std::fs::write(
+                &child,
+                r#"#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"direct SDK native needle"}]}]}'
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut registry = direct_agent_resource_registry(
+                root.path(),
+                "native-result-owner",
+                &root.path().join("hub"),
+            );
+            registry.push(Box::new(crate::subagents::SubagentTool::with_paths(
+                root.path().to_path_buf(),
+                global,
+                child,
+            )));
+            let output = registry
+                .get("subagent")
+                .unwrap()
+                .execute(
+                    "native-child",
+                    serde_json::json!({"agent":"scout", "task":"return a result"}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!output.is_error, "{output:?}");
+            let id = output.details.as_ref().unwrap()["results"][0]["hubId"]
+                .as_str()
+                .unwrap();
+            for (name, input) in [
+                ("read", serde_json::json!({"path":format!("agent://{id}")})),
+                (
+                    "grep",
+                    serde_json::json!({"pattern":"native needle", "path":format!("agent://{id}")}),
+                ),
+            ] {
+                let output = registry
+                    .get(name)
+                    .unwrap()
+                    .execute("native-result", input, None)
+                    .await
+                    .unwrap();
+                assert!(get_text(&output.content).contains("direct SDK native needle"));
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_registry_shell_jobs_keep_their_live_parent_authority() {
+        let _guard = crate::jobs::process_test_guard();
+        asupersync::test_utils::run_test(|| async {
+            let root = tempfile::tempdir().unwrap();
+            let owner = format!("direct-shell-{}", uuid::Uuid::new_v4());
+            let mut registry = direct_agent_resource_registry(
+                root.path(),
+                &owner,
+                &root.path().join("hub"),
+            );
+            registry.push(Box::new(BashTool::with_artifact_root(
+                root.path(),
+                root.path(),
+            )));
+            registry.push(Box::new(JobsTool::new()));
+            let output = registry
+                .get("bash")
+                .unwrap()
+                .execute(
+                    "direct-shell",
+                    serde_json::json!({"command":"printf owned-shell-result", "background":true, "timeout":5}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!output.is_error, "{output:?}");
+            let id = output.details.as_ref().unwrap()["id"].as_str().unwrap();
+            let result = registry
+                .get("jobs")
+                .unwrap()
+                .execute(
+                    "owned-wait",
+                    serde_json::json!({"action":"wait", "jobId":id, "timeoutMs":5000}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!result.is_error);
+            assert!(get_text(&result.content).contains("owned-shell-result"));
+
+            let mut foreign = JobsTool::new();
+            foreign.bind_job_session_scope(crate::jobs::JobSessionScope::fixed(owner.clone()));
+            let visible = foreign
+                .execute("foreign-list", serde_json::json!({"action":"list"}), None)
+                .await
+                .unwrap();
+            assert!(
+                visible.details.as_ref().unwrap()["jobs"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            let error = foreign
+                .execute(
+                    "foreign-wait",
+                    serde_json::json!({"action":"wait", "jobId":id, "timeoutMs":0}),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("PI_JOBS_UNKNOWN_ID"));
+
+            let hub = registry
+                .job_session_scope()
+                .agent_hub_for_session(&owner)
+                .unwrap();
+            let notices = crate::agent_hub::with_registry(hub, async {
+                crate::jobs::take_completion_notices(&owner)
+            })
+            .await;
+            assert_eq!(notices.len(), 1);
         });
     }
 

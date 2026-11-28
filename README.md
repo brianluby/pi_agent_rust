@@ -764,6 +764,8 @@ files. Queued children and corrective retries use that same baseline. Accepted
 patches apply after execution in task order; conflicts and cancelled work remain
 in their worktrees for inspection. `isoApply: "keep"` retains a result without
 applying it, and `isoApply: "drop"` discards its worktree after reporting the patch.
+Fresh `git init` repositories are supported before their first commit: a private
+root snapshot preserves the parent's branch and staging state during delegation.
 
 In interactive mode, `/tan <work>` starts the same task-role child machinery
 without interrupting the main conversation. The child runs in the current
@@ -774,7 +776,7 @@ the opt-in `subagent` tool is enabled. It captures the same model precedence whe
 the command is submitted, so a later parent model switch does not retarget it.
 
 Native children include `hub` in their default tool set and can exchange messages
-with other children of the same parent Pi process. Agent definitions with an
+with other children of the same live parent session. Agent definitions with an
 explicit tool allowlist must include `hub` to enable this capability. A child's
 `hub` call with `{"op":"agent","action":"roster"}` returns its authenticated
 `selfId` and the parent's child roster. Use those run IDs as recipients:
@@ -784,6 +786,27 @@ explicit tool allowlist must include `hub` to enable this capability. A child's
 {"op":"agent","action":"inbox"}
 {"op":"agent","action":"send","name":"parent","text":"I found a blocking dependency."}
 ```
+
+Child controls, parent inboxes, accepted `agent://` results, and background
+job delivery retain their originating live session. Separately loaded handles
+of the same saved session have independent child authority; cloned SDK scopes
+share it. `/hub`, `/tan`, retained workers, and pooled delegation use that same
+ownership, including during cancellation and cleanup. The low-level SDK's
+explicit durable-owner job observation and teardown APIs remain owner-wide.
+
+SDK handle shutdown and replacement retire only that handle's live job scope,
+including shell jobs, foreground shell calls, editor terminals, subagents,
+`/tan`, and persistent workers from sessions previously selected within it.
+The admission fence and cancellation requests are installed before waiting for
+session saves or locks. Dropping shutdown leaves the fence closed. Awaiting it
+waits within bounded budgets for process reaping, output draining, editor
+terminal release, isolated writeback disposition, and accepted-result retention.
+Dropped foreground calls retain cleanup ownership through the native reaper or
+editor release acknowledgment. Unfinished cleanup and lost acknowledgments are
+reported instead of treating a cancelled roster entry as proof of process exit.
+Discarding a replacement candidate cannot stop an active handle's work merely
+because both loaded the same saved session. Bound SDK `read` and `grep` calls
+also resolve `agent://` results through the same live owner as native delegation.
 
 Sibling messages enter the recipient's steering queue between turns and remain
 available in its inbox. The parent reads child reports with
@@ -907,6 +930,53 @@ An explicit `--api-key` admits additional models only for its bound provider;
 other providers still need their own credentials unless they require no key.
 If an editor shows an empty picker, compare its `session/new` response with
 `pi --list-models` using the same configuration and launch environment.
+
+**ACP planning.** The editor's Session Mode selector offers `code` and `plan`
+through the `mode` entry in `configOptions`. Older ACP v1 clients can use
+`modes` and `session/set_mode`. Plan mode allows exploration while blocking
+mutating tools and process execution. When the agent submits a plan, Pi asks
+the editor to review its full text. Approving that exact proposal switches to
+Code and continues the conversation; implementation tools still require their
+ordinary editor permissions. Rejecting keeps the session in Plan mode.
+Cancelled, unknown, or stale permission responses cannot approve a plan.
+
+Changing mode during a prompt cancels that prompt and waits for its session
+cleanup before acknowledging the selection. Saved or forked submitted plans
+restore for fresh review, never with inherited execution approval. Planning
+controls are unavailable when built-in tools are disabled.
+
+**ACP clarification questions.** Editors can enable native `ask` by advertising
+`clientCapabilities.elicitation.form: {}` during initialization. When the host
+enables that tool, Pi presents questions through `elicitation/create` in both
+Code and Plan modes. Forms support single or multiple selections and an Other
+answer; accepted answers return through the ordinary native tool result.
+The editor's tool permission prompt still precedes the question, and answering
+does not approve a submitted plan or grant permission to write files.
+
+Declined, dismissed, malformed, or expired forms never choose a recommendation
+automatically. Session cancellation, live steering, and disconnects retire the
+owning request, so a late response cannot answer another question. Forms time
+out after five minutes and are for implementation decisions, not credentials
+or authentication. Clients without explicit form support do not receive the
+`ask` tool, and `--no-tools` remains authoritative.
+
+**ACP context maintenance.** The editor's command menu includes `/compact
+[focus]`, `/compact aggressive [focus]`, `/shake [focus]`, and `/handoff
+[focus]`. These invoke the native context transactions without creating a user
+message or an ordinary assistant turn. Compaction summarizes older context;
+aggressive compaction retains a smaller recent window. Shake drops bulky older
+tool output without requesting a model summary. Handoff saves a continuation
+brief in the same session using its current model. Recent complete turns and
+tool-call/result pairs retain the native preservation rules.
+
+Send a context command as one standalone text block. Additional text blocks,
+attachments, and embedded resources cannot become command arguments. Native
+command names take precedence over extension registrations. `session/cancel`
+can stop preparation; a save already in progress settles before the command
+returns, and success is reported only after durable installation. An editor
+can send another prompt after completion using the updated context. Handoff
+preview, report, export, and import options remain available through their
+existing terminal and SDK surfaces, rather than these editor commands.
 
 **ACP session forks.** Pi advertises the optional ACP v1 draft
 `sessionCapabilities.fork` capability. A client can create an active branch

@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,8 @@ use crate::error::{Error, Result};
 
 pub mod ipc;
 mod wait;
+#[cfg(test)]
+mod session_tests;
 
 pub(crate) use wait::{DependencyHold, ResultDependencies, ResultDependency};
 pub use wait::{InboxWaitResult, InboxWaitStatus, PendingReply, wait_for_replies};
@@ -140,9 +142,15 @@ pub struct BusMessage {
     pub sent_ms: u64,
 }
 
-/// Session-scoped registry: one per parent process.
+/// Child authority for one live parent and its selected durable session.
 #[derive(Default)]
 pub struct AgentHubRegistry {
+    /// Immutable for scoped registries. The explicit standalone hub has no
+    /// durable owner and retains its original host-selected owner contract.
+    owner_session_id: Option<String>,
+    /// Retained separately from the SDK handle so old tool and worker clones
+    /// cannot admit jobs after their live parent has begun retiring.
+    job_scope: Option<Arc<crate::jobs::JobScopeLifecycle>>,
     entries: BTreeMap<String, ChildEntry>,
     /// Process-control authority ends at reap, even when an accepted result
     /// still awaits ordered worktree application. Entry PIDs remain history.
@@ -210,11 +218,100 @@ impl std::fmt::Debug for AgentHubRegistry {
     }
 }
 
-static REGISTRY: OnceLock<Mutex<AgentHubRegistry>> = OnceLock::new();
+/// Retained authority for one live parent's child roster, control and inboxes.
+pub type SharedHub = Arc<Mutex<AgentHubRegistry>>;
 
-/// The process-wide registry (session-scoped: one hub per parent run).
+static REGISTRY: OnceLock<SharedHub> = OnceLock::new();
+
+std::thread_local! {
+    static CURRENT_HUB: std::cell::RefCell<Option<SharedHub>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Explicit standalone registry. Native Agent sessions use their own retained
+/// registry; this surface never aggregates or exposes those session hubs.
 pub fn registry() -> &'static Mutex<AgentHubRegistry> {
-    REGISTRY.get_or_init(|| Mutex::new(AgentHubRegistry::default()))
+    REGISTRY
+        .get_or_init(|| Arc::new(Mutex::new(AgentHubRegistry::default())))
+        .as_ref()
+}
+
+/// Capture the invocation's hub before crossing a task, thread or drop boundary.
+/// Calls outside an installed session context use only the standalone hub.
+pub(crate) fn current_registry() -> SharedHub {
+    invocation_registry().unwrap_or_else(|| {
+        Arc::clone(REGISTRY.get_or_init(|| Arc::new(Mutex::new(AgentHubRegistry::default()))))
+    })
+}
+
+/// Distinguish a model/tool invocation from an explicit low-level host call.
+/// The latter keeps the jobs API's durable-owner lifecycle contract.
+pub(crate) fn invocation_registry() -> Option<SharedHub> {
+    CURRENT_HUB.with(|current| current.borrow().clone())
+}
+
+pub(crate) struct RegistryContext {
+    previous: Option<SharedHub>,
+    // A thread-local restoration token must not migrate or cross an await.
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+pub(crate) fn enter_registry(hub: SharedHub) -> RegistryContext {
+    let previous = CURRENT_HUB.with(|current| current.replace(Some(hub)));
+    RegistryContext {
+        previous,
+        _thread: std::marker::PhantomData,
+    }
+}
+
+impl Drop for RegistryContext {
+    fn drop(&mut self) {
+        CURRENT_HUB.with(|current| {
+            current.replace(self.previous.take());
+        });
+    }
+}
+
+/// Install ownership for each poll and for destruction of the inner future.
+/// A suspended or never-polled invocation cannot leak its hub to another task.
+pub fn with_registry<F: std::future::Future>(
+    hub: SharedHub,
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    RegistryFuture {
+        hub,
+        future: Some(Box::pin(future)),
+    }
+}
+
+struct RegistryFuture<F> {
+    hub: SharedHub,
+    future: Option<std::pin::Pin<Box<F>>>,
+}
+
+impl<F: std::future::Future> std::future::Future for RegistryFuture<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        let _context = enter_registry(Arc::clone(&this.hub));
+        this.future
+            .as_mut()
+            .expect("registry future is present")
+            .as_mut()
+            .poll(cx)
+    }
+}
+
+impl<F> Drop for RegistryFuture<F> {
+    fn drop(&mut self) {
+        let _context = enter_registry(Arc::clone(&self.hub));
+        drop(self.future.take());
+    }
 }
 
 fn now_ms() -> u64 {
@@ -224,6 +321,55 @@ fn now_ms() -> u64 {
 }
 
 impl AgentHubRegistry {
+    pub(crate) fn for_session(session_id: &str) -> Self {
+        Self {
+            owner_session_id: Some(session_id.to_string()),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn for_job_scope(
+        session_id: &str,
+        scope: Arc<crate::jobs::JobScopeLifecycle>,
+    ) -> Self {
+        Self {
+            job_scope: Some(scope),
+            ..Self::for_session(session_id)
+        }
+    }
+
+    pub(crate) fn job_scope(&self) -> Option<Arc<crate::jobs::JobScopeLifecycle>> {
+        self.job_scope.clone()
+    }
+
+    pub(crate) fn scope_is_closed(&self) -> bool {
+        self.job_scope.as_ref().is_some_and(|scope| scope.is_closed())
+    }
+
+    /// Revoke every unfinished child while its native execution lease keeps
+    /// responsibility for process-tree reap and worktree disposition. Status
+    /// alone is not proof of cleanup: live PID authority must survive until
+    /// the process lease actually observes or performs the reap.
+    pub(crate) fn retire_scope_children(&mut self) {
+        let finished_ms = now_ms();
+        for entry in self.entries.values_mut() {
+            if !entry.status.settled() {
+                entry.status = ChildStatus::Cancelled;
+                entry.finished_ms = Some(finished_ms);
+            }
+        }
+    }
+
+    pub(crate) fn native_cleanup_pending(&self) -> bool {
+        !self.active_executions.is_empty() || !self.live_processes.is_empty()
+    }
+
+    pub(crate) fn admits_native_owner(&self, session_id: &str) -> bool {
+        self.owner_session_id
+            .as_deref()
+            .is_none_or(|owner| owner == session_id)
+    }
+
     /// Point the registry's artifacts dir at `dir` (integration-test hook:
     /// keeps hub files out of the real `<global_dir>/agent-hub/` tree).
     #[doc(hidden)]
@@ -310,6 +456,9 @@ impl AgentHubRegistry {
 
     /// Register a child with an explicit spawn kind.
     pub fn register_kind(&mut self, name: &str, task: &str, kind: ChildKind) -> Result<ChildEntry> {
+        if let Some(scope) = &self.job_scope {
+            scope.ensure_open()?;
+        }
         let seq = self
             .seq
             .checked_add(1)
@@ -392,6 +541,15 @@ impl AgentHubRegistry {
 
     fn native_job_admission(&self) -> Result<Option<crate::jobs::NativeTaskOwner>> {
         let owner = crate::jobs::current_native_task();
+        if owner
+            .as_ref()
+            .is_some_and(|owner| !self.admits_native_owner(&owner.session))
+        {
+            return Err(Error::tool(
+                "hub",
+                "PI_HUB_SESSION_CHANGED: native child no longer belongs to this parent hub",
+            ));
+        }
         if owner.is_some() && self.native_jobs.len() >= MAX_NATIVE_JOB_CHILDREN {
             return Err(Error::tool(
                 "hub",
@@ -410,6 +568,9 @@ impl AgentHubRegistry {
     /// transcript I/O and registers nothing, so a refused preparation leaves
     /// no Starting entry behind.
     pub(crate) fn native_revival_source(&self, id: &str) -> Result<RevivalSource> {
+        if let Some(scope) = &self.job_scope {
+            scope.ensure_open()?;
+        }
         let entry = self
             .entries
             .get(id)
@@ -457,6 +618,9 @@ impl AgentHubRegistry {
     /// Mark a newly spawned child running. A late spawn callback cannot
     /// resurrect an already killed or cancelled run.
     pub fn mark_running(&mut self, id: &str, pid: u32) {
+        if self.scope_is_closed() {
+            return;
+        }
         if let Some(entry) = self.entries.get_mut(id)
             && entry.status == ChildStatus::Starting
         {
@@ -470,7 +634,8 @@ impl AgentHubRegistry {
     /// its process has been reaped. Historical `entry.pid` is not authority:
     /// the live-process map must be empty before another child can own it.
     pub(crate) fn can_start_schema_correction(&self, id: &str) -> bool {
-        self.active_executions.contains(id)
+        !self.scope_is_closed()
+            && self.active_executions.contains(id)
             && self.native_launches.contains_key(id)
             && self.control_pid(id).is_none()
             && self
@@ -1422,6 +1587,38 @@ mod tests {
             fs::read_to_string(retained.join(child.transcript_path.file_name().unwrap())).unwrap(),
             "original history\n"
         );
+    }
+
+    #[test]
+    fn scope_retirement_retains_native_cleanup_until_both_process_and_execution_retire() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = crate::jobs::JobSessionScope::fixed("native-cleanup-lease");
+        let registry = scope.agent_hub_for_session("native-cleanup-lease").unwrap();
+        let (active, complete) = {
+            let mut hub = registry.lock().unwrap();
+            hub.set_dir_for_tests(root.path().to_path_buf());
+            let active = hub.register("active", "pending result acceptance").unwrap();
+            hub.active_executions.insert(active.id.clone());
+            hub.mark_running(&active.id, 123);
+            let complete = hub.register("complete", "already accepted").unwrap();
+            hub.settle(&complete.id, ChildStatus::Done);
+            (active, complete)
+        };
+        drop(scope.begin_shutdown().unwrap());
+        let mut hub = registry.lock().unwrap();
+        assert!(hub.scope_is_closed());
+        assert_eq!(hub.get(&active.id).unwrap().status, ChildStatus::Cancelled);
+        assert_eq!(hub.get(&complete.id).unwrap().status, ChildStatus::Done);
+        assert_eq!(hub.control_pid(&active.id), Some(123));
+        assert!(hub.native_cleanup_pending());
+        assert!(!hub.can_start_schema_correction(&active.id));
+        assert!(hub.native_revival_source(&active.id).is_err());
+        hub.mark_running(&active.id, 456);
+        assert_eq!(hub.control_pid(&active.id), Some(123));
+        hub.mark_process_reaped(&active.id);
+        assert!(hub.native_cleanup_pending(), "unapplied result lease still owns cleanup");
+        hub.finish_native_execution(&active.id);
+        assert!(!hub.native_cleanup_pending());
     }
 
     #[test]

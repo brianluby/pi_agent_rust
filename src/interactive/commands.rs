@@ -9,7 +9,7 @@ use crate::provider_metadata::{
     split_provider_model_spec,
 };
 
-#[cfg(feature = "clipboard")]
+#[cfg(all(feature = "clipboard", not(windows)))]
 use arboard::Clipboard as ArboardClipboard;
 
 const BASH_COMPLETION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1038,42 +1038,66 @@ pub fn copy_text_to_clipboard(text: &str) -> String {
         Ok(path)
     }
 
-    // GH #242: under WSL without WSLg there is no display for arboard, but
-    // WSL puts Windows' clip.exe on PATH.
-    if running_under_wsl() && copy_via_clip_exe(text).is_ok() {
-        return String::from("Copied to clipboard");
-    }
-
-    #[cfg(feature = "clipboard")]
-    {
-        match ArboardClipboard::new().and_then(|mut clipboard| clipboard.set_text(text.to_string()))
-        {
-            Ok(()) => String::from("Copied to clipboard"),
-            Err(err) => match write_fallback(text) {
-                Ok(path) => format!(
-                    "Clipboard support is disabled or unavailable ({err}). Wrote to {}",
-                    path.display()
-                ),
-                Err(io_err) => format!(
-                    "Clipboard support is disabled or unavailable ({err}); also failed to write fallback file: {io_err}"
-                ),
-            },
-        }
-    }
-
-    #[cfg(not(feature = "clipboard"))]
-    {
-        match write_fallback(text) {
-            Ok(path) => format!("Clipboard support is disabled. Wrote to {}", path.display()),
-            Err(err) => {
-                format!("Clipboard support is disabled; failed to write fallback file: {err}")
-            }
-        }
+    match set_system_clipboard_text(text) {
+        Ok(()) => String::from("Copied to clipboard"),
+        Err(error) => match write_fallback(text) {
+            Ok(path) => format!(
+                "Clipboard support is disabled or unavailable ({error}). Wrote to {}",
+                path.display()
+            ),
+            Err(io_error) => format!(
+                "Clipboard support is disabled or unavailable ({error}); also failed to write fallback file: {io_error}"
+            ),
+        },
     }
 }
 
-/// Whether this process runs inside WSL (GH #242).
-pub fn running_under_wsl() -> bool {
+/// Copy without creating a fallback file. Sharing a gist uses this path so a
+/// clipboard failure doesn't leave an extra copy of its secret URL on disk.
+pub(super) fn set_system_clipboard_text(text: &str) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        // CF_UNICODETEXT is NUL-terminated. Preserve the whole selection in
+        // the caller's fallback rather than reporting a partial copy.
+        if text.contains('\0') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows clipboard text contains an embedded NUL",
+            ));
+        }
+        clipboard_win::set_clipboard_string(text)
+            .map_err(|error| std::io::Error::other(error.to_string()))
+    }
+
+    #[cfg(not(windows))]
+    {
+        if running_under_wsl() && copy_via_clip_exe(text).is_ok() {
+            return Ok(());
+        }
+        #[cfg(feature = "clipboard")]
+        {
+            ArboardClipboard::new()
+                .and_then(|mut clipboard| clipboard.set_text(text))
+                .map_err(std::io::Error::other)
+        }
+        #[cfg(not(feature = "clipboard"))]
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no system clipboard backend available",
+        ))
+    }
+}
+
+/// Native full builds use arboard directly. WSL and native Windows TUI builds
+/// without the optional image backend can read images via Windows PowerShell.
+pub(crate) fn windows_clipboard_images_use_powershell() -> bool {
+    if cfg!(windows) {
+        return !cfg!(all(feature = "clipboard", feature = "image-resize"));
+    }
+    running_under_wsl()
+}
+
+fn running_under_wsl() -> bool {
     wsl_detected(
         std::env::var_os("WSL_DISTRO_NAME").is_some() || std::env::var_os("WSL_INTEROP").is_some(),
         std::fs::read_to_string("/proc/sys/kernel/osrelease")
@@ -1089,6 +1113,7 @@ fn wsl_detected(wsl_env: bool, kernel_release: Option<&str>) -> bool {
 
 /// What `clip.exe` is fed: UTF-16LE with a byte-order mark. Plain UTF-8 is
 /// read in the console code page and garbles anything non-ASCII.
+#[cfg(any(not(windows), test))]
 fn clip_exe_payload(text: &str) -> Vec<u8> {
     let mut bytes = vec![0xFF, 0xFE];
     for unit in text.encode_utf16() {
@@ -1098,18 +1123,22 @@ fn clip_exe_payload(text: &str) -> Vec<u8> {
 }
 
 /// Put `text` on the Windows clipboard from inside WSL.
-pub fn copy_via_clip_exe(text: &str) -> std::io::Result<()> {
+#[cfg(not(windows))]
+fn copy_via_clip_exe(text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let mut child = Command::new("clip.exe")
+    let mut command = Command::new("clip.exe");
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(&clip_exe_payload(text))?;
-    }
+        .stderr(Stdio::null());
+    let mut child = crate::tools::guard_process_spawn(|| command.spawn())?;
+    let write_result = child
+        .stdin
+        .take()
+        .map_or(Ok(()), |mut stdin| stdin.write_all(&clip_exe_payload(text)));
     let status = child.wait()?;
+    write_result?;
     if status.success() {
         Ok(())
     } else {
@@ -4312,12 +4341,17 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     fn completed_tan_event(
         owner_session_id: String,
         completion: &pi::subagents::TanCompletion,
+        hub: &pi::agent_hub::SharedHub,
     ) -> PiMsg {
-        let card = pi::jobs::push_completion_notice(&owner_session_id, completion.follow_up_text())
-            .map_or_else(
-                |err| format!("(/tan failed to queue follow-up)\n{err}"),
-                |()| completion.card_text(),
-            );
+        let card = pi::jobs::push_completion_notice_in_hub(
+            &owner_session_id,
+            completion.follow_up_text(),
+            hub,
+        )
+        .map_or_else(
+            |err| format!("(/tan failed to queue follow-up)\n{err}"),
+            |()| completion.card_text(),
+        );
         PiMsg::SessionSystemNote {
             owner_session_id,
             message: card,
@@ -4334,6 +4368,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             Enabled(
                 Option<pi::tools::ToolModelSelection>,
                 Option<pi::cost::CostBudget>,
+                pi::jobs::JobSessionScope,
             ),
             Disabled,
             Busy,
@@ -4349,12 +4384,16 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let gate = self.agent.try_lock().map_or(TanGate::Busy, |agent| {
             if agent.has_tool("subagent") {
                 let tools = agent.shared_tools().snapshot();
-                TanGate::Enabled(tools.model_scope().current(), tools.cost_scope().current())
+                TanGate::Enabled(
+                    tools.model_scope().current(),
+                    tools.cost_scope().current(),
+                    tools.job_session_scope(),
+                )
             } else {
                 TanGate::Disabled
             }
         });
-        let (parent_model, cost_budget) = match gate {
+        let (parent_model, cost_budget, job_session_scope) = match gate {
             TanGate::Busy => {
                 self.status_message = Some("/tan unavailable: agent session is busy".to_string());
                 self.scroll_to_bottom();
@@ -4368,7 +4407,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 self.scroll_to_bottom();
                 return None;
             }
-            TanGate::Enabled(model, cost) => (model, cost),
+            TanGate::Enabled(model, cost, scope) => (model, cost, scope),
         };
 
         // Same TryLockError-guard temporary pattern as /btw (bd-9x70g).
@@ -4382,6 +4421,15 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             return None;
         }
 
+        let hub = match job_session_scope.agent_hub_for_session(&owner_session_id) {
+            Ok(hub) => hub,
+            Err(error) => {
+                self.status_message = Some(format!("/tan unavailable: {error}"));
+                self.scroll_to_bottom();
+                return None;
+            }
+        };
+
         let tool = pi::subagents::SubagentTool::new(&self.cwd)
             .with_workspace(self.workspace.clone())
             .with_secrets_settings(self.config.secrets.as_ref())
@@ -4393,16 +4441,16 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let event_tx = self.event_tx.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         let display_work = work.clone();
-        runtime.spawn(async move {
+        runtime.spawn(pi::agent_hub::with_registry(Arc::clone(&hub), async move {
             let event = match tool.run_background_tan(&work).await {
-                Ok(completion) => Self::completed_tan_event(owner_session_id, &completion),
+                Ok(completion) => Self::completed_tan_event(owner_session_id, &completion, &hub),
                 Err(err) => PiMsg::SessionSystemNote {
                     owner_session_id,
                     message: format!("(/tan failed)\n{err}"),
                 },
             };
             let _ = crate::interactive::enqueue_pi_event(&event_tx, &task_cx, event).await;
-        });
+        }));
 
         self.messages.push(ConversationMessage {
             role: MessageRole::System,
@@ -5468,6 +5516,13 @@ mod tests {
         assert!(!wsl_detected(false, None));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn native_clipboard_refuses_text_that_windows_would_truncate() {
+        let error = super::set_system_clipboard_text("before\0after").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
     /// clip.exe gets UTF-16LE with a BOM, so non-ASCII text survives.
     #[test]
     fn clip_exe_payload_is_utf16le_with_bom() {
@@ -6387,7 +6442,17 @@ mod tests {
         };
         let expected_card = completion.card_text();
         let expected_follow_up = completion.follow_up_text();
-        let event = PiApp::completed_tan_event(origin_session_id.clone(), &completion);
+        let origin_hub = app
+            .agent
+            .try_lock()
+            .expect("test agent lock")
+            .shared_tools()
+            .snapshot()
+            .job_session_scope()
+            .agent_hub_for_session(&origin_session_id)
+            .expect("origin hub");
+        let event =
+            PiApp::completed_tan_event(origin_session_id.clone(), &completion, &origin_hub);
         assert!(matches!(
             &event,
             PiMsg::SessionSystemNote {
@@ -6428,7 +6493,21 @@ mod tests {
             !message.content.contains(task_marker) && !message.content.contains(output_marker)
         }));
 
-        let origin_notices = pi::jobs::take_completion_notices(&origin_session_id);
+        let foreign_hub = pi::jobs::JobSessionScope::fixed(origin_session_id.clone())
+            .agent_hub_for_session(&origin_session_id)
+            .expect("separate live hub");
+        assert!(
+            runtime()
+                .block_on(pi::agent_hub::with_registry(foreign_hub, async {
+                    pi::jobs::take_completion_notices(&origin_session_id)
+                }))
+                .is_empty(),
+            "another live handle of the saved session must not consume this follow-up"
+        );
+        let origin_notices =
+            runtime().block_on(pi::agent_hub::with_registry(origin_hub, async {
+                pi::jobs::take_completion_notices(&origin_session_id)
+            }));
         assert_eq!(
             origin_notices.len(),
             1,

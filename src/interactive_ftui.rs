@@ -7934,10 +7934,9 @@ impl PiFtuiModel {
                             });
                         }
                         // The pasted screenshot is attached when the prompt
-                        // is sent, through its `@file` reference. Under WSL
-                        // the paste starts powershell.exe (seconds), so it
-                        // runs off the loop thread there.
-                        if crate::interactive::running_under_wsl() {
+                        // is sent, through its `@file` reference. PowerShell
+                        // captures run off the loop thread on Windows and WSL.
+                        if crate::interactive::windows_clipboard_images_use_powershell() {
                             return Cmd::task(move || PiFtuiMsg::PastedImage {
                                 request_id,
                                 reference: crate::interactive::paste_clipboard_image_ref(),
@@ -10601,6 +10600,16 @@ async fn run_tan_command(
     // Capture before spawning: a later /model command must not retarget work
     // the user has already delegated to this background child.
     let tools = handle.session().agent.shared_tools().snapshot();
+    let hub = match tools
+        .job_session_scope()
+        .agent_hub_for_session(&owner_session_id)
+    {
+        Ok(hub) => hub,
+        Err(error) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("/tan: {error}")));
+            return;
+        }
+    };
     let parent_model = tools.model_scope().current();
     let cost_budget = tools.cost_scope().current();
     let tool = crate::subagents::SubagentTool::new(cwd)
@@ -10612,7 +10621,7 @@ async fn run_tan_command(
         .with_cost_budget(cost_budget);
     // ubs:ignore Sender clone per background job — the task must own its sender
     let tx = agent_tx.clone();
-    runtime_handle.spawn(async move {
+    runtime_handle.spawn(crate::agent_hub::with_registry(Arc::clone(&hub), async move {
         let message = match tool.run_background_tan(&work).await {
             // Two deliveries, exactly as the classic stack does it
             // (`completed_tan_event`): the summary is queued through the
@@ -10621,11 +10630,15 @@ async fn run_tan_command(
             // agent half needs nothing from this stack — `Agent` drains
             // completion notices itself, so it already worked here.
             Ok(completion) => {
-                crate::jobs::push_completion_notice(&owner_session_id, completion.follow_up_text())
-                    .map_or_else(
-                        |err| format!("(/tan failed to queue follow-up)\n{err}"),
-                        |()| completion.card_text(),
-                    )
+                crate::jobs::push_completion_notice_in_hub(
+                    &owner_session_id,
+                    completion.follow_up_text(),
+                    &hub,
+                )
+                .map_or_else(
+                    |err| format!("(/tan failed to queue follow-up)\n{err}"),
+                    |()| completion.card_text(),
+                )
             }
             Err(err) => format!("(/tan failed)\n{err}"),
         };
@@ -10633,7 +10646,7 @@ async fn run_tan_command(
             owner_session_id,
             message,
         });
-    });
+    }));
 }
 
 /// Run one prompt as a controlled turn (`session_control`): its control lane

@@ -7,9 +7,11 @@
 //! not clear the poison or authorize new work from potentially damaged state.
 
 use super::{SubagentResult, SubagentStatus, cancel};
-use crate::agent_hub::{AgentHubRegistry, ChildEntry, ChildKind, ChildStatus, registry};
+use crate::agent_hub::{AgentHubRegistry, ChildEntry, ChildKind, ChildStatus, SharedHub};
+#[cfg(test)]
+use crate::agent_hub::registry;
 use crate::error::{Error, Result};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const OPERATOR_KILLED: &str = "Child was killed by the operator.";
 const HUB_CANCELLED: &str = "Child was cancelled through the agent hub.";
@@ -57,6 +59,9 @@ fn admission(hub: &Mutex<AgentHubRegistry>, id: &str) -> Admission {
     let Ok(hub) = hub.lock() else {
         return Admission::Refused(HUB_POISONED);
     };
+    if hub.scope_is_closed() {
+        return Admission::Cancelled(HUB_CANCELLED);
+    }
     disposition(hub.get(id).map(|entry| entry.status))
 }
 
@@ -64,10 +69,17 @@ fn activate_in(hub: &Mutex<AgentHubRegistry>, id: &str, pid: u32) -> Admission {
     let Ok(mut hub) = hub.lock() else {
         return Admission::Refused(HUB_POISONED);
     };
+    if hub.scope_is_closed() {
+        return Admission::Cancelled(HUB_CANCELLED);
+    }
     match hub.get(id).map(|entry| entry.status) {
         Some(ChildStatus::Starting) => {
             hub.mark_running(id, pid);
-            Admission::Live
+            if hub.scope_is_closed() {
+                Admission::Cancelled(HUB_CANCELLED)
+            } else {
+                Admission::Live
+            }
         }
         Some(ChildStatus::Running) => Admission::Refused(HUB_ACTIVATED),
         status => disposition(status),
@@ -87,7 +99,8 @@ fn apply_admission(result: &mut SubagentResult, admission: Admission) -> bool {
 /// setup errors). The runner assigns it before any process may be spawned.
 pub(super) fn checkpoint(result: &mut SubagentResult) -> bool {
     if let Some(id) = &result.hub_id {
-        let admission = admission(registry(), id);
+        let hub = crate::agent_hub::current_registry();
+        let admission = admission(&hub, id);
         return apply_admission(result, admission);
     }
     !result.is_error
@@ -122,9 +135,9 @@ fn settle_result_in(hub: &Mutex<AgentHubRegistry>, id: &str, result: &SubagentRe
                 return;
             }
         };
-        let owns_settlement = hub.get(id).is_some_and(|entry| !entry.status.settled());
-        hub.settle(id, status);
-        hub.finish_native_execution(id);
+        let retired = hub.scope_is_closed();
+        let owns_settlement = !retired && hub.get(id).is_some_and(|entry| !entry.status.settled());
+        hub.settle(id, if retired { ChildStatus::Cancelled } else { status });
         if owns_settlement { hub.get(id) } else { None }
     };
     // Result serialization and retention never run with the hub lock held.
@@ -139,17 +152,28 @@ fn settle_result_in(hub: &Mutex<AgentHubRegistry>, id: &str, result: &SubagentRe
             result.error.as_deref(),
         );
     }
+    // Acceptance is linearized under the hub lock above. A previously
+    // accepted result remains valid, but retirement must still wait for its
+    // out-of-lock retention to finish before reporting native cleanup done.
+    hub.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .finish_native_execution(id);
 }
 
 /// Independent of process ownership: cancellation can drop a future before
 /// spawn or after process exit but before result acceptance and writeback.
 pub(super) struct HubLease {
     id: Option<String>,
+    registry: SharedHub,
 }
 
 impl HubLease {
-    pub(super) const fn empty() -> Self {
-        Self { id: None }
+    pub(super) fn empty() -> Self {
+        Self::in_registry(crate::agent_hub::current_registry())
+    }
+
+    pub(super) const fn in_registry(registry: SharedHub) -> Self {
+        Self { id: None, registry }
     }
 
     /// A persistent RPC worker owns process control but has no one-shot
@@ -163,7 +187,7 @@ impl HubLease {
                 "PI_SUBAGENT_HUB: child lease already registered",
             ));
         }
-        let entry = registry()
+        let entry = self.registry
             .lock()
             .map_err(|_| Error::tool("subagent", HUB_POISONED))?
             .register_worker(name, kind)?;
@@ -185,7 +209,7 @@ impl HubLease {
                 "PI_SUBAGENT_HUB: child lease already registered",
             ));
         }
-        let entry = registry()
+        let entry = self.registry
             .lock()
             .map_err(|_| Error::tool("subagent", HUB_POISONED))?
             .register_native(name, task, kind, launch, revived_from)
@@ -209,7 +233,7 @@ impl HubLease {
             .id
             .as_deref()
             .map_or(Admission::Refused(HUB_MISSING), |id| {
-                activate_in(registry(), id, pid)
+                activate_in(&self.registry, id, pid)
             });
         if !apply_admission(result, admission) {
             return false;
@@ -225,10 +249,14 @@ impl HubLease {
             apply_admission(result, Admission::Refused(HUB_MISSING));
             return None;
         };
-        let Ok(hub) = registry().lock() else {
+        let Ok(hub) = self.registry.lock() else {
             apply_admission(result, Admission::Refused(HUB_POISONED));
             return None;
         };
+        if hub.scope_is_closed() {
+            apply_admission(result, Admission::Cancelled(HUB_CANCELLED));
+            return None;
+        }
         if hub.can_start_schema_correction(id) {
             return hub.get(id);
         }
@@ -249,9 +277,12 @@ impl HubLease {
         let Some(id) = self.id.as_deref() else {
             return apply_admission(result, Admission::Refused(HUB_MISSING));
         };
-        let Ok(mut hub) = registry().lock() else {
+        let Ok(mut hub) = self.registry.lock() else {
             return apply_admission(result, Admission::Refused(HUB_POISONED));
         };
+        if hub.scope_is_closed() {
+            return apply_admission(result, Admission::Cancelled(HUB_CANCELLED));
+        }
         if hub.resume_schema_correction(id, pid) {
             result.status = SubagentStatus::Running;
             return true;
@@ -269,18 +300,23 @@ impl HubLease {
     pub(super) fn process_lifetime(&self) -> ProcessLease {
         ProcessLease {
             id: self.id.clone(),
+            registry: Arc::clone(&self.registry),
         }
     }
 
     pub(super) fn settle(&mut self, result: &SubagentResult) {
-        if let Some(id) = self.id.take() {
-            settle_result_in(registry(), &id, result);
+        if let Some(id) = self.id.as_deref() {
+            settle_result_in(&self.registry, id, result);
+            // Keep Drop's cleanup authority until publication returns, too:
+            // a panicking serializer cannot strand an active native lease.
+            self.id = None;
         }
     }
 }
 
 pub(super) struct ProcessLease {
     id: Option<String>,
+    registry: SharedHub,
 }
 
 impl ProcessLease {
@@ -291,7 +327,7 @@ impl ProcessLease {
         &self,
         child: &mut std::process::Child,
     ) -> std::io::Result<Option<std::process::ExitStatus>> {
-        let mut hub = registry()
+        let mut hub = self.registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let status = child.try_wait();
@@ -304,7 +340,7 @@ impl ProcessLease {
     }
 
     pub(super) fn terminate(&self, child: &mut super::ChildProcessGuard) {
-        let mut hub = registry()
+        let mut hub = self.registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         child.terminate_untracked();
@@ -317,7 +353,7 @@ impl ProcessLease {
 impl Drop for ProcessLease {
     fn drop(&mut self) {
         if let Some(id) = &self.id {
-            registry()
+            self.registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .mark_process_reaped(id);
@@ -328,7 +364,7 @@ impl Drop for ProcessLease {
 impl Drop for HubLease {
     fn drop(&mut self) {
         if let Some(id) = self.id.take() {
-            settle_in(registry(), &id, ChildStatus::Cancelled);
+            settle_in(&self.registry, &id, ChildStatus::Cancelled);
         }
     }
 }
@@ -341,6 +377,39 @@ mod tests {
         let mut hub = AgentHubRegistry::default();
         hub.set_dir_for_tests(dir.to_path_buf());
         Mutex::new(hub)
+    }
+
+    #[test]
+    fn cancellation_and_process_retirement_use_the_original_registry_after_context_switch() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first = Arc::new(local_hub(first_dir.path()));
+        let second = Arc::new(local_hub(second_dir.path()));
+        let first_child = register_in(&first, "worker", "first", ChildKind::Subagent).unwrap();
+        let second_child = register_in(&second, "worker", "second", ChildKind::Subagent).unwrap();
+        assert_eq!(first_child.id, second_child.id);
+        first.lock().unwrap().mark_running(&first_child.id, 41);
+        second.lock().unwrap().mark_running(&second_child.id, 42);
+        let lease = HubLease {
+            id: Some(first_child.id.clone()),
+            registry: Arc::clone(&first),
+        };
+        let process = lease.process_lifetime();
+        {
+            let _other = crate::agent_hub::enter_registry(Arc::clone(&second));
+            drop(process);
+            assert_eq!(first.lock().unwrap().control_pid(&first_child.id), None);
+            assert_eq!(second.lock().unwrap().control_pid(&second_child.id), Some(42));
+            drop(lease);
+        }
+        assert_eq!(
+            first.lock().unwrap().get(&first_child.id).unwrap().status,
+            ChildStatus::Cancelled,
+        );
+        assert_eq!(
+            second.lock().unwrap().get(&second_child.id).unwrap().status,
+            ChildStatus::Running,
+        );
     }
 
     #[test]
@@ -482,6 +551,20 @@ mod tests {
             (dir, runner)
         }
 
+        fn scoped_fixture(
+            script: &str,
+            scope: &crate::jobs::JobSessionScope,
+            session_id: &str,
+            kind: ChildKind,
+        ) -> (tempfile::TempDir, ChildRunner, SharedHub) {
+            let (dir, mut runner) = fixture(script);
+            let hub = scope.agent_hub_for_session(session_id).unwrap();
+            hub.lock().unwrap().set_dir_for_tests(dir.path().join("hub"));
+            runner.hub = Arc::clone(&hub);
+            runner.hub_kind = kind;
+            (dir, runner, hub)
+        }
+
         fn task(schema: bool) -> SubagentTask {
             let mut value = json!({
                 "agent":"tan",
@@ -543,6 +626,130 @@ mod tests {
                     .status()
                     .unwrap();
                 assert!(!status.success(), "child was not reaped");
+            }
+        }
+
+        fn assert_scope_cancelled(result: &SubagentResult, registry: &SharedHub) {
+            assert!(matches!(result.status, SubagentStatus::Cancelled));
+            assert!(result.is_error);
+            assert_eq!(result.error.as_deref(), Some(HUB_CANCELLED));
+            let id = result.hub_id.as_deref().unwrap();
+            {
+                let hub = registry.lock().unwrap();
+                assert_eq!(hub.get(id).unwrap().status, ChildStatus::Cancelled);
+                assert!(hub.control_pid(id).is_none());
+                assert!(!hub.native_cleanup_pending());
+            }
+            let _scope = crate::agent_hub::enter_registry(Arc::clone(registry));
+            assert!(crate::url_router::resolve(&format!("agent://{id}/ok"), &result.cwd)
+                .unwrap_err()
+                .to_string()
+                .contains("PI_URL_AGENT_OUTPUT_REJECTED"));
+            if let Some(pid) = result.pid {
+                let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+                assert!(rustix::process::test_kill_process(pid).is_err());
+            }
+        }
+
+        #[test]
+        fn live_scope_retirement_drains_foreground_and_tan_children_without_touching_same_id_peer() {
+            let _guard = crate::jobs::process_test_guard();
+            let scope = crate::jobs::JobSessionScope::fixed("shared-native-parent");
+            let peer_scope = crate::jobs::JobSessionScope::fixed("shared-native-parent");
+            let (_first_dir, first, first_hub) = scoped_fixture(
+                "exec sleep 30", &scope, "shared-native-parent", ChildKind::Subagent,
+            );
+            let (_tan_dir, tan, tan_hub) = scoped_fixture(
+                "exec sleep 30", &scope, "previously-selected-parent", ChildKind::Tan,
+            );
+            let (_peer_dir, peer, peer_hub) = scoped_fixture(
+                "exec sleep 30", &peer_scope, "shared-native-parent", ChildKind::Subagent,
+            );
+            let agents = BTreeMap::from([
+                ("tan".to_string(), crate::subagents::tan_agent_definition()),
+            ]);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+            runtime.block_on(async {
+                let mut first_run = Box::pin(first.run_one(&agents, task(false), None, None));
+                let mut tan_run = Box::pin(tan.run_one(&agents, task(false), None, None));
+                let mut peer_run = Box::pin(peer.run_one(&agents, task(false), None, None));
+                assert!(futures::poll!(&mut first_run).is_pending());
+                assert!(futures::poll!(&mut tan_run).is_pending());
+                assert!(futures::poll!(&mut peer_run).is_pending());
+                let first_entry = first_hub.lock().unwrap().roster()[0].clone();
+                let tan_entry = tan_hub.lock().unwrap().roster()[0].clone();
+                let peer_entry = peer_hub.lock().unwrap().roster()[0].clone();
+                let shutdown = scope.begin_shutdown().unwrap();
+                for (hub, entry) in [(&first_hub, &first_entry), (&tan_hub, &tan_entry)] {
+                    let hub = hub.lock().unwrap();
+                    assert_eq!(hub.get(&entry.id).unwrap().status, ChildStatus::Cancelled);
+                    assert_eq!(hub.control_pid(&entry.id), entry.pid);
+                    assert!(hub.native_cleanup_pending());
+                }
+                {
+                    let peer = peer_hub.lock().unwrap();
+                    assert_eq!(peer.get(&peer_entry.id).unwrap().status, ChildStatus::Running);
+                    assert_eq!(peer.control_pid(&peer_entry.id), peer_entry.pid);
+                }
+                let mut finish = Box::pin(shutdown.finish());
+                assert!(futures::poll!(&mut finish).is_pending(), "cancellation status cannot masquerade as completed reap");
+                let first_result = first_run.await;
+                let tan_result = tan_run.await;
+                finish.await.unwrap();
+                assert_scope_cancelled(&first_result, &first_hub);
+                assert_scope_cancelled(&tan_result, &tan_hub);
+                assert!(futures::poll!(&mut peer_run).is_pending(), "same durable ID does not confer cleanup authority");
+                assert_eq!(peer_hub.lock().unwrap().get(&peer_entry.id).unwrap().status, ChildStatus::Running);
+                drop(peer_run);
+                peer_scope.begin_shutdown().unwrap().finish().await.unwrap();
+                let pid = rustix::process::Pid::from_raw(i32::try_from(peer_entry.pid.unwrap()).unwrap()).unwrap();
+                assert!(rustix::process::test_kill_process(pid).is_err());
+            });
+        }
+
+        #[test]
+        fn dropped_scope_shutdown_token_fences_starting_children_and_schema_correction() {
+            let _guard = crate::jobs::process_test_guard();
+            for (status, output, schema) in [
+                ("starting", None, false),
+                ("running", Some("not JSON"), true),
+            ] {
+                let scope = crate::jobs::JobSessionScope::fixed("retiring-child-race");
+                let script = concat!(
+                    "cat >/dev/null\n",
+                    "printf 'launch\\n' >> launches\n",
+                    "printf '%s\\n' '{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[{\"type\":\"text\",\"text\":\"not JSON\"}]}]}'\n"
+                );
+                let (dir, runner, hub) = scoped_fixture(script, &scope, "retiring-child-race", ChildKind::Tan);
+                let close = scope.clone();
+                let update: UpdateCallback = Arc::new(move |update| {
+                    let Some(result) = update.details.as_ref().and_then(|value| value.get("result")) else {
+                        return;
+                    };
+                    if result["status"] == status
+                        && output.is_none_or(|expected| result["output"] == expected)
+                    {
+                        drop(close.begin_shutdown().unwrap());
+                    }
+                });
+                let agents = BTreeMap::from([
+                    ("tan".to_string(), crate::subagents::tan_agent_definition()),
+                ]);
+                let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+                let result = runtime.block_on(runner.run_one(&agents, task(schema), None, Some(update)));
+                assert_scope_cancelled(&result, &hub);
+                if status == "starting" {
+                    assert!(result.pid.is_none());
+                    assert!(!dir.path().join("launches").exists());
+                } else {
+                    assert!(result.pid.is_some());
+                    assert_eq!(std::fs::read_to_string(dir.path().join("launches")).unwrap(), "launch\n");
+                    assert_ne!(result.schema_retries, Some(1));
+                }
+                let retry = runtime.block_on(runner.run_one(&agents, task(false), None, None));
+                assert!(retry.is_error);
+                assert!(retry.pid.is_none(), "retained runner cannot spawn after retirement");
+                runtime.block_on(scope.begin_shutdown().unwrap().finish()).unwrap();
             }
         }
 
@@ -619,6 +826,7 @@ mod tests {
                 hub.mark_running(&entry.id, pid);
                 let child = child.with_process_lifetime(ProcessLease {
                     id: Some(entry.id.clone()),
+                    registry: crate::agent_hub::current_registry(),
                 });
                 let (starting, started) = std::sync::mpsc::channel();
                 let (finishing, finished) = std::sync::mpsc::channel();

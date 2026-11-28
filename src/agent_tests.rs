@@ -7262,6 +7262,8 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum PublicRecovery {
         Retry,
+        RevertUser,
+        RevertIncomplete,
         CommitFailover,
         WalkFailover,
         RestorePrimary,
@@ -7281,6 +7283,10 @@ mod tests {
         );
         match operation {
             PublicRecovery::Retry => session.restore_retry_tail(&cx, true).await,
+            PublicRecovery::RevertUser => session.revert_last_user_message().await.map(|_| ()),
+            PublicRecovery::RevertIncomplete => {
+                session.revert_incomplete_response().await.map(|_| ())
+            }
             PublicRecovery::CommitFailover => {
                 let request = FailoverSwapRequest {
                     entry: target,
@@ -7384,6 +7390,8 @@ mod tests {
         runtime.block_on(async {
             for operation in [
                 PublicRecovery::Retry,
+                PublicRecovery::RevertUser,
+                PublicRecovery::RevertIncomplete,
                 PublicRecovery::CommitFailover,
                 PublicRecovery::WalkFailover,
                 PublicRecovery::RestorePrimary,
@@ -7440,6 +7448,8 @@ mod tests {
         runtime.block_on(async {
             for operation in [
                 PublicRecovery::Retry,
+                PublicRecovery::RevertUser,
+                PublicRecovery::RevertIncomplete,
                 PublicRecovery::CommitFailover,
                 PublicRecovery::WalkFailover,
                 PublicRecovery::RestorePrimary,
@@ -7519,6 +7529,8 @@ mod tests {
         runtime.block_on(async {
             for operation in [
                 PublicRecovery::Retry,
+                PublicRecovery::RevertUser,
+                PublicRecovery::RevertIncomplete,
                 PublicRecovery::CommitFailover,
                 PublicRecovery::WalkFailover,
                 PublicRecovery::RestorePrimary,
@@ -7572,6 +7584,99 @@ mod tests {
                 // away; cancellation may leave its earlier write in flight.
                 asupersync::runtime::spawn_blocking(|| {}).await;
             }
+        });
+    }
+
+    #[test]
+    fn native_rewinds_persist_the_selected_path_and_retire_prepared_compaction() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        let runtime_handle = runtime.handle();
+        runtime.block_on(async {
+            for incomplete_only in [false, true] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let (mut session, provider, _) = public_recovery_fixture(dir.path());
+                let store = Arc::clone(&session.session);
+                let cx = AgentCx::for_current_or_request();
+                let (path, entry_ids) = {
+                    let mut stored = store.lock(cx.cx()).await.expect("session");
+                    stored.save().await.expect("save original history");
+                    (
+                        stored.path.clone().expect("saved path"),
+                        stored
+                            .entries
+                            .iter()
+                            .map(|entry| entry.base().id.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                session.park_pending_compaction_for_test(&runtime_handle, None);
+                assert!(session.has_pending_background_compaction());
+                let changed = if incomplete_only {
+                    session.revert_incomplete_response().await
+                } else {
+                    session.revert_last_user_message().await
+                }
+                .expect("durable rewind");
+                assert!(changed);
+                assert!(!session.has_pending_background_compaction());
+                let expected_messages = if incomplete_only {
+                    vec![user_message("accepted input")]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(
+                    serde_json::to_value(session.agent.messages()).expect("live messages"),
+                    serde_json::to_value(&expected_messages).expect("expected messages"),
+                );
+                let reopened = Session::open(path.to_string_lossy().as_ref())
+                    .await
+                    .expect("reopen accepted rewind");
+                assert_eq!(
+                    serde_json::to_value(reopened.to_messages_for_current_path())
+                        .expect("durable messages"),
+                    serde_json::to_value(expected_messages).expect("expected messages"),
+                );
+                assert_eq!(
+                    reopened.leaf_id(),
+                    store.try_lock().expect("live session").leaf_id(),
+                );
+                for id in entry_ids {
+                    assert!(
+                        reopened.get_entry(&id).is_some(),
+                        "rewinding must retain abandoned history for branch navigation",
+                    );
+                }
+                assert!(provider.calls().lock().expect("calls").is_empty());
+                session
+                    .ensure_provider_reentry_allowed()
+                    .expect("accepted rewind remains usable");
+            }
+        });
+    }
+
+    #[test]
+    fn native_incomplete_rewind_reports_no_change_but_checks_persistence() {
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (mut session, provider, _) = public_recovery_fixture(dir.path());
+            assert!(session.revert_incomplete_response().await.expect("first rewind"));
+            assert!(
+                !session
+                    .revert_incomplete_response()
+                    .await
+                    .expect("no incomplete tail")
+            );
+            let blocked = dir.path().join("blocked.jsonl");
+            std::fs::create_dir(&blocked).expect("unwritable session target");
+            session.session.try_lock().expect("session").path = Some(blocked);
+            let error = session
+                .revert_incomplete_response()
+                .await
+                .expect_err("a no-tail recovery cannot skip durable verification");
+            assert!(error.is_session_persistence());
+            assert!(session.ensure_provider_reentry_allowed().is_err());
+            assert!(provider.calls().lock().expect("calls").is_empty());
         });
     }
 
@@ -11974,26 +12079,36 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                 } else {
                     crate::tools::ToolOrigin::BuiltIn
                 };
-                let mut tools = xdev_policy_tools(root.path(), "github", origin, &executions);
-                if revoked == "xdev" {
-                    tools.push(Box::new(XdevPolicyProbeTool {
-                        name: "xdev",
-                        origin: crate::tools::ToolOrigin::Extension,
-                        executions: Arc::clone(&executions),
-                    }));
-                }
+                let tools = xdev_policy_tools(root.path(), "github", origin, &executions);
+                assert!(tools.has_generated_dispatcher());
                 let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
                 let shared = agent.shared_tools();
                 let updates = shared.clone();
                 let requests = Arc::new(StdMutex::new(Vec::<String>::new()));
                 let observed = Arc::clone(&requests);
+                let tool_executions = Arc::clone(&executions);
                 agent.set_tool_approval(Some(Arc::new(move |request| {
                     let updates = updates.clone();
                     let observed = Arc::clone(&observed);
+                    let tool_executions = Arc::clone(&tool_executions);
                     Box::pin(async move {
                         observed.lock().unwrap().push(request.tool_name.clone());
                         if request.tool_name == "github" {
-                            updates.update(|registry| registry.set_active_extension_tools(&[]));
+                            updates.update(|registry| {
+                                if revoked == "xdev" {
+                                    // Revoke the actual generated dispatcher while retaining
+                                    // the target in the replacement host catalog.
+                                    *registry = ToolRegistry::from_tools(vec![Box::new(
+                                        XdevPolicyProbeTool {
+                                            name: "github",
+                                            origin: crate::tools::ToolOrigin::BuiltIn,
+                                            executions: tool_executions,
+                                        },
+                                    )]);
+                                } else {
+                                    registry.set_active_extension_tools(&[]);
+                                }
+                            });
                         }
                         ToolApprovalDecision::Allow
                     })
@@ -12007,6 +12122,9 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                     vec!["xdev".to_string(), "github".to_string()]
                 );
                 assert!(shared.snapshot().get(revoked).is_none());
+                if revoked == "xdev" {
+                    assert!(shared.snapshot().get("github").is_some());
+                }
             }
         });
     }
@@ -12537,6 +12655,186 @@ assert denied["isError"] and "denied by eval test" in denied["content"][0]["text
                         assert_eq!(details["dispatchedVia"], "xdev");
                         assert_eq!(details["tool"], "recall");
                     }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn jobs_effects_distinguish_observation_from_process_control() {
+        let jobs = crate::tools::JobsTool::new();
+        assert!(jobs.effects().processes());
+        for input in [json!({"action": "list"}), json!({"action": " LIST "})] {
+            let effects = jobs.effects_for_input(&input);
+            assert!(effects.reads() && effects.parallel_safe());
+            assert!(!effects.processes() && !effects.writes());
+        }
+        let wait = jobs.effects_for_input(&json!({
+            "action": " WaIt ", "jobId": "retained-task", "timeoutMs": 0,
+        }));
+        assert!(wait.reads() && wait.requires_ordered_execution());
+        assert!(!wait.parallel_safe() && !wait.processes() && !wait.writes());
+        for input in [
+            json!({"action": "cancel", "jobId": "retained-task"}),
+            json!({"action": "unknown"}),
+            json!({"action": 7}),
+            json!({"action": "wait", "timeoutMs": "unbounded"}),
+            json!({}),
+            Value::Null,
+        ] {
+            assert!(jobs.effects_for_input(&input).processes(), "{input}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn planning_observes_owned_background_results_without_cancelling_or_consuming_them() {
+        let _serial = crate::jobs::process_test_guard();
+        let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+        runtime.block_on(async {
+            for through_xdev in [false, true] {
+                for pending_review in [false, true] {
+                    let root = tempfile::tempdir().expect("job workspace");
+                    let config: crate::config::Config = serde_json::from_value(json!({
+                        "tools": {"loadMode": {"jobs": "discoverable"}},
+                    }))
+                    .expect("discovery config");
+                    let tools = ToolRegistry::new(&["jobs"], root.path(), Some(&config));
+                    assert!(tools.is_discoverable("jobs"));
+                    let approvals = Arc::new(StdMutex::new(Vec::new()));
+                    let requested = Arc::clone(&approvals);
+                    let agent = Agent::new(
+                        Arc::new(SilentProvider),
+                        tools,
+                        AgentConfig {
+                            tool_approval: Some(Arc::new(move |request| {
+                                requested.lock().expect("approvals").push(request.tool_name);
+                                Box::pin(async { ToolApprovalDecision::Allow })
+                            })),
+                            ..AgentConfig::default()
+                        },
+                    );
+                    let owner = agent.job_session_scope.session_id().await.expect("owner");
+                    let hub = agent
+                        .job_session_scope
+                        .agent_hub_for_session(&owner)
+                        .expect("owner hub");
+                    let (release, ready) = futures::channel::oneshot::channel::<()>();
+                    let task = {
+                        let _hub_scope = crate::agent_hub::enter_registry(Arc::clone(&hub));
+                        crate::jobs::spawn_owned_task(
+                            crate::jobs::admit_owned_task(&owner).expect("task admission"),
+                            "planning background result",
+                            AgentCx::for_request(),
+                            Duration::from_secs(30),
+                            Some(root.path()),
+                            crate::text_completion::AuxiliaryPrivacySnapshot::from_privacy(
+                                crate::text_completion::AuxiliaryPrivacy::default(),
+                            ),
+                            async move {
+                                ready.await.expect("release retained work");
+                                Ok(ToolOutput {
+                                    content: vec![ContentBlock::Text(TextContent::new(
+                                        "retained analysis result",
+                                    ))],
+                                    details: Some(json!({"analysis": "complete"})),
+                                    is_error: false,
+                                })
+                            },
+                        )
+                        .expect("publish owned task")
+                    };
+                    agent.plan_state().enter_planning();
+                    if pending_review {
+                        agent.plan_state().submit_plan("Review this proposal".to_string());
+                    }
+                    let call = |arguments| {
+                        if through_xdev {
+                            xdev_call("run", Some("jobs"), Some(arguments))
+                        } else {
+                            ToolCall {
+                                id: "planning-jobs".to_string(),
+                                name: "jobs".to_string(),
+                                arguments,
+                                thought_signature: None,
+                            }
+                        }
+                    };
+                    let (listed, failed) = execute_xdev_policy_call(
+                        &agent,
+                        call(json!({"action": "list"})),
+                    )
+                    .await;
+                    assert!(!failed, "{listed:?}");
+                    assert_eq!(listed.details.as_ref().unwrap()["jobs"][0]["id"], task.id);
+                    let (polled, failed) = execute_xdev_policy_call(
+                        &agent,
+                        call(json!({"action": "wait", "jobId": task.id, "timeoutMs": 0})),
+                    )
+                    .await;
+                    assert!(!failed, "{polled:?}");
+                    assert_eq!(polled.details.as_ref().unwrap()["status"], "running");
+                    let admitted = approvals.lock().expect("approvals").len();
+                    assert_eq!(admitted, if through_xdev { 4 } else { 2 });
+                    let (blocked, failed) = execute_xdev_policy_call(
+                        &agent,
+                        call(json!({"action": "cancel", "jobId": task.id})),
+                    )
+                    .await;
+                    assert!(failed && blocked.is_error);
+                    assert!(assistant_text_content(&blocked.content).contains("PLAN_MODE_BLOCKED"));
+                    assert_eq!(approvals.lock().expect("approvals").len(), admitted);
+
+                    let foreign = Agent::new(
+                        Arc::new(SilentProvider),
+                        ToolRegistry::new(&["jobs"], root.path(), Some(&config)),
+                        AgentConfig::default(),
+                    );
+                    let shared_session_id = owner.clone();
+                    foreign.job_session_scope.bind(Arc::new(move || {
+                        let id = shared_session_id.clone();
+                        Box::pin(async move { Some(id) })
+                    }));
+                    foreign.plan_state().enter_planning();
+                    let (hidden, failed) = execute_xdev_policy_call(
+                        &foreign,
+                        call(json!({"action": "list"})),
+                    )
+                    .await;
+                    assert!(!failed, "{hidden:?}");
+                    assert_eq!(hidden.details.as_ref().unwrap()["jobs"], json!([]));
+                    let (hidden, failed) = execute_xdev_policy_call(
+                        &foreign,
+                        call(json!({"action": "wait", "jobId": task.id, "timeoutMs": 0})),
+                    )
+                    .await;
+                    assert!(failed && hidden.is_error);
+                    assert!(assistant_text_content(&hidden.content).contains("PI_JOBS_UNKNOWN_ID"));
+
+                    release.send(()).expect("planning did not cancel owned work");
+                    let (settled, failed) = execute_xdev_policy_call(
+                        &agent,
+                        call(json!({"action": "wait", "jobId": task.id, "timeoutMs": 10_000})),
+                    )
+                    .await;
+                    assert!(!failed, "{settled:?}");
+                    let details = settled.details.as_ref().expect("settled descriptor");
+                    assert_eq!(details["status"], "exited");
+                    assert_eq!(details["result"]["details"]["analysis"], "complete");
+                    {
+                        let _hub_scope = crate::agent_hub::enter_registry(Arc::clone(&hub));
+                        assert_eq!(crate::jobs::take_completion_notices(&owner).len(), 1);
+                        assert!(crate::jobs::take_completion_notices(&owner).is_empty());
+                        assert_eq!(crate::jobs::list(&owner).expect("retained job")[0].id, task.id);
+                    }
+                    assert_eq!(
+                        agent.plan_state().mode(),
+                        if pending_review {
+                            crate::plan::PlanMode::PendingApproval
+                        } else {
+                            crate::plan::PlanMode::Planning
+                        },
+                    );
                 }
             }
         });
